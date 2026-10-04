@@ -26,10 +26,11 @@ default-drain|--drain
 whole-i32|--cache memory --miss-policy whole
 range-i32|--cache memory --miss-policy range
 inflight12|--inflight 12
+coalesce4k|--coalesce 4096
 coalesce32k|--coalesce 32768
-coalesce128k|--coalesce 131072
 coalesce512k|--coalesce 524288
 span1m|--span 1048576
+chunk0|--chunk 0
 warmup0|--warmup false
 early-warmup|--early-warmup
 cold-np20-rr100|--cold-nprobe 20 --cold-rerank 100
@@ -39,10 +40,10 @@ EOF
 )
 # configs per profile (NAMES overrides)
 declare -A SET=(
-	[rtt25]="legacy default default-drain whole-i32 range-i32 inflight12 coalesce32k coalesce128k coalesce512k span1m warmup0 early-warmup cold-np20-rr100 disk-fill disk-restart"
-	[rtt25link500]="legacy default default-drain whole-i32 range-i32 coalesce32k coalesce128k coalesce512k span1m cold-np20-rr100"
-	[rtt60]="legacy default whole-i32 coalesce128k coalesce512k cold-np20-rr100"
-	[r2s3]="legacy default whole-i32 coalesce128k coalesce512k cold-np20-rr100 disk-fill disk-restart"
+	[rtt25]="legacy default default-drain whole-i32 range-i32 inflight12 coalesce4k coalesce32k coalesce512k span1m chunk0 warmup0 early-warmup cold-np20-rr100 disk-fill disk-restart"
+	[rtt25link500]="legacy default default-drain whole-i32 range-i32 coalesce4k coalesce512k chunk0 cold-np20-rr100"
+	[rtt60]="legacy default whole-i32 coalesce4k chunk0 cold-np20-rr100"
+	[r2s3]="legacy default whole-i32 coalesce4k chunk0 cold-np20-rr100 disk-fill disk-restart"
 )
 
 want() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
