@@ -5,6 +5,11 @@ The same bench as bench/cold/cold_bench.mjs (TypeScript SDK): same CLI, same sce
     sdk/python/.venv/bin/python bench/cold/cold_bench.py --store r2s3|proxy|pack [--n 10] [--queries 0]
         [--nprobe N] [--rerank R] [--proxy http://127.0.0.1:9555] [--pack-key packs/g4-cold.threadpack]
         [--label TEXT] [--out data/cold/NAME.jsonl] [--env sdk/ts/examples/basic/.env.secrets]
+        store / cache options (absent = the SDK's defaults), the same as cold_bench.mjs:
+        [--legacy] (the pre-cold-store defaults: MemoryCache with "whole" misses, inflight 12, no warm-up)
+        [--cache none|memory|disk] [--disk-dir data/cold-store/dc-{t}] [--miss-policy whole|range|range+warm]
+        [--inflight N] [--coalesce BYTES] [--span BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
+        [--drain] (wait for background cache warms before the `warm` scenario)
 
 Each trial t spawns a fresh interpreter (fresh connections, fresh native module import, fresh index, empty caches):
   process-cold  query (offset + 2t): import thread_sdk, open the index, one query
@@ -59,6 +64,28 @@ PACK_KEY = ARGS.get("pack-key", "packs/g4-cold.threadpack")
 ENV_FILE = ARGS.get("env", "sdk/ts/examples/basic/.env.secrets")
 NPROBE = int(ARGS["nprobe"]) if "nprobe" in ARGS else None
 RERANK = int(ARGS["rerank"]) if "rerank" in ARGS else None
+
+
+def _num(k: str) -> int | None:
+    return int(ARGS[k]) if k in ARGS else None
+
+
+LEGACY = ARGS.get("legacy") == "true"
+#: The store / cache / query configuration under test (recorded in every row).
+CONFIG: dict[str, Any] = {
+    "legacy": LEGACY,
+    "cache": ARGS.get("cache", "memory" if LEGACY else "default"),
+    "diskDir": ARGS.get("disk-dir"),
+    "missPolicy": ARGS.get("miss-policy", "whole" if LEGACY else None),
+    "inflight": _num("inflight") if "inflight" in ARGS else (12 if LEGACY else None),
+    "coalesceBytes": _num("coalesce"),
+    "spanBytes": _num("span"),
+    "warmup": 0 if ARGS.get("warmup") == "false" else (_num("warmup") if "warmup" in ARGS else (0 if LEGACY else None)),
+    "coldPolicy": ({**({"nprobe": _num("cold-nprobe")} if "cold-nprobe" in ARGS else {}),
+                    **({"rerank": _num("cold-rerank")} if "cold-rerank" in ARGS else {})}
+                   if "cold-nprobe" in ARGS or "cold-rerank" in ARGS else None),
+    "drain": ARGS.get("drain") == "true",
+}
 
 
 def load_env(file: str) -> dict[str, str]:
@@ -124,18 +151,34 @@ def child() -> None:
     ms: dict[str, Any] = {"boot": round(t_entry - spawn_at)}
     t = time.perf_counter()
     import thread_sdk  # noqa: PLC0415 - timed on purpose
-    from thread_sdk import PackedBlobStore, S3BlobStore, open_index  # noqa: PLC0415
+    from thread_sdk import DiskCache, MemoryCache, PackedBlobStore, S3BlobStore, open_index  # noqa: PLC0415
 
     ms["import"] = (time.perf_counter() - t) * 1000
     env = load_env(ENV_FILE)
     ds = Dataset()
+    kw = {k: v for k, v in (("inflight", CONFIG["inflight"]), ("coalesce_bytes", CONFIG["coalesceBytes"]),
+                              ("span_bytes", CONFIG["spanBytes"])) if v is not None}
     if use_proxy:
-        s3 = S3BlobStore(PROXY, env.get("S3_BUCKET", "vib-bench"), "fake", "fake")
+        s3 = S3BlobStore(PROXY, env.get("S3_BUCKET", "vib-bench"), "fake", "fake", **kw)
     else:
-        s3 = S3BlobStore(env["S3_ENDPOINT"], env["S3_BUCKET"], env["S3_ACCESS_KEY_ID"], env["S3_SECRET_ACCESS_KEY"])
+        s3 = S3BlobStore(env["S3_ENDPOINT"], env["S3_BUCKET"], env["S3_ACCESS_KEY_ID"], env["S3_SECRET_ACCESS_KEY"], **kw)
     store = PackedBlobStore(s3, PACK_KEY) if STORE == "pack" else s3
-    # No cache argument: the default for a remote store (a 256 MB MemoryCache).
-    index = open_index(store)
+    # No options: the default for a remote store (a 256 MB MemoryCache with "range+warm" misses).
+    okw: dict[str, Any] = {}
+    c = CONFIG["cache"]
+    if c == "none":
+        okw["cache"] = False
+    elif c == "memory":
+        okw["cache"] = MemoryCache()
+    elif c == "disk":
+        okw["cache"] = DiskCache(os.path.join(ROOT, (CONFIG["diskDir"] or "data/cold-store/dc-{t}").replace("{t}", str(trial))))
+    if CONFIG["missPolicy"]:
+        okw["miss_policy"] = CONFIG["missPolicy"]
+    if CONFIG["warmup"] is not None:
+        okw["warmup"] = CONFIG["warmup"]
+    if CONFIG["coldPolicy"]:
+        okw["cold_policy"] = CONFIG["coldPolicy"]
+    index = open_index(store, **okw)
     os_ = index.open_stats
     qopts: dict[str, Any] = {"top_k": 10}
     if NPROBE is not None:
@@ -223,7 +266,10 @@ def child() -> None:
                 "phase2": tl["phase2"]["bytes"],
                 "query": st["io"]["bytes"],
             },
-            "stats": {"scanned": st["scanned"], "scanBytes": st["scan_bytes"], "slabBytes": st["slab_bytes"],
+            "config": CONFIG,
+            "stats": {"wholeSlabs": st["whole_slabs"], "warms": st["io"].get("warms", 0), "inflight": st["inflight"],
+                      "coalesceBytes": st["coalesce_bytes"], "spanBytes": st["span_bytes"], "cold": st.get("cold"),
+                      "scanned": st["scanned"], "scanBytes": st["scan_bytes"], "slabBytes": st["slab_bytes"],
                       "rerankSlabs": st["rerank_slabs"], "rerankReads": st["rerank_reads"],
                       "rerankBytes": st["rerank_bytes"], "rerankLocal": st["rerank_local"],
                       "specRecords": st["spec_records"], "specUsed": st["spec_used"], "cacheHits": st["io"]["hits"],
@@ -234,6 +280,10 @@ def child() -> None:
     qa = OFFSET + 2 * trial
     run("process-cold", qa, True)
     run("slab-cold", qa + 1, False)
+    if CONFIG["drain"] and hasattr(index.store, "drain"):
+        index.store.drain(60)
+        if use_proxy:
+            proxy_call("POST", "/__reset")  # background warm traffic is not the warm query's
     run("warm", qa + 1, False)
     index.close()
     _ = thread_sdk
@@ -373,16 +423,21 @@ def run_child(trial: int) -> list[dict[str, Any]]:
     return [json.loads(line[6:]) for line in p.stdout.splitlines() if line.startswith("@@ROW ")]
 
 
-def sign_microbench() -> int:
+def sign_microbench(cached: bool = False) -> int:
+    """SigV4 cost per request (us), deriving the signing key every time or with a `SigningKeyCache`."""
     sys.path.insert(0, os.path.join(ROOT, "sdk/python"))
+    from thread_sdk import s3 as s3mod  # noqa: PLC0415
     from thread_sdk.s3 import EMPTY_SHA256, amz_date_of, sign_v4  # noqa: PLC0415
 
+    extra: dict[str, Any] = {}
+    if cached and hasattr(s3mod, "SigningKeyCache"):
+        extra["keys"] = s3mod.SigningKeyCache("secret")
     n = 300
     t0 = time.perf_counter()
     for i in range(n):
         sign_v4(method="GET", path="/vib-bench/idx/g4/slab/01234.179", headers={"range": f"bytes=0-{1000 + i}"},
                 payload_hash=EMPTY_SHA256, host="x.r2.cloudflarestorage.com", region="auto",
-                access_key_id="AKIDEXAMPLE", secret_access_key="secret", amz_date=amz_date_of(time.time()))
+                access_key_id="AKIDEXAMPLE", secret_access_key="secret", amz_date=amz_date_of(time.time()), **extra)
     return round((time.perf_counter() - t0) / n * 1e6)
 
 
@@ -404,12 +459,14 @@ def parent() -> None:
         "endpoint": urlsplit(env["S3_ENDPOINT"]).netloc if STORE == "r2s3" else PROXY,
         "packKey": PACK_KEY if STORE == "pack" else None,
         "proxyConfig": proxy_config,
-        "cache": "MemoryCache 256 MB (open_index's default for a remote store)",
+        "cache": CONFIG["cache"],
+        "config": CONFIG,
         "n": N,
         "queries": {"offset": OFFSET, "used": f"{OFFSET}..{OFFSET + 2 * N - 1}"},
         "nprobe": NPROBE if NPROBE is not None else "manifest",
         "rerank": RERANK if RERANK is not None else "manifest",
         "signUsPerRequest": sign_microbench(),
+        "signUsPerRequestCached": sign_microbench(True),
         "label": ARGS.get("label"),
         "git": git,
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -422,7 +479,8 @@ def parent() -> None:
             f.write(json.dumps(meta) + "\n")
     pc = f" (rtt {proxy_config['rttMs']} ms, {proxy_config['mbps']} Mbps, conn +{proxy_config['connMs']} ms, jitter {proxy_config['jitterMs']} ms)" if proxy_config else ""
     print(f"cold_bench py store={STORE} {meta['endpoint']}{pc} n={N} queries {meta['queries']['used']}  "
-          f"sign_v4 {meta['signUsPerRequest']} us/request", flush=True)
+          f"sign_v4 {meta['signUsPerRequest']} us/request ({meta['signUsPerRequestCached']} with the key cache)  "
+          f"config {json.dumps(CONFIG)}", flush=True)
     for t in range(N):
         got = run_child(t)
         rows += got

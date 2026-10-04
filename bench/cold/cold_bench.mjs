@@ -6,6 +6,11 @@
  *   node bench/cold/cold_bench.mjs --store r2s3|proxy|pack [--n 10] [--queries 0] [--nprobe N] [--rerank R]
  *        [--proxy http://127.0.0.1:9555] [--pack-key packs/g4-cold.threadpack] [--label TEXT]
  *        [--out data/cold/NAME.jsonl] [--env sdk/ts/examples/basic/.env.secrets]
+ *        store / cache options (absent = the SDK's defaults):
+ *        [--legacy] (the pre-cold-store defaults: no cache, inflight 12, no warm-up)
+ *        [--cache none|memory|disk] [--disk-dir data/cold/dc-{t}] [--miss-policy whole|range|range+warm]
+ *        [--inflight N] [--coalesce BYTES] [--span BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
+ *        [--keepalive MS] [--h2] [--drain] (wait for background cache warms before the `warm` scenario)
  *
  * Each trial t spawns a fresh child process (fresh TLS/connection pool, fresh wasm, fresh index, empty caches) that
  * runs three scenarios, each on query vectors nobody used before in the run:
@@ -36,6 +41,23 @@ const ENV_FILE = args.env ?? "sdk/ts/examples/basic/.env.secrets";
 const nprobe = args.nprobe !== undefined ? Number(args.nprobe) : undefined;
 const rerank = args.rerank !== undefined ? Number(args.rerank) : undefined;
 const dist = path.join(root, "sdk/ts/dist");
+const num = (k) => (args[k] !== undefined ? Number(args[k]) : undefined);
+const LEGACY = args.legacy === "true";
+/** The store / cache / query configuration under test (recorded in every row). */
+const config = {
+	legacy: LEGACY,
+	cache: args.cache ?? (LEGACY ? "none" : "default"),
+	diskDir: args["disk-dir"] ?? null,
+	missPolicy: args["miss-policy"] ?? null,
+	inflight: num("inflight") ?? (LEGACY ? 12 : null),
+	coalesceBytes: num("coalesce") ?? null,
+	spanBytes: num("span") ?? null,
+	warmup: args.warmup === "false" ? 0 : (num("warmup") ?? (LEGACY ? 0 : null)),
+	coldPolicy: args["cold-nprobe"] || args["cold-rerank"] ? { ...(num("cold-nprobe") !== undefined ? { nprobe: num("cold-nprobe") } : {}), ...(num("cold-rerank") !== undefined ? { rerank: num("cold-rerank") } : {}) } : null,
+	keepAliveMs: num("keepalive") ?? null,
+	h2: args.h2 === "true",
+	drain: args.drain === "true",
+};
 
 const nowMs = () => performance.now();
 const r1 = (x) => (x === null || x === undefined ? null : Math.round(x * 10) / 10);
@@ -66,12 +88,22 @@ async function child() {
 	ms.wasmCompile = nowMs() - t;
 	const thread = await sdk.Thread.init({ wasmModule });
 	ms.wasmInit = thread.initMs;
+	const node = await import(path.join(dist, "node.js"));
+	const fetchFn = config.keepAliveMs !== null || config.h2 ? await node.nodeFetch({ keepAliveTimeout: config.keepAliveMs ?? 4000, allowH2: config.h2 }) : undefined;
+	const s3opts = { ...(fetchFn ? { fetch: fetchFn } : {}), ...(config.inflight !== null ? { inflight: config.inflight } : {}), ...(config.coalesceBytes !== null ? { coalesceBytes: config.coalesceBytes } : {}), ...(config.spanBytes !== null ? { spanBytes: config.spanBytes } : {}) };
 	const s3 = useProxy
-		? new sdk.S3BlobStore({ endpoint: PROXY, bucket: env.S3_BUCKET ?? "vib-bench", region: "auto", accessKeyId: "fake", secretAccessKey: "fake" })
-		: new sdk.S3BlobStore({ endpoint: env.S3_ENDPOINT, bucket: env.S3_BUCKET, region: "auto", accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY });
+		? new sdk.S3BlobStore({ endpoint: PROXY, bucket: env.S3_BUCKET ?? "vib-bench", region: "auto", accessKeyId: "fake", secretAccessKey: "fake", ...s3opts })
+		: new sdk.S3BlobStore({ endpoint: env.S3_ENDPOINT, bucket: env.S3_BUCKET, region: "auto", accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY, ...s3opts });
 	const store = STORE === "pack" ? await sdk.PackedBlobStore.open(s3, PACK_KEY) : s3;
-	// No `cache` option: what a Node user gets by default (the Cache API does not exist in Node, so: none).
-	const index = await thread.open({ store });
+	// No options: what a Node user gets by default (a MemoryCache with "range+warm" in front of a remote store).
+	const cache = config.cache === "none" ? false : config.cache === "memory" ? new sdk.MemoryCache() : config.cache === "disk" ? new node.DiskCache(path.resolve(root, (config.diskDir ?? "data/cold-store/dc-{t}").replace("{t}", String(trial)))) : undefined;
+	const index = await thread.open({
+		store,
+		...(cache !== undefined ? { cache } : {}),
+		...(config.missPolicy ? { missPolicy: config.missPolicy } : {}),
+		...(config.warmup !== null ? { warmup: config.warmup } : {}),
+		...(config.coldPolicy ? { coldPolicy: config.coldPolicy } : {}),
+	});
 	const os = index.openStats;
 	const qopts = { topK: 10, ...(nprobe !== undefined ? { nprobe } : {}), ...(rerank !== undefined ? { rerank } : {}) };
 	const emit = (row) => process.stdout.write("@@ROW " + JSON.stringify(row) + "\n");
@@ -144,7 +176,8 @@ async function child() {
 				phase2: tl.phase2.bytes,
 				query: st.io.bytes,
 			},
-			stats: { scanned: st.scanned, scanBytes: st.scanBytes, slabBytes: st.slabBytes, rerankSlabs: st.rerankSlabs, rerankReads: st.rerankReads, rerankBytes: st.rerankBytes, rerankLocal: st.rerankLocal, specRecords: st.specRecords, specUsed: st.specUsed, cacheHits: st.io.hits, cacheMisses: st.io.misses, baseFiles: withOpen ? os.base.files : null },
+			config,
+			stats: { wholeSlabs: st.wholeSlabs, warms: st.io.warms ?? 0, inflight: st.inflight, coalesceBytes: st.coalesceBytes, spanBytes: st.spanBytes, cold: st.cold ?? null, scanned: st.scanned, scanBytes: st.scanBytes, slabBytes: st.slabBytes, rerankSlabs: st.rerankSlabs, rerankReads: st.rerankReads, rerankBytes: st.rerankBytes, rerankLocal: st.rerankLocal, specRecords: st.specRecords, specUsed: st.specUsed, cacheHits: st.io.hits, cacheMisses: st.io.misses, baseFiles: withOpen ? os.base.files : null },
 			proxy,
 		});
 	};
@@ -152,6 +185,10 @@ async function child() {
 	const qb = qa + 1;
 	await run("process-cold", qa, true);
 	await run("slab-cold", qb, false);
+	if (config.drain && index.store.drain) {
+		await index.store.drain();
+		if (useProxy) await proxyCall("POST", "/__reset"); // background warm traffic is not the warm query's
+	}
 	await run("warm", qb, false);
 	index.close();
 }
@@ -175,10 +212,12 @@ function fileURLToPathSafe(u) {
 	return new URL(u).pathname;
 }
 
-async function signMicrobench(sdk) {
+/** SigV4 cost per request (us), deriving the signing key every time or with the store's `SigningKeyCache`. */
+async function signMicrobench(sdk, cached = false) {
 	const n = 300;
+	const keys = cached && sdk.SigningKeyCache ? new sdk.SigningKeyCache("secret") : undefined;
 	const t0 = nowMs();
-	for (let i = 0; i < n; i++) await sdk.signV4({ method: "GET", path: "/vib-bench/idx/g4/slab/01234.179", headers: { range: `bytes=0-${1000 + i}` }, payloadHash: sdk.EMPTY_SHA256, host: "x.r2.cloudflarestorage.com", region: "auto", accessKeyId: "AKIDEXAMPLE", secretAccessKey: "secret", amzDate: sdk.amzDateOf(Date.now()) });
+	for (let i = 0; i < n; i++) await sdk.signV4({ method: "GET", path: "/vib-bench/idx/g4/slab/01234.179", headers: { range: `bytes=0-${1000 + i}` }, payloadHash: sdk.EMPTY_SHA256, host: "x.r2.cloudflarestorage.com", region: "auto", accessKeyId: "AKIDEXAMPLE", secretAccessKey: "secret", amzDate: sdk.amzDateOf(Date.now()) }, keys);
 	return Math.round(((nowMs() - t0) / n) * 1000);
 }
 
@@ -200,12 +239,14 @@ async function parent() {
 		endpoint: STORE === "r2s3" ? new URL(env.S3_ENDPOINT).host : PROXY,
 		packKey: STORE === "pack" ? PACK_KEY : null,
 		proxyConfig,
-		cache: "none (Node has no Cache API; thread.open puts no cache in front of the store)",
+		cache: config.cache,
+		config,
 		n: N,
 		queries: { offset: OFFSET, used: `${OFFSET}..${OFFSET + 2 * N - 1}` },
 		nprobe: nprobe ?? "manifest",
 		rerank: rerank ?? "manifest",
 		signUsPerRequest: await signMicrobench(sdk),
+		signUsPerRequestCached: await signMicrobench(sdk, true),
 		label: args.label ?? null,
 		git,
 		date: new Date().toISOString(),
@@ -216,7 +257,7 @@ async function parent() {
 		fs.mkdirSync(path.dirname(out), { recursive: true });
 		fs.writeFileSync(out, JSON.stringify(meta) + "\n");
 	}
-	console.log(`cold_bench ts store=${STORE} ${meta.endpoint}${proxyConfig ? ` (rtt ${proxyConfig.rttMs} ms, ${proxyConfig.mbps} Mbps, conn +${proxyConfig.connMs} ms, jitter ${proxyConfig.jitterMs} ms)` : ""} n=${N} queries ${meta.queries.used}  signV4 ${meta.signUsPerRequest} us/request`);
+	console.log(`cold_bench ts store=${STORE} ${meta.endpoint}${proxyConfig ? ` (rtt ${proxyConfig.rttMs} ms, ${proxyConfig.mbps} Mbps, conn +${proxyConfig.connMs} ms, jitter ${proxyConfig.jitterMs} ms)` : ""} n=${N} queries ${meta.queries.used}  signV4 ${meta.signUsPerRequest} us/request (${meta.signUsPerRequestCached} with the key cache)  config ${JSON.stringify(config)}`);
 	for (let t = 0; t < N; t++) {
 		const got = await runChild(t);
 		for (const r of got) {
