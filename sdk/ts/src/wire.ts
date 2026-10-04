@@ -299,6 +299,9 @@ export type RoutingOption = RoutingElem | "auto";
 /** Bytes of one routing table row. */
 export const routingRowBytes = (dim: number, elem: RoutingElem): number => (elem === "f32" ? 4 * dim : elem === "f16" ? 2 * dim : 4 + dim);
 
+/** Bytes of a whole routing table of `k` rows (i8: the f32 centre the rows are residuals from, then the rows). */
+export const routingTableBytes = (dim: number, k: number, elem: RoutingElem): number => (elem === "i8" ? 4 * dim : 0) + k * routingRowBytes(dim, elem);
+
 export interface RoutingTableRef {
 	key: string;
 	bytes: number;

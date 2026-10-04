@@ -3,7 +3,8 @@
  * centroid tree and the means of just the groups it needs, range-read from the tree-grouped table
  * (`fine.grouped.{rev}.{elem}`, "VIBG"). Group g's rows are `[dataOff + offsets[g] * rowBytes, +n * rowBytes)` with
  * the tree's CSR offsets, so one round trip after the tree (0.8 MB at 4096 cells / 128 groups) brings the beam's
- * groups (beam x 32 cells). Loaded groups stay loaded for later queries; concurrent queries share in-flight reads.
+ * groups (beam x 32 cells); for i8 rows the first such read also brings the table's head (the directory and the centre
+ * the rows are residuals from, 23 KB at 4096 x 1536). Loaded groups stay loaded for later queries; concurrent queries share in-flight reads.
  * Delta segments need `q·mean` for the cells they hold entries in: their rows are read the same way (by row, from
  * the cell's row in the grouped table), so delta scores match the full table's.
  */
@@ -65,6 +66,9 @@ export class ColdRouting {
 	private async readRuns(runs: Run[], trace: BlobTrace, stat: ColdStat): Promise<void> {
 		const rb = this.ref.rowBytes;
 		const ranges: BlobRange[] = runs.map((r) => ({ offset: this.ref.dataOff + r.first * rb, length: r.n * rb }));
+		// i8 rows are residuals from the centre in the table's head: the first read brings it along.
+		const head = this.router.needs_head();
+		if (head) ranges.unshift({ offset: 0, length: this.ref.dataOff });
 		let got: Uint8Array[] | null = null;
 		if (ranges.length > 1 && this.store.getRanges) {
 			got = await this.store.getRanges(this.ref.key, ranges, { trace });
@@ -79,6 +83,11 @@ export class ColdRouting {
 					return b;
 				}),
 			);
+		}
+		if (head) {
+			const h = got.shift()!;
+			stat.bytes += h.byteLength;
+			if (this.router.needs_head()) this.router.set_head(h);
 		}
 		runs.forEach((r, i) => {
 			if (got![i].byteLength !== r.n * rb) throw new ThreadError(`${this.ref.key}: rows ${r.first}..${r.first + r.n} came back as ${got![i].byteLength} bytes`);

@@ -335,11 +335,12 @@ impl Searcher {
                 coarse.len()
             )));
         }
-        if table.len() != k * elem.row_bytes(dim) {
+        if table.len() != elem.table_bytes(dim, k) {
             return Err(value_err(format!(
-                "{} routing table is {} bytes, expected {k} rows of {} bytes",
+                "{} routing table is {} bytes, expected {} ({k} rows of {} bytes)",
                 elem.name(),
                 table.len(),
+                elem.table_bytes(dim, k),
                 elem.row_bytes(dim)
             )));
         }
@@ -528,6 +529,10 @@ pub struct ColdRouter {
 }
 
 impl ColdRouter {
+    fn set_head(&self, head: &[u8]) -> PyResult<()> {
+        let t = GroupedTable::parse(head).map_err(value_err)?;
+        self.write().set_head(&t).map_err(value_err)
+    }
     fn read(&self) -> std::sync::RwLockReadGuard<'_, PartialRouter> {
         self.inner.read().unwrap_or_else(|e| e.into_inner())
     }
@@ -548,16 +553,37 @@ impl ColdRouter {
 
 #[pymethods]
 impl ColdRouter {
+    /// `tree`: the centroid tree the grouped table follows; `elem`: its row type; `head`: the table's
+    /// first `data_off` bytes (header, directory and, for i8, the centre the rows are residuals
+    /// from), or None: i8 rows then need `set_head` before the first `add_rows` (`needs_head`).
     #[new]
-    fn new(tree: Buf, elem: &str) -> PyResult<Self> {
+    #[pyo3(signature = (tree, elem, head = None))]
+    fn new(tree: Buf, elem: &str, head: Option<Buf>) -> PyResult<Self> {
         let elem = elem_arg(elem)?;
         let tree = CentroidTree::from_bytes(tree.as_slice()).map_err(value_err)?;
         let (dim, k) = (tree.dim, tree.k);
-        Ok(ColdRouter {
-            inner: RwLock::new(PartialRouter::new(tree, elem)),
+        let r = ColdRouter {
+            inner: RwLock::new(PartialRouter::new(tree, elem, None).map_err(value_err)?),
             dim,
             k,
-        })
+        };
+        if let Some(h) = head.as_ref() {
+            r.set_head(h.as_slice())?;
+        }
+        Ok(r)
+    }
+
+    /// Whether i8 rows still need the table's head (`set_head`) before they can be added.
+    #[getter]
+    fn needs_head(&self) -> bool {
+        self.read().needs_head()
+    }
+
+    /// Installs the table's head (its first `data_off` bytes): checks it against the tree, takes the
+    /// i8 centre.
+    #[pyo3(name = "set_head")]
+    fn set_head_py(&self, head: Buf) -> PyResult<()> {
+        self.set_head(head.as_slice())
     }
 
     #[getter]

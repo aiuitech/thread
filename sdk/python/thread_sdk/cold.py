@@ -50,12 +50,22 @@ class ColdRouting:
     def _read_runs(self, runs: list[tuple[int, int]], trace: BlobTrace, stat: dict[str, int]) -> None:
         rb, off, key = self.ref["rowBytes"], self.ref["dataOff"], self.ref["key"]
         ranges = [BlobRange(off + first * rb, n * rb) for first, n in runs]
+        # i8 rows are residuals from the centre in the table's head: the first read brings it along.
+        head = self.router.needs_head
+        if head:
+            ranges.insert(0, BlobRange(0, off))
         got = self.store.get_ranges(key, ranges, trace=trace) if len(ranges) > 1 and self.store.supports_ranges else None
         reads = 1
         if got is None:
             got = [self.store.get(key, r, trace=trace) for r in ranges]
             reads = len(ranges)
-        for (first, n), b in zip(runs, got):
+        if head:
+            h = got[0]
+            if h is None:
+                raise ThreadError(f"missing {key}", 404)
+            if self.router.needs_head:
+                self.router.set_head(h)
+        for (first, n), b in zip(runs, got[1:] if head else got):
             if b is None:
                 raise ThreadError(f"missing {key}", 404)
             if len(b) != n * rb:

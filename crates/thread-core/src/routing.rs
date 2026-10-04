@@ -1,5 +1,6 @@
 //! Compact routing tables: the fine cell means stored as IEEE half floats
-//! (`fine.f16`) or int8 with one f32 scale per row (`fine.i8`), the same means
+//! (`fine.f16`) or int8 around their common centre with one f32 scale per row
+//! (`fine.i8`), the same means
 //! in centroid-tree group order (`fine.grouped.*`, "VIBG") so a cold reader can
 //! range-read just the groups a query needs, and [`PartialRouter`], which
 //! routes over whatever subset of cell means it has been given.
@@ -11,13 +12,19 @@
 //! once, on load: a [`crate::route::Router`] over decoded means routes exactly
 //! as it does over `fine.f32`, only with slightly different means.
 //!
-//! Row layouts (little-endian, `k` rows of `dim` values, no header):
+//! Table layouts (little-endian, `k` rows of `dim` values):
 //! ```text
-//! f32  dim * 4 bytes      the raw means (fine.f32)
-//! f16  dim * 2 bytes      IEEE 754 binary16, round to nearest even
-//! i8   4 + dim bytes      [scale f32][code i8 * dim], value = code * scale,
-//!                         scale = max |x| / 127 (0 for a zero row)
+//! f32  k rows of dim * 4 bytes   the raw means (fine.f32)
+//! f16  k rows of dim * 2 bytes   IEEE 754 binary16, round to nearest even
+//! i8   centre dim * 4 bytes      the mean of all rows (f32)
+//!      k rows of 4 + dim bytes   [scale f32][code i8 * dim]: value = centre + code * scale,
+//!                                scale = max |x - centre| / 127 (0 for a row equal to the centre)
 //! ```
+//! The i8 rows are residuals from the centre because cell means share a large
+//! common component (on dbpedia-openai, |centre| = 0.83 of a mean norm of 0.90,
+//! with one dimension at 0.66): a per-row scale over the raw means spends its
+//! 8 bits on that component, a scale over the residuals on what tells the cells
+//! apart (probe overlap with f32 routing at nprobe 34: 96.9% raw, 99.8% centred).
 //!
 //! Tree-grouped table ("VIBG" v1, little-endian):
 //! ```text
@@ -25,6 +32,7 @@
 //!                    dim u32, k u32, groups u32, n_rows u32, data_off u32
 //! offsets   (groups + 1) u32    CSR: group g is rows offsets[g]..offsets[g + 1]
 //! cells     n_rows u32          the cell id of every row
+//! centre    dim f32             i8 tables only: the centre the rows are residuals from
 //! zero padding to data_off (a multiple of 8)
 //! rows      n_rows * row_bytes  in the order above
 //! ```
@@ -32,7 +40,7 @@
 //! / `all_members`), so a reader holding the tree can compute the byte range of
 //! any group without reading the directory: `data_off + offsets[g] * row_bytes`.
 
-use crate::error::{need, rd_f32, rd_u32, FormatError};
+use crate::error::{f32s_from_le, need, rd_f32, rd_u32, FormatError};
 use crate::math::{dot, inv_norms};
 use crate::route::{push_top_unique, CentroidTree};
 
@@ -88,6 +96,33 @@ impl Elem {
             Elem::I8 => 4 + dim,
         }
     }
+
+    /// Bytes in front of the rows of a whole table (the i8 centre).
+    pub fn prefix_bytes(self, dim: usize) -> usize {
+        match self {
+            Elem::I8 => 4 * dim,
+            _ => 0,
+        }
+    }
+
+    /// Bytes of a whole table of `k` rows.
+    pub fn table_bytes(self, dim: usize, k: usize) -> usize {
+        self.prefix_bytes(dim) + k * self.row_bytes(dim)
+    }
+}
+
+/// The mean of the rows of `means` (`k * dim`), accumulated in f64.
+pub fn centre_of(means: &[f32], dim: usize) -> Vec<f32> {
+    let k = means.len() / dim;
+    let mut acc = vec![0f64; dim];
+    for row in means.chunks_exact(dim) {
+        for (a, &x) in acc.iter_mut().zip(row) {
+            *a += x as f64;
+        }
+    }
+    acc.into_iter()
+        .map(|a| if k > 0 { (a / k as f64) as f32 } else { 0.0 })
+        .collect()
 }
 
 /// `x` as IEEE 754 binary16 bits, rounded to nearest even (overflow gives
@@ -158,7 +193,8 @@ pub fn f16_to_f32(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-fn encode_row(row: &[f32], elem: Elem, out: &mut Vec<u8>) {
+/// Encodes one row (`centre`: the i8 residual base; ignored for f32 / f16).
+fn encode_row(row: &[f32], elem: Elem, centre: &[f32], out: &mut Vec<u8>) {
     match elem {
         Elem::F32 => {
             for x in row {
@@ -171,7 +207,10 @@ fn encode_row(row: &[f32], elem: Elem, out: &mut Vec<u8>) {
             }
         }
         Elem::I8 => {
-            let max = row.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let max = row
+                .iter()
+                .zip(centre)
+                .fold(0f32, |m, (x, c)| m.max((x - c).abs()));
             let scale = if max > 0.0 && max.is_finite() {
                 max / 127.0
             } else {
@@ -179,31 +218,19 @@ fn encode_row(row: &[f32], elem: Elem, out: &mut Vec<u8>) {
             };
             out.extend_from_slice(&scale.to_le_bytes());
             let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
-            for &x in row {
-                out.push((x * inv).round().clamp(-127.0, 127.0) as i8 as u8);
+            for (&x, &c) in row.iter().zip(centre) {
+                out.push(((x - c) * inv).round().clamp(-127.0, 127.0) as i8 as u8);
             }
         }
     }
 }
 
-/// Encodes `means` (`k * dim` f32) as `k` rows of `elem`.
-pub fn encode_rows(means: &[f32], dim: usize, elem: Elem) -> Vec<u8> {
-    assert!(
-        dim > 0 && means.len() % dim == 0,
-        "means is not a whole number of rows"
-    );
-    let mut out = Vec::with_capacity(means.len() / dim * elem.row_bytes(dim));
-    for row in means.chunks_exact(dim) {
-        encode_row(row, elem, &mut out);
-    }
-    out
-}
-
-/// Decodes rows of `elem` into `out` (`rows * dim` f32).
-pub fn decode_rows_into(
+/// Decodes rows of `elem` (no table prefix) into `out` (`rows * dim`); `centre` is required for i8.
+fn decode_rows_with(
     bytes: &[u8],
     dim: usize,
     elem: Elem,
+    centre: Option<&[f32]>,
     out: &mut [f32],
 ) -> Result<(), FormatError> {
     let rb = elem.row_bytes(dim);
@@ -229,10 +256,14 @@ pub fn decode_rows_into(
             }
         }
         Elem::I8 => {
+            let centre = centre.ok_or(FormatError::Inconsistent("i8 rows need their centre"))?;
+            if centre.len() != dim {
+                return Err(FormatError::Inconsistent("i8 centre length != dim"));
+            }
             for (row, o) in bytes.chunks_exact(rb).zip(out.chunks_exact_mut(dim)) {
                 let scale = rd_f32(row, 0);
-                for (v, &c) in o.iter_mut().zip(&row[4..]) {
-                    *v = c as i8 as f32 * scale;
+                for ((v, &c), &m) in o.iter_mut().zip(&row[4..]).zip(centre) {
+                    *v = m + c as i8 as f32 * scale;
                 }
             }
         }
@@ -240,16 +271,41 @@ pub fn decode_rows_into(
     Ok(())
 }
 
-/// Decodes a whole routing table of `elem` rows into f32 means (`rows * dim`).
+/// Encodes `means` (`k * dim` f32) as a whole routing table of `elem`
+/// (for i8: their centre, then `k` rows of residuals from it).
+pub fn encode_rows(means: &[f32], dim: usize, elem: Elem) -> Vec<u8> {
+    assert!(
+        dim > 0 && means.len() % dim == 0,
+        "means is not a whole number of rows"
+    );
+    let k = means.len() / dim;
+    let mut out = Vec::with_capacity(elem.table_bytes(dim, k));
+    let centre = if elem == Elem::I8 {
+        centre_of(means, dim)
+    } else {
+        Vec::new()
+    };
+    for x in &centre {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
+    for row in means.chunks_exact(dim) {
+        encode_row(row, elem, &centre, &mut out);
+    }
+    out
+}
+
+/// Decodes a whole routing table of `elem` (as [`encode_rows`] writes it) into f32 means (`k * dim`).
 pub fn decode_rows(bytes: &[u8], dim: usize, elem: Elem) -> Result<Vec<f32>, FormatError> {
+    let pre = elem.prefix_bytes(dim);
     let rb = elem.row_bytes(dim);
-    if dim == 0 || bytes.len() % rb != 0 {
+    if dim == 0 || bytes.len() < pre || (bytes.len() - pre) % rb != 0 {
         return Err(FormatError::Inconsistent(
             "routing table length is not a whole number of rows",
         ));
     }
-    let mut out = vec![0f32; bytes.len() / rb * dim];
-    decode_rows_into(bytes, dim, elem, &mut out)?;
+    let centre = (pre > 0).then(|| f32s_from_le(&bytes[..pre]));
+    let mut out = vec![0f32; (bytes.len() - pre) / rb * dim];
+    decode_rows_with(&bytes[pre..], dim, elem, centre.as_deref(), &mut out)?;
     Ok(out)
 }
 
@@ -257,13 +313,18 @@ pub const GROUPED_MAGIC: &[u8; 4] = b"VIBG";
 pub const GROUPED_VERSION: u32 = 1;
 pub const GROUPED_HEADER: usize = 32;
 
+/// Byte offset of the i8 centre of a grouped table (right after the directory).
+pub fn grouped_centre_off(groups: usize, n_rows: usize) -> usize {
+    GROUPED_HEADER + 4 * (groups + 1) + 4 * n_rows
+}
+
 /// Byte offset of the first row of a grouped table with this many groups and rows.
-pub fn grouped_data_off(groups: usize, n_rows: usize) -> usize {
-    (GROUPED_HEADER + 4 * (groups + 1) + 4 * n_rows).div_ceil(8) * 8
+pub fn grouped_data_off(elem: Elem, dim: usize, groups: usize, n_rows: usize) -> usize {
+    (grouped_centre_off(groups, n_rows) + elem.prefix_bytes(dim)).div_ceil(8) * 8
 }
 
 /// Header and directory of a tree-grouped routing table.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GroupedTable {
     pub elem: Elem,
     pub dim: usize,
@@ -273,6 +334,8 @@ pub struct GroupedTable {
     pub data_off: usize,
     pub offsets: Vec<u32>,
     pub cells: Vec<u32>,
+    /// i8 tables: the centre the rows are residuals from.
+    pub centre: Option<Vec<f32>>,
 }
 
 impl GroupedTable {
@@ -302,7 +365,7 @@ impl GroupedTable {
             && self.cells == tree.all_members()
     }
 
-    /// Parses the header and directory (`buf` may be just the first `data_off` bytes or the whole object).
+    /// Parses the header, directory and i8 centre (`buf` may be just the first `data_off` bytes or the whole object).
     pub fn parse(buf: &[u8]) -> Result<GroupedTable, FormatError> {
         need(buf, GROUPED_HEADER)?;
         if &buf[0..4] != GROUPED_MAGIC {
@@ -327,7 +390,7 @@ impl GroupedTable {
                 "grouped table: dim, k and groups must be positive",
             ));
         }
-        if data_off != grouped_data_off(groups, n_rows) {
+        if data_off != grouped_data_off(elem, dim, groups, n_rows) {
             return Err(FormatError::Inconsistent(
                 "grouped table: data_off does not follow the directory",
             ));
@@ -348,6 +411,13 @@ impl GroupedTable {
         if cells.iter().any(|&c| c as usize >= k) {
             return Err(FormatError::Inconsistent("grouped table: cell id >= k"));
         }
+        let centre = if elem == Elem::I8 {
+            let a = grouped_centre_off(groups, n_rows);
+            need(buf, a + 4 * dim)?;
+            Some(f32s_from_le(&buf[a..a + 4 * dim]))
+        } else {
+            None
+        };
         let t = GroupedTable {
             elem,
             dim,
@@ -357,6 +427,7 @@ impl GroupedTable {
             data_off,
             offsets,
             cells,
+            centre,
         };
         if buf.len() > t.data_off && buf.len() != t.byte_len() {
             return Err(FormatError::Inconsistent(
@@ -377,7 +448,12 @@ pub fn encode_grouped(means: &[f32], dim: usize, tree: &CentroidTree, elem: Elem
     );
     let groups = tree.groups();
     let cells = tree.all_members();
-    let data_off = grouped_data_off(groups, cells.len());
+    let data_off = grouped_data_off(elem, dim, groups, cells.len());
+    let centre = if elem == Elem::I8 {
+        centre_of(means, dim)
+    } else {
+        Vec::new()
+    };
     let mut out = Vec::with_capacity(data_off + cells.len() * elem.row_bytes(dim));
     out.extend_from_slice(GROUPED_MAGIC);
     for v in [
@@ -394,10 +470,13 @@ pub fn encode_grouped(means: &[f32], dim: usize, tree: &CentroidTree, elem: Elem
     for v in tree.member_offsets().iter().chain(cells) {
         out.extend_from_slice(&v.to_le_bytes());
     }
+    for x in &centre {
+        out.extend_from_slice(&x.to_le_bytes());
+    }
     out.resize(data_off, 0);
     for &c in cells {
         let c = c as usize;
-        encode_row(&means[c * dim..(c + 1) * dim], elem, &mut out);
+        encode_row(&means[c * dim..(c + 1) * dim], elem, &centre, &mut out);
     }
     out
 }
@@ -424,11 +503,23 @@ pub struct PartialRouter {
     /// Row of each cell in the grouped table (its first appearance).
     row_of: Vec<u32>,
     group_loaded: Vec<bool>,
+    /// i8 rows: their centre.
+    centre: Option<Vec<f32>>,
 }
 
 impl PartialRouter {
-    /// A router with no means loaded yet, for rows of `elem` in `tree`'s group order.
-    pub fn new(tree: CentroidTree, elem: Elem) -> PartialRouter {
+    /// A router with no means loaded yet, for rows of `elem` in `tree`'s group
+    /// order. i8 rows are residuals from the table's centre: pass it here
+    /// ([`GroupedTable::centre`]) or later with [`PartialRouter::set_head`],
+    /// before the first [`PartialRouter::add_rows`].
+    pub fn new(
+        tree: CentroidTree,
+        elem: Elem,
+        centre: Option<Vec<f32>>,
+    ) -> Result<PartialRouter, FormatError> {
+        if centre.as_ref().is_some_and(|c| c.len() != tree.dim) {
+            return Err(FormatError::Inconsistent("centre length != dim"));
+        }
         let mut row_of = vec![NONE; tree.k];
         for (r, &c) in tree.all_members().iter().enumerate() {
             if row_of[c as usize] == NONE {
@@ -436,7 +527,7 @@ impl PartialRouter {
             }
         }
         let groups = tree.groups();
-        PartialRouter {
+        Ok(PartialRouter {
             dim: tree.dim,
             k: tree.k,
             elem,
@@ -445,8 +536,29 @@ impl PartialRouter {
             inv: Vec::new(),
             row_of,
             group_loaded: vec![false; groups],
+            centre: if elem == Elem::I8 { centre } else { None },
             tree,
+        })
+    }
+
+    /// Whether rows cannot be decoded yet: i8 rows without the table's centre
+    /// (read the table's head, `[0, data_off)`, and pass it to [`PartialRouter::set_head`]).
+    pub fn needs_head(&self) -> bool {
+        self.elem == Elem::I8 && self.centre.is_none()
+    }
+
+    /// Takes the centre (i8) from the table's parsed head, after checking the
+    /// head describes this router's tree and element type.
+    pub fn set_head(&mut self, head: &GroupedTable) -> Result<(), FormatError> {
+        if head.elem != self.elem || !head.matches_tree(&self.tree) {
+            return Err(FormatError::Inconsistent(
+                "grouped table head does not match the tree / element type",
+            ));
         }
+        if self.elem == Elem::I8 {
+            self.centre = head.centre.clone();
+        }
+        Ok(())
     }
 
     pub fn elem(&self) -> Elem {
@@ -528,6 +640,11 @@ impl PartialRouter {
             ));
         }
         let n = bytes.len() / rb;
+        if self.needs_head() {
+            return Err(FormatError::Inconsistent(
+                "i8 grouped rows need the table's centre (set_head)",
+            ));
+        }
         let members = self.tree.all_members();
         if first_row + n > members.len() {
             return Err(FormatError::Inconsistent("grouped rows: past the last row"));
@@ -540,7 +657,13 @@ impl PartialRouter {
             if self.slot[c] != NONE {
                 continue;
             }
-            decode_rows_into(&bytes[i * rb..(i + 1) * rb], dim, self.elem, &mut row)?;
+            decode_rows_with(
+                &bytes[i * rb..(i + 1) * rb],
+                dim,
+                self.elem,
+                self.centre.as_deref(),
+                &mut row,
+            )?;
             self.slot[c] = self.inv.len() as u32;
             self.inv.push(inv_norms(&row, dim)[0]);
             self.means.extend_from_slice(&row);
@@ -699,11 +822,15 @@ mod tests {
         let m = means(&mut rng, k, dim);
         for elem in [Elem::F32, Elem::F16, Elem::I8] {
             let b = encode_rows(&m, dim, elem);
-            assert_eq!(b.len(), k * elem.row_bytes(dim));
+            assert_eq!(b.len(), elem.table_bytes(dim, k));
             let d = decode_rows(&b, dim, elem).unwrap();
             assert_eq!(d.len(), m.len());
+            let centre = centre_of(&m, dim);
             for (row, drow) in m.chunks_exact(dim).zip(d.chunks_exact(dim)) {
-                let max = row.iter().fold(0f32, |a, x| a.max(x.abs()));
+                let max = row
+                    .iter()
+                    .zip(&centre)
+                    .fold(0f32, |a, (x, c)| a.max((x - c).abs()));
                 for (x, y) in row.iter().zip(drow) {
                     let tol = match elem {
                         Elem::F32 => 0.0,
@@ -750,6 +877,39 @@ mod tests {
     }
 
     #[test]
+    fn centred_i8_keeps_routing_when_means_share_a_large_component() {
+        // cell means = a common direction (norm ~0.8, one large dimension) + small cell-specific parts,
+        // like the means of a real embedding model
+        let mut rng = Rng::new(17);
+        let (k, dim) = (300, 96);
+        let mut common: Vec<f32> = (0..dim).map(|_| uni(&mut rng) * 0.05).collect();
+        common[3] = 0.66;
+        let m: Vec<f32> = (0..k * dim)
+            .map(|i| common[i % dim] + uni(&mut rng) * 0.03)
+            .collect();
+        let full = Router::new(dim, 1, k, &vec![1.0; dim], m.clone());
+        let i8 = Router::new(
+            dim,
+            1,
+            k,
+            &vec![1.0; dim],
+            decode_rows(&encode_rows(&m, dim, Elem::I8), dim, Elem::I8).unwrap(),
+        );
+        let mut same = 0;
+        for _ in 0..300 {
+            let mut q: Vec<f32> = common.iter().map(|c| c + uni(&mut rng) * 0.03).collect();
+            normalize(&mut q);
+            let a: Vec<usize> = full.route_flat(&q, 10).into_iter().map(|x| x.0).collect();
+            let b: Vec<usize> = i8.route_flat(&q, 10).into_iter().map(|x| x.0).collect();
+            same += a.iter().filter(|c| b.contains(c)).count();
+        }
+        assert!(
+            same as f32 / 3000.0 > 0.9,
+            "centred i8 probe overlap {same}/3000"
+        );
+    }
+
+    #[test]
     fn grouped_table_layout_and_partial_routing() {
         let mut rng = Rng::new(3);
         let (k, dim, groups) = (300, 32, 12);
@@ -774,16 +934,42 @@ mod tests {
             assert_eq!(GroupedTable::parse(&bad), Err(FormatError::BadMagic));
             // every row decodes to the cell's (quantized) mean
             let flat = decode_rows(&encode_rows(&m, dim, elem), dim, elem).unwrap();
+            assert_eq!(t.centre.is_some(), elem == Elem::I8);
+            // a group's rows as a whole table (with the centre in front for i8)
+            let prefix: Vec<u8> = t
+                .centre
+                .iter()
+                .flatten()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
             for g in 0..groups {
                 let (off, len) = t.group_range(g);
-                let rows = decode_rows(&bytes[off..off + len], dim, elem).unwrap();
+                let rows = decode_rows(&[&prefix[..], &bytes[off..off + len]].concat(), dim, elem)
+                    .unwrap();
                 for (i, &c) in tree.members(g).iter().enumerate() {
                     let c = c as usize;
                     assert_eq!(&rows[i * dim..(i + 1) * dim], &flat[c * dim..(c + 1) * dim]);
                 }
             }
 
-            let mut pr = PartialRouter::new(tree.clone(), elem);
+            if elem == Elem::I8 {
+                // without the centre the rows cannot be decoded; the head supplies it
+                let mut no = PartialRouter::new(tree.clone(), elem, None).unwrap();
+                assert!(no.needs_head());
+                let (off, len) = t.group_range(0);
+                assert!(no.add_group(0, &bytes[off..off + len]).is_err());
+                no.set_head(&GroupedTable::parse(&bytes[..t.data_off]).unwrap())
+                    .unwrap();
+                assert!(!no.needs_head());
+                assert!(no.add_group(0, &bytes[off..off + len]).unwrap() > 0);
+            }
+            let mut pr = PartialRouter::new(tree.clone(), elem, t.centre.clone()).unwrap();
+            assert!(!pr.needs_head());
+            let other = CentroidTree::build(&m, dim, k, groups + 1, 5, 1);
+            assert!(pr
+                .clone()
+                .set_head(&GroupedTable::parse(&encode_grouped(&m, dim, &other, elem)).unwrap())
+                .is_err());
             assert_eq!(pr.loaded_cells(), 0);
             let q = unit(&mut rng, dim);
             // nothing loaded: no candidates, every top group missing

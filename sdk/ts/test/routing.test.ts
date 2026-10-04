@@ -39,15 +39,16 @@ describe("compact routing tables", () => {
 		const fine = unitRows(20, dim, rng(3));
 		for (const elem of ["f16", "i8"] as const) {
 			const b = w.routing_table_encode(fine, dim, elem);
-			expect(b.byteLength).toBe(20 * (elem === "f16" ? 2 * dim : 4 + dim));
-			expect(w.routing_row_bytes(dim, elem)).toBe(b.byteLength / 20);
+			expect(b.byteLength).toBe(elem === "f16" ? 20 * 2 * dim : 4 * dim + 20 * (4 + dim));
+			expect(w.routing_table_bytes(dim, 20, elem)).toBe(b.byteLength);
+			expect(w.routing_row_bytes(dim, elem)).toBe(elem === "f16" ? 2 * dim : 4 + dim);
 			const d = w.routing_table_decode(b, dim, elem);
 			for (let i = 0; i < fine.length; i++) expect(Math.abs(d[i] - fine[i])).toBeLessThan(elem === "f16" ? 1e-3 : 1 / 127);
 		}
 		expect(Array.from(w.routing_table_decode(w.routing_table_encode(fine, dim, "f32"), dim, "f32"))).toEqual(Array.from(fine));
 		expect(() => w.routing_table_encode(fine, dim, "f8")).toThrow(/f32, f16 or i8/);
 		const coarse = new Float32Array(dim).fill(0.25);
-		expect(() => w.Searcher.from_table(dim, 1, 20, coarse, w.routing_table_encode(fine, dim, "f16").subarray(2), "f16")).toThrow(/expected 20 rows/);
+		expect(() => w.Searcher.from_table(dim, 1, 20, coarse, w.routing_table_encode(fine, dim, "f16").subarray(2), "f16")).toThrow(/20 rows of/);
 	});
 
 	it("open({routing}) loads the requested table, routes like f32 and falls back when the revision has none", async () => {
@@ -60,7 +61,7 @@ describe("compact routing tables", () => {
 
 		const { manifest } = await addRoutingRev(b.store, "gr");
 		expect(manifest.routing!.f16!.key).toBe("idx/gr/fine.f16");
-		expect(manifest.routing!.i8!.bytes).toBe(16 * (4 + b.dim));
+		expect(manifest.routing!.i8!.bytes).toBe(4 * b.dim + 16 * (4 + b.dim)); // centre + rows
 		expect(chooseRouting(manifest, manifestFiles(manifest), "auto")).toEqual({ elem: "i8", key: "idx/gr/fine.i8" });
 		const f32 = await thread.open({ store: b.store, cache: false });
 		const results: Record<string, number[][]> = {};
@@ -172,7 +173,9 @@ describe("cold routing (coldRouting: tree)", () => {
 		expect(first.stats.cold!.groups).toBeGreaterThanOrEqual(1);
 		expect(first.stats.cold!.groups).toBeLessThanOrEqual(2);
 		expect(first.stats.cold!.reads).toBe(1); // one (multi-)range request for the groups
-		expect(first.stats.cold!.bytes).toBe(first.stats.cold!.loadedCells * (4 + b.dim));
+		// i8 rows: the first read also brings the table's head (directory + the centre the rows are residuals from)
+		const g = groupedTableOf(cold.manifest, cold.revision.files)!;
+		expect(first.stats.cold!.bytes).toBe(g.dataOff + first.stats.cold!.loadedCells * (4 + b.dim));
 		const again = await cold.query(q, { nprobe: 4 });
 		expect(again.stats.cold!.groups).toBe(0);
 		expect(again.stats.cold!.bytes).toBe(0);

@@ -798,13 +798,14 @@ export async function loadColdBase(store: BlobStore, rev: RevState, epoch: numbe
 	if (!Number.isInteger(b) || b < 1) throw new ThreadError("coldBeam must be an integer >= 1", 400);
 	const t0 = nowMs();
 	const trace = newTrace();
+	// (i8 rows are residuals from a centre in the grouped table's head: the first group read fetches it too.)
 	const [t, p] = await Promise.all([getRequired(store, g.tree, trace), files.pq ? getRequired(store, files.pq, trace) : Promise.resolve(null)]);
 	const t1 = nowMs();
 	if (rev.format === 3 && !p) throw new ThreadError(`format 3 generation ${rev.gen} has no PQ codebook`);
 	const pq = p ? checkedCodebook(rev, p) : null;
 	let router: W.ColdRouter | null = null;
 	try {
-		router = new W.ColdRouter(t, g.elem);
+		router = new W.ColdRouter(t, g.elem, new Uint8Array(0));
 		const k = manifest.k1 * manifest.k2;
 		if (router.k() !== k || router.dim() !== manifest.dim || router.groups() !== g.groups || router.row_bytes() !== g.rowBytes) throw new ThreadError(`${g.tree} (k ${router.k()}, dim ${router.dim()}, ${router.groups()} groups) does not match ${g.key} / the manifest (k ${k}, dim ${manifest.dim}, ${g.groups} groups)`);
 		const cold = new ColdRouting(W, store, router, g, b);

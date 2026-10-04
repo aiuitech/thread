@@ -38,6 +38,7 @@ __all__ = [
     "manifest_files",
     "ROUTING_ELEMS",
     "routing_row_bytes",
+    "routing_table_bytes",
     "routing_tables_of",
     "choose_routing",
     "grouped_table_of",
@@ -339,6 +340,11 @@ ROUTING_ELEMS = ("f32", "f16", "i8")
 def routing_row_bytes(dim: int, elem: str) -> int:
     """Bytes of one routing table row."""
     return 4 * dim if elem == "f32" else 2 * dim if elem == "f16" else 4 + dim
+
+
+def routing_table_bytes(dim: int, k: int, elem: str) -> int:
+    """Bytes of a whole routing table of `k` rows (i8: the f32 centre the rows are residuals from, then the rows)."""
+    return (4 * dim if elem == "i8" else 0) + k * routing_row_bytes(dim, elem)
 
 
 def routing_tables_of(m: dict[str, Any], files: dict[str, Any] | None = None) -> dict[str, Any] | None:

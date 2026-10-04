@@ -15,7 +15,15 @@ from .cold import ColdRouting
 from .fusion import DEFAULT_RRF_K, rrf
 from .lex import DocRecord, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import QUERY_INFLIGHT, Base, QueryContext, QueryResult, RevState, execute_query
-from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
+from .store import (
+    BlobCache,
+    BlobStore,
+    BlobTrace,
+    CachedBlobStore,
+    MemoryCache,
+    PrefixedBlobStore,
+    phase_stat,
+)
 from .pack import PackedBlobStore, store_at
 from .revision import get_required, head_revision, load_rev_state, resolve_target
 from .wire import (
@@ -27,7 +35,7 @@ from .wire import (
     grouped_table_of,
     has_dense,
     resolve_lex_config,
-    routing_row_bytes,
+    routing_table_bytes,
 )
 from .write import (
     CompactSegmentsResult,
@@ -108,7 +116,7 @@ def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, loaded: d
     k = m["k1"] * m["k2"]
     if len(c) != m["k1"] * m["dim"] * 4:
         raise ThreadError(f"{files['coarse']} is {len(c)} bytes, expected {m['k1']} x {m['dim']} f32")
-    if len(f) != k * routing_row_bytes(m["dim"], elem):
+    if len(f) != routing_table_bytes(m["dim"], k, elem):
         raise ThreadError(f"{table_key} is {len(f)} bytes, expected {k} {elem} rows of dim {m['dim']}")
     if elem == "f32":
         searcher = _native.Searcher(m["dim"], m["k1"], m["k2"], c, f)
@@ -142,6 +150,7 @@ def load_cold_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, beam
     trace = BlobTrace()
     ft = io.submit(get_required, store, g["tree"], trace)
     fp = io.submit(get_required, store, files["pq"], trace) if files.get("pq") else None
+    # (i8 rows are residuals from a centre in the grouped table's head: the first group read fetches it too.)
     t, p = ft.result(), fp.result() if fp else None
     t1 = time.perf_counter()
     if rev.format == 3 and p is None:

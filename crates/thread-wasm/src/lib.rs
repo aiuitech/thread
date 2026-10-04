@@ -739,6 +739,12 @@ pub fn routing_row_bytes(dim: u32, elem: &str) -> Result<u32, JsValue> {
     Ok(elem_arg(elem)?.row_bytes(dim as usize) as u32)
 }
 
+/// Bytes of a whole routing table of `k` rows (`"i8"`: the f32 centre in front of the rows).
+#[wasm_bindgen]
+pub fn routing_table_bytes(dim: u32, k: u32, elem: &str) -> Result<f64, JsValue> {
+    Ok(elem_arg(elem)?.table_bytes(dim as usize, k as usize) as f64)
+}
+
 /// The means (`k * dim` f32) in the group order of a centroid tree built over
 /// them ("VIBG": header, directory, rows of `elem`), so a cold reader can
 /// range-read the rows of the groups a query needs (`ColdRouter`).
@@ -775,12 +781,30 @@ pub struct ColdRouter {
 #[wasm_bindgen]
 impl ColdRouter {
     /// `tree_bytes`: the centroid tree the grouped table was written in the
-    /// order of; `elem`: its row type.
+    /// order of; `elem`: its row type; `head`: the table's first `data_off`
+    /// bytes (header, directory and, for i8, the centre the rows are residuals
+    /// from), or empty: i8 rows then need `set_head` before the first `add_rows`
+    /// (`needs_head`). A head is checked against the tree.
     #[wasm_bindgen(constructor)]
-    pub fn new(tree_bytes: &[u8], elem: &str) -> Result<ColdRouter, JsValue> {
+    pub fn new(tree_bytes: &[u8], elem: &str, head: &[u8]) -> Result<ColdRouter, JsValue> {
         let elem = elem_arg(elem)?;
         let tree = CentroidTree::from_bytes(tree_bytes).map_err(js_err)?;
-        Ok(ColdRouter { inner: PartialRouter::new(tree, elem) })
+        let mut r = ColdRouter { inner: PartialRouter::new(tree, elem, None).map_err(js_err)? };
+        if !head.is_empty() {
+            r.set_head(head)?;
+        }
+        Ok(r)
+    }
+
+    /// Whether i8 rows still need the table's head (`set_head`) before they can be added.
+    pub fn needs_head(&self) -> bool {
+        self.inner.needs_head()
+    }
+
+    /// Installs the table's head (its first `data_off` bytes): checks it against the tree, takes the i8 centre.
+    pub fn set_head(&mut self, head: &[u8]) -> Result<(), JsValue> {
+        let t = GroupedTable::parse(head).map_err(js_err)?;
+        self.inner.set_head(&t).map_err(js_err)
     }
 
     pub fn dim(&self) -> u32 {
@@ -905,8 +929,8 @@ impl Searcher {
     pub fn from_table(dim: u32, k1: u32, k2: u32, coarse_means: &[f32], table: &[u8], elem: &str) -> Result<Searcher, JsValue> {
         let elem = elem_arg(elem)?;
         let (d, k) = (dim as usize, (k1 * k2) as usize);
-        if table.len() != k * elem.row_bytes(d) {
-            return Err(js_err(format!("{} routing table is {} bytes, expected {k} rows of {} bytes", elem.name(), table.len(), elem.row_bytes(d))));
+        if table.len() != elem.table_bytes(d, k) {
+            return Err(js_err(format!("{} routing table is {} bytes, expected {} ({k} rows of {} bytes)", elem.name(), table.len(), elem.table_bytes(d, k), elem.row_bytes(d))));
         }
         if coarse_means.len() != k1 as usize * d {
             return Err(js_err("centroid buffer size mismatch"));
