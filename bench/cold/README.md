@@ -18,6 +18,12 @@ Results, method and analysis: [docs/cold-start.md](../../docs/cold-start.md).
 | `store_table.mjs` | markdown tables of the matrix, with the baseline row; `--tag TAG` compares a `run_baseline.sh` run with the baseline |
 | `refresh_bench.mjs` / `refresh_bench.py` | what a revision switch costs the query that notices it (blocking refresh vs the background prefetch), via a proxy `--overlay` holding a second revision |
 | `lib.mjs` | dataset, recall, the summary table |
+| `make_routing.mjs` | offline `publish-rev {routing}` of an existing generation: `fine.f16` / `fine.i8`, tree-grouped tables and a manifest revision naming them and its base packs (`data/cold/g4-base` -> `data/cold/base-overlay`) |
+| `make_base_pack.mjs` | offline base packs (`base.{rev}.threadpack`, `base.cold.{rev}.threadpack`) into the overlay, with the SDK's `buildBasePack` |
+| `routing_agreement.mjs` | probe-set agreement of every routing mode (f16, i8, tree beams, cold rows) with flat f32 routing, 2000 queries, no slab reads |
+| `routing_recall.mjs` | end-to-end recall@10 of the routing modes over R2 (range reads into a local SQLite range cache; slabs are never read whole) |
+| `run_base.sh` | the cold_bench runs of every open mode (routing table, cold tree routing, base packs) against a proxy serving `data/cold/base-overlay` |
+| `base_table.mjs` | the per-mode table of `run_base.sh` runs (docs/query-path.md, docs/cold-start.md) |
 
 ```sh
 (cd sdk/ts && npm run build)                         # the benches and the proxy use sdk/ts/dist

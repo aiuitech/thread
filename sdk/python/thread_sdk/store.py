@@ -155,6 +155,13 @@ class BlobStore:
     def head(self, key: str) -> BlobHead | None:
         raise NotImplementedError
 
+    def get_tail(self, key: str, length: int, *, trace: BlobTrace | None = None) -> tuple[Bytes, BlobHead] | None:
+        """The last `length` bytes of an object (all of it when shorter) and its size / etag, in ONE request
+        (`Range: bytes=-length`), so a reader of a trailer (a pack's footer and directory) needs no `head` first.
+        Raises NotImplementedError when the store cannot (callers fall back to `head` + a range); None if the object
+        does not exist."""
+        raise NotImplementedError
+
     def put(self, key: str, data: Bytes | str, *, if_absent: bool = False, if_match: str | None = None,
             content_type: str | None = None) -> BlobHead | None:
         """Writes an object; None when a put condition failed (`if_absent`: create-only; `if_match`: compare the
@@ -213,6 +220,14 @@ class MemoryBlobStore(BlobStore):
     def head(self, key):
         o = self.objects.get(key)
         return BlobHead(len(o[0]), o[1]) if o else None
+
+    def get_tail(self, key, length, *, trace=None):
+        o = self.objects.get(key)
+        if o is None:
+            return None
+        b = o[0][max(0, len(o[0]) - length):]
+        _trace_read(trace, len(b))
+        return b, BlobHead(len(o[0]), o[1])
 
     def put(self, key, data, *, if_absent=False, if_match=None, content_type=None):
         b = _encode(data)
@@ -293,6 +308,18 @@ class FileBlobStore(BlobStore):
         except FileNotFoundError:
             return None
         return BlobHead(st.st_size, self._etag(st))
+
+    def get_tail(self, key, length, *, trace=None):
+        try:
+            with open(self.path(key), "rb") as f:
+                st = os.fstat(f.fileno())
+                n = min(st.st_size, length)
+                f.seek(st.st_size - n)
+                b = f.read(n)
+        except FileNotFoundError:
+            return None
+        _trace_read(trace, len(b))
+        return b, BlobHead(st.st_size, self._etag(st))
 
     def put(self, key, data, *, if_absent=False, if_match=None, content_type=None):
         path = self.path(key)
@@ -398,6 +425,9 @@ class PrefixedBlobStore(BlobStore):
 
     def head(self, key):
         return self.inner.head(self.prefix + key)
+
+    def get_tail(self, key, length, *, trace=None):
+        return self.inner.get_tail(self.prefix + key, length, trace=trace)
 
     def put(self, key, data, *, if_absent=False, if_match=None, content_type=None):
         return self.inner.put(self.prefix + key, data, if_absent=if_absent, if_match=if_match,
@@ -822,6 +852,17 @@ class CachedBlobStore(BlobStore):
         if fill:
             return self._miss_fill(key, ranges, False, trace)
         return self._origin(lambda: self.inner.get_ranges(key, ranges, trace=trace))
+
+    def get_tail(self, key, length, *, trace=None):
+        """The last `length` bytes and the size: from the cache when it holds the whole object, else ONE origin
+        request (a tail is not cached: a pack reader reads it once per open)."""
+        full = self.cache.get(key) if self.cacheable(key) and self.cache.contains(key) else None
+        if full is not None:
+            b = memoryview(full)[max(0, len(full) - length):]
+            if trace is not None:
+                trace.add(hits=1, bytes=len(b))
+            return b, BlobHead(len(full), "")
+        return self._origin(lambda: self.inner.get_tail(key, length, trace=trace))
 
     def head(self, key):
         return self.inner.head(key)

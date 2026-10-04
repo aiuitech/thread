@@ -234,6 +234,10 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
         if cur is None:
             return self._reply(404, b"<Error><Code>NoSuchKey</Code></Error>")
         rng = self.headers.get("range")
+        if rng and rng.startswith("bytes=-"):
+            a = max(0, len(cur) - int(rng.removeprefix("bytes=-")))
+            return self._reply(206, cur[a:], {"content-range": f"bytes {a}-{len(cur) - 1}/{len(cur)}",
+                                              "etag": etag(cur)})
         if rng:
             a, b = (int(x) for x in rng.removeprefix("bytes=").split("-"))
             b = min(b, len(cur) - 1)
@@ -276,6 +280,10 @@ def test_s3_store(s3_server):
     assert s.get("idx/g4/a b+c.json") == b"odd key"
     assert s.list("idx/") == ["idx/current.json", "idx/g4/a b+c.json", "idx/g4/slab/00001"]  # paginated, 2 per page
     assert s.get_ranges("idx/g4/slab/00001", [BlobRange(0, 1), BlobRange(5, 1)]) is None  # no multi-range in S3
+    tail, head = s.get_tail("idx/g4/slab/00001", 40)  # one GET with bytes=-40
+    assert tail == body[-40:] and head.size == 300 and head.etag
+    assert s.get_tail("idx/g4/slab/00001", 1000)[0] == body
+    assert s.get_tail("idx/nope", 10) is None
     put = next(c for c in FakeS3.calls if c[0] == "PUT")
     assert put[1] == "/bucket/idx/current.json"
     assert put[2]["if-none-match"] == "*"
@@ -346,3 +354,7 @@ def test_s3_whole_gets_are_chunked(s3_server):
     s.put("idx/empty", b"")
     assert s.get("idx/empty") == b""
     assert s.get("idx/none") is None
+    n2 = len(FakeS3.calls)
+    tail, head = s.get_tail("idx/g4/fine.f32", 250)  # a suffix read is never chunked
+    assert bytes(tail) == body[100:] and head.size == 350
+    assert [c[2]["range"] for c in FakeS3.calls[n2:]] == ["bytes=-250"]

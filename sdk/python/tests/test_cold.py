@@ -228,6 +228,22 @@ def test_larger_coalescing_fewer_requests_same_answers():
     assert res["span"][0] <= res["c128k"][0] and res["span"][1] >= res["c4k"][1]
 
 
+def test_get_tail_through_a_cache():
+    inner = RemoteStore()
+    body = bytes((i * 7) & 0xFF for i in range(5000))
+    inner.put("idx/g/obj", body)
+    cs = CachedBlobStore(inner, MemoryCache())
+    t1 = BlobTrace()
+    tail, head = cs.get_tail("idx/g/obj", 100, trace=t1)
+    assert bytes(tail) == body[4900:] and head.size == 5000 and (t1.reads, t1.hits) == (1, 0)
+    assert not cs.contains("idx/g/obj")  # a tail is not cached
+    cs.get("idx/g/obj")
+    t2 = BlobTrace()
+    tail, head = cs.get_tail("idx/g/obj", 100, trace=t2)
+    assert bytes(tail) == body[4900:] and head.size == 5000 and (t2.reads, t2.hits) == (0, 1)
+    assert cs.get_tail("idx/g/none", 10) is None
+
+
 def test_cold_policy():
     b = build_gen("gcp", 3, n=800)
     q = row(b.vectors, 0, 16)

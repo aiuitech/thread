@@ -125,6 +125,10 @@ up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whol
 | `delta_cache_bytes` | 40 MB | delta segments kept in memory across queries |
 | `lex_transient_bytes` | 8 MB | transient lexical bytes (buckets, posting lists, texts) each segment reader may hold |
 | `io_workers` | 32 | threads for reads, shared by concurrent queries |
+| `routing` | `"f32"` | routing table to load: `"f32"` (`fine.f32`, 25 MB at 4096 x 1536), `"f16"` (half), `"i8"` (a quarter) or `"auto"` (the smallest the revision has); decoded to f32 on load, a revision without the table falls back to f32 |
+| `cold_routing` | `"off"` | `"tree"`: the open waits only for the centroid tree and the codebook; until the full table has loaded (on a background thread) queries route over the tree's best `cold_beam` groups, range-reading just those groups' means |
+| `cold_beam` | `defaults.beam`, else 16 | groups ranked per cold-routed query |
+| `base_pack` | True | GET the revision's base pack (one object with everything the open reads) and, without one, start every read of the open as soon as the manifest is in; False: one read after another |
 | `job_workers` | 4-16 (CPUs) | threads for `query_many`, the lexical half of a hybrid search and background refreshes |
 | `miss_policy` | the cache's: `"range+warm"` for `MemoryCache` / `DiskCache` | what a slab-prefix cache miss reads (see "Pointing at the index") |
 | `warm_concurrency` | 2 | `"range+warm"`: background whole-slab fetches at once |
@@ -135,16 +139,25 @@ up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whol
 `gen` without `rev` reads the generation's head (the current rev when `current.json` names that generation, else
 the newest `manifest.*.json` in the store). `ThreadIndex` is a context manager; `close()` releases its threads.
 
-`index.open_stats` is the cold-start timeline of `open_index`: `{total, current, manifest, slabs, base, pack?}`, each
+With a base pack (`idx/{gen}/base.{rev}.threadpack`, written by publish) a cold open is two round trips:
+`current.json`, then the pack (the manifest is read alongside, in case there is none); without one, three. With
+`routing="i8"` (or `"auto"`, the table a base pack holds by default) that is `current.json` + one 8.8 MB GET on g4;
+`cold_routing="tree"` reads the 2.5 MB cold base pack and ~1 MB of group means with the first query. The trade-offs
+and measured numbers: [docs/query-path.md](../../docs/query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs).
+
+`index.open_stats` is the cold-start timeline of `open_index`: `{total, prefetch, current, manifest, slabs, base, pack?}`, each
 step a phase stat (`current`: current.json; `manifest`; `slabs`: slabs table + tombstone sets; `base`: routing table
 and codebook, plus `fetch` / `build` ms and `files: {coarse, fine, pq}` bytes; `pack`, for a `PackedBlobStore`, its
-own head + tail + directory reads, `PackedBlobStore.open_stats`, not part of `total`). A "read" is a request that
+own head + tail + directory reads, `PackedBlobStore.open_stats`, not part of `total`; `prefetch`: how the open's
+objects were fetched up front, `source` `"base-pack"` / `"index-pack"` / `"files"` / `"none"` and `key`, with the
+pack read's work; objects read early are counted in the step that uses them). A "read" is a request that
 reached the origin store; with a cache in front, `hits` / `misses` count cache lookups. Same fields as the
 TypeScript SDK's `index.openStats` (which adds `wasmInit`). `bench/cold/` measures these against S3.
 
 Properties: `manifest` (the stored dict, camelCase keys), `gen`, `rev`, `dim`, `cells` (`k1 * k2`), `format`
 (1 int8 only, 2 sq4 + sq8, 3 pq + sq8), `defaults` (`{nprobe, rerank, pc}`), `has_dense`, `lex_config`
-(`ResolvedLexConfig` or None), `segments`, `revision` (the parsed `RevState`).
+(`ResolvedLexConfig` or None), `segments`, `revision` (the parsed `RevState`), `routing_state` (`"full"` once the
+routing table is loaded, `"cold"` while queries route cold); `when_full_routing()` waits for the full table.
 
 ### `index.query(vector, **options) -> QueryResult`
 
@@ -160,6 +173,7 @@ Properties: `manifest` (the stored dict, camelCase keys), `gen`, `rev`, `dim`, `
 | `return_payload` | False | also return each hit's payload bytes |
 | `inflight` | the store's: 32 for `S3BlobStore`, else 12 | reads in flight per query (remote stores) |
 | `speculate` | True | read the running top-T's rerank records while the last 6 slabs are still scanning (remote stores) |
+| `beam` | `cold_beam` | cold routing only: tree groups whose cells are ranked (until the full routing table is in) |
 | `filter` | None | an attribute filter (see [Filtering](#filtering)): field conditions, or the compiled words |
 | `max_nprobe` | 4 x nprobe | with a filter: how many cells a selective filter may scan in all, in routing order, until `max(top_k, rerank)` candidates match (`nprobe` = no widening) |
 | `coalesce_bytes` | the store's: 128 KB for `S3BlobStore`, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while it stays within this many bytes |
@@ -172,7 +186,9 @@ class QueryResult:
     hits: list[Hit]          # Hit(id, score, attrs, source: "slab" | "delta", payload: bytes | None)
     params: dict             # {top_k, nprobe, rerank, pc, source: {nprobe, rerank, pc}} ("query" | "manifest" | "legacy");
                              # with a filter also filter: True and the max_nprobe in effect
-    stats: dict              # gen, rev, format, routing, cells (scanned; beyond nprobe when a filter widened), filter_dropped,
+    stats: dict              # gen, rev, format, routing ("flat" | "tree" | "cold"), routing_table ("f32" | "f16" | "i8"),
+                             # cold_routing? ({beam, groups, cells, reads, bytes, loaded_groups, loaded_cells}),
+                             # cells (scanned; beyond nprobe when a filter widened), filter_dropped,
                              # candidates, scanned, scan_bytes, slab_bytes,
                              # rerank, rerank_candidates, rerank_slabs, rerank_reads, rerank_bytes, rerank_local,
                              # spec_records, spec_used, deltas, delta_bytes, delta_scanned, delta_hits, delta_dropped,
@@ -292,6 +308,7 @@ class BlobStore:
     supports_put = supports_list = supports_ranges = remote = False
     def get(self, key, range: BlobRange | None = None, *, trace=None, fill=False) -> bytes | memoryview | None: ...
     def get_ranges(self, key, ranges, *, trace=None, fill=False) -> list | None: ...   # None: read ranges one by one
+    def get_tail(self, key, length, *, trace=None) -> tuple[bytes, BlobHead] | None: ...   # bytes=-N; NotImplementedError: head + range
     def head(self, key) -> BlobHead | None: ...
     def put(self, key, data, *, if_absent=False, if_match=None, content_type=None) -> BlobHead | None: ...
     def list(self, prefix) -> list[str]: ...
@@ -322,8 +339,12 @@ data, r = pack_to_bytes(src)                              # the same pack in mem
 index = open_index("idx.threadpack")                      # queried in place; store_at(path) gives the store alone
 ```
 
-`pack_index` writes `idx/current.json` (pointing at the packed revision) and then `snapshot_keys` in key order, so
-the two SDKs produce identical files for the same revision (the interop test checks). A pack is read-only:
+`pack_index` writes `idx/current.json` (pointing at the packed revision), then the objects a cold open reads
+(`base_keys`: manifest, slabs table, tombstone sets, coarse, codebook, tree, the smallest routing table), then the
+rest of `snapshot_keys` in key order, and records that leading range as `base: [offset, length]`: `open_index` on a
+`PackedBlobStore` loads it with one range read. The two SDKs produce identical files for the same revision (the
+interop test checks). `thread_sdk.pack.build_base_pack(store, rev_state, "base" | "cold", routing)` builds a
+revision's base pack (`idx/{gen}/base.{rev}.threadpack`, what publish writes), byte-identical to the TypeScript one. A pack is read-only:
 `copy_objects(pack, dst)` into a directory or a bucket to write on top of it. Format and rationale:
 [docs/portability.md](../../docs/portability.md).
 

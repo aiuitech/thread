@@ -47,6 +47,12 @@
 import wasmModule from "../../../crates/thread-wasm/pkg/thread_bg.wasm";
 import init, * as thread from "../../../crates/thread-wasm/pkg/thread.js";
 import { compileFilter, validateSchema, type AttrFilterExpr, type AttrSchema } from "../../../sdk/ts/src/attrs.ts";
+// Pure-TS builders shared with the SDK (no wasm import of their own: they take this module's bindings).
+import { buildRoutingObjects } from "../../../sdk/ts/src/routing.ts";
+import { buildBasePack } from "../../../sdk/ts/src/pack.ts";
+import { loadRevState as sdkLoadRevState } from "../../../sdk/ts/src/revision.ts";
+import { R2BlobStore } from "../../../sdk/ts/src/store.ts";
+import { groupedTableOf, keys as sdkKeys, type Manifest as SdkManifest, type RoutingElem, type RoutingOption, type RoutingTables } from "../../../sdk/ts/src/wire.ts";
 
 interface Env {
 	BUCKET: R2Bucket;
@@ -1008,6 +1014,86 @@ interface TreeReq {
 	recallBeams?: number[];
 }
 
+/**
+ * `routing` option of publish / publish-rev: compact copies of the fine means (`fine.f16`, `fine.i8`) that readers can
+ * route with instead of `fine.f32`, and the means in centroid-tree group order (`fine.grouped.{rev}.{elem}`) for cold
+ * routing (manifest.routing; SDK `open({routing, coldRouting})`).
+ */
+interface RoutingReq {
+	/** Tables to write (default both). */
+	tables?: ("f16" | "i8")[];
+	/** Element type of the tree-grouped table, written when the revision has a centroid tree (default "i8"); false = none. */
+	grouped?: RoutingElem | false;
+}
+
+function checkRoutingReq(r: RoutingReq): Required<RoutingReq> {
+	const tables = r.tables ?? ["f16", "i8"];
+	if (!Array.isArray(tables) || tables.some((t) => t !== "f16" && t !== "i8") || new Set(tables).size !== tables.length) throw new HttpError(400, 'routing.tables must be a list of distinct "f16" / "i8"');
+	const grouped = r.grouped ?? "i8";
+	if (grouped !== false && grouped !== "f32" && grouped !== "f16" && grouped !== "i8") throw new HttpError(400, 'routing.grouped must be "f32", "f16", "i8" or false');
+	return { tables, grouped };
+}
+
+/**
+ * Builds the routing objects of `fineKey`'s means (the compact tables, and the tree-grouped table when `tree` is given)
+ * and writes them (`unique`: create-only with a unique key, for revisions; else plain puts, for publish).
+ */
+async function writeRouting(env: Env, gen: string, rev: number, fineKey: string, fine: Float32Array, dim: number, req: RoutingReq, unique: boolean, tree: { key: string; bytes: Uint8Array } | null): Promise<RoutingTables> {
+	await ensureWasm();
+	const { tables, grouped } = checkRoutingReq(req);
+	const built = buildRoutingObjects(thread, { fineKey, fine, dim, tables, grouped: tree && grouped ? { gen, rev, treeKey: tree.key, tree: tree.bytes, elem: grouped } : undefined });
+	const put = async (key: string) => {
+		const bytes = built.objects.find(([k]) => k === key)![1];
+		return unique ? await putUnique(env, key, bytes) : (await putBytes(env.BUCKET, key, bytes), key);
+	};
+	const routing: RoutingTables = { fine: fineKey };
+	for (const elem of tables) routing[elem] = { ...built.routing[elem]!, key: await put(built.routing[elem]!.key) };
+	if (built.routing.grouped) routing.grouped = { ...built.routing.grouped, key: await put(built.routing.grouped.key) };
+	return routing;
+}
+
+/**
+ * `basePack` option of publish / publish-rev: one object per revision holding everything a cold open reads
+ * (`idx/{gen}/base.{rev}.threadpack`: manifest, slabs table, tombstone sets, coarse, codebook, tree, one routing
+ * table), and a cold variant without the routing table (`base.cold.{rev}.threadpack`) when the revision has a
+ * tree-grouped table. Readers find them by (gen, rev); the manifest names them in files.base / files.baseCold.
+ */
+interface BasePackReq {
+	/** The routing table in the base pack (default "auto": the smallest the revision has). */
+	routing?: RoutingOption;
+	/** Also write the cold base pack (default true; only when the revision has a grouped table). */
+	cold?: boolean;
+}
+
+/** The files.base / files.baseCold names of revision `rev` (set before the commit; the packs are written after it). */
+function basePackFiles(gen: string, rev: number, m: { routing?: RoutingTables; tree?: TreeRef; k1: number; files?: IndexFiles }, req: BasePackReq | false | undefined): Pick<IndexFiles, "base" | "baseCold"> {
+	if (req === false) return {};
+	const cold = req?.cold !== false && groupedTableOf(m as unknown as SdkManifest) !== null;
+	return { base: sdkKeys.basePack(gen, rev), ...(cold ? { baseCold: sdkKeys.baseColdPack(gen, rev) } : {}) };
+}
+
+/** Writes the base pack(s) of a committed revision (built from the objects it names, read back from R2). */
+async function writeBasePacks(env: Env, gen: string, rev: number, req: BasePackReq | false | undefined): Promise<{ key: string; bytes: number; routing: string | null }[]> {
+	if (req === false) return [];
+	const store = new R2BlobStore(env.BUCKET);
+	const rs = await sdkLoadRevState(store, gen, rev);
+	const out: { key: string; bytes: number; routing: string | null }[] = [];
+	const kinds: ("base" | "cold")[] = rs.files.baseCold ? ["base", "cold"] : ["base"];
+	for (const kind of kinds) {
+		const p = await buildBasePack(store, rs, kind, req?.routing ?? "auto");
+		await putBytes(env.BUCKET, p.key, p.bytes);
+		out.push({ key: p.key, bytes: p.bytes.byteLength, routing: p.routing });
+	}
+	return out;
+}
+
+/** The routing request that reproduces a manifest's tables (for a split commit that writes new means). */
+const routingReqOf = (r: RoutingTables | undefined): RoutingReq | null => {
+	if (!r) return null;
+	const tables = (["f16", "i8"] as const).filter((e) => r[e]);
+	return tables.length || r.grouped ? { tables, grouped: r.grouped?.elem ?? false } : null;
+};
+
 /** Defaults of manifests without `defaults` (generations before g3). */
 const LEGACY_DEFAULTS: QueryDefaults = { nprobe: 1, rerank: 32, pc: 0 };
 
@@ -1039,6 +1125,10 @@ interface PublishReq {
 	setCurrent?: boolean;
 	/** Build a centroid tree over the fine means (idx/{gen}/tree.0.bin, manifest.tree). */
 	tree?: TreeReq;
+	/** Compact routing tables (idx/{gen}/fine.f16, fine.i8; manifest.routing). Default `{}` (both); false = none. */
+	routing?: RoutingReq | false;
+	/** Base packs of rev 0 (idx/{gen}/base.0.threadpack, base.cold.0.threadpack). Default `{}`; false = none. */
+	basePack?: BasePackReq | false;
 	/** Automatic compaction thresholds and split cap (manifest.compaction; the driver sends the profile's). */
 	compaction?: CompactionPolicy;
 	/**
@@ -1131,7 +1221,7 @@ async function buildTree(env: Env, gen: string, m: { dim: number; k1: number; k2
 }
 
 async function stagePublish(env: Env, body: PublishReq) {
-	const { gen, coarseKey, fineKey, slabs, setCurrent, codebookKey, overwrite, tree: treeReq, ...rest } = body;
+	const { gen, coarseKey, fineKey, slabs, setCurrent, codebookKey, overwrite, tree: treeReq, routing: routingReq, basePack: basePackReq, ...rest } = body;
 	if (!overwrite) {
 		const revs = await listRevs(env, gen);
 		if (revs.length) throw new HttpError(409, `${gen} already has manifest revs ${revs.map((r) => r.rev).join(",")}; use publish-rev to change defaults (or overwrite: true for a rebuild of the same gen)`);
@@ -1178,17 +1268,24 @@ async function stagePublish(env: Env, body: PublishReq) {
 		codebook ? putBytes(env.BUCKET, `idx/${gen}/pq.bin`, codebook) : Promise.resolve(),
 	]);
 	let tree: TreeRef | undefined;
+	let treeBytes: Uint8Array | null = null;
 	if (treeReq) {
 		const notes = body.notes as { cfg?: { sampleGroups?: number } } | undefined;
 		const t = await buildTree(env, gen, body, coarseKey, fineKey, treeReq, notes?.cfg?.sampleGroups);
 		tree = { key: treeKey(gen, 0), ...t.ref };
+		treeBytes = t.bytes;
 		await putBytes(env.BUCKET, tree.key, t.bytes);
 	}
+	const routing = routingReq === false ? undefined : await writeRouting(env, gen, 0, `idx/${gen}/fine.f32`, new Float32Array(fine), body.dim, routingReq ?? {}, false, tree && treeBytes ? { key: tree.key, bytes: treeBytes } : null);
 	// Rev 0 of the generation (manifest.json / slabs.json / slab/{cell:05}); later revisions are manifest.{rev}.json.
-	const manifest = { gen, ...rest, format, tiers, ...(format === 3 ? { pq: { m: pqM } } : {}), ...(tree ? { tree } : {}), rev: 0, createdAt: new Date().toISOString() };
+	const packFiles = basePackFiles(gen, 0, { routing, tree, k1: body.k1 }, basePackReq);
+	// Rev 0 names its files only when it names base packs (older readers use the fixed names either way).
+	const files: IndexFiles | undefined = packFiles.base ? { coarse: `idx/${gen}/coarse.f32`, fine: `idx/${gen}/fine.f32`, pq: format === 3 ? `idx/${gen}/pq.bin` : null, slabs: `idx/${gen}/slabs.json`, ...packFiles } : undefined;
+	const manifest = { gen, ...rest, format, tiers, ...(format === 3 ? { pq: { m: pqM } } : {}), ...(tree ? { tree } : {}), ...(routing ? { routing } : {}), ...(files ? { files } : {}), rev: 0, createdAt: new Date().toISOString() };
 	await putBytes(env.BUCKET, manifestKey(gen, 0), JSON.stringify(manifest));
+	const basePacks = slabTable ? await writeBasePacks(env, gen, 0, basePackReq) : [];
 	if (setCurrent !== false) await putBytes(env.BUCKET, CURRENT_KEY, JSON.stringify({ gen, rev: 0 }));
-	return { ...manifest, current: setCurrent !== false };
+	return { ...manifest, basePacks, current: setCurrent !== false };
 }
 
 // ---------- revisions: object names, manifests, current pointer ----------
@@ -1227,6 +1324,10 @@ interface IndexFiles {
 	fine: string;
 	pq: string | null;
 	slabs: string | null;
+	/** The base pack of the revision that wrote it (base.{rev}.threadpack); inherited by later revisions. */
+	base?: string;
+	/** The cold base pack of that revision (base.cold.{rev}.threadpack). */
+	baseCold?: string;
 }
 
 interface Manifest {
@@ -1265,6 +1366,8 @@ interface Manifest {
 	nextSeq?: number;
 	/** Automatic compaction thresholds and the cell split cap (absent: no automatic compaction, no splits). */
 	compaction?: CompactionPolicy;
+	/** Compact routing tables (fine.f16 / fine.i8) made from the means `routing.fine`; ignored by readers once files.fine differs. */
+	routing?: RoutingTables;
 	/** Lexical / docs configuration written by the SDK (`index.configureLexical`); opaque here. */
 	lex?: Record<string, unknown>;
 	/** Lexical / docs segments (SDK, `idx/{gen}/seg/*`): filtered by tombstone sets with rev > addedRev, like deltas. */
@@ -3052,6 +3155,13 @@ interface PublishRevReq {
 	 * (idx/{gen}/tree.{rev}.bin); null removes the tree (and a beam route default).
 	 */
 	tree?: TreeReq | null;
+	/**
+	 * Write compact routing tables (fine.f16 / fine.i8) from the revision's fine means and name them in the new
+	 * revision (manifest.routing); null removes them. Absent: kept (a new tree does not change them).
+	 */
+	routing?: RoutingReq | null;
+	/** Base packs of the new revision (base.{rev}.threadpack, base.cold.{rev}.threadpack). Default `{}`; false = none. */
+	basePack?: BasePackReq | false;
 	/** Point idx/current.json at this generation even if another one is current (default false). */
 	setCurrent?: boolean;
 	/**
@@ -3077,6 +3187,7 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 	// The tree is built once (outside the commit loop) over the head's fine means; a retry only re-checks the files.
 	let built: { fine: string; bytes: Uint8Array; ref: Omit<TreeRef, "key"> } | null = null;
 	let treeWritten: TreeRef | null = null;
+	let routingWritten: { for: string; routing: RoutingTables } | null = null;
 	const c = await commitRev(env, gen, async ({ rev, manifest }) => {
 		const files = manifestFiles(manifest);
 		let tree: TreeRef | undefined = manifest.tree;
@@ -3095,18 +3206,42 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 		if (!tree && defaults.route === "beam" && body.defaults?.route === undefined) delete defaults.route;
 		if (!tree && body.defaults?.beam === undefined) delete defaults.beam;
 		checkDefaults(defaults, tree);
+		// Routing objects: written on request; otherwise a head's grouped table that follows another tree is rebuilt for
+		// the new one (or dropped without a tree), and tables made from other means are dropped.
+		let routing: RoutingTables | undefined = manifest.routing?.fine === files.fine ? manifest.routing : undefined;
+		const treeArg = async () => (tree ? { key: tree.key, bytes: built && treeWritten?.key === tree.key ? built.bytes : new Uint8Array(await getBuffer(env.BUCKET, tree.key)) } : null);
+		const memo = async (req: RoutingReq): Promise<RoutingTables> => {
+			const id = `${files.fine}|${tree?.key ?? "-"}|${JSON.stringify(req)}`;
+			if (!routingWritten || routingWritten.for !== id) routingWritten = { for: id, routing: await writeRouting(env, gen, rev + 1, files.fine, await getF32(env.BUCKET, files.fine), manifest.dim, req, true, await treeArg()) };
+			return routingWritten.routing;
+		};
+		if (body.routing === null) routing = undefined;
+		else if (body.routing) routing = await memo(body.routing);
+		else if (routing?.grouped && routing.grouped.tree !== tree?.key) {
+			const { grouped, ...rest } = routing;
+			const rebuilt = tree ? (await memo({ tables: [], grouped: grouped.elem })).grouped : undefined;
+			routing = rebuilt ? { ...rest, grouped: rebuilt } : rest;
+		}
 		const next: Manifest = { ...inherit(manifest), defaults, ...(body.profile ? { profile: body.profile } : {}) };
 		if (tree) next.tree = tree;
 		else delete next.tree;
+		if (routing) next.routing = routing;
+		else delete next.routing;
+		const { base: _b, baseCold: _bc, ...plainFiles } = next.files!;
+		next.files = { ...plainFiles, ...basePackFiles(gen, rev + 1, { ...next, files: plainFiles }, body.basePack) };
 		const compaction = resolveCompaction(body.compaction, manifest, body.profile);
 		if (compaction) next.compaction = compaction;
 		else delete next.compaction;
 		const treeChange = body.tree === undefined ? {} : { tree: tree ? { key: tree.key, groups: tree.groups, beam: tree.beam } : null };
+		const routingChange = body.routing === undefined ? {} : { routing: routing ? { f16: routing.f16?.key ?? null, i8: routing.i8?.key ?? null, grouped: routing.grouped?.key ?? null } : null };
 		const compactionChange = body.compaction === undefined ? {} : { compaction: { from: manifest.compaction ?? null, to: compaction ?? null } };
-		return { ...next, change: { op: "publish-rev", defaults: { from: prev, to: defaults }, ...treeChange, ...compactionChange } };
+		return { ...next, change: { op: "publish-rev", defaults: { from: prev, to: defaults }, ...treeChange, ...routingChange, ...compactionChange } };
 	});
+	// The packs hold the committed manifest, so they are written after the commit (a reader that sees the revision
+	// first finds no pack and reads the separate files).
+	const basePacks = c.manifest.files?.base ? await writeBasePacks(env, gen, c.rev, body.basePack) : [];
 	const cur = body.setCurrent ? await advanceCurrent(env, gen, c.rev, true) : null;
-	return { gen, rev: c.rev, parentRev: c.parentRev, defaults: c.manifest.defaults, tree: c.manifest.tree ?? null, compaction: c.manifest.compaction ?? null, conflicts: c.conflicts, currentUpdated: c.currentUpdated || !!cur?.updated };
+	return { gen, rev: c.rev, parentRev: c.parentRev, defaults: c.manifest.defaults, tree: c.manifest.tree ?? null, routing: c.manifest.routing ?? null, basePacks, compaction: c.manifest.compaction ?? null, conflicts: c.conflicts, currentUpdated: c.currentUpdated || !!cur?.updated };
 }
 
 /** Sorted unique ids as a tombstone buffer. */
@@ -3819,7 +3954,7 @@ async function readSlabMean(env: Env, key: string, dim: number): Promise<Float32
  * headers, which are what the slabs were encoded against) and, if the head has a centroid tree, a tree rebuilt over
  * them with the same groups/iters/seed/beam.
  */
-async function splitRouting(env: Env, gen: string, rev: number, m: Manifest, files: IndexFiles, slabRev: number, splits: [number, number][], measureTree: boolean): Promise<{ fine: string; k: number; tree?: TreeRef; fineBytes: number }> {
+async function splitRouting(env: Env, gen: string, rev: number, m: Manifest, files: IndexFiles, slabRev: number, splits: [number, number][], measureTree: boolean): Promise<{ fine: string; k: number; tree?: TreeRef; routing?: RoutingTables; fineBytes: number }> {
 	const dim = m.dim;
 	const k = m.k1 * m.k2;
 	const old = await getF32(env.BUCKET, files.fine);
@@ -3834,6 +3969,7 @@ async function splitRouting(env: Env, gen: string, rev: number, m: Manifest, fil
 	});
 	const fine = await putUnique(env, `idx/${gen}/fine.${rev}.f32`, means);
 	let tree: TreeRef | undefined;
+	let treeBytes: Uint8Array | null = null;
 	if (m.tree) {
 		const t = m.tree;
 		// The recall check costs ~1.3e10 multiply-adds per call at 2000 rows (exact top 3 over all k cells): measure
@@ -3841,8 +3977,12 @@ async function splitRouting(env: Env, gen: string, rev: number, m: Manifest, fil
 		const req: TreeReq = { groups: Math.min(t.groups, kk), iters: t.iters ?? 10, seed: t.seed ?? 7, beam: t.beam, sampleRows: measureTree ? 125 : 0 };
 		const built = await buildTree(env, gen, { dim, k1: 1, k2: kk }, files.coarse, fine, req, undefined, means);
 		tree = { key: await putUnique(env, treeKey(gen, rev), built.bytes), ...built.ref };
+		treeBytes = built.bytes;
 	}
-	return { fine, k: kk, tree, fineBytes: means.byteLength };
+	// The head's routing objects describe the old means (and tree): write the same ones for the new means.
+	const rr = routingReqOf(m.routing?.fine === files.fine ? m.routing : undefined);
+	const routing = rr ? await writeRouting(env, gen, rev, fine, means, dim, rr, true, tree && treeBytes ? { key: tree.key, bytes: treeBytes } : null) : undefined;
+	return { fine, k: kk, tree, routing, fineBytes: means.byteLength };
 }
 
 async function compactCommit(env: Env, body: CompactCommitReq) {
@@ -3920,6 +4060,8 @@ async function compactCommit(env: Env, body: CompactCommitReq) {
 			next.k2 = routing.k;
 			next.files = { ...next.files!, fine: routing.fine };
 			if (routing.tree) next.tree = routing.tree;
+			if (routing.routing) next.routing = routing.routing;
+			else delete next.routing;
 		}
 		const splitChange = splits.length ? { splits: splits.map(([cell, newCell]) => [cell, newCell, (table[cell] as SlabMeta)[2], (table[newCell] as SlabMeta)[2]]), k: { from: baseK, to: k } } : {};
 		return { ...next, change: { op: "compact", baseRev, slabRev, cells: body.rows.length, foldedDeltas: folded.size, droppedTombstoneSets: dropped.length, ...splitChange, ...(body.auto ? { auto: body.auto } : {}) } };

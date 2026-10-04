@@ -42,6 +42,9 @@ instead of whole-file appends. Details and tuning: [lexical.md](lexical.md).
 - **Range reads, not whole objects.** A query reads only the scan prefix of each probed slab, then the handful of
   int8 records it wants to rerank, with multi-range requests. On g4 that is about 6 MB per query at 95% recall,
   down from 41 MB in g1.
+- **Small cold starts.** The centroid table is also published as `fine.f16` / `fine.i8` (12.6 / 6.3 MB), as
+  tree-grouped rows a cold query range-reads by group, and in a per-revision base pack, so a fresh process routes
+  its first query after `current.json` + one GET (see [query-path.md](query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs)).
 - **Bounded memory.** The only resident state is the centroid table (25 MB at 4096 x 1536), a PQ codebook (1.5 MB)
   and a few KB per lexical segment. Everything else streams through. That is what lets the query path run in a
   128 MB Worker isolate, and the build path too.
@@ -72,7 +75,8 @@ such host that also runs the build.
                       cell splits: split_slab, split_slab_records, split_part_records, reencode_records;
                       centroid tree: build_centroid_tree, centroid_tree_info,
                       Searcher.set_tree/route_beam/cell_dots_for/tree_recall/tree_recall_top, DeltaJob.set_tree,
-                      AssignJob.set_tree (not used by the driver yet); lexical (`src/lex.rs`): LexTokenizer,
+                      AssignJob.set_tree (not used by the driver yet); compact routing: routing_table_encode/
+                      decode, Searcher.from_table, grouped_table_encode/info, ColdRouter; lexical (`src/lex.rs`): LexTokenizer,
                       SegmentJob, SegmentReader (paged), merge_segments, rrf_fuse, best_doc_ranks, rerank_fuse,
                       Lines, Excerpter
 - `crates/thread-cli`    native CLI: `seg build|inspect|search|merge`, `tokenize`, slab/scan benchmarks

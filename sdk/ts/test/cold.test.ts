@@ -244,6 +244,29 @@ describe("in flight and coalescing", () => {
 	});
 });
 
+describe("getTail through a cache", () => {
+	it("serves a whole cached object, else one origin request, and is not cached itself", async () => {
+		const inner = new RemoteStore();
+		await inner.put("idx/g/obj", body);
+		const cs = new CachedBlobStore(inner, new MemoryCache());
+		const t1 = newTrace();
+		const a = await cs.getTail!("idx/g/obj", 100, { trace: t1 });
+		expect(a!.size).toBe(5000);
+		expect(a!.bytes).toEqual(body.slice(4900));
+		expect(t1).toMatchObject({ reads: 1, hits: 0 });
+		expect(cs.contains("idx/g/obj")).toBe(false);
+		await cs.get("idx/g/obj"); // whole read: cached
+		const t2 = newTrace();
+		const b = await cs.getTail!("idx/g/obj", 100, { trace: t2 });
+		expect(b!.bytes).toEqual(body.slice(4900));
+		expect(t2).toMatchObject({ reads: 0, hits: 1 });
+		expect(await cs.getTail!("idx/g/none", 10)).toBeNull();
+		// a store without getTail: none through the cache either
+		const plain = new CachedBlobStore({ get: async () => null, head: async () => null }, new MemoryCache());
+		expect(plain.getTail).toBeUndefined();
+	});
+});
+
 describe("cold-path policy", () => {
 	it("applies only when most probed slabs are not cached", async () => {
 		const b = await buildGen("gcp", 3, { n: 800 });

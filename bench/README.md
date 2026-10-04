@@ -16,7 +16,8 @@ prep/             dataset -> data/prep/ -> R2 ingest/ (run once)
   split_bench.mjs   splits the largest cells, recall and latency before and after
 
 cold/             cold-start benches of both SDKs against S3 (no Worker): fake_s3.mjs proxy with a network
-                  model, cold_bench.mjs / cold_bench.py, warm-up, packs, run_baseline.sh; see cold/README.md
+                  model, cold_bench.mjs / cold_bench.py, warm-up, packs, run_baseline.sh, the routing / base-pack
+                  tools (make_routing, make_base_pack, routing_agreement, routing_recall, run_base.sh); see cold/README.md
                   and docs/cold-start.md
 
 offline/          numpy experiments on local files only (g1 era; data/idx-g1, data/vectors.npy)

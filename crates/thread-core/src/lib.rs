@@ -59,6 +59,7 @@ pub mod pq;
 pub mod quant;
 pub mod rerank;
 pub mod route;
+pub mod routing;
 pub mod search;
 pub mod segment;
 pub mod slab;

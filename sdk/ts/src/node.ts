@@ -70,6 +70,28 @@ export class FileBlobStore implements BlobStore {
 		return b;
 	}
 
+	async getTail(key: string, length: number, opts?: GetOptions): Promise<{ bytes: Uint8Array; size: number; etag?: string } | null> {
+		let fh: fs.FileHandle;
+		try {
+			fh = await fs.open(this.path(key), "r");
+		} catch (e) {
+			if (errno(e) === "ENOENT") return null;
+			throw e;
+		}
+		try {
+			const size = (await fh.stat()).size;
+			const n = Math.min(size, length);
+			const bytes = await readAt(fh, { offset: size - n, length: n });
+			if (opts?.trace) {
+				opts.trace.reads++;
+				opts.trace.bytes += bytes.byteLength;
+			}
+			return { bytes, size };
+		} finally {
+			await fh.close();
+		}
+	}
+
 	async getRanges(key: string, ranges: BlobRange[], opts?: GetOptions): Promise<Uint8Array[] | null> {
 		let fh: fs.FileHandle;
 		try {

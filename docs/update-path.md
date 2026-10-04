@@ -70,6 +70,11 @@ idx/{gen}/tombstones.{rev}.u32          sorted unique u32 LE ids deleted/replace
 idx/{gen}/tree.{rev}.bin                centroid tree over the fine means (publish / publish-rev with `tree`, or a
                                         compaction that split cells); inherited
 idx/{gen}/fine.{rev}.f32                fine means of a revision whose compaction split cells (k + splits rows)
+idx/{gen}/fine{.rev}.f16, fine{.rev}.i8 compact copies of those means (publish, publish-rev {routing}, a split
+                                        commit): manifest.routing, docs/query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs
+idx/{gen}/fine.grouped.{rev}.{elem}     the means in centroid-tree group order (cold routing); rebuilt with the tree
+idx/{gen}/base.{rev}.threadpack         base pack of rev (publish / publish-rev): everything a cold open reads
+idx/{gen}/base.cold.{rev}.threadpack    the same without the routing table (coldRouting "tree")
 idx/{gen}/compact.lock                  automatic compaction in progress (create-only PUT, stale after 10 min); mutable
 idx/{gen}/compact.last.json             the latest automatic compaction runs (GET /index/status); mutable
 idx/current.json                        {gen, rev} (rev absent = 0 for older pointers)
@@ -89,8 +94,12 @@ read unchanged. A manifest of rev >= 1 carries everything a query needs:
  "nextSeq":4}
 ```
 
-`files` names the routing table, codebook and slabs table (rev 0 manifests have none and use the fixed names; a
-revision whose compaction split cells names `fine.{rev}.f32` and has `k2` = k + splits);
+`files` names the routing table, codebook and slabs table (rev 0 manifests have none and use the fixed names, unless
+publish wrote base packs; a revision whose compaction split cells names `fine.{rev}.f32` and has `k2` = k + splits),
+and `files.base` / `files.baseCold` the newest base packs (inherited, informational: readers fetch the pack of the
+revision they open by its conventional key, and an upsert or compaction revision has none);
+`routing` (optional, inherited) names the compact routing tables made from the means `routing.fine` (readers ignore
+them once `files.fine` differs; a split commit writes new ones);
 `tree` (optional) names the centroid tree the delta encoder and `route=beam` queries use; `compaction` (optional,
 inherited) is the automatic compaction policy and split cap (see [Automatic compaction](#automatic-compaction));
 `deltas[].addedRev` is the rev that first listed the segment. Build `notes` stay in rev 0.

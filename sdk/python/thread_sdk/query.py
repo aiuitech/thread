@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 from . import _native
+from .cold import ColdRouting, new_cold_stat
 from .store import BlobRange, BlobStore, BlobTrace, Bytes, phase_stat
 from .wire import LEGACY_DEFAULTS, TombState, ThreadError, keys, slab_rev_of, tomb_for, tomb_for_delta
 
@@ -86,8 +87,13 @@ class Base:
     """Routing table and PQ codebook of a generation, in native memory."""
 
     key: str
-    searcher: _native.Searcher
+    #: The full routing table (None for a cold base, which routes with `cold`).
+    searcher: _native.Searcher | None
     pq: _native.PqCodebook | None
+    #: The routing table the searcher was built from ("f32" = `files.fine`; the grouped table's for a cold base).
+    routing: str = "f32"
+    #: Cold routing (`cold_routing="tree"`): the centroid tree plus the groups' means loaded so far.
+    cold: ColdRouting | None = None
 
 
 @dataclass
@@ -199,6 +205,7 @@ def execute_query(
     coalesce_bytes: int | None = None,
     span_bytes: int | None = None,
     cold_policy: dict[str, Any] | Literal[False] | None = None,
+    beam: int | None = None,
 ) -> QueryResult:
     """`filter`: a compiled attribute filter (the words `compile_filter` returns; None or empty = none), applied
     inside every scan before top-k insertion. With one, probing widens past `nprobe` in batches (routing order)
@@ -236,12 +243,29 @@ def execute_query(
     tr_start = trace.as_dict()
     # Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
     delta_reads = [ctx.get_delta(d, trace) for d in deltas]
+    cold_r = base.cold
+    cold_stat: dict[str, int] | None = None
+    # Routed to the widening bound; an unfiltered query scans exactly its nprobe cells.
+    route_n = max(nprobe_v, max_nprobe_v)
     try:
-        query = base.searcher.query(q_raw, dots=flat or bool(deltas), codebook=base.pq)
+        if cold_r is not None:
+            # Cold routing: the tree's best groups (their means read now unless an earlier query loaded them), then
+            # the members of those groups ranked as the full table would rank them. Delta segments get q·mean for
+            # the cells they hold entries in (those rows read too).
+            beam_v = _int_param("beam", beam if beam is not None else cold_r.beam, 1)
+            cold_stat = new_cold_stat(beam_v)
+            q0 = cold_r.router.query(q_raw)
+            cold_r.ensure_groups(q0, beam_v, trace, cold_stat)
+            dot_cells = sorted({c for d, f in zip(deltas, delta_reads) for c in cold_r.cells_of(d["key"], f.result())})
+            cold_r.ensure_cells(dot_cells, trace, cold_stat)
+            query = cold_r.router.query(q_raw, dot_cells=dot_cells or None, codebook=base.pq)
+            cells = cold_r.router.route_beam(query, beam_v, route_n)
+        else:
+            assert base.searcher is not None
+            query = base.searcher.query(q_raw, dots=flat or bool(deltas), codebook=base.pq)
+            cells = base.searcher.route(query, 0 if flat else pc_v, route_n)
     except ValueError as e:
         raise ThreadError(str(e), 400) from e
-    # Routed to the widening bound; an unfiltered query scans exactly its nprobe cells.
-    cells = base.searcher.route(query, 0 if flat else pc_v, max(nprobe_v, max_nprobe_v))
     # Cold-path policy: fewer probes / a smaller rerank when most probed slabs would come from the origin. Cells are in
     # routing order (best first), so the cold probe set is the best `cold_policy["nprobe"]` of them. A filtered query
     # the policy applies to widens from the reduced nprobe (4 x it unless `max_nprobe` was given).
@@ -422,7 +446,9 @@ def execute_query(
             "gen": gen,
             "rev": rev.rev,
             "format": fmt,
-            "routing": "flat" if flat else "tree",
+            "routing": "cold" if cold_r is not None else "flat" if flat else "tree",
+            "routing_table": base.routing,
+            **({"cold_routing": cold_r.finish_stat(cold_stat)} if cold_r is not None and cold_stat is not None else {}),
             "cells": cells[:scanned_cells],
             "filter_dropped": rs["filter_dropped"],
             "candidates": run.candidates(),

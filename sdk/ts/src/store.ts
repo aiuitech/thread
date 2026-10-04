@@ -96,6 +96,12 @@ export interface BlobStore {
 	 */
 	getRanges?(key: string, ranges: BlobRange[], opts?: GetOptions): Promise<Uint8Array[] | null>;
 	head(key: string): Promise<BlobHead | null>;
+	/**
+	 * The last `length` bytes of an object (the whole object when it is shorter) and its size, in ONE request
+	 * (`Range: bytes=-length`), so a reader of a trailer (a pack's footer and directory) needs no `head` first.
+	 * `null` if the object does not exist. Optional: callers fall back to `head` + a range.
+	 */
+	getTail?(key: string, length: number, opts?: GetOptions): Promise<{ bytes: Uint8Array; size: number; etag?: string } | null>;
 	/** Writes an object; `null` when a put condition failed. Optional (read-only stores). */
 	put?(key: string, data: Uint8Array | string, opts?: PutOptions): Promise<BlobHead | null>;
 	/** Keys under `prefix`. Optional (used to find a generation's head revision and by writers). */
@@ -124,7 +130,7 @@ const toView = (data: Uint8Array | string): Uint8Array | string => (typeof data 
 
 /** The subset of the Workers `R2Bucket` binding the SDK uses (structural, so no type dependency). */
 export interface R2BucketLike {
-	get(key: string, options?: { range?: BlobRange }): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; etag: string; size: number } | null>;
+	get(key: string, options?: { range?: BlobRange | { suffix: number } }): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; etag: string; size: number } | null>;
 	head(key: string): Promise<{ etag: string; size: number } | null>;
 	put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string }; httpMetadata?: { contentType?: string } }): Promise<{ etag: string; size: number } | null>;
 	list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{ objects: { key: string }[]; truncated: boolean; cursor?: string }>;
@@ -144,6 +150,17 @@ export class R2BlobStore implements BlobStore {
 			opts.trace.bytes += b.byteLength;
 		}
 		return b;
+	}
+
+	async getTail(key: string, length: number, opts?: GetOptions): Promise<{ bytes: Uint8Array; size: number; etag?: string } | null> {
+		const obj = await this.bucket.get(key, { range: { suffix: length } });
+		if (!obj) return null;
+		const bytes = new Uint8Array(await obj.arrayBuffer());
+		if (opts?.trace) {
+			opts.trace.reads++;
+			opts.trace.bytes += bytes.byteLength;
+		}
+		return { bytes, size: obj.size, etag: obj.etag };
 	}
 
 	async head(key: string): Promise<BlobHead | null> {
@@ -204,6 +221,17 @@ export class MemoryBlobStore implements BlobStore {
 	async head(key: string): Promise<BlobHead | null> {
 		const o = this.objects.get(key);
 		return o ? { size: o.bytes.byteLength, etag: o.etag } : null;
+	}
+
+	async getTail(key: string, length: number, opts?: GetOptions): Promise<{ bytes: Uint8Array; size: number; etag?: string } | null> {
+		const o = this.objects.get(key);
+		if (!o) return null;
+		const bytes = o.bytes.slice(Math.max(0, o.bytes.byteLength - length));
+		if (opts?.trace) {
+			opts.trace.reads++;
+			opts.trace.bytes += bytes.byteLength;
+		}
+		return { bytes, size: o.bytes.byteLength, etag: o.etag };
 	}
 
 	async put(key: string, data: Uint8Array | string, opts: PutOptions = {}): Promise<BlobHead | null> {
@@ -684,6 +712,27 @@ export class CachedBlobStore implements BlobStore {
 		return this.origin_(async () => (await this.inner.getRanges?.(key, ranges, opts)) ?? null);
 	}
 
+	/**
+	 * The last `length` bytes and the object's size: served from an in-process cache that holds the whole object,
+	 * else ONE origin request (a tail is not cached: a pack reader reads it once per open).
+	 */
+	get getTail(): BlobStore["getTail"] {
+		const inner = this.inner;
+		if (!inner.getTail) return undefined;
+		return async (key, length, opts) => {
+			const full = this.blobCache && this.cacheable(key) ? await this.blobCache.get(key) : null;
+			if (full) {
+				const bytes = full.subarray(Math.max(0, full.byteLength - length));
+				if (opts?.trace) {
+					opts.trace.hits++;
+					opts.trace.bytes += bytes.byteLength;
+				}
+				return { bytes, size: full.byteLength };
+			}
+			return this.origin_(() => inner.getTail!(key, length, opts));
+		};
+	}
+
 	head(key: string): Promise<BlobHead | null> {
 		return this.inner.head(key);
 	}
@@ -728,6 +777,10 @@ export class PrefixedBlobStore implements BlobStore {
 	}
 	head(key: string) {
 		return this.inner.head(this.prefix + key);
+	}
+	get getTail(): BlobStore["getTail"] {
+		const inner = this.inner;
+		return inner.getTail ? (key, length, opts) => inner.getTail!(this.prefix + key, length, opts) : undefined;
 	}
 	put(key: string, data: Uint8Array | string, opts?: PutOptions) {
 		if (!this.inner.put) throw new ThreadError("the underlying store is read-only", 400);

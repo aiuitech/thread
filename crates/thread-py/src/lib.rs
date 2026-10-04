@@ -14,6 +14,7 @@ use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::fmt::Display;
+use std::sync::RwLock;
 use thread_core::delta::{DeltaEncoder, DeltaView};
 use thread_core::filter::AttrFilter;
 use thread_core::kmeans::{assign_tree_top_m, effective_probe_coarse};
@@ -21,7 +22,10 @@ use thread_core::math::normalize;
 use thread_core::part::PartBuilder;
 use thread_core::pq::{Codebook, QueryTable};
 use thread_core::quant::{encode_residual_sq4, encode_residual_sq8};
-use thread_core::route::Router;
+use thread_core::route::{CentroidTree, Router};
+use thread_core::routing::{
+    decode_rows, encode_grouped, encode_rows, Elem, GroupedTable, PartialRouter,
+};
 use thread_core::search::{
     rerank_records, scan_delta as scan_delta_core, scan_slab, scan_slab_pq, ScanStats,
 };
@@ -344,6 +348,46 @@ impl Searcher {
         }))
     }
 
+    /// A searcher over a compact routing table (`fine.f16` / `fine.i8`, or `fine.f32` bytes with
+    /// `"f32"`): the rows are decoded to f32 once, so routing costs what it does over `fine.f32`.
+    #[staticmethod]
+    fn from_table(
+        py: Python<'_>,
+        dim: usize,
+        k1: usize,
+        k2: usize,
+        coarse_means: &Bound<'_, PyAny>,
+        table: Buf,
+        elem: &str,
+    ) -> PyResult<Self> {
+        let elem = elem_arg(elem)?;
+        let coarse = f32_vec(coarse_means)?;
+        let table = table.as_slice();
+        let k = k1 * k2;
+        if dim == 0 || coarse.len() != k1 * dim {
+            return Err(value_err(format!(
+                "centroid buffer size mismatch: {} coarse floats for k1 {k1}, dim {dim}",
+                coarse.len()
+            )));
+        }
+        if table.len() != elem.table_bytes(dim, k) {
+            return Err(value_err(format!(
+                "{} routing table is {} bytes, expected {} ({k} rows of {} bytes)",
+                elem.name(),
+                table.len(),
+                elem.table_bytes(dim, k),
+                elem.row_bytes(dim)
+            )));
+        }
+        py.detach(|| {
+            let fine = decode_rows(table, dim, elem).map_err(err_s)?;
+            Ok::<_, String>(Searcher {
+                router: Router::new(dim, k1, k2, &coarse, fine),
+            })
+        })
+        .map_err(value_err)
+    }
+
     #[getter]
     fn dim(&self) -> usize {
         self.router.dim
@@ -409,6 +453,298 @@ impl Searcher {
                 (_, false) => r.route(&q.q, probe_coarse, nprobe),
             };
             cells.into_iter().map(|(c, _)| c as u32).collect()
+        }))
+    }
+}
+
+fn elem_arg(elem: &str) -> PyResult<Elem> {
+    Elem::parse(elem).ok_or_else(|| {
+        value_err(format!(
+            "unknown routing table element type {elem:?} (f32, f16 or i8)"
+        ))
+    })
+}
+
+/// Encodes cell means (`k * dim` floats, e.g. `fine.f32`) as a routing table of `elem` rows:
+/// `"f16"` (IEEE half), `"i8"` (`[scale f32][i8 * dim]` per row) or `"f32"`.
+#[pyfunction]
+fn routing_table_encode<'py>(
+    py: Python<'py>,
+    means: &Bound<'_, PyAny>,
+    dim: usize,
+    elem: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let elem = elem_arg(elem)?;
+    let means = f32_vec(means)?;
+    check_batch(means.len(), dim)?;
+    let out = py.detach(|| encode_rows(&means, dim, elem));
+    Ok(PyBytes::new(py, &out))
+}
+
+/// Decodes a routing table of `elem` rows to f32 means (raw little-endian f32 bytes).
+#[pyfunction]
+fn routing_table_decode<'py>(
+    py: Python<'py>,
+    table: Buf,
+    dim: usize,
+    elem: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let elem = elem_arg(elem)?;
+    let v = decode_rows(table.as_slice(), dim, elem).map_err(value_err)?;
+    Ok(f32_bytes(py, &v))
+}
+
+/// Builds a centroid tree ("VIBC") over `k = len(means) / dim` cell means: spherical k-means of the
+/// means into `groups` groups, deterministic for `seed` (the Worker's `build_centroid_tree`).
+#[pyfunction]
+fn build_centroid_tree<'py>(
+    py: Python<'py>,
+    means: &Bound<'_, PyAny>,
+    dim: usize,
+    groups: usize,
+    iters: usize,
+    seed: u64,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let means = f32_vec(means)?;
+    let k = check_batch(means.len(), dim)?;
+    if k == 0 {
+        return Err(value_err("means is empty"));
+    }
+    let out = py.detach(|| CentroidTree::build(&means, dim, k, groups, iters, seed).to_bytes());
+    Ok(PyBytes::new(py, &out))
+}
+
+/// The means (`k * dim`) in the group order of a centroid tree built over them ("VIBG").
+#[pyfunction]
+fn grouped_table_encode<'py>(
+    py: Python<'py>,
+    means: &Bound<'_, PyAny>,
+    dim: usize,
+    tree: Buf,
+    elem: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let elem = elem_arg(elem)?;
+    let means = f32_vec(means)?;
+    let k = check_batch(means.len(), dim)?;
+    let tree = CentroidTree::from_bytes(tree.as_slice()).map_err(value_err)?;
+    if tree.dim != dim || tree.k != k {
+        return Err(value_err(format!(
+            "tree is for k = {} cells of dim {}, expected k = {k}, dim = {dim}",
+            tree.k, tree.dim
+        )));
+    }
+    let out = py.detach(|| encode_grouped(&means, dim, &tree, elem));
+    Ok(PyBytes::new(py, &out))
+}
+
+/// Header of a grouped table: `[elem code, dim, k, groups, n_rows, data_off, row_bytes, byte_len]`.
+#[pyfunction]
+fn grouped_table_info(table: Buf) -> PyResult<Vec<u64>> {
+    let t = GroupedTable::parse(table.as_slice()).map_err(value_err)?;
+    Ok(vec![
+        t.elem.code() as u64,
+        t.dim as u64,
+        t.k as u64,
+        t.groups as u64,
+        t.n_rows as u64,
+        t.data_off as u64,
+        t.row_bytes() as u64,
+        t.byte_len() as u64,
+    ])
+}
+
+/// Cold-start routing over a subset of the cell means: a centroid tree plus the rows of the
+/// groups loaded so far from a tree-grouped table (`fine.grouped.*`). Thread-safe: loads take a
+/// write lock, lookups a read lock.
+#[pyclass(frozen, module = "thread_sdk._native")]
+pub struct ColdRouter {
+    inner: RwLock<PartialRouter>,
+    dim: usize,
+    k: usize,
+}
+
+impl ColdRouter {
+    fn set_head(&self, head: &[u8]) -> PyResult<()> {
+        let t = GroupedTable::parse(head).map_err(value_err)?;
+        self.write().set_head(&t).map_err(value_err)
+    }
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, PartialRouter> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, PartialRouter> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+    }
+    fn check_q(&self, q: &[f32]) -> PyResult<()> {
+        if q.len() != self.dim {
+            return Err(value_err(format!(
+                "query dim {} != index dim {}",
+                q.len(),
+                self.dim
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl ColdRouter {
+    /// `tree`: the centroid tree the grouped table follows; `elem`: its row type; `head`: the table's
+    /// first `data_off` bytes (header, directory and, for i8, the centre the rows are residuals
+    /// from), or None: i8 rows then need `set_head` before the first `add_rows` (`needs_head`).
+    #[new]
+    #[pyo3(signature = (tree, elem, head = None))]
+    fn new(tree: Buf, elem: &str, head: Option<Buf>) -> PyResult<Self> {
+        let elem = elem_arg(elem)?;
+        let tree = CentroidTree::from_bytes(tree.as_slice()).map_err(value_err)?;
+        let (dim, k) = (tree.dim, tree.k);
+        let r = ColdRouter {
+            inner: RwLock::new(PartialRouter::new(tree, elem, None).map_err(value_err)?),
+            dim,
+            k,
+        };
+        if let Some(h) = head.as_ref() {
+            r.set_head(h.as_slice())?;
+        }
+        Ok(r)
+    }
+
+    /// Whether i8 rows still need the table's head (`set_head`) before they can be added.
+    #[getter]
+    fn needs_head(&self) -> bool {
+        self.read().needs_head()
+    }
+
+    /// Installs the table's head (its first `data_off` bytes): checks it against the tree, takes the
+    /// i8 centre.
+    #[pyo3(name = "set_head")]
+    fn set_head_py(&self, head: Buf) -> PyResult<()> {
+        self.set_head(head.as_slice())
+    }
+
+    #[getter]
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    #[getter]
+    fn k(&self) -> usize {
+        self.k
+    }
+
+    #[getter]
+    fn groups(&self) -> usize {
+        self.read().groups()
+    }
+
+    #[getter]
+    fn row_bytes(&self) -> usize {
+        self.read().row_bytes()
+    }
+
+    #[getter]
+    fn loaded_cells(&self) -> usize {
+        self.read().loaded_cells()
+    }
+
+    #[getter]
+    fn loaded_groups(&self) -> usize {
+        self.read().loaded_groups()
+    }
+
+    /// `(first row, row count)` of group `g` in the grouped table.
+    fn group_rows(&self, g: usize) -> PyResult<(usize, usize)> {
+        let r = self.read();
+        if g >= r.groups() {
+            return Err(value_err(format!("group {g} >= {} groups", r.groups())));
+        }
+        Ok(r.group_rows(g))
+    }
+
+    /// Row of cell `c` in the grouped table (None if no group lists it).
+    fn cell_row(&self, c: usize) -> Option<usize> {
+        self.read().cell_row(c)
+    }
+
+    /// The listed cells whose means are not loaded, in order.
+    fn missing_cells(&self, cells: &Bound<'_, PyAny>) -> PyResult<Vec<u32>> {
+        let cells = u32_vec(cells)?;
+        let r = self.read();
+        Ok(cells
+            .into_iter()
+            .filter(|&c| !r.has_cell(c as usize))
+            .collect())
+    }
+
+    /// The groups among the `beam` best for the (unit) query that are not fully loaded, best first.
+    fn missing_groups(&self, query: &Bound<'_, Query>, beam: usize) -> PyResult<Vec<usize>> {
+        let q = &query.get().q;
+        self.check_q(q)?;
+        Ok(self.read().missing_groups(q, beam))
+    }
+
+    /// Installs rows `first_row..` (a whole number of rows); returns the cells newly loaded.
+    fn add_rows(&self, py: Python<'_>, first_row: usize, rows: Buf) -> PyResult<usize> {
+        let rows = rows.as_slice();
+        py.detach(|| self.write().add_rows(first_row, rows).map_err(err_s))
+            .map_err(value_err)
+    }
+
+    /// Prepares a query: normalizes `q`, fills `q·mean` for `dot_cells` (which must be loaded; the
+    /// delta scans' base scores) and builds the PQ table when a `codebook` is given.
+    #[pyo3(signature = (q, dot_cells = None, codebook = None))]
+    fn query(
+        &self,
+        py: Python<'_>,
+        q: &Bound<'_, PyAny>,
+        dot_cells: Option<&Bound<'_, PyAny>>,
+        codebook: Option<&Bound<'_, PqCodebook>>,
+    ) -> PyResult<Query> {
+        let mut q = f32_vec(q)?;
+        self.check_q(&q)?;
+        normalize(&mut q);
+        let cells = dot_cells.map(u32_vec).transpose()?;
+        let cb = codebook.map(|c| &c.get().cb);
+        let k = self.k;
+        py.detach(|| {
+            let qc = match cells {
+                Some(cells) => {
+                    if let Some(&c) = cells.iter().find(|&&c| c as usize >= k) {
+                        return Err(format!("cell id {c} >= {k} cells"));
+                    }
+                    let dots = self.read().cell_dots_for(&q, &cells).map_err(err_s)?;
+                    let mut qc = vec![0f32; k];
+                    for (&c, d) in cells.iter().zip(dots) {
+                        qc[c as usize] = d;
+                    }
+                    Some(qc)
+                }
+                None => None,
+            };
+            let table = cb
+                .map(|cb| QueryTable::new(&q, cb))
+                .transpose()
+                .map_err(err_s)?;
+            Ok(Query { q, qc, table })
+        })
+        .map_err(value_err)
+    }
+
+    /// Global ids of the `nprobe` best loaded cells among the members of the best `beam` groups.
+    fn route_beam(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, Query>,
+        beam: usize,
+        nprobe: usize,
+    ) -> PyResult<Vec<u32>> {
+        let q = &query.get().q;
+        self.check_q(q)?;
+        Ok(py.detach(|| {
+            self.read()
+                .route_beam(q, beam, nprobe)
+                .into_iter()
+                .map(|(c, _)| c as u32)
+                .collect()
         }))
     }
 }
@@ -958,6 +1294,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PqCodebook>()?;
     m.add_class::<Query>()?;
     m.add_class::<Searcher>()?;
+    m.add_class::<ColdRouter>()?;
     m.add_class::<DeltaJob>()?;
     m.add_class::<AssignJob>()?;
     m.add_class::<SlabJob>()?;
@@ -977,6 +1314,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(slab_info, m)?)?;
     m.add_function(wrap_pyfunction!(residuals_for, m)?)?;
     m.add_function(wrap_pyfunction!(pq_init_codebook, m)?)?;
+    m.add_function(wrap_pyfunction!(routing_table_encode, m)?)?;
+    m.add_function(wrap_pyfunction!(routing_table_decode, m)?)?;
+    m.add_function(wrap_pyfunction!(grouped_table_encode, m)?)?;
+    m.add_function(wrap_pyfunction!(build_centroid_tree, m)?)?;
+    m.add_function(wrap_pyfunction!(grouped_table_info, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     lex::register(m)
 }

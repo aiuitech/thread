@@ -6,10 +6,14 @@ The same bench as bench/cold/cold_bench.mjs (TypeScript SDK): same CLI, same sce
         [--nprobe N] [--rerank R] [--proxy http://127.0.0.1:9555] [--pack-key packs/g4-cold.threadpack]
         [--label TEXT] [--out data/cold/NAME.jsonl] [--env sdk/ts/examples/basic/.env.secrets]
         store / cache options (absent = the SDK's defaults), the same as cold_bench.mjs:
-        [--legacy] (the pre-cold-store defaults: MemoryCache with "whole" misses, inflight 12, no warm-up)
+        [--legacy] (the pre-cold-store defaults: MemoryCache with "whole" misses, inflight 12, no warm-up, no base pack)
         [--cache none|memory|disk] [--disk-dir data/cold-store/dc-{t}] [--miss-policy whole|range|range+warm]
         [--inflight N] [--coalesce BYTES] [--span BYTES] [--chunk BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
         [--drain] (wait for background cache warms before the `warm` scenario)
+        open options: [--routing f32|f16|i8|auto] [--cold-routing tree] [--cold-beam N] [--base-pack 0|1] [--gen G --rev R]
+
+The open options are open_index's (`routing`, `cold_routing`, `cold_beam`, `base_pack`, `gen`/`rev`), as in
+cold_bench.mjs.
 
 Each trial t spawns a fresh interpreter (fresh connections, fresh native module import, fresh index, empty caches):
   process-cold  query (offset + 2t): import thread_sdk, open the index, one query
@@ -142,6 +146,26 @@ def r1(x: float | None) -> float | None:
 # ---------- child: one trial ----------
 
 
+def open_opts() -> dict[str, Any]:
+    """open_index options from the command line."""
+    o: dict[str, Any] = {}
+    if "routing" in ARGS:
+        o["routing"] = ARGS["routing"]
+    if "cold-routing" in ARGS:
+        o["cold_routing"] = ARGS["cold-routing"]
+    if "cold-beam" in ARGS:
+        o["cold_beam"] = int(ARGS["cold-beam"])
+    if "base-pack" in ARGS:
+        o["base_pack"] = ARGS["base-pack"] != "0"
+    elif LEGACY:
+        o["base_pack"] = False
+    if "gen" in ARGS:
+        o["gen"] = ARGS["gen"]
+    if "rev" in ARGS:
+        o["rev"] = int(ARGS["rev"])
+    return o
+
+
 def child() -> None:
     t_entry = time.time() * 1000
     spawn_at = float(ARGS["spawn-at"])
@@ -180,7 +204,7 @@ def child() -> None:
         okw["warmup"] = CONFIG["warmup"]
     if CONFIG["coldPolicy"]:
         okw["cold_policy"] = CONFIG["coldPolicy"]
-    index = open_index(store, **okw)
+    index = open_index(store, **okw, **open_opts())
     os_ = index.open_stats
     qopts: dict[str, Any] = {"top_k": 10}
     if NPROBE is not None:
@@ -202,7 +226,8 @@ def child() -> None:
         tl = st["timeline"]
         ids = [h.id for h in res.hits]
         pack = os_.get("pack")
-        open_phases = [pack, os_["current"], os_["manifest"], os_["slabs"], os_["base"]] if with_open else []
+        open_phases = [pack, os_.get("prefetch"), os_["current"], os_["manifest"], os_["slabs"], os_["base"]] \
+            if with_open else []
 
         def osum(f: str) -> int:
             return sum(p[f] for p in open_phases if p)
@@ -225,12 +250,18 @@ def child() -> None:
             "rerank": res.params["rerank"],
             "recall": recall_at(ids, ds.truth(qi)),
             "ids": ids,
+            "routing": st["routing"],
+            "routingTable": st.get("routing_table"),
+            "cells": st["cells"],
+            "coldRouting": st.get("cold_routing"),
+            "prefetchSource": os_["prefetch"]["source"] if with_open and os_.get("prefetch") else None,
             "ms": {
                 "boot": o(ms["boot"]),
                 "import": o(r1(ms["import"])),
                 "wasmCompile": None,
                 "wasmInit": None,
                 "pack": r1(pack["ms"]) if with_open and pack else None,
+                "prefetch": r1(os_["prefetch"]["ms"]) if with_open and os_.get("prefetch") else None,
                 "current": o(r1(os_["current"]["ms"])),
                 "manifest": o(r1(os_["manifest"]["ms"])),
                 "slabs": o(r1(os_["slabs"]["ms"])),
@@ -246,6 +277,7 @@ def child() -> None:
             },
             "reqs": {
                 "pack": pack["reads"] if with_open and pack else None,
+                "prefetch": os_["prefetch"]["reads"] if with_open and os_.get("prefetch") else None,
                 "current": o(os_["current"]["reads"]),
                 "manifest": o(os_["manifest"]["reads"]),
                 "slabs": o(os_["slabs"]["reads"]),
@@ -258,6 +290,7 @@ def child() -> None:
             },
             "bytes": {
                 "pack": pack["bytes"] if with_open and pack else None,
+                "prefetch": os_["prefetch"]["bytes"] if with_open and os_.get("prefetch") else None,
                 "current": o(os_["current"]["bytes"]),
                 "manifest": o(os_["manifest"]["bytes"]),
                 "slabs": o(os_["slabs"]["bytes"]),
@@ -470,6 +503,7 @@ def parent() -> None:
         "signUsPerRequest": sign_microbench(),
         "signUsPerRequestCached": sign_microbench(True),
         "label": ARGS.get("label"),
+        "open": open_opts(),
         "git": git,
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }

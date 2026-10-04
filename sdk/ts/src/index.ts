@@ -14,11 +14,12 @@ import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, Pr
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { compactSegments, configureAttrs, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
-import { hasDense, keys, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
-import { asF32, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
+import { chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseManifest, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
+import { asF32, baseKeysOf, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchOptions, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
-import { PackedBlobStore } from "./pack.js";
+import { ColdRouting } from "./cold.js";
+import { isPackHeader, PackedBlobStore, PrefetchStore } from "./pack.js";
 
 export * from "./wire.js";
 export * from "./attrs.js";
@@ -26,6 +27,8 @@ export * from "./store.js";
 export * from "./s3.js";
 export * from "./lex.js";
 export * from "./fusion.js";
+export * from "./routing.js";
+export type { ColdStat } from "./cold.js";
 export * from "./pack.js";
 export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
@@ -102,6 +105,13 @@ export interface OpenStats {
 	/** The routing table and PQ codebook (`coarse.f32`, `fine.f32`, `pq.bin`) read and loaded into wasm; null without a dense index. */
 	base: BaseStat | null;
 	/**
+	 * How the open's objects were fetched up front (`basePack`): from the revision's base pack (`"base-pack"`), from
+	 * a `PackedBlobStore`'s base range (`"index-pack"`), started all at once after the manifest (`"files"`), or not
+	 * at all (`"none"`, `basePack: false`); the wall time until then and the work of the pack read (objects served
+	 * from a pack count here only; reads started early count in the step that uses them), and the pack key tried.
+	 */
+	prefetch: PhaseStat & { source: "base-pack" | "index-pack" | "files" | "none"; key: string | null };
+	/**
 	 * When the store is a `PackedBlobStore`: its own open (head, tail and directory reads, `PackedBlobStore.openStats`).
 	 * It happened before `open` (when the pack store was created), so it is not part of `total`.
 	 */
@@ -158,6 +168,30 @@ export interface OpenOptions {
 	deltaCacheBytes?: number;
 	/** Transient lexical bytes (buckets, posting lists, texts) each segment reader may hold (default 8 MB). */
 	lexTransientBytes?: number;
+	/**
+	 * Routing table to load (default `"f32"`, the 25 MB `fine.f32` at 4096 x 1536): `"f16"` (half the bytes) or
+	 * `"i8"` (a quarter), decoded to f32 on load, or `"auto"` for the smallest the revision has. A revision without
+	 * the table falls back to f32. The table only picks which cells to probe; slabs are scored with their own f32
+	 * means. See docs/query-path.md for the measured probe overlap and recall.
+	 */
+	routing?: RoutingOption;
+	/**
+	 * `"tree"`: a cold open does not wait for the routing table. It loads the centroid tree (0.8 MB at 4096 cells) and
+	 * the PQ codebook, and the first queries rank the cells of the tree's best `coldBeam` groups, range-reading just
+	 * those groups' means from the tree-grouped table; the full table (`routing`) loads in the background and takes
+	 * over once it is in. Needs a revision with `manifest.routing.grouped` for its tree, else the open waits for the
+	 * full table as usual. Default `"off"`.
+	 */
+	coldRouting?: "tree" | "off";
+	/** Groups ranked per cold-routed query (default: `manifest.defaults.beam`, else 16). See docs/query-path.md. */
+	coldBeam?: number;
+	/**
+	 * Base packs (default true): a cold open first GETs the revision's base pack
+	 * (`idx/{gen}/base.{rev}.threadpack`, `base.cold.{rev}` with `coldRouting: "tree"`), every object the open reads in
+	 * one object, in parallel with the manifest; from a `PackedBlobStore` it reads the pack's recorded base range. Without
+	 * a pack, the open starts every read as soon as the manifest is in. `false`: the reads one after another, as before.
+	 */
+	basePack?: boolean;
 }
 
 /** One wasm instance per isolate. `Thread.init` once, then `open` indexes. */
@@ -245,6 +279,11 @@ export class ThreadIndex {
 	private revState: RevState;
 	private base: BaseSlot | null = null;
 	private basePromise: Promise<BaseSlot> | null = null;
+	/** The prefetching view the open reads through (null after the open). */
+	private openStore: BlobStore | null = null;
+	/** Cold routing (`coldRouting: "tree"`) while the full routing table loads. */
+	private cold: BaseSlot | null = null;
+	private coldPromise: Promise<BaseSlot> | null = null;
 	private readonly pinned: boolean;
 	private readonly refreshInterval: number;
 	private lastCheck = 0;
@@ -277,6 +316,9 @@ export class ThreadIndex {
 			if (this.base) this.base.dropped = true;
 			this.base = null;
 			this.basePromise = null;
+			if (this.cold) this.cold.dropped = true;
+			this.cold = null;
+			this.coldPromise = null;
 			this.segCache.clear();
 			this.segLoading.clear();
 			this.lex = null;
@@ -301,13 +343,26 @@ export class ThreadIndex {
 			opts.waitUntil?.(p);
 		}
 		const tl: RevTimeline = {};
-		const target = await resolveTarget(store, opts.gen, opts.rev, tl);
-		const rev = await loadRevState(store, target.gen, target.rev, tl);
+		// The open's reads go through a prefetching view: a pack's base range, the base pack, or the files started
+		// together. A PackedBlobStore's base range (it starts with idx/current.json) is read before anything else.
+		const pre = new PrefetchStore(store);
+		const fromPack = await prefetchIndexPack(pre, opts);
+		const target = await resolveTarget(fromPack ? pre : store, opts.gen, opts.rev, tl);
+		const prefetch = fromPack && pre.has(keys.manifest(target.gen, target.rev)) ? fromPack : await prefetchOpen(store, pre, target.gen, target.rev, opts);
+		const rev = await loadRevState(pre, target.gen, target.rev, tl);
 		const ix = new ThreadIndex(thread, store, rev, opts);
+		ix.openStore = pre;
 		const loaded: { stat?: BaseStat } = {};
-		if (hasDense(rev.manifest)) await ix.acquireBase(loaded).then((s) => ix.releaseBase(s));
+		if (hasDense(rev.manifest)) {
+			if (ix.coldWanted(rev)) {
+				// Cold routing: wait for the tree and the codebook only; the full table loads in the background.
+				await ix.acquireCold(loaded).then((s) => ix.releaseBase(s));
+				ix.loadFullInBackground();
+			} else await ix.acquireBase(loaded).then((s) => ix.releaseBase(s));
+		}
+		ix.openStore = null; // the prefetched bytes are not kept
 		const none = phaseStat(0, newTrace());
-		ix.openStats = { total: roundMs(nowMs() - t0), wasmInit: thread.initMs, current: tl.current ?? none, manifest: tl.manifest ?? none, slabs: tl.slabs ?? none, base: loaded.stat ?? null };
+		ix.openStats = { total: roundMs(nowMs() - t0), wasmInit: thread.initMs, current: tl.current ?? none, prefetch, manifest: tl.manifest ?? none, slabs: tl.slabs ?? none, base: loaded.stat ?? null };
 		if (opts.store instanceof PackedBlobStore) ix.openStats.pack = opts.store.openStats;
 		return ix;
 	}
@@ -414,16 +469,13 @@ export class ThreadIndex {
 		let pre: BaseSlot | null = null;
 		const haveBase = (this.base && this.base.key === next.baseKey && !this.base.dropped) || (this.basePromise && !this.base && prev.baseKey === next.baseKey);
 		if (hasDense(next.manifest) && !haveBase) {
-			const b = await loadBase(this.store, next, epoch);
+			const b = await loadBase(this.store, next, epoch, undefined, this.opts.routing);
 			pre = { ...b, users: 0, dropped: false };
 		}
 		const total = next.deltas.reduce((a, d) => a + d.bytes, 0);
 		if (total <= this.deltaBudget) await Promise.all(next.deltas.filter((d) => !this.deltaCache.has(d.key)).map((d) => this.getDelta(d, newTrace(), next).catch(() => {})));
 		if (this.closed) {
-			if (pre && pre.epoch === this.thread.epoch) {
-				safeFree(pre.searcher);
-				if (pre.pq) safeFree(pre.pq);
-			}
+			if (pre && pre.epoch === this.thread.epoch) freeBase(pre);
 			return;
 		}
 		this.revState = next;
@@ -441,15 +493,15 @@ export class ThreadIndex {
 		}
 		this.lexLoading = null;
 		if (this.base && this.base.key !== next.baseKey) this.dropBase();
+		if (this.cold && this.cold.key !== coldKeyOf(next)) this.dropCold();
 		if (pre) {
 			if (pre.epoch !== this.thread.epoch) pre.dropped = true; // a reset happened while loading: rebuilt on demand
-			else if (this.base && this.base.key === pre.key && !this.base.dropped) {
-				safeFree(pre.searcher); // loaded concurrently by a query
-				if (pre.pq) safeFree(pre.pq);
-			} else {
+			else if (this.base && this.base.key === pre.key && !this.base.dropped) freeBase(pre); // loaded concurrently by a query
+			else {
 				this.dropBase();
 				this.base = pre;
 				this.basePromise = Promise.resolve(pre);
+				this.dropCold(); // the full table takes over from cold routing
 			}
 		}
 		const before = new Set(snapshotKeys(prev));
@@ -699,7 +751,7 @@ export class ThreadIndex {
 		this.maybeRefresh();
 		return this.thread.withRecovery("query", async (attempt) => {
 			const loaded: { stat?: BaseStat } = {};
-			const base = await this.acquireBase(loaded);
+			const base = await this.acquireQueryBase(loaded);
 			try {
 				const rev = this.revState;
 				const r = await executeQuery(
@@ -756,6 +808,7 @@ export class ThreadIndex {
 		this.closed = true;
 		this.unsubscribe();
 		this.dropBase();
+		this.dropCold();
 		this.deltaCache.clear();
 		for (const v of this.segCache.values()) if (v.epoch === this.thread.epoch) v.seg.free();
 		this.segCache.clear();
@@ -793,10 +846,12 @@ export class ThreadIndex {
 		}
 		if (!this.basePromise) {
 			const rev = this.revState;
-			const p = loadBase(this.store, rev, this.thread.epoch, loaded).then((b) => {
+			const p = loadBase(this.openStore ?? this.store, rev, this.thread.epoch, loaded, this.opts.routing).then((b) => {
 				const slot: BaseSlot = { ...b, users: 0, dropped: false };
-				if (this.basePromise === p && !this.closed) this.base = slot;
-				else slot.dropped = true; // superseded while loading
+				if (this.basePromise === p && !this.closed) {
+					this.base = slot;
+					this.dropCold(); // the full table takes over from cold routing
+				} else slot.dropped = true; // superseded while loading
 				return slot;
 			});
 			this.basePromise = p;
@@ -810,10 +865,7 @@ export class ThreadIndex {
 
 	private releaseBase(slot: BaseSlot): void {
 		slot.users--;
-		if (slot.dropped && slot.users === 0 && slot.epoch === this.thread.epoch) {
-			safeFree(slot.searcher);
-			if (slot.pq) safeFree(slot.pq);
-		}
+		if (slot.dropped && slot.users === 0 && slot.epoch === this.thread.epoch) freeBase(slot);
 	}
 
 	private dropBase(): void {
@@ -822,42 +874,232 @@ export class ThreadIndex {
 		this.basePromise = null;
 		if (!b || b.dropped) return;
 		b.dropped = true;
-		if (b.users === 0 && b.epoch === this.thread.epoch) {
-			safeFree(b.searcher);
-			if (b.pq) safeFree(b.pq);
+		if (b.users === 0 && b.epoch === this.thread.epoch) freeBase(b);
+	}
+
+	// ---- cold routing ----
+
+	/** Whether queries of `rev` may route cold (the option is on and the revision has a usable grouped table). */
+	private coldWanted(rev: RevState): boolean {
+		return this.opts.coldRouting === "tree" && hasDense(rev.manifest) && groupedTableOf(rev.manifest, rev.files) !== null;
+	}
+
+	/**
+	 * The base a query uses: the full routing table once it is loaded; before that, with cold routing, the cold base
+	 * (and the full table keeps loading in the background).
+	 */
+	private acquireQueryBase(loaded?: { stat?: BaseStat }): Promise<BaseSlot> {
+		if (this.base && this.base.epoch === this.thread.epoch && !this.base.dropped) return this.acquireBase(loaded);
+		const rev = this.revState;
+		if (!this.coldWanted(rev)) return this.acquireBase(loaded);
+		this.loadFullInBackground();
+		return this.acquireCold(loaded);
+	}
+
+	/** Starts loading the full routing table (once) without waiting for it. */
+	private loadFullInBackground(): void {
+		if (this.basePromise || (this.base && !this.base.dropped && this.base.epoch === this.thread.epoch)) return;
+		const p = this.acquireBase()
+			.then((s) => this.releaseBase(s))
+			.catch((e: unknown) => console.error(`thread-sdk: loading the routing table failed (cold routing continues): ${e instanceof Error ? e.message : String(e)}`));
+		this.opts.waitUntil?.(p);
+	}
+
+	private acquireCold(loaded?: { stat?: BaseStat }): Promise<BaseSlot> {
+		const rev = this.revState;
+		const key = coldKeyOf(rev);
+		if (this.cold && this.cold.epoch === this.thread.epoch && !this.cold.dropped && this.cold.key === key) {
+			this.cold.users++;
+			return Promise.resolve(this.cold);
 		}
+		if (!this.coldPromise) {
+			const p = loadColdBase(this.openStore ?? this.store, rev, this.thread.epoch, this.opts.coldBeam, loaded).then((b) => {
+				const slot: BaseSlot = { ...b, users: 0, dropped: false };
+				if (this.coldPromise === p && !this.closed && !this.base) this.cold = slot;
+				else slot.dropped = true; // superseded while loading (or the full table won the race)
+				return slot;
+			});
+			this.coldPromise = p;
+			p.catch(() => this.coldPromise === p && (this.coldPromise = null));
+		}
+		return this.coldPromise.then((slot) => {
+			slot.users++;
+			return slot;
+		});
+	}
+
+	private dropCold(): void {
+		const b = this.cold;
+		this.cold = null;
+		this.coldPromise = null;
+		if (!b || b.dropped) return;
+		b.dropped = true;
+		if (b.users === 0 && b.epoch === this.thread.epoch) freeBase(b);
+	}
+
+	/** `"full"` once the routing table is loaded, `"cold"` while queries route cold, `"none"` before either. */
+	get routingState(): "full" | "cold" | "none" {
+		if (this.base && !this.base.dropped) return "full";
+		return this.cold && !this.cold.dropped ? "cold" : "none";
+	}
+
+	/** Waits until the full routing table is loaded (starting the load if needed). */
+	async whenFullRouting(): Promise<void> {
+		if (!this.hasDense) return;
+		await this.acquireBase().then((s) => this.releaseBase(s));
 	}
 }
 
 // ---------- loading ----------
 
-export { asF32, headRevision, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
-
-/**
- * Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. With `loaded`, records
- * the load's wall time, reads and bytes in `loaded.stat` (`fetch`: reading the files, `build`: the wasm objects).
- */
-export async function loadBase(store: BlobStore, rev: RevState, epoch: number, loaded?: { stat?: BaseStat }): Promise<Base> {
-	const { manifest, files } = rev;
+/** A `PackedBlobStore`'s recorded base range, read with one range read into `pre` (null when there is none). */
+async function prefetchIndexPack(pre: PrefetchStore, opts: OpenOptions): Promise<OpenStats["prefetch"] | null> {
+	if (opts.basePack === false || !(opts.store instanceof PackedBlobStore) || opts.prefix) return null;
 	const t0 = nowMs();
 	const trace = newTrace();
-	const [c, f, p] = await Promise.all([getRequired(store, files.coarse, trace), getRequired(store, files.fine, trace), files.pq ? getRequired(store, files.pq, trace) : Promise.resolve(null)]);
-	const t1 = nowMs();
-	if (rev.format === 3 && !p) throw new ThreadError(`format 3 generation ${rev.gen} has no PQ codebook`);
-	let pq: W.PqCodebook | null = null;
-	if (p) {
-		pq = new W.PqCodebook(p);
-		if (pq.dim() !== manifest.dim || (manifest.pq && pq.m() !== manifest.pq.m)) {
-			const msg = `${files.pq} is dim ${pq.dim()} m ${pq.m()}, manifest dim ${manifest.dim} pq ${JSON.stringify(manifest.pq)}`;
-			safeFree(pq);
-			throw new ThreadError(msg);
+	// The range ends with the smallest routing table (`fine{.r}.{elem}`): an open that loads another one stops before it.
+	const routing = opts.routing ?? "f32";
+	const rk = opts.store.directory.meta.baseRouting;
+	const inRange = typeof rk !== "string" ? null : rk.endsWith(".i8") ? "i8" : rk.endsWith(".f16") ? "f16" : "f32";
+	const got = await opts.store.readBase(trace, opts.coldRouting === "tree" || routing === "auto" || routing === inRange);
+	if (!got) return null;
+	for (const [k, b] of got) pre.set(k, b);
+	return { ...phaseStat(nowMs() - t0, trace), source: "index-pack", key: opts.store.key };
+}
+
+/**
+ * Starts the reads of an open before the loaders ask for them: the revision's base pack (one GET, in parallel with
+ * the manifest in case there is none), a `PackedBlobStore`'s base range, or, without a pack, every base object as
+ * soon as the manifest is in (slabs table, tombstone sets, coarse, codebook, routing table or, for cold routing, the
+ * tree). The loaders then read `pre`, which serves those objects from memory.
+ */
+async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, rev: number, opts: OpenOptions): Promise<OpenStats["prefetch"]> {
+	const t0 = nowMs();
+	const trace = newTrace();
+	const done = (source: OpenStats["prefetch"]["source"], key: string | null) => ({ ...phaseStat(nowMs() - t0, trace), source, key });
+	if (opts.basePack === false) return done("none", null);
+	const cold = opts.coldRouting === "tree";
+	const routing = opts.routing ?? "f32";
+	const mkey = keys.manifest(gen, rev);
+	// A base pack holds the smallest routing table (publish's default): worth its GET for cold routing and for
+	// routing "auto" / "i8"; an f32 / f16 open would download that table for nothing and reads the files instead.
+	if (!(opts.store instanceof PackedBlobStore) && (cold || routing === "auto" || routing === "i8")) {
+		const packKey = cold ? keys.baseColdPack(gen, rev) : keys.basePack(gen, rev);
+		pre.prefetch(mkey); // in case there is no pack
+		if (!cold) {
+			// Should the pack hold another table than the one asked for (a generation without fine.i8), start that one
+			// as soon as the manifest is in rather than after the pack.
+			pre.peek(mkey)
+				.then((mb) => {
+					const m = mb ? parseManifest(mb, gen, rev) : null;
+					if (!m || !hasDense(m)) return;
+					const files = manifestFiles(m);
+					const want = chooseRouting(m, files, routing).key;
+					if (want !== chooseRouting(m, files, "auto").key) pre.prefetch(want);
+				})
+				.catch(() => {});
+		}
+		const b = await store.get(packKey, undefined, { trace }).catch(() => null);
+		if (b && isPackHeader(b)) {
+			try {
+				const meta = pre.addPack(b);
+				if (meta.gen === gen && meta.rev === rev) return done("base-pack", packKey);
+			} catch (e) {
+				console.error(`thread-sdk: ignoring the base pack ${packKey}: ${e instanceof Error ? e.message : String(e)}`);
+			}
 		}
 	}
+	// No pack (or not worth one): every base object as soon as the manifest is in (each read is accounted where its
+	// bytes are used).
+	pre.prefetch(mkey);
+	const mb = await pre.peek(mkey).catch(() => null);
+	if (mb) {
+		let m: Manifest | null = null;
+		try {
+			m = parseManifest(mb, gen, rev);
+		} catch {
+			/* loadRevState reports it */
+		}
+		if (m) for (const k of baseKeysOf(m, gen, rev, cold ? "cold" : "base", routing)) pre.prefetch(k);
+	}
+	return done("files", null);
+}
+
+function freeBase(b: Base): void {
+	if (b.searcher) safeFree(b.searcher);
+	if (b.cold) safeFree(b.cold.router);
+	if (b.pq) safeFree(b.pq);
+}
+
+/** Key of a cold base: the base files plus the grouped table (a revision with another tree or means has another). */
+const coldKeyOf = (rev: RevState): string => `${rev.baseKey}|${groupedTableOf(rev.manifest, rev.files)?.key ?? "-"}`;
+
+function checkedCodebook(rev: RevState, p: Uint8Array): W.PqCodebook {
+	const { manifest, files } = rev;
+	const pq = new W.PqCodebook(p);
+	if (pq.dim() !== manifest.dim || (manifest.pq && pq.m() !== manifest.pq.m)) {
+		const msg = `${files.pq} is dim ${pq.dim()} m ${pq.m()}, manifest dim ${manifest.dim} pq ${JSON.stringify(manifest.pq)}`;
+		safeFree(pq);
+		throw new ThreadError(msg);
+	}
+	return pq;
+}
+
+/**
+ * Loads a cold base (`coldRouting: "tree"`): the centroid tree and the PQ codebook, plus an empty cold router over the
+ * tree-grouped table that queries fill group by group. `beam` defaults to `manifest.defaults.beam`, else 16.
+ */
+export async function loadColdBase(store: BlobStore, rev: RevState, epoch: number, beam?: number, loaded?: { stat?: BaseStat }): Promise<Base> {
+	const { manifest, files } = rev;
+	const g = groupedTableOf(manifest, files);
+	if (!g) throw new ThreadError(`${rev.gen} rev ${rev.rev} has no tree-grouped routing table for its tree`);
+	const b = beam ?? (manifest.defaults as { beam?: number } | undefined)?.beam ?? 16;
+	if (!Number.isInteger(b) || b < 1) throw new ThreadError("coldBeam must be an integer >= 1", 400);
+	const t0 = nowMs();
+	const trace = newTrace();
+	// (i8 rows are residuals from a centre in the grouped table's head: the first group read fetches it too.)
+	const [t, p] = await Promise.all([getRequired(store, g.tree, trace), files.pq ? getRequired(store, files.pq, trace) : Promise.resolve(null)]);
+	const t1 = nowMs();
+	if (rev.format === 3 && !p) throw new ThreadError(`format 3 generation ${rev.gen} has no PQ codebook`);
+	const pq = p ? checkedCodebook(rev, p) : null;
+	let router: W.ColdRouter | null = null;
 	try {
-		const searcher = new W.Searcher(manifest.dim, manifest.k1, manifest.k2, asF32(c, files.coarse), asF32(f, files.fine));
+		router = new W.ColdRouter(t, g.elem, new Uint8Array(0));
+		const k = manifest.k1 * manifest.k2;
+		if (router.k() !== k || router.dim() !== manifest.dim || router.groups() !== g.groups || router.row_bytes() !== g.rowBytes) throw new ThreadError(`${g.tree} (k ${router.k()}, dim ${router.dim()}, ${router.groups()} groups) does not match ${g.key} / the manifest (k ${k}, dim ${manifest.dim}, ${g.groups} groups)`);
+		const cold = new ColdRouting(W, store, router, g, b);
+		const t2 = nowMs();
+		if (loaded) loaded.stat = { ...phaseStat(t2 - t0, trace), fetch: roundMs(t1 - t0), build: roundMs(t2 - t1), files: { coarse: 0, fine: t.byteLength, pq: p?.byteLength ?? 0 } };
+		return { key: coldKeyOf(rev), searcher: null, cold, pq, epoch, routing: g.elem };
+	} catch (e) {
+		if (router) safeFree(router);
+		if (pq) safeFree(pq);
+		throw e;
+	}
+}
+
+export { asF32, baseKeys, baseKeysOf, headRevision, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
+
+/**
+ * Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. `routing` picks the table:
+ * `fine.f32` (default), the compact `fine.f16` / `fine.i8` copies (decoded to f32 on load) or `"auto"` (the smallest
+ * the revision has); a revision without the requested table falls back to `fine.f32`. With `loaded`, records the
+ * load's wall time, reads and bytes in `loaded.stat` (`fetch`: reading the files, `build`: the wasm objects).
+ */
+export async function loadBase(store: BlobStore, rev: RevState, epoch: number, loaded?: { stat?: BaseStat }, routing: RoutingOption = "f32"): Promise<Base> {
+	const { manifest, files } = rev;
+	const table = chooseRouting(manifest, files, routing);
+	const t0 = nowMs();
+	const trace = newTrace();
+	const [c, f, p] = await Promise.all([getRequired(store, files.coarse, trace), getRequired(store, table.key, trace), files.pq ? getRequired(store, files.pq, trace) : Promise.resolve(null)]);
+	const t1 = nowMs();
+	if (rev.format === 3 && !p) throw new ThreadError(`format 3 generation ${rev.gen} has no PQ codebook`);
+	const pq = p ? checkedCodebook(rev, p) : null;
+	try {
+		const searcher = table.elem === "f32" ? new W.Searcher(manifest.dim, manifest.k1, manifest.k2, asF32(c, files.coarse), asF32(f, files.fine)) : W.Searcher.from_table(manifest.dim, manifest.k1, manifest.k2, asF32(c, files.coarse), f, table.elem);
 		const t2 = nowMs();
 		if (loaded) loaded.stat = { ...phaseStat(t2 - t0, trace), fetch: roundMs(t1 - t0), build: roundMs(t2 - t1), files: { coarse: c.byteLength, fine: f.byteLength, pq: p?.byteLength ?? 0 } };
-		return { key: rev.baseKey, searcher, pq, epoch };
+		return { key: rev.baseKey, searcher, pq, epoch, routing: table.elem };
 	} catch (e) {
 		if (pq) safeFree(pq);
 		throw e;

@@ -671,3 +671,93 @@ query's own reads (speculative reads that land during phase 1 count there); `MB 
 - The Python extension was built with `maturin develop --release` (cargo `release` profile, not the `python` profile
   the README uses; only panic behaviour differs). Python's `load_rev_state` reads the slabs table and tombstone sets
   one after the other (TS reads them concurrently); g4 rev 179 has no tombstone sets, so it does not show here.
+
+## Routing base and base packs
+
+The levers the baseline points at (the routing table is ~60% of process-cold; a pack open costs 3 serial requests
+before the open starts), implemented on `cold/base` and described in
+[query-path.md](query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs):
+
+- **Compact routing tables** `fine.f16` (12.6 MB) / `fine.i8` (6.3 MB, int8 residuals from the means' centre),
+  `open({routing})` / `open_index(routing=)`, decoded to f32 on load.
+- **Cold tree routing** `coldRouting: "tree"` / `cold_routing="tree"`: the open loads the tree (0.8 MB) and the
+  codebook; first queries range-read only their beam's groups of the tree-grouped table `fine.grouped.{rev}.i8`;
+  the full table loads in the background.
+- **Base packs** `idx/{gen}/base.{rev}.threadpack` (8.8 MB: manifest, slabs table, tombstones, coarse, codebook,
+  tree, `fine.i8`) and `base.cold.{rev}.threadpack` (2.5 MB, no routing table): `current.json` + one GET; files
+  requested together once the manifest is in when there is no pack (or the open's table is not in it).
+- **Index packs**: `PackedBlobStore` opens with ONE suffix-range read (`getTail`, `Range: bytes=-524288`: footer +
+  175 KB directory, no HEAD); `packIndex` writes `idx/current.json` and the base objects first and records
+  `base: [offset, length]` and `baseRouting` (the table ending the range), so the open after that is one range read
+  (minus the routing table when the open loads another one).
+
+All objects for g4 were generated offline (`make_routing.mjs`, `make_base_pack.mjs`, `make_pack.mjs --overlay`) as
+rev 180 = rev 179 + routing objects, served from `data/cold/base-overlay` by a second proxy on port 9761; nothing was
+written to R2. Same queries (0..19), same proxy cache, n = 10, medians. Bytes are what the SDK read before its first
+slab read (open + routing).
+
+### TypeScript SDK, per-object store (`--store proxy`)
+
+| profile | mode | MB before 1st slab read | open ms | process e2e ms | vs baseline e2e |
+|---|---|---:|---:|---:|---:|
+| rtt25 | baseline (f32, as before) | 25.66 | 1292 | 1925 | |
+| rtt25 | f16 | 13.64 | 744 | 1363 | -29% |
+| rtt25 | i8 + base pack | 8.42 | 556 | 1200 | -38% |
+| rtt25 | cold beam 16 + cold pack | 3.42 | 275 | 1033 | -46% |
+| rtt60 | baseline | 25.66 | 2587 | 3786 | |
+| rtt60 | i8 + base pack | 8.42 | 1123 | 2373 | -37% |
+| rtt60 | cold beam 16 + cold pack | 3.42 | 591 | 2043 | -46% |
+| rtt25link500 | baseline | 25.66 | 1294 | 1955 | |
+| rtt25link500 | i8 + base pack | 8.42 | 554 | 1233 | -37% |
+| rtt25link500 | cold beam 16 + cold pack | 3.42 | 282 | 1070 | -45% |
+
+The f32 rows of this branch (default routing, `basePack` on, which for f32 means the files prefetch) match the
+baseline within 30-80 ms (rtt25 open 1251 ms, e2e 1881 ms): the routing table's bytes are the cost, and only a
+smaller table or no table removes it. Full per-mode tables (f32 / f16 / i8 with and without base pack, cold beams
+8 / 16 / 32, an rtt90 / 400 Mbps profile) are in query-path.md.
+
+### Python SDK, per-object store, rtt25
+
+| mode | open ms | process e2e ms | vs baseline e2e |
+|---|---:|---:|---:|
+| baseline (f32) | 1255 | 1813 | |
+| f32 (this branch, files prefetch) | 1264 | 1818 | 0% |
+| i8 + base pack | 479 | 1025 | -43% |
+| cold beam 16 + cold pack | 213 | 810 | -55% |
+
+(Python's cold groups are read in parallel on its I/O pool; S3 has no multi-range GET, so a beam of 16 is ~16
+range requests in one round trip.)
+
+### Packs (`--store pack`), rtt25
+
+The old pack (`packs/g4-cold.threadpack`, rev 179, key order) and a base-first pack of rev 180
+(`packs/g4-base.threadpack`, `make_pack.mjs --overlay data/cold/base-overlay`), both sparse, both through the proxy.
+`open.pack` is the `PackedBlobStore` open; `open total` includes it.
+
+| SDK | pack, mode | open.pack ms | open total ms | process e2e ms |
+|---|---|---:|---:|---:|
+| TS | baseline: old pack, old SDK (HEAD + 64 KB tail + directory) | 218 | 1447 | 2012 |
+| TS | old pack, new SDK (one suffix read) | 110 | 1308 | 1897 |
+| TS | base-first pack, f32 (base range up to `fine.i8`, then `fine.f32`) | 111 | 1339 | 1947 |
+| TS | base-first pack, i8 (one range: 8.8 MB) | 111 | 536 | 1177 |
+| TS | base-first pack, cold beam 16 | 111 | 516 | 1187 |
+| Python | baseline: old pack, old SDK | 145 | 1345 | 1892 |
+| Python | old pack, new SDK | 105 | 1327 | 1855 |
+| Python | base-first pack, f32 | 105 | 1348 | 1899 |
+| Python | base-first pack, i8 | 105 | 507 | 1061 |
+| Python | base-first pack, cold beam 16 | 105 | 493 | 1107 |
+
+The pack open went from three serial requests to one (-108 ms TS, -40 ms Python); a pack open is now
+`tail read` + `one base range` (+ the routing table when the open wants another one than the pack's smallest).
+With an f32 open, a pack is as fast as the per-object store again; with i8 it is 1.18 s process e2e instead of 2.0 s.
+In a pack, cold routing gains nothing over i8: the base range is one read either way and the cold query pays a
+round trip for its groups.
+
+### Recall
+
+Probe agreement over 2000 queries (no slab reads, `routing_agreement.mjs`): f16 99.98%, i8 99.82%, cold beam
+8 / 16 / 32 with i8 rows 90.6% / 95.9% / 98.7% of flat-f32 probes (full table in query-path.md). End-to-end recall@10
+over 2000 queries against R2 (`routing_recall.mjs`, every query routed by the mode): f32 95.11%, f16 95.11%, i8
+95.11% (same top 10 as f32 for 99.6% of queries), cold beam 8 / 16 / 32 94.36% / 94.93% / 95.10%. On the 10
+process-cold queries of the bench every mode returns the baseline's recall except cold beam 8 / 16 (one / two
+queries lose a neighbour).

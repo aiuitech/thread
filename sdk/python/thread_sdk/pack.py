@@ -22,14 +22,16 @@ import io
 import os
 import struct
 import tempfile
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Iterable, Sequence
 
-from .revision import load_rev_state, resolve_target, snapshot_keys
+from .query import RevState
+from .revision import base_keys, load_rev_state, resolve_target, snapshot_keys
 from .store import BlobHead, BlobRange, BlobStore, BlobTrace, Bytes, FileBlobStore, MemoryBlobStore, phase_stat
-from .wire import ThreadError, decode_json, dumps
+from .wire import ThreadError, choose_routing, decode_json, dumps, has_dense, keys as index_keys
 
 __all__ = [
     "PACK_MAGIC",
@@ -44,14 +46,19 @@ __all__ = [
     "copy_objects",
     "store_at",
     "is_pack_header",
+    "pack_entries",
+    "build_base_pack",
+    "BasePackResult",
+    "PrefetchStore",
 ]
 
 PACK_MAGIC = b"THRDPACK"
 PACK_VERSION = 1
 PACK_HEADER_BYTES = 16
 PACK_FOOTER_BYTES = 32
-#: Bytes a reader fetches from the end of a pack to find the footer (the directory often fits in them).
-PACK_TAIL_READ = 64 * 1024
+#: Bytes a reader fetches from the end of a pack to find the footer and, in the same request, the directory (~43 bytes
+#: per entry: 512 KB covers ~12,000 objects).
+PACK_TAIL_READ = 512 * 1024
 _ALIGN = 8
 _HEADER = struct.Struct("<8sHHI")
 _FOOTER = struct.Struct("<QQIHH8s")
@@ -107,6 +114,18 @@ def parse_pack_directory(b: Bytes, dir_off: int, count: int) -> tuple[dict[str, 
     return entries, meta
 
 
+def pack_entries(data: Bytes) -> tuple[dict[str, memoryview], dict[str, Any]]:
+    """The objects of a pack held in memory, by key (views into `data`), and its metadata."""
+    mv = memoryview(data)
+    if len(mv) < PACK_HEADER_BYTES + PACK_FOOTER_BYTES or not is_pack_header(mv):
+        raise ThreadError("not a thread pack (bad header)")
+    dir_off, dir_len, count = parse_pack_footer(mv[len(mv) - PACK_FOOTER_BYTES:])
+    if dir_off < PACK_HEADER_BYTES or dir_off + dir_len > len(mv) - PACK_FOOTER_BYTES:
+        raise ThreadError(f"pack directory [{dir_off}, +{dir_len}) is outside the pack")
+    entries, meta = parse_pack_directory(mv[dir_off: dir_off + dir_len], dir_off, count)
+    return {k: mv[o: o + n] for k, (o, n) in entries.items()}, meta
+
+
 # ---------- reading ----------
 
 
@@ -117,7 +136,7 @@ class PackedBlobStore(BlobStore):
 
     supports_list = True
 
-    def __init__(self, inner: BlobStore, key: str) -> None:
+    def __init__(self, inner: BlobStore, key: str, tail_bytes: int = PACK_TAIL_READ) -> None:
         self.inner = inner
         self.key = key
         self.supports_ranges = inner.supports_ranges
@@ -127,17 +146,26 @@ class PackedBlobStore(BlobStore):
         self.span_bytes = inner.span_bytes
         t0 = time.perf_counter()
         trace = BlobTrace()
-        h = inner.head(key)
-        trace.add(reads=1)
-        if h is None:
-            raise ThreadError(f"no pack at {key}", 404)
+        # One suffix-range request when the store can (footer + directory, no head), else a head and a range.
+        try:
+            got = inner.get_tail(key, tail_bytes, trace=trace)
+            if got is None:
+                raise ThreadError(f"no pack at {key}", 404)
+            tail, h = got
+        except NotImplementedError:
+            hh = inner.head(key)
+            trace.add(reads=1)
+            if hh is None:
+                raise ThreadError(f"no pack at {key}", 404) from None
+            h, tail = hh, None
         if h.size < PACK_HEADER_BYTES + PACK_FOOTER_BYTES:
             raise ThreadError(f"{key} is too small to be a pack ({h.size} bytes)")
         #: Size and etag of the pack object.
         self.pack = h
         self.warmup = inner.warmup  # type: ignore[method-assign]
-        tail_len = min(h.size, PACK_TAIL_READ)
-        tail = inner.get(key, BlobRange(h.size - tail_len, tail_len), trace=trace)
+        tail_len = min(h.size, len(tail) if tail is not None else tail_bytes)
+        if tail is None:
+            tail = inner.get(key, BlobRange(h.size - tail_len, tail_len), trace=trace)
         if tail is None:
             raise ThreadError(f"no pack at {key}", 404)
         tail = memoryview(tail)
@@ -175,6 +203,34 @@ class PackedBlobStore(BlobStore):
     def rev(self) -> int | None:
         r = self.meta.get("rev")
         return r if isinstance(r, int) and not isinstance(r, bool) else None
+
+    @property
+    def base_range(self) -> BlobRange | None:
+        """The `base: [offset, length]` range `pack_index` records: the objects a cold open reads, contiguous."""
+        b = self.meta.get("base")
+        if (not isinstance(b, list) or len(b) != 2
+                or not all(isinstance(x, int) and not isinstance(x, bool) and x >= 0 for x in b)):
+            return None
+        return BlobRange(b[0], b[1])
+
+    def read_base(self, trace: BlobTrace | None = None, with_routing: bool = True) -> dict[str, memoryview] | None:
+        """Reads the pack's base range with ONE range read and returns the objects inside it (views into the read),
+        for a cold open (`open_index` does this for a `PackedBlobStore`). None when the pack records no range.
+        `with_routing=False` stops before the routing table that ends the range (`meta["baseRouting"]`), for an open
+        that loads another table."""
+        r = self.base_range
+        if r is None or r.length == 0:
+            return None
+        rk = self.meta.get("baseRouting")
+        re_ = self.entries.get(rk) if isinstance(rk, str) else None
+        if not with_routing and re_ is not None and re_[0] > r.offset and re_[0] + re_[1] == r.offset + r.length:
+            r = BlobRange(r.offset, re_[0] - r.offset)
+        b = self.inner.get(self.key, r, trace=trace)
+        if b is None:
+            raise ThreadError(f"pack {self.key} disappeared", 404)
+        mv = memoryview(b)
+        return {k: mv[o - r.offset: o - r.offset + n] for k, (o, n) in self.entries.items()
+                if o >= r.offset and o + n <= r.offset + r.length}
 
     def _locate(self, key: str, range: BlobRange | None) -> BlobRange | None:
         e = self.entries.get(key)
@@ -280,10 +336,22 @@ class PackResult:
     keys: list[str] = field(default_factory=list)
 
 
+def _base_meta(w: PackWriter, state: RevState, last: str) -> None:
+    """`base: [offset, length]` (current.json to the end of the base objects) and `baseRouting`, the routing table
+    that ends the range (an open with another routing table stops before it)."""
+    w.meta["base"] = [PACK_HEADER_BYTES, w.written - PACK_HEADER_BYTES]
+    if has_dense(state.manifest) and last == choose_routing(state.manifest, state.files, "auto")[1]:
+        w.meta["baseRouting"] = last
+
+
 def _pack_into(store: BlobStore, out: BinaryIO, gen: str | None, rev: int | None, workers: int) -> PackResult:
     g, r = resolve_target(store, gen, rev)
     state = load_rev_state(store, g, r)
-    ks = snapshot_keys(state)
+    snap = snapshot_keys(state)
+    in_snap = set(snap)
+    base = [k for k in base_keys(state, "base", "auto") if k in in_snap]
+    base_set = set(base)
+    ks = base + [k for k in snap if k not in base_set]
     w = PackWriter(out, {"gen": g, "rev": r})
     w.add("idx/current.json", dumps({"gen": g, "rev": r}).encode("utf-8"))
     trace = BlobTrace()
@@ -303,9 +371,13 @@ def _pack_into(store: BlobStore, out: BinaryIO, gen: str | None, rev: int | None
                     futs.append(pool.submit(fetch, ks[i + workers]))
                 w.add(k, futs[i].result())
                 futs[i] = None  # type: ignore[call-overload]
+                if i == len(base) - 1:
+                    _base_meta(w, state, k)
     else:
-        for k in ks:
+        for i, k in enumerate(ks):
             w.add(k, fetch(k))
+            if i == len(base) - 1:
+                _base_meta(w, state, k)
     size, count = w.finish()
     return PackResult(g, r, count, size, ["idx/current.json", *ks])
 
@@ -313,8 +385,10 @@ def _pack_into(store: BlobStore, out: BinaryIO, gen: str | None, rev: int | None
 def pack_index(store: BlobStore, dest: str | os.PathLike[str] | BinaryIO, *, gen: str | None = None,
                rev: int | None = None, workers: int = 8) -> PackResult:
     """Writes a snapshot of one revision to `dest` (a path, written to a temp sibling and renamed into place, or an
-    open binary file): `idx/current.json` pointing at it, then every object the revision reads (`snapshot_keys`),
-    in key order. `gen` / `rev` pick the revision as `open_index` does (default: what `idx/current.json` names).
+    open binary file): `idx/current.json` pointing at it, then the objects a cold open reads (`base_keys` with the
+    smallest routing table), contiguous, then every other object the revision reads (`snapshot_keys`) in key order;
+    the directory records `{gen, rev, base: [offset, length], baseRouting}` (`PackedBlobStore.read_base`). `gen` / `rev` pick
+    the revision as `open_index` does (default: what `idx/current.json` names).
     Two SDKs packing the same revision produce the same bytes."""
     if hasattr(dest, "write"):
         return _pack_into(store, dest, gen, rev, workers)  # type: ignore[arg-type]
@@ -394,3 +468,123 @@ def store_at(path: str | os.PathLike[str]) -> BlobStore:
     if not is_pack_header(head):
         raise ThreadError(f"{p} is not a thread pack", 400)
     return PackedBlobStore(FileBlobStore(os.path.dirname(p)), os.path.basename(p))
+
+
+# ---------- base packs ----------
+
+
+@dataclass
+class BasePackResult:
+    key: str
+    data: bytes
+    #: The objects in it, in order.
+    keys: list[str]
+    #: The routing table it holds (kind "base").
+    routing: str | None
+
+
+def build_base_pack(store: BlobStore, rev: RevState, kind: str = "base", routing: str = "auto") -> BasePackResult:
+    """The base pack of a revision (`idx/{gen}/base.{rev}.threadpack`): every object a cold open reads
+    (`base_keys`), so a reader that knows (gen, rev) from `idx/current.json` loads the revision and its routing table
+    with ONE GET; `kind="cold"` (`base.cold.{rev}.threadpack`) leaves the routing table out, for
+    `cold_routing="tree"`. The directory records `{gen, rev, kind: "base" | "base-cold", routing}`; the TypeScript
+    SDK's `buildBasePack` writes the same bytes."""
+    ks = base_keys(rev, kind, routing)
+    elem = choose_routing(rev.manifest, rev.files, routing)[0] if kind == "base" and has_dense(rev.manifest) else None
+    buf = io.BytesIO()
+    w = PackWriter(buf, {"gen": rev.gen, "rev": rev.rev, "kind": "base-cold" if kind == "cold" else "base",
+                         "routing": elem})
+    for k in ks:
+        b = store.get(k)
+        if b is None:
+            raise ThreadError(f"base pack of {rev.gen} rev {rev.rev} needs {k}, which is missing", 404)
+        w.add(k, b)
+    w.finish()
+    key = index_keys.base_cold_pack(rev.gen, rev.rev) if kind == "cold" else index_keys.base_pack(rev.gen, rev.rev)
+    return BasePackResult(key, buf.getvalue(), ks, elem)
+
+
+class PrefetchStore(BlobStore):
+    """A read-through view of a store with some objects already in memory (a base pack's, or reads started early):
+    reads of such a key are served from memory (byte-identical: the same object), everything else goes to the inner
+    store. A read started early (`prefetch`) keeps its own trace, which the first `get` of the key adds to the
+    caller's, so per-step accounting (`open_stats`) still sees the read where its bytes are used. Used by
+    `open_index` for the reads of the open only; read-only."""
+
+    def __init__(self, inner: BlobStore) -> None:
+        self.inner = inner
+        self.supports_list = inner.supports_list
+        self.supports_ranges = True
+        self.remote = inner.remote
+        # key -> [bytes-like | Future, BlobTrace | None (not yet credited)]
+        self._entries: dict[str, list[Any]] = {}
+        self._lock = threading.Lock()
+
+    def set(self, key: str, data: Any) -> None:
+        """Serves `key` from `data` (accounted elsewhere, e.g. as part of a pack)."""
+        with self._lock:
+            self._entries[key] = [data, None]
+
+    def prefetch(self, key: str, io: ThreadPoolExecutor) -> None:
+        """Starts reading `key` now on `io` (once); later reads of it wait for this one."""
+        with self._lock:
+            if key in self._entries:
+                return
+            trace = BlobTrace()
+            self._entries[key] = [io.submit(self.inner.get, key, None, trace=trace), trace]
+
+    def add_pack(self, data: Bytes) -> dict[str, Any]:
+        """Serves every object of a pack held in memory; returns its metadata."""
+        entries, meta = pack_entries(data)
+        with self._lock:
+            for k, v in entries.items():
+                self._entries[k] = [v, None]
+        return meta
+
+    def has(self, key: str) -> bool:
+        return key in self._entries
+
+    def peek(self, key: str) -> Any:
+        """The bytes of a prefetched key without crediting its read (None when absent)."""
+        with self._lock:
+            e = self._entries.get(key)
+        if e is None:
+            return None
+        v = e[0]
+        return v.result() if isinstance(v, Future) else v
+
+    def _take(self, key: str, trace: BlobTrace | None) -> tuple[bool, Any]:
+        with self._lock:
+            e = self._entries.get(key)
+        if e is None:
+            return False, None
+        v = e[0].result() if isinstance(e[0], Future) else e[0]
+        with self._lock:
+            credit, e[1] = e[1], None
+        if credit is not None and trace is not None:
+            trace.add(**credit.as_dict())
+        return True, v
+
+    def get(self, key, range=None, *, trace=None, fill=False):
+        found, b = self._take(key, trace)
+        if not found:
+            return self.inner.get(key, range, trace=trace, fill=fill)
+        if b is None or range is None:
+            return b
+        if range.offset < 0 or range.length < 0 or range.offset + range.length > len(b):
+            raise ThreadError(f"{key} [{range.offset}, +{range.length}) is outside the object ({len(b)} bytes)")
+        return memoryview(b)[range.offset: range.offset + range.length]
+
+    def get_ranges(self, key, ranges, *, trace=None, fill=False):
+        if key not in self._entries:
+            return self.inner.get_ranges(key, ranges, trace=trace, fill=fill)
+        return [self.get(key, r, trace=trace) for r in ranges]
+
+    def head(self, key):
+        if key not in self._entries:
+            return self.inner.head(key)
+        b = self.peek(key)
+        return BlobHead(len(b), "prefetched") if b is not None else None
+
+    def list(self, prefix):
+        return self.inner.list(prefix)
