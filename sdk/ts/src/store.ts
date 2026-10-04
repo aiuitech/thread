@@ -514,18 +514,20 @@ export class CachedBlobStore implements BlobStore {
 	private fetchWhole(key: string, opts: GetOptions | undefined, cache: boolean): Promise<Uint8Array | null> {
 		const pending = this.fills.get(key);
 		if (pending) return pending;
-		const p = (async () => {
-			const full = await this.origin_(() => this.inner.get(key, undefined, opts?.trace ? { trace: opts.trace } : undefined));
-			// The fill stays registered until the cache holds the object, so a concurrent miss shares it.
-			if (full && cache) await this.store(key, full);
-			return full;
-		})();
-		this.fills.set(key, p);
 		const done = () => {
 			if (this.fills.get(key) === p) this.fills.delete(key);
 			this.wakeIdle();
 		};
-		p.then(done, done);
+		const p: Promise<Uint8Array | null> = (async () => {
+			const full = await this.origin_(() => this.inner.get(key, undefined, opts?.trace ? { trace: opts.trace } : undefined));
+			// The caller gets the object at once; the fill stays registered until the cache holds it, so a concurrent
+			// miss shares this read instead of starting another.
+			if (full && cache) this.store(key, full).then(done, done);
+			else queueMicrotask(done);
+			return full;
+		})();
+		p.catch(done);
+		this.fills.set(key, p);
 		return p;
 	}
 
