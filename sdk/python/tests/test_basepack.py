@@ -131,4 +131,11 @@ def test_index_pack_base_range_is_one_read():
             open_index(b.store, cache=False, routing="auto", base_pack=False) as plain:
         assert ix.open_stats["prefetch"]["source"] == "index-pack"
         assert inner.reads == [f"index.threadpack@16+{r.length}"]
+        assert p.meta["baseRouting"] == "idx/bi/fine.i8"
         same_answers(plain, ix, b.dim)
+    # routing f32: the base range up to fine.i8 (which it does not need), then fine.f32 from the pack
+    inner.reads.clear()
+    f32_off, f32_len = p.entries["idx/bi/fine.f32"]
+    with open_index(pc, cache=False) as f32, open_index(b.store, cache=False, base_pack=False) as plain:
+        assert inner.reads == [f"index.threadpack@16+{off - 16}", f"index.threadpack@{f32_off}+{f32_len}"]
+        same_answers(plain, f32, b.dim)

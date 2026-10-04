@@ -117,24 +117,39 @@ once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 | `waitUntil` | - | `ctx.waitUntil`, keeps background cache writes alive |
 | `refreshInterval` | 30 000 ms | a query older than this re-reads `current.json` first (0 = only `refresh()`) |
 | `deltaCacheBytes` | 40 MB | delta segments kept in memory across queries (per index) |
+| `routing` | `"f32"` | routing table to load: `"f32"` (`fine.f32`, 25 MB at 4096 x 1536), `"f16"` (`fine.f16`, half), `"i8"` (`fine.i8`, a quarter) or `"auto"` (the smallest the revision has); decoded to f32 on load, a revision without the table falls back to f32 |
+| `coldRouting` | `"off"` | `"tree"`: the open waits only for the centroid tree and the codebook; until the full table has loaded (in the background) queries route over the tree's best `coldBeam` groups, range-reading just those groups' means from the tree-grouped table |
+| `coldBeam` | `defaults.beam`, else 16 | groups ranked per cold-routed query |
+| `basePack` | true | GET the revision's base pack (one object with everything the open reads) and, without one, start every read of the open as soon as the manifest is in; `false`: one read after another |
 
 `open` reads `current.json` (a pointer without `rev` means rev 0 = the legacy `idx/{gen}/manifest.json`), the
 manifest, the slabs table and the tombstone sets, and loads the routing table (`coarse.f32` + `fine.f32`, ~25 MB
-in wasm at 4096 x 1536) and the PQ codebook (format 3). `gen` without `rev` reads the generation's head: the
+in wasm at 4096 x 1536) and the PQ codebook (format 3). With a base pack (`idx/{gen}/base.{rev}.threadpack`,
+written by publish) that is two round trips: `current.json`, then the pack (the manifest is read alongside, in case
+there is none); without one, three: the base files are all requested as soon as the manifest is in. `routing: "i8"`
+(or `"auto"`) cuts the routing table to 6.3 MB and is the table a base pack holds by default, so the whole open is
+`current.json` + one 8.8 MB GET on g4; `coldRouting: "tree"` cuts it to the 2.5 MB cold base pack plus ~1 MB of
+group means read by the first query. Which mode suits which deployment, and the probe overlap and recall each
+costs: [docs/query-path.md](../../docs/query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs). `gen` without `rev` reads the generation's head: the
 current rev when `current.json` names that generation, else the newest `manifest.*.json` listed in the store
 (stores without `list` fall back to rev 0).
 
-`index.openStats` is the cold-start timeline of `open`: `{ total, wasmInit, current, manifest, slabs, base, pack? }`
+`index.openStats` is the cold-start timeline of `open`: `{ total, wasmInit, current, prefetch, manifest, slabs, base, pack? }`
 where `current` (current.json), `manifest`, `slabs` (slabs table + tombstone sets) and `base` (routing table and
 codebook) are `PhaseStat`s (`base` adds `fetch` and `build` ms and `files: {coarse, fine, pq}` bytes), `wasmInit`
 is how long `Thread.init` took (`thread.initMs`, not part of `total`) and `pack`, for a `PackedBlobStore`, is its
-own open (`head` + tail + directory reads, `PackedBlobStore.openStats`; it happened before `open`). A "read" is a
+own open (`head` + tail + directory reads, `PackedBlobStore.openStats`; it happened before `open`). `prefetch` is
+how the open's objects were fetched up front: `source` `"base-pack"` (the revision's base pack, `key`),
+`"index-pack"` (a `PackedBlobStore`'s base range, one range read), `"files"` (no pack: all requested once the
+manifest was in) or `"none"` (`basePack: false`), with the pack read's work; objects read early are counted in the
+step that uses them. A "read" is a
 request that reached the origin store; with a cache in front, `hits`/`misses` count cache lookups. Python's
 `index.open_stats` has the same fields except `wasmInit`. `bench/cold/` measures these against S3.
 
 Properties: `index.manifest`, `index.gen`, `index.rev`, `index.dim`, `index.cells` (`k1 * k2`), `index.format`
 (1 int8 only, 2 sq4 + sq8, 3 pq + sq8), `index.defaults` (`{nprobe, rerank, pc}`), `index.revision` (parsed
-manifest, slabs table, deltas, tombstone state).
+manifest, slabs table, deltas, tombstone state), `index.routingState` (`"full"` once the routing table is
+loaded, `"cold"` while queries route cold). `await index.whenFullRouting()` waits for the full table.
 
 ### `index.query(vector, options): Promise<QueryResult>`
 
@@ -149,6 +164,7 @@ manifest, slabs table, deltas, tombstone state).
 | `returnPayload` | false | also return each hit's payload bytes (one extra range read per slab with payloads not already in memory) |
 | `inflight` | 12 | reads in flight per query |
 | `speculate` | true | read the running top-T's rerank records while the last 6 slabs are still scanning |
+| `beam` | `coldBeam` | cold routing only: tree groups whose cells are ranked (until the full routing table is in) |
 
 Manifests without `defaults` (g1, g2) use `nprobe 1, rerank 32, pc 0`; `params.source` says where each value
 came from (`query`, `manifest`, `legacy`).
@@ -158,7 +174,8 @@ interface QueryResult {
 	hits: { id: number; score: number; attrs: number; payload?: Uint8Array; source: "slab" | "delta" }[];
 	params: { topK; nprobe; rerank; pc; source: { nprobe; rerank; pc } };
 	stats: {
-		gen; rev; format; routing: "flat" | "tree"; cells: number[];     // probed cells
+		gen; rev; format; routing: "flat" | "tree" | "cold"; routingTable: "f32" | "f16" | "i8"; cells: number[];  // probed cells
+		cold?: { beam; groups; cells; reads; bytes; loadedGroups; loadedCells };  // cold routing: means this query read
 		scanned; scanBytes; slabBytes;                                   // phase 1
 		rerank; rerankCandidates; rerankSlabs; rerankReads; rerankBytes; rerankLocal; specRecords; specUsed;  // phase 2
 		deltas; deltaBytes; deltaScanned; deltaHits; deltaDropped; deltaTop; tombstones; tombSets; tombDropped;
@@ -300,13 +317,18 @@ const { bytes } = await packToBytes(src);                         // the same pa
 await packIndex(src, sink);                                       // any PackSink: { write(bytes) }
 ```
 
-`packIndex` writes `idx/current.json` (pointing at the packed revision) and then `snapshotKeys` in key order, so
-the two SDKs produce identical files for the same revision. A pack is read-only: `copyObjects(pack, dst)` into a
+`packIndex` writes `idx/current.json` (pointing at the packed revision), then the objects a cold open reads
+(`baseKeys`: manifest, slabs table, tombstone sets, coarse, codebook, tree, the smallest routing table) and then the
+rest of `snapshotKeys` in key order, and records that leading range as `base: [offset, length]` in the directory:
+`thread.open` over a `PackedBlobStore` loads it with one range read. The two SDKs produce identical files for the
+same revision. `buildBasePack(store, revState, "base" | "cold", routing)` builds a revision's base pack (what publish
+writes as `idx/{gen}/base.{rev}.threadpack` / `base.cold.{rev}.threadpack`; `bench/cold/make_base_pack.mjs` offline). A pack is read-only: `copyObjects(pack, dst)` into a
 directory or a bucket to write on top of it. Format and rationale: [docs/portability.md](../../docs/portability.md).
 
 ## Memory and limits
 
-- The wasm linear memory never shrinks. Routing table 25 MB (4096 x 1536) + codebook 1.5 MB per generation, one
+- The wasm linear memory never shrinks. Routing table 25 MB (4096 x 1536; f16 / i8 tables are decoded to the same
+  25 MB: they save download, not memory) + codebook 1.5 MB per generation, one
   PqTable (192 x 256 x 4 B) per query, one slab prefix (~200 KB at nprobe 34 on g4) copied into wasm per `scan`
   call and freed right after. A query holds its prefixes only until scanned; on a cold cache every slab is read
   whole (~1.7 MB each on g4), so a cold query transfers ~57 MB and keeps ~T x 1.5 KB of rerank records.

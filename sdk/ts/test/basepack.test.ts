@@ -138,9 +138,16 @@ describe("base packs", () => {
 		const ix = await thread.open({ store: viaRange, cache: false, routing: "auto" });
 		expect(ix.openStats.prefetch.source).toBe("index-pack");
 		expect(c.reads).toEqual([`index.threadpack@16+${range.length}`]);
+		expect(p.directory.meta.baseRouting).toBe("idx/bi/fine.i8");
 		const plain = await thread.open({ store: b.store, cache: false, routing: "auto", basePack: false });
 		await sameAnswers(plain, ix, b.dim);
-		ix.close();
-		plain.close();
+		// routing f32: the base range up to fine.i8 (which it does not need), then fine.f32 from the pack
+		c.reads.length = 0;
+		const f32 = await thread.open({ store: viaRange, cache: false });
+		const f32e = p.directory.entries.get("idx/bi/fine.f32")!;
+		expect(c.reads).toEqual([`index.threadpack@16+${fineI8.offset - 16}`, `index.threadpack@${f32e.offset}+${f32e.length}`]);
+		const plainF32 = await thread.open({ store: b.store, cache: false, basePack: false });
+		await sameAnswers(plainF32, f32, b.dim);
+		for (const x of [ix, plain, f32, plainF32]) x.close();
 	});
 });

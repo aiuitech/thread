@@ -82,7 +82,10 @@ for (const k of keys) {
 		realBytes += b.byteLength;
 	}
 	await w.add(k, b);
-	if (base.length && k === base[base.length - 1]) w.setMeta("base", [sdk.PACK_HEADER_BYTES, w.written - sdk.PACK_HEADER_BYTES]);
+	if (base.length && k === base[base.length - 1]) {
+		w.setMeta("base", [sdk.PACK_HEADER_BYTES, w.written - sdk.PACK_HEADER_BYTES]);
+		if (k === sdk.chooseRouting(rev.manifest, rev.files, "auto").key) w.setMeta("baseRouting", k);
+	}
 }
 const { bytes, count } = await w.finish();
 fs.ftruncateSync(fd, bytes);
@@ -117,6 +120,7 @@ console.log(
 			holeBytes,
 			layout: LAYOUT,
 			base: ps.directory.meta.base ?? null,
+			baseRouting: ps.directory.meta.baseRouting ?? null,
 			firstEntries: order.slice(0, 8),
 			lastEntries: order.slice(-3),
 		},

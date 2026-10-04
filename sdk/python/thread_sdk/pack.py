@@ -209,12 +209,18 @@ class PackedBlobStore(BlobStore):
             return None
         return BlobRange(b[0], b[1])
 
-    def read_base(self, trace: BlobTrace | None = None) -> dict[str, memoryview] | None:
+    def read_base(self, trace: BlobTrace | None = None, with_routing: bool = True) -> dict[str, memoryview] | None:
         """Reads the pack's base range with ONE range read and returns the objects inside it (views into the read),
-        for a cold open (`open_index` does this for a `PackedBlobStore`). None when the pack records no range."""
+        for a cold open (`open_index` does this for a `PackedBlobStore`). None when the pack records no range.
+        `with_routing=False` stops before the routing table that ends the range (`meta["baseRouting"]`), for an open
+        that loads another table."""
         r = self.base_range
         if r is None or r.length == 0:
             return None
+        rk = self.meta.get("baseRouting")
+        re_ = self.entries.get(rk) if isinstance(rk, str) else None
+        if not with_routing and re_ is not None and re_[0] > r.offset and re_[0] + re_[1] == r.offset + r.length:
+            r = BlobRange(r.offset, re_[0] - r.offset)
         b = self.inner.get(self.key, r, trace=trace)
         if b is None:
             raise ThreadError(f"pack {self.key} disappeared", 404)
@@ -326,6 +332,14 @@ class PackResult:
     keys: list[str] = field(default_factory=list)
 
 
+def _base_meta(w: PackWriter, state: RevState, last: str) -> None:
+    """`base: [offset, length]` (current.json to the end of the base objects) and `baseRouting`, the routing table
+    that ends the range (an open with another routing table stops before it)."""
+    w.meta["base"] = [PACK_HEADER_BYTES, w.written - PACK_HEADER_BYTES]
+    if has_dense(state.manifest) and last == choose_routing(state.manifest, state.files, "auto")[1]:
+        w.meta["baseRouting"] = last
+
+
 def _pack_into(store: BlobStore, out: BinaryIO, gen: str | None, rev: int | None, workers: int) -> PackResult:
     g, r = resolve_target(store, gen, rev)
     state = load_rev_state(store, g, r)
@@ -354,12 +368,12 @@ def _pack_into(store: BlobStore, out: BinaryIO, gen: str | None, rev: int | None
                 w.add(k, futs[i].result())
                 futs[i] = None  # type: ignore[call-overload]
                 if i == len(base) - 1:
-                    w.meta["base"] = [PACK_HEADER_BYTES, w.written - PACK_HEADER_BYTES]
+                    _base_meta(w, state, k)
     else:
         for i, k in enumerate(ks):
             w.add(k, fetch(k))
             if i == len(base) - 1:
-                w.meta["base"] = [PACK_HEADER_BYTES, w.written - PACK_HEADER_BYTES]
+                _base_meta(w, state, k)
     size, count = w.finish()
     return PackResult(g, r, count, size, ["idx/current.json", *ks])
 
@@ -369,7 +383,7 @@ def pack_index(store: BlobStore, dest: str | os.PathLike[str] | BinaryIO, *, gen
     """Writes a snapshot of one revision to `dest` (a path, written to a temp sibling and renamed into place, or an
     open binary file): `idx/current.json` pointing at it, then the objects a cold open reads (`base_keys` with the
     smallest routing table), contiguous, then every other object the revision reads (`snapshot_keys`) in key order;
-    the directory records `{gen, rev, base: [offset, length]}` (`PackedBlobStore.read_base`). `gen` / `rev` pick
+    the directory records `{gen, rev, base: [offset, length], baseRouting}` (`PackedBlobStore.read_base`). `gen` / `rev` pick
     the revision as `open_index` does (default: what `idx/current.json` names).
     Two SDKs packing the same revision produce the same bytes."""
     if hasattr(dest, "write"):

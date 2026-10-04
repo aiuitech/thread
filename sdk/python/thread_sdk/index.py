@@ -133,13 +133,14 @@ def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, loaded: d
     return Base(rev.base_key, searcher, pq, elem)
 
 
-def _prefetch_index_pack(pre: PrefetchStore, packed: PackedBlobStore | None) -> dict[str, Any] | None:
+def _prefetch_index_pack(pre: PrefetchStore, packed: PackedBlobStore | None, with_routing: bool = True
+                         ) -> dict[str, Any] | None:
     """A `PackedBlobStore`'s recorded base range, read with one range read into `pre` (None when there is none)."""
     if packed is None:
         return None
     t0 = time.perf_counter()
     trace = BlobTrace()
-    got = packed.read_base(trace)
+    got = packed.read_base(trace, with_routing)
     if got is None:
         return None
     for k, b in got.items():
@@ -328,7 +329,13 @@ class ThreadIndex:
         # The open's reads go through a prefetching view: a pack's base range, the base pack, or the files started
         # together. A PackedBlobStore's base range (it starts with idx/current.json) is read before anything else.
         pre = PrefetchStore(store)
-        from_pack = _prefetch_index_pack(pre, packed) if base_pack else None
+        # The range ends with the smallest routing table (`fine{.r}.{elem}`): an open that loads another one stops
+        # before it.
+        rk = packed.meta.get("baseRouting") if packed is not None else None
+        in_range = None if not isinstance(rk, str) else "i8" if rk.endswith(".i8") else "f16" if rk.endswith(
+            ".f16") else "f32"
+        from_pack = _prefetch_index_pack(pre, packed, cold_routing == "tree" or routing in ("auto", in_range)) \
+            if base_pack else None
         g, r = resolve_target(pre if from_pack else store, gen, rev, timeline)
         ix = cls(store, None, gen=gen, pinned=gen is not None and rev is not None,  # type: ignore[arg-type]
                  refresh_interval=refresh_interval, delta_cache_bytes=delta_cache_bytes,

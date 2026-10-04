@@ -794,7 +794,11 @@ async function prefetchIndexPack(pre: PrefetchStore, opts: OpenOptions): Promise
 	if (opts.basePack === false || !(opts.store instanceof PackedBlobStore) || opts.prefix) return null;
 	const t0 = nowMs();
 	const trace = newTrace();
-	const got = await opts.store.readBase(trace);
+	// The range ends with the smallest routing table (`fine{.r}.{elem}`): an open that loads another one stops before it.
+	const routing = opts.routing ?? "f32";
+	const rk = opts.store.directory.meta.baseRouting;
+	const inRange = typeof rk !== "string" ? null : rk.endsWith(".i8") ? "i8" : rk.endsWith(".f16") ? "f16" : "f32";
+	const got = await opts.store.readBase(trace, opts.coldRouting === "tree" || routing === "auto" || routing === inRange);
 	if (!got) return null;
 	for (const [k, b] of got) pre.set(k, b);
 	return { ...phaseStat(nowMs() - t0, trace), source: "index-pack", key: opts.store.key };
@@ -911,7 +915,7 @@ export async function loadColdBase(store: BlobStore, rev: RevState, epoch: numbe
 	}
 }
 
-export { asF32, headRevision, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
+export { asF32, baseKeys, baseKeysOf, headRevision, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
 
 /**
  * Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. `routing` picks the table:

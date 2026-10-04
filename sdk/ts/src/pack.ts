@@ -200,10 +200,15 @@ export class PackedBlobStore implements BlobStore {
 	/**
 	 * Reads the pack's base range with ONE range read and returns the objects that lie inside it (views into the
 	 * read), for a cold open (`thread.open` does this for a `PackedBlobStore`). Null when the pack records no range.
+	 * `withRouting: false` stops before the routing table that ends the range (`meta.baseRouting`), for an open that
+	 * loads another table.
 	 */
-	async readBase(trace?: BlobTrace): Promise<Map<string, Uint8Array> | null> {
-		const r = this.baseRange;
+	async readBase(trace?: BlobTrace, withRouting = true): Promise<Map<string, Uint8Array> | null> {
+		let r = this.baseRange;
 		if (!r || r.length === 0) return null;
+		const rk = this.directory.meta.baseRouting;
+		const re = typeof rk === "string" ? this.directory.entries.get(rk) : undefined;
+		if (!withRouting && re && re.offset > r.offset && re.offset + re.length === r.offset + r.length) r = { offset: r.offset, length: re.offset - r.offset };
 		const b = await this.inner.get(this.key, r, trace ? { trace } : undefined);
 		if (!b) throw new ThreadError(`pack ${this.key} disappeared`, 404);
 		const out = new Map<string, Uint8Array>();
@@ -342,9 +347,9 @@ export interface PackIndexResult {
 /**
  * Writes a snapshot of one revision to `sink`: `idx/current.json` pointing at it, then the objects a cold open reads
  * (`baseKeys` with the smallest routing table), contiguous, then every other object the revision reads
- * (`snapshotKeys`) in key order. The directory records `{gen, rev, base: [offset, length]}`: the range from
- * `idx/current.json` to the end of the base objects, so a reader can load a cold base with one range read
- * (`PackedBlobStore.readBase`). Two SDKs packing the same revision produce the same bytes.
+ * (`snapshotKeys`) in key order. The directory records `{gen, rev, base: [offset, length], baseRouting}`: the range
+ * from `idx/current.json` to the end of the base objects, so a reader can load a cold base with one range read
+ * (`PackedBlobStore.readBase`), and the routing table that ends it. Two SDKs packing the same revision produce the same bytes.
  */
 export async function packIndex(store: BlobStore, sink: PackSink, opts: PackIndexOptions = {}): Promise<PackIndexResult> {
 	const t = await resolveTarget(store, opts.gen, opts.rev);
@@ -368,7 +373,11 @@ export async function packIndex(store: BlobStore, sink: PackSink, opts: PackInde
 	for (let i = 0; i < keys.length; i++) {
 		while (pending.length < window && i + pending.length < keys.length) pending.push(fetch(keys[i + pending.length]));
 		await w.add(keys[i], await pending.shift()!);
-		if (i === base.length - 1) w.setMeta("base", [PACK_HEADER_BYTES, w.written - PACK_HEADER_BYTES]);
+		if (i === base.length - 1) {
+			w.setMeta("base", [PACK_HEADER_BYTES, w.written - PACK_HEADER_BYTES]);
+			// the routing table that ends the base range, which an open with another routing table skips
+			if (hasDense(rev.manifest) && keys[i] === chooseRouting(rev.manifest, rev.files, "auto").key) w.setMeta("baseRouting", keys[i]);
+		}
 	}
 	const { bytes, count } = await w.finish();
 	return { gen: t.gen, rev: t.rev, count, bytes, keys: ["idx/current.json", ...keys] };
