@@ -10,16 +10,26 @@ import { asF32 } from "./index.js";
 import { safeFree } from "./query.js";
 import type { BlobStore } from "./store.js";
 import type * as W from "./wasm/thread.js";
-import { idUnion, keys, manifestFiles, parseCurrent, parseManifest, ThreadError, type CurrentPointer, type IndexFiles, type Manifest } from "./wire.js";
+import { buildTombState, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
 
 export interface UpsertInput {
 	ids: ArrayLike<number>;
-	/** `n * dim` floats (flat) or one array per vector; any norm (normalized here). */
-	vectors: Float32Array | number[] | (Float32Array | number[])[];
+	/**
+	 * `n * dim` floats (flat) or one array per vector; any norm (normalized here). Optional when the generation has
+	 * a lexical configuration: documents without a vector are only found by text.
+	 */
+	vectors?: Float32Array | number[] | (Float32Array | number[])[];
 	/** One u32 per vector (default 0). */
 	attrs?: ArrayLike<number>;
 	/** One payload per vector (strings are UTF-8 encoded). */
 	payloads?: (Uint8Array | string)[];
+	/**
+	 * One text per id, indexed by BM25 (and stored when `manifest.lex.text`) in a lexical segment; needs
+	 * `manifest.lex`. `null` indexes an empty document.
+	 */
+	texts?: (string | null)[];
+	/** One metadata string per id for the `docs` store (a title, a JSON object, an external key); default "". */
+	metas?: (string | null)[];
 	/**
 	 * Also write a tombstone set for the ids so older copies stop resolving (default true). Pass false when the
 	 * ids are known to be new: no tombstones to filter on every later query.
@@ -32,11 +42,13 @@ export interface UpsertResult {
 	rev: number;
 	seq: number;
 	count: number;
-	/** Primary cell of each vector. */
+	/** Primary cell of each vector (empty without vectors). */
 	cells: number[];
 	distinctCells: number;
-	keys: { delta: string; tombstones: string | null; manifest: string };
-	bytes: { delta: number; tombstones: number; manifest: number };
+	keys: { delta: string | null; segment: string | null; tombstones: string | null; manifest: string };
+	bytes: { delta: number; segment: number; tombstones: number; manifest: number };
+	/** Tokens indexed by the lexical segment. */
+	tokens: number;
 	/** Lost manifest races and current.json CAS retries. */
 	conflicts: number;
 	casConflicts: number;
@@ -63,6 +75,38 @@ export interface WriterContext {
 	gen: string;
 	/** The index's loaded PqCodebook for these base files (if any), to avoid re-parsing 1.5 MB. */
 	borrowPq: (baseKey: string) => W.PqCodebook | null;
+}
+
+export interface ConfigureLexicalResult {
+	gen: string;
+	rev: number;
+	config: LexConfig;
+	conflicts: number;
+	currentUpdated: boolean;
+}
+
+export interface CompactSegmentsResult {
+	gen: string;
+	rev: number;
+	/** Segments merged (0 when nothing needed compacting; no revision is written then and `rev` is the head). */
+	merged: number;
+	key: string | null;
+	count: number;
+	bytes: number;
+	/** Bytes of the segments read. */
+	readBytes: number;
+	conflicts: number;
+	currentUpdated: boolean;
+	ms: number;
+}
+
+export interface CreateLexicalOptions {
+	store: BlobStore;
+	gen: string;
+	lex: LexConfig;
+	/** Point `idx/current.json` at the new generation (default true). */
+	setCurrent?: boolean;
+	notes?: unknown;
 }
 
 export const MAX_UPSERT = 4096;
@@ -147,7 +191,7 @@ interface CommitResult {
  * objects it references first). The create-only put of `manifest.{rev+1}.json` serializes writers; a lost
  * race rebuilds on the new head.
  */
-async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifest: Manifest; files: IndexFiles }) => Promise<Manifest>): Promise<CommitResult> {
+async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifest: Manifest; files: IndexFiles }) => Promise<Manifest | null>): Promise<CommitResult> {
 	const { store, gen } = ctx;
 	let conflicts = 0;
 	let useList = false;
@@ -158,6 +202,7 @@ async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifes
 		if (!mb) throw new ThreadError(`no manifest ${keys.manifest(gen, head)}`, 404);
 		const base = parseManifest(mb, gen, head);
 		const next = await make({ rev: head, manifest: base, files: manifestFiles(base) });
+		if (next === null) return { rev: head, manifest: base, manifestKey: keys.manifest(gen, head), manifestBytes: mb.byteLength, conflicts, casConflicts: 0, currentUpdated: false };
 		const rev = head + 1;
 		const manifest: Manifest = { ...next, gen, rev, parentRev: head, updatedAt: new Date().toISOString() };
 		const body = JSON.stringify(manifest);
@@ -176,7 +221,7 @@ async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifes
 /** The fields a new revision inherits (build notes and the previous change stay with their revision). */
 function inherit(m: Manifest): Manifest {
 	const { notes: _n, change: _c, rev: _r, parentRev: _p, updatedAt: _u, ...rest } = m;
-	return { ...rest, files: manifestFiles(m), deltas: m.deltas ?? [], tombstones: m.tombstones ?? [], nextSeq: m.nextSeq ?? 1 };
+	return { ...rest, files: manifestFiles(m), deltas: m.deltas ?? [], tombstones: m.tombstones ?? [], segments: m.segments ?? [], nextSeq: m.nextSeq ?? 1 };
 }
 
 function u32(a: ArrayLike<number>, name: string): Uint32Array {
@@ -184,13 +229,35 @@ function u32(a: ArrayLike<number>, name: string): Uint32Array {
 	return Uint32Array.from(a as ArrayLike<number>);
 }
 
+interface Batch {
+	ids: Uint32Array;
+	/** Unit-normalized vectors (a copy), or null for a text-only batch. */
+	vectors: Float32Array | null;
+	attrs: Uint32Array | null;
+	payloads: Uint8Array[] | null;
+	texts: (string | null)[] | null;
+	metas: (string | null)[] | null;
+}
+
 /** Validates the batch and returns ids and unit-normalized vectors (a copy). */
-function prepareBatch(input: UpsertInput, dim: number): { ids: Uint32Array; vectors: Float32Array; attrs: Uint32Array | null; payloads: Uint8Array[] | null } {
+function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | null): Batch {
 	const ids = u32(input.ids, "ids");
 	const n = ids.length;
 	if (n === 0) throw new ThreadError("empty batch", 400);
-	if (n > MAX_UPSERT) throw new ThreadError(`at most ${MAX_UPSERT} vectors per upsert`, 400);
+	if (n > MAX_UPSERT) throw new ThreadError(`at most ${MAX_UPSERT} documents per upsert`, 400);
 	if (new Set(ids).size !== n) throw new ThreadError("duplicate ids in the batch", 400);
+	if (ids.some((id) => id === 0xffffffff)) throw new ThreadError("id 4294967295 is reserved", 400);
+	const texts = input.texts ?? null;
+	const metas = input.metas ?? null;
+	if (texts && texts.length !== n) throw new ThreadError(`${texts.length} texts for ${n} ids`, 400);
+	if (metas && metas.length !== n) throw new ThreadError(`${metas.length} metas for ${n} ids`, 400);
+	if ((texts || metas) && !lex) throw new ThreadError("texts/metas need a lexical configuration (index.configureLexical)", 400);
+	if (input.vectors === undefined) {
+		if (!texts && !metas) throw new ThreadError("an upsert needs vectors, texts or metas", 400);
+		if (input.attrs || input.payloads) throw new ThreadError("attrs/payloads belong to vectors", 400);
+		return { ids, vectors: null, attrs: null, payloads: null, texts, metas };
+	}
+	if (dim === 0) throw new ThreadError("this generation has no dense index: upsert texts/metas only", 400);
 	const v = input.vectors;
 	let vectors: Float32Array;
 	if (Array.isArray(v) && v.length && typeof v[0] !== "number") {
@@ -217,14 +284,41 @@ function prepareBatch(input: UpsertInput, dim: number): { ids: Uint32Array; vect
 	const enc = new TextEncoder();
 	const payloads = input.payloads ? input.payloads.map((p) => (typeof p === "string" ? enc.encode(p) : p)) : null;
 	if (payloads && payloads.length !== n) throw new ThreadError(`${payloads.length} payloads for ${n} vectors`, 400);
-	return { ids, vectors, attrs, payloads };
+	return { ids, vectors, attrs, payloads, texts, metas };
 }
 
-/** The first free delta seq >= `from` (HEAD probes, so a crashed writer's segment is skipped). */
+/** The first free seq >= `from` for both the delta and the segment key (a crashed writer's objects are skipped). */
 async function allocSeq(store: BlobStore, gen: string, from: number): Promise<number> {
 	let seq = Math.max(1, from);
-	for (let i = 0; i < 64 && (await store.head(keys.delta(gen, seq))); i++) seq++;
+	for (let i = 0; i < 64 && ((await store.head(keys.delta(gen, seq))) || (await store.head(keys.segment(gen, seq)))); i++) seq++;
 	return seq;
+}
+
+interface EncodedSegment {
+	key: string;
+	bytes: number;
+	tokens: number;
+	ref: Omit<SegmentRef, "addedRev">;
+}
+
+/** Tokenizes and writes one lexical/docs segment for the batch under the generation's `lex` configuration. */
+async function encodeSegment(ctx: WriterContext, seq: number, lex: ResolvedLexConfig, b: Batch): Promise<EncodedSegment> {
+	const { w, store, gen } = ctx;
+	// `{}` is the default tokenizer; a null tokenizer would mean a docs-only segment without a lexical index.
+	const job = new w.SegmentJob(JSON.stringify(lex.tokenizer ?? {}), lex.k1, lex.b, lex.lengths, lex.bucketTerms, lex.docs, lex.text, lex.bucketDocs);
+	let bytes: Uint8Array;
+	let finished = false;
+	const epoch = ctx.thread.epoch;
+	try {
+		for (let i = 0; i < b.ids.length; i++) job.add(b.ids[i], b.texts?.[i] ?? undefined, b.metas?.[i] ?? undefined);
+		finished = true;
+		bytes = job.finish();
+	} finally {
+		if (!finished && epoch === ctx.thread.epoch) safeFree(job);
+	}
+	const tokens = 0; // reported from the job before finish would need a second pass; the meta carries the count
+	const key = await putUnique(store, keys.segment(gen, seq), bytes);
+	return { key, bytes: bytes.byteLength, tokens, ref: { seq, key, count: b.ids.length, bytes: bytes.byteLength, lex: true, docs: lex.docs, text: lex.docs && lex.text } };
 }
 
 interface EncodedDelta {
@@ -237,13 +331,14 @@ interface EncodedDelta {
 }
 
 /** Encodes and writes one delta segment against the generation's fine means (and PQ codebook). */
-async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b: ReturnType<typeof prepareBatch>): Promise<EncodedDelta> {
+async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b: Batch, seq: number): Promise<EncodedDelta> {
 	const { w, store, gen } = ctx;
+	const vectors = b.vectors!;
 	const format = m.format ?? 1;
 	if (format === 3 && !files.pq) throw new ThreadError(`format 3 generation ${gen} has no PQ codebook`);
 	const baseKey = `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}`;
 	const borrowed = ctx.borrowPq(baseKey);
-	const [seq, meansBytes, pqBytes] = await Promise.all([allocSeq(store, gen, m.nextSeq ?? 1), store.get(files.fine), format === 3 && !borrowed ? store.get(files.pq!) : Promise.resolve(null)]);
+	const [meansBytes, pqBytes] = await Promise.all([store.get(files.fine), format === 3 && !borrowed ? store.get(files.pq!) : Promise.resolve(null)]);
 	if (!meansBytes) throw new ThreadError(`missing ${files.fine}`, 404);
 	const k = m.k1 * m.k2;
 	const means = asF32(meansBytes, files.fine);
@@ -264,7 +359,7 @@ async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b
 		const dim = m.dim;
 		for (let a = 0; a < b.ids.length; a += DELTA_ADD_CHUNK) {
 			const e = Math.min(b.ids.length, a + DELTA_ADD_CHUNK);
-			const v = b.vectors.subarray(a * dim, e * dim);
+			const v = vectors.subarray(a * dim, e * dim);
 			const attrs = b.attrs ? b.attrs.subarray(a, e) : new Uint32Array(0);
 			let c: Uint32Array;
 			if (b.payloads) {
@@ -301,42 +396,153 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 	writable(store);
 	const replace = input.replace ?? true;
 	return ctx.thread.withRecovery("upsert", async () => {
-		const st: { batch: ReturnType<typeof prepareBatch> | null; delta: EncodedDelta | null; tombKey: string | null; tombBytes: number } = { batch: null, delta: null, tombKey: null, tombBytes: 0 };
+		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0 };
 		const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
-			const batch = (st.batch ??= prepareBatch(input, manifest.dim));
+			const lex = resolveLexConfig(manifest);
+			const batch = (st.batch ??= prepareBatch(input, hasDense(manifest) ? manifest.dim : 0, lex));
+			const wantSeg = lex !== null && (batch.texts !== null || batch.metas !== null);
 			const next = inherit(manifest);
 			const newRev = rev + 1;
 			const filesKey = `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}`;
-			// The segment is reused across retries unless the means/codebook changed under us; the tombstone set
-			// is keyed by the rev, so it is rewritten for every attempt.
+			if (!st.seq) st.seq = await allocSeq(store, gen, manifest.nextSeq ?? 1);
+			// The delta and the segment are reused across retries (unless the means/codebook changed under us);
+			// the tombstone set is keyed by the rev, so it is rewritten for every attempt.
 			const tb = replace ? tombBytes(w, batch.ids) : null;
-			const [delta, tombKey] = await Promise.all([st.delta && st.delta.filesKey === filesKey ? st.delta : encodeDelta(ctx, manifest, files, batch), tb ? putUnique(store, keys.tombstones(gen, newRev), tb) : Promise.resolve(null)]);
+			const [delta, seg, tombKey] = await Promise.all([
+				batch.vectors ? (st.delta && st.delta.filesKey === filesKey ? st.delta : encodeDelta(ctx, manifest, files, batch, st.seq)) : Promise.resolve(null),
+				wantSeg ? (st.seg ?? encodeSegment(ctx, st.seq, lex!, batch)) : Promise.resolve(null),
+				tb ? putUnique(store, keys.tombstones(gen, newRev), tb) : Promise.resolve(null),
+			]);
 			st.delta = delta;
+			st.seg = seg;
 			st.tombKey = tombKey;
 			if (tb && tombKey) {
 				st.tombBytes = tb.byteLength;
 				next.tombstones!.push({ rev: newRev, key: tombKey, count: tb.byteLength / 4 });
 			}
-			next.deltas!.push({ seq: delta.seq, key: delta.key, count: batch.ids.length, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
-			next.nextSeq = Math.max(next.nextSeq ?? 1, delta.seq + 1);
-			return { ...next, change: { op: "upsert", seq: delta.seq, count: batch.ids.length, replace, writer: "thread-sdk" } };
+			if (delta) next.deltas!.push({ seq: delta.seq, key: delta.key, count: batch.ids.length, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
+			if (seg) next.segments = [...(next.segments ?? []), { ...seg.ref, addedRev: newRev }];
+			next.nextSeq = Math.max(next.nextSeq ?? 1, st.seq + 1);
+			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, dense: !!delta, lexical: !!seg, writer: "thread-sdk" } };
 		});
-		const d = st.delta!;
+		const d = st.delta;
 		return {
 			gen,
 			rev: c.rev,
-			seq: d.seq,
+			seq: st.seq,
 			count: st.batch!.ids.length,
-			cells: Array.from(d.cells),
-			distinctCells: d.nCells,
-			keys: { delta: d.key, tombstones: st.tombKey, manifest: c.manifestKey },
-			bytes: { delta: d.bytes, tombstones: st.tombBytes, manifest: c.manifestBytes },
+			cells: d ? Array.from(d.cells) : [],
+			distinctCells: d?.nCells ?? 0,
+			keys: { delta: d?.key ?? null, segment: st.seg?.key ?? null, tombstones: st.tombKey, manifest: c.manifestKey },
+			bytes: { delta: d?.bytes ?? 0, segment: st.seg?.bytes ?? 0, tombstones: st.tombBytes, manifest: c.manifestBytes },
+			tokens: st.seg?.tokens ?? 0,
 			conflicts: c.conflicts,
 			casConflicts: c.casConflicts,
 			currentUpdated: c.currentUpdated,
 			ms: Date.now() - t0,
 		};
 	});
+}
+
+/** Commits a manifest revision carrying a (new or changed) lexical configuration. */
+export async function configureLexical(ctx: WriterContext, config: LexConfig): Promise<ConfigureLexicalResult> {
+	const { store, gen, w } = ctx;
+	writable(store);
+	// Validate the tokenizer and the parameters before writing anything.
+	w.tokenizer_config_json(JSON.stringify(config.tokenizer ?? {}));
+	if (config.lengths !== undefined && config.lengths !== "exact" && config.lengths !== "byte") throw new ThreadError(`lengths must be "exact" or "byte"`, 400);
+	if (config.k1 !== undefined && !(config.k1 >= 0)) throw new ThreadError("k1 must be >= 0", 400);
+	if (config.b !== undefined && !(config.b >= 0 && config.b <= 1)) throw new ThreadError("b must be in [0, 1]", 400);
+	const c = await commitRev(ctx, async ({ manifest }) => {
+		if (manifest.lex && (manifest.segments?.length ?? 0) > 0) {
+			// Tokenization must stay the same across the segments of a generation.
+			const old = JSON.stringify(manifest.lex.tokenizer ?? null);
+			if (old !== JSON.stringify(config.tokenizer ?? null)) throw new ThreadError("the tokenizer of a generation with segments cannot change (build a new generation)", 400);
+		}
+		return { ...inherit(manifest), lex: config, change: { op: "configure-lex", writer: "thread-sdk" } };
+	});
+	return { gen, rev: c.rev, config, conflicts: c.conflicts, currentUpdated: c.currentUpdated };
+}
+
+/**
+ * Merges every segment of the head into one base segment and commits a revision listing only it. Reads the
+ * segments whole. Nothing is written when the head has at most one segment and no tombstone set newer than it.
+ */
+export async function compactSegments(ctx: WriterContext): Promise<CompactSegmentsResult> {
+	const t0 = Date.now();
+	const { store, gen, w } = ctx;
+	writable(store);
+	let merged = 0;
+	let key: string | null = null;
+	let count = 0;
+	let bytes = 0;
+	let readBytes = 0;
+	let built: { forKeys: string; key: string; bytes: number; count: number } | null = null;
+	const c = await commitRev(ctx, async ({ rev, manifest }) => {
+		const lex = resolveLexConfig(manifest);
+		if (!lex) throw new ThreadError("this generation has no lexical configuration", 400);
+		const segs = manifest.segments ?? [];
+		const sets = manifest.tombstones ?? [];
+		const newest = Math.max(0, ...sets.map((t) => t.rev));
+		const needed = segs.length > 1 || (segs.length === 1 && newest > segs[0].addedRev);
+		if (!needed) return null;
+		const forKeys = segs.map((s) => s.key).join("|");
+		if (!built || built.forKeys !== forKeys) {
+			const parts = await Promise.all(
+				segs.map(async (s) => {
+					const b = await store.get(s.key);
+					if (!b) throw new ThreadError(`missing segment ${s.key}`, 404);
+					return b;
+				}),
+			);
+			readBytes = parts.reduce((a, b) => a + b.byteLength, 0);
+			const tombSets = await Promise.all(sets.map(async (t) => ({ rev: t.rev, ids: new Uint32Array((await store.get(t.key))!.slice().buffer) })));
+			const tomb = tombSets.length ? buildTombState(tombSets) : null;
+			const concat = new Uint8Array(readBytes);
+			let o = 0;
+			for (const p of parts) {
+				concat.set(p, o);
+				o += p.byteLength;
+			}
+			const tombBufs = segs.map((s) => (tomb ? tombForSegment(tomb, s.addedRev) : new Uint8Array(0)));
+			const tombs = new Uint8Array(tombBufs.reduce((a, b) => a + b.byteLength, 0));
+			o = 0;
+			for (const t of tombBufs) {
+				tombs.set(t, o);
+				o += t.byteLength;
+			}
+			const out = w.merge_segments(concat, Float64Array.from(parts, (p) => p.byteLength), tombs, Uint32Array.from(tombBufs, (t) => t.byteLength), JSON.stringify(lex.tokenizer ?? {}), lex.k1, lex.b, lex.lengths, lex.bucketTerms, lex.docs, lex.text, lex.bucketDocs);
+			const meta = JSON.parse(w.segment_meta(out)) as { lex?: { num_docs: number }; docs?: { n: number } };
+			const k = await putUnique(store, keys.segmentBase(gen, rev + 1), out);
+			built = { forKeys, key: k, bytes: out.byteLength, count: meta.docs?.n ?? meta.lex?.num_docs ?? 0 };
+		}
+		merged = segs.length;
+		key = built.key;
+		bytes = built.bytes;
+		count = built.count;
+		const ref: SegmentRef = { seq: 0, key: built.key, addedRev: rev + 1, count, bytes, lex: true, docs: lex.docs, text: lex.docs && lex.text, base: true };
+		return { ...inherit(manifest), segments: [ref], change: { op: "compact-segments", merged, count, writer: "thread-sdk" } };
+	});
+	return { gen, rev: c.rev, merged, key, count, bytes, readBytes, conflicts: c.conflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
+}
+
+/**
+ * Publishes a lexical-only generation (no dense index: `k2 0, dim 0, vectors 0`) with the given configuration as
+ * rev 0, so documents can be upserted with texts and searched by text alone.
+ */
+export async function createLexicalGeneration(opts: CreateLexicalOptions): Promise<{ gen: string; rev: number; manifest: Manifest }> {
+	const { store, gen } = opts;
+	writable(store);
+	if (!/^[A-Za-z0-9_.-]+$/.test(gen)) throw new ThreadError(`bad generation name ${JSON.stringify(gen)}`, 400);
+	const manifest: Manifest = { gen, k1: 1, k2: 0, dim: 0, m: 0, vectors: 0, format: 1, profile: "lexical", createdAt: new Date().toISOString(), lex: opts.lex, segments: [], deltas: [], tombstones: [], nextSeq: 1, ...(opts.notes !== undefined ? { notes: opts.notes } : {}) };
+	if (!(await putIfAbsent(store, keys.manifest(gen, 0), JSON.stringify(manifest), "application/json"))) throw new ThreadError(`generation ${gen} already exists`, 409);
+	if (opts.setCurrent !== false) {
+		const cur = await readCurrent(store);
+		const body = JSON.stringify({ gen, rev: 0 });
+		if (!cur) await putIfAbsent(store, keys.current(), body, "application/json");
+		else await writable(store).put(keys.current(), body, { ifMatch: cur.etag, contentType: "application/json" });
+	}
+	return { gen, rev: 0, manifest };
 }
 
 export async function deleteIds(ctx: WriterContext, idsIn: ArrayLike<number>): Promise<DeleteResult> {

@@ -189,6 +189,84 @@ export interface DeltaRef {
 	cells?: number;
 }
 
+/**
+ * A lexical/docs segment listed in a manifest (`idx/{gen}/seg/{seq}.thread`, or the base `seg/base.{rev}.thread` a
+ * compaction wrote): a `THREADIX` container with `meta`, optionally `terms` + `postings` (BM25 over its documents)
+ * and `docs` (id -> metadata, optionally the text). Filtered like a delta: sets with rev > addedRev hide its entries.
+ */
+export interface SegmentRef {
+	/** The delta seq of the upsert that wrote it (0 for a compaction's base segment). */
+	seq: number;
+	key: string;
+	/** The manifest rev that first listed the segment. */
+	addedRev: number;
+	/** Documents in the segment. */
+	count: number;
+	bytes: number;
+	/** Which sections it holds. */
+	lex: boolean;
+	docs: boolean;
+	text: boolean;
+	/** Written by a compaction (holds every live document of the segments it replaced). */
+	base?: boolean;
+}
+
+/**
+ * The lexical/docs configuration of a generation (`manifest.lex`): how upserts build segments and how queries
+ * tokenize. Set with `index.configureLexical(...)` (a manifest revision); every segment of a generation shares it.
+ */
+export interface LexConfig {
+	/** The `tokenizer` object (bm25s-compatible keys: lowercase, token_pattern, stopwords, stemmer, segmenter, identifiers). */
+	tokenizer?: Record<string, unknown>;
+	/** BM25 parameters (default 1.2 / 0.75). */
+	k1?: number;
+	b?: number;
+	/** How postings carry document lengths: `exact` (default) or `byte` (one SmallFloat byte, smaller, scores within a few %). */
+	lengths?: "exact" | "byte";
+	/** Terms per `terms` bucket (default 256): fewer = smaller reads per query term, more = smaller resident directory. */
+	bucketTerms?: number;
+	/** Write `docs` entries (default true) and store the texts in them (default false). */
+	docs?: boolean;
+	text?: boolean;
+	/** Documents per `docs` bucket (default 128). */
+	bucketDocs?: number;
+	/** Query defaults for `search`: RRF constant (60), per-list depth (max(topK, 50)) and list weights (1 / 1). */
+	defaults?: { rrfK?: number; recallK?: number; weights?: { dense?: number; lexical?: number } };
+}
+
+export interface ResolvedLexConfig {
+	tokenizer: Record<string, unknown> | null;
+	k1: number;
+	b: number;
+	lengths: "exact" | "byte";
+	bucketTerms: number;
+	docs: boolean;
+	text: boolean;
+	bucketDocs: number;
+	rrfK: number;
+	recallK: number | null;
+	weights: { dense: number; lexical: number };
+}
+
+/** `manifest.lex` with its defaults filled in (`null` when the generation has no lexical configuration). */
+export function resolveLexConfig(m: Manifest): ResolvedLexConfig | null {
+	const c = m.lex;
+	if (!c) return null;
+	return {
+		tokenizer: c.tokenizer ?? null,
+		k1: c.k1 ?? 1.2,
+		b: c.b ?? 0.75,
+		lengths: c.lengths ?? "exact",
+		bucketTerms: c.bucketTerms ?? 256,
+		docs: c.docs ?? true,
+		text: c.text ?? false,
+		bucketDocs: c.bucketDocs ?? 128,
+		rrfK: c.defaults?.rrfK ?? 60,
+		recallK: c.defaults?.recallK ?? null,
+		weights: { dense: c.defaults?.weights?.dense ?? 1, lexical: c.defaults?.weights?.lexical ?? 1 },
+	};
+}
+
 /** A tombstone set: ids deleted (or replaced by an upsert) at manifest rev `rev`. */
 export interface TombRef {
 	rev: number;
@@ -231,6 +309,10 @@ export interface Manifest {
 	tombstones?: TombRef[];
 	/** Next delta sequence number. */
 	nextSeq?: number;
+	/** Lexical / docs configuration (absent: the generation has no lexical index and no docs store). */
+	lex?: LexConfig;
+	/** Lexical / docs segments, oldest first (a compaction's base first). */
+	segments?: SegmentRef[];
 }
 
 /** `idx/current.json`: the generation and revision queries use by default. */
@@ -249,6 +331,8 @@ export const keys = {
 	slab: (gen: string, cell: number, slabRev = 0): string => (slabRev === 0 ? `idx/${gen}/slab/${pad5(cell)}` : `idx/${gen}/slab/${pad5(cell)}.${slabRev}`),
 	tombstones: (gen: string, rev: number): string => `idx/${gen}/tombstones.${rev}.u32`,
 	delta: (gen: string, seq: number): string => `idx/${gen}/delta/${seq}.vibd`,
+	segment: (gen: string, seq: number): string => `idx/${gen}/seg/${seq}.thread`,
+	segmentBase: (gen: string, rev: number): string => `idx/${gen}/seg/base.${rev}.thread`,
 };
 
 export function manifestFiles(m: Manifest): IndexFiles {
@@ -268,6 +352,9 @@ export function parseCurrent(b: Uint8Array): CurrentPointer {
 	if (!Number.isInteger(rev) || rev < 0) throw new ThreadError(`current.json has a bad rev ${String(j.rev)}`);
 	return { gen: j.gen, rev };
 }
+
+/** Whether a generation has a dense index (a lexical-only generation is published with `k2: 0, dim: 0`). */
+export const hasDense = (m: Manifest): boolean => m.k2 > 0 && m.dim > 0;
 
 /** Parses a manifest and checks it is for `gen`; fills `rev` (absent in rev-0 manifests). */
 export function parseManifest(b: Uint8Array, gen: string, rev: number): Manifest {
@@ -349,6 +436,16 @@ export function tombForDelta(t: TombState, addedRev: number): Uint8Array {
 		t.deltaUnions.set(addedRev, u);
 	}
 	return u;
+}
+
+/** Filter buffer for the entries of a lexical/docs segment added at rev `addedRev`: the delta rule. */
+export const tombForSegment = tombForDelta;
+
+/** Whether `id` is hidden in a segment added at `addedRev` (a set with rev > addedRev holds it). */
+export function tombHides(t: TombState | null, id: number, addedRev: number): boolean {
+	if (!t) return false;
+	const r = t.maxRev.get(id);
+	return r !== undefined && r > addedRev;
 }
 
 export const NO_TOMBSTONES: Uint8Array = new Uint8Array(0);

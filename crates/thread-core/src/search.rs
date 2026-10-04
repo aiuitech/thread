@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Scanning a slab for a query, and reranking int8 records.
 
 use crate::error::{rd_f32, FormatError};
@@ -153,7 +155,7 @@ mod tests {
 
     fn cluster(dim: usize, n: usize, seed: u64) -> (Vec<f32>, Vec<Vec<f32>>) {
         let mut rng = Rng::new(seed);
-        let mut rand_unit = |rng: &mut Rng| {
+        let rand_unit = |rng: &mut Rng| {
             let mut v: Vec<f32> = (0..dim).map(|_| rng.below(2000) as f32 / 1000.0 - 1.0).collect();
             normalize(&mut v);
             v

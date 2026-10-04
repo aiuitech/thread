@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Numeric kernels.
 //!
 //! Every hot kernel (`dot`, `dot_f32_i8`, `dot_f32_i4`) has a portable scalar

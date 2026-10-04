@@ -9,4 +9,5 @@ name = "thread"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"
 thread-core = { path = "../thread-core" }

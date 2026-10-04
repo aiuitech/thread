@@ -1,4 +1,7 @@
-//! thread-core: a blob-native IVF vector index.
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
+//! thread-core: a blob-native search index, dense (IVF vectors) and lexical (BM25), with one
+//! document id space and rank fusion between the two.
 //!
 //! Everything here operates on byte slices and `f32` slices. There is no I/O:
 //! the caller (a Cloudflare Worker, a CLI, a test) fetches bytes from wherever
@@ -23,19 +26,45 @@
 //! - cell splits: `kmeans::split_cell` (2-means over a cell's decoded
 //!   entries), then `slab::split_records` / `part::split_part_records`
 //!   re-encode every entry against the nearer new mean (`part::RecordEncoder`)
+//!
+//! Lexical side (ported and reshaped from Wiper's thread engine; see `docs/lexical.md`):
+//! - `source`: `ByteSource`, `Range`, `Plan`, `Prefetched` (demand paging over range reads),
+//!   `SubSource`
+//! - `container`: the `THREADIX` blob of named sections a segment is stored as
+//! - `tokenize`: the bm25s-compatible tokenizer (Snowball English, stopwords, CJK bigrams,
+//!   identifiers), configured per index
+//! - `lex`: the `terms` (bucketed term table with df and posting ranges) and `postings`
+//!   (gap/tf/length varints) sections, BM25 scoring with corpus-wide statistics so several
+//!   segments score like one index, and their merge (compaction)
+//! - `docs`: the `docs` section, document id -> metadata (+ optional text), bucketed by id
+//! - `segment`: one object holding `meta`, `terms`, `postings` and `docs` for a batch of
+//!   documents (an upsert) or for the whole corpus (a compaction)
+//! - `fusion`: Reciprocal Rank Fusion of the dense and lexical lists
+//! - `excerpts`, `rerank`: query-time passages and judge-based rank fusion
 
+pub mod container;
 pub mod delta;
+pub mod docs;
 pub mod error;
+pub mod excerpts;
+pub mod fusion;
+pub mod lex;
 pub mod kmeans;
 pub mod math;
 pub mod part;
 pub mod pq;
 pub mod quant;
+pub mod rerank;
 pub mod route;
 pub mod search;
+pub mod segment;
 pub mod slab;
+pub mod source;
+pub mod tokenize;
 pub mod tomb;
 pub mod topk;
+pub mod varint;
 
-pub use error::FormatError;
+pub use error::{Error, FormatError};
+pub use source::{ByteSource, Plan, Prefetched, Range, SourceError, SubSource, Window};
 pub use topk::Hit;

@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Streaming, map-reduce friendly spherical k-means.
 //!
 //! A *map* job streams vectors, assigns each to a centroid and adds it into an

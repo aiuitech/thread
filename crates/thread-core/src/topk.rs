@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Bounded top-k with a min-heap, plus a merge/dedupe for multi-slab results.
 
 use std::cmp::Ordering;
@@ -13,7 +15,8 @@ pub struct Hit {
 }
 
 /// Wrapper whose ordering is reversed on score so `BinaryHeap` (a max-heap)
-/// pops the *lowest* score first.
+/// pops the *lowest* score first, and among equal scores the *highest* id, so
+/// the retained set is always the top-k by (score desc, id asc).
 #[derive(Clone, Copy, PartialEq)]
 struct MinHit(Hit);
 
@@ -31,7 +34,7 @@ impl Ord for MinHit {
             .0
             .score
             .total_cmp(&self.0.score)
-            .then_with(|| other.0.id.cmp(&self.0.id))
+            .then_with(|| self.0.id.cmp(&other.0.id))
     }
 }
 
@@ -144,6 +147,18 @@ mod tests {
         let v = t.into_sorted();
         assert_eq!(v.iter().map(|h| h.id).collect::<Vec<_>>(), vec![1, 3, 5]);
         assert_eq!(v.iter().map(|h| h.idx).collect::<Vec<_>>(), vec![101, 103, 105]);
+    }
+
+    #[test]
+    fn ties_keep_the_lowest_ids() {
+        let mut t = TopK::new(2);
+        // the first two fill the heap; later equal scores never enter; the better score evicts the highest id
+        for id in [1u32, 4, 7, 8, 9] {
+            t.push(id, 0.5, 0);
+        }
+        t.push(3, 0.9, 0);
+        let ids: Vec<u32> = t.into_sorted().iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![3, 1]);
     }
 
     #[test]

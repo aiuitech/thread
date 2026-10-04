@@ -1262,6 +1262,10 @@ interface Manifest {
 	nextSeq?: number;
 	/** Automatic compaction thresholds and the cell split cap (absent: no automatic compaction, no splits). */
 	compaction?: CompactionPolicy;
+	/** Lexical / docs configuration written by the SDK (`index.configureLexical`); opaque here. */
+	lex?: Record<string, unknown>;
+	/** Lexical / docs segments (SDK, `idx/{gen}/seg/*`): filtered by tombstone sets with rev > addedRev, like deltas. */
+	segments?: { seq: number; key: string; addedRev: number; count: number; bytes: number }[];
 }
 
 /**
@@ -3729,12 +3733,13 @@ interface CompactCommitReq {
 }
 
 /**
- * Whether a tombstone set can be dropped from the manifest: no remaining delta predates it, no slab written at
- * a rev in (0, set.rev] remains (such a slab may hold an id the set hides), and none of its ids is a build id
- * (rev-0 slabs hold ids [0, manifest.vectors), the driver's id space).
+ * Whether a tombstone set can be dropped from the manifest: no remaining delta or lexical/docs segment predates
+ * it, no slab written at a rev in (0, set.rev] remains (such a slab may hold an id the set hides), and none of
+ * its ids is a build id (rev-0 slabs hold ids [0, manifest.vectors), the driver's id space).
  */
-function tombDroppable(t: { rev: number; ids: Uint32Array }, deltas: DeltaRef[], slabs: SlabMeta[], baseIds: number): boolean {
+function tombDroppable(t: { rev: number; ids: Uint32Array }, deltas: DeltaRef[], slabs: SlabMeta[], baseIds: number, segments: { addedRev: number }[] = []): boolean {
 	if (deltas.some((d) => d.addedRev < t.rev)) return false;
+	if (segments.some((s) => s.addedRev < t.rev)) return false;
 	if (slabs.some((row) => slabRevOf(row) > 0 && slabRevOf(row) <= t.rev)) return false;
 	for (const id of t.ids) if (id < baseIds) return false;
 	return true;
@@ -3840,7 +3845,7 @@ async function compactCommit(env: Env, body: CompactCommitReq) {
 		if (table.length !== k || table.some((r) => !r)) throw new HttpError(400, `slabs table would have ${table.length} rows (holes: ${table.findIndex((r) => !r)}), expected ${k}`);
 		const tombRefs = manifest.tombstones ?? [];
 		const tombs = await pmap(tombRefs, SUBREQUEST_CONCURRENCY, async (t) => ({ ...t, ids: new Uint32Array(await getBuffer(env.BUCKET, t.key)) }));
-		const keep = tombs.filter((t) => !tombDroppable(t, remaining, table, manifest.vectors));
+		const keep = tombs.filter((t) => !tombDroppable(t, remaining, table, manifest.vectors, manifest.segments ?? []));
 		dropped = tombs.filter((t) => !keep.includes(t)).map((t) => t.rev);
 		const tj = JSON.stringify(table);
 		tableBytes = tj.length;
@@ -4259,6 +4264,7 @@ async function stageGc(env: Env, body: GcReq) {
 		for (const k of [f.coarse, f.fine, f.pq, f.slabs]) if (k) referenced.add(k);
 		if (f.slabs) tables.add(f.slabs);
 		for (const d of m.deltas ?? []) referenced.add(d.key);
+		for (const s of m.segments ?? []) referenced.add(s.key);
 		for (const t of m.tombstones ?? []) referenced.add(t.key);
 		if (m.tree) referenced.add(m.tree.key);
 	});
@@ -4272,7 +4278,7 @@ async function stageGc(env: Env, body: GcReq) {
 		const rest = key.slice(`idx/${gen}/`.length);
 		if (/^fine\.\d+(\.[0-9a-f]+)?\.f32$/.test(rest)) return "fine"; // fine means of a split revision (never fine.f32)
 		if (/^tree\.\d+(\.[0-9a-f]+)?\.bin$/.test(rest)) return "tree";
-		return rest.startsWith("slab/") ? "slab" : rest.startsWith("delta/") ? "delta" : rest.startsWith("tombstones.") ? "tombstones" : rest.startsWith("slabs.") ? "slabs-table" : null;
+		return rest.startsWith("slab/") ? "slab" : rest.startsWith("delta/") ? "delta" : rest.startsWith("seg/") ? "segment" : rest.startsWith("tombstones.") ? "tombstones" : rest.startsWith("slabs.") ? "slabs-table" : null;
 	};
 	const garbage = all.filter((o) => kindOf(o.key) !== null && !referenced.has(o.key) && now - o.uploaded.getTime() >= graceMs);
 	const kinds: Record<string, { n: number; bytes: number }> = {};

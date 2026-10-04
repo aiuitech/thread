@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Two-level routing table: `k1` coarse centroids, each with `k2` fine cells.
 //!
 //! Stores raw means plus inverse norms, so cosine routing needs no second

@@ -1,9 +1,15 @@
-//! Native helper CLI for thread.
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
+//! Native CLI for thread.
 //!
+//!   thread seg build|search|inspect|merge ...  lexical/docs segments on local files (see lex_cli.rs)
+//!   thread tokenize [--tokenizer json] "text"   the index's tokenizer
 //!   thread bench-scan [n_vectors] [dim] [pq_m]   time v1 (int8), v2 (4-bit + int8 rerank) and v3 (PQ + int8 rerank) scans of a synthetic slab
 //!   thread bench-route [k1] [k2] [dim] [nprobe]  time flat vs two-level routing
 //!   thread bench-neighbors [k] [dim] [count] [n]  time one cell_neighbors range (cells [0, count))
 //!   thread inspect <slab-file>            print slab header info
+
+mod lex_cli;
 
 use std::time::Instant;
 use thread_core::math::{dot, normalize, Rng};
@@ -261,9 +267,24 @@ fn inspect(path: &str) {
     }
 }
 
+fn usage() -> String {
+    format!(
+        "thread: a blob-native search index (dense + lexical). Commands:\n{}\n  thread bench-scan [n] [dim] [pq_m]            time v1/v2/v3 scans of a synthetic slab\n  thread bench-route [k1] [k2] [dim] [nprobe]   time flat vs two-level routing\n  thread bench-neighbors [k] [dim] [count] [n]  time one cell_neighbors range\n  thread inspect <slab-file>                    print a dense slab's header",
+        lex_cli::USAGE
+    )
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some(cmd @ ("seg" | "tokenize")) => match lex_cli::run(cmd, &args[2..]) {
+            Ok(lex_cli::Output::Json(v)) => println!("{}", serde_json::to_string(&v).unwrap()),
+            Ok(lex_cli::Output::Help(h)) => print!("{h}"),
+            Err(e) => {
+                eprintln!("thread: error: {e}");
+                std::process::exit(if e.contains("required") || e.contains("needs") || e.contains("unknown") { 1 } else { 2 });
+            }
+        },
         Some("bench-scan") => {
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(750);
             let dim = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1536);
@@ -279,6 +300,10 @@ fn main() {
             bench_neighbors(a(2, 4096), a(3, 1536), a(4, 512), a(5, 64));
         }
         Some("inspect") => inspect(args.get(2).expect("slab path")),
-        _ => eprintln!("usage: thread bench-scan [n] [dim] [pq_m] | thread bench-route [k1] [k2] [dim] [nprobe] | thread bench-neighbors [k] [dim] [count] [n] | thread inspect <slab>"),
+        Some("--help" | "-h" | "help") => println!("{}", usage()),
+        _ => {
+            eprintln!("{}", usage());
+            std::process::exit(1);
+        }
     }
 }

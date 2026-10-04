@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Recall/latency of `route::CentroidTree` against exhaustive search on real
 //! centroids. Usage:
 //! `cargo run --release -p thread-core --example tree_bench -- <means.f32> <sample.f32> <dim> [groups,..] [iters]`

@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Residual scalar quantization with a per-vector scale.
 //!
 //! A vector `x` stored in the slab of cell `c` is written as `code` such that

@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Tombstones: the set of deleted vector ids.
 //!
 //! Serialized as a plain array of `u32` little-endian ids, sorted ascending

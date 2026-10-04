@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! The slab: one immutable blob per fine cell.
 //!
 //! Version 2 (written by [`SlabBuilder`]; little-endian, offsets relative to

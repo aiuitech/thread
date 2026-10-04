@@ -1,9 +1,10 @@
 # thread-sdk
 
-Query (and, experimentally, update) a [thread](../README.md) blob-native vector index from a Cloudflare
-Worker. The index lives as immutable objects in R2 (or any S3-compatible store); the SDK streams the probed
-slabs through the Rust/wasm kernels and returns the top-k, like a Vectorize binding but with the index in
-your own bucket, readable through the Workers Cache API at the edge.
+Query and update a [thread](../README.md) blob-native search index from a Cloudflare Worker: dense vectors (the
+IVF slabs), BM25 text (lexical segments), or both fused by rank, with one document store for the hits. The index
+lives as immutable objects in R2 (or any S3-compatible store); the SDK streams the probed slabs and the queried
+posting lists through the Rust/wasm kernels, like a Vectorize binding but with the index in your own bucket,
+readable through the Workers Cache API at the edge.
 
 ```ts
 import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
@@ -11,7 +12,9 @@ import { Thread } from "thread-sdk";
 
 const thread = await Thread.init({ wasmModule });                   // once per isolate
 const index = await thread.open({ bucket: env.BUCKET, waitUntil: (p) => ctx.waitUntil(p) });
-const { hits } = await index.query(embedding, { topK: 10 });  // [{ id, score, attrs, source }, ...]
+const { hits } = await index.query(embedding, { topK: 10 });  // dense: [{ id, score, attrs, source }, ...]
+const r = await index.search({ text: "deploy failed", vector: embedding, topK: 10, docs: true });
+// hybrid: r.hits = [{ id, score, dense?: {rank, score}, lexical?: {rank, score}, doc?: {id, meta} }, ...]
 ```
 
 ## Install
@@ -155,6 +158,37 @@ with `rerank: 0` they are scan-tier (4-bit or PQ) estimates.
 
 `index.queryMany(vectors, options)` runs the queries concurrently against the same snapshot and routing table.
 
+### `index.search(request): Promise<SearchResult>`
+
+Text, vector or both (see [docs/lexical.md](../docs/lexical.md)). A text needs `manifest.lex` (`configureLexical`),
+a vector a dense generation.
+
+| field | default | meaning |
+|---|---|---|
+| `text` | - | the query text, tokenized with the index's tokenizer, BM25 over the lexical segments |
+| `vector` | - | the query embedding (`query` with `dense` options) |
+| `topK` | 10 | results |
+| `recallK` | `lex.defaults.recallK`, else max(topK, 50) | depth of each list before fusion |
+| `rrfK` | `lex.defaults.rrfK`, else 60 | RRF constant |
+| `weights` | `lex.defaults.weights`, else 1 / 1 | `{dense, lexical}` list weights |
+| `dense` | - | `QueryOptions` of the dense list (nprobe, rerank, ...) |
+| `docs` | false | `true`: resolve each hit's metadata through the `docs` store; `"text"`: the stored text too |
+
+```ts
+interface SearchResult {
+	hits: { id; score; dense?: { rank; score }; lexical?: { rank; score }; doc?: { id; meta; text? } | null }[];
+	mode: "dense" | "lexical" | "hybrid";        // one list is returned as is; two are fused with RRF
+	params: { topK; recallK; rrfK; weights };
+	dense?: QueryResult;                         // the dense query's full result
+	lexical?: { hits; tokens; found; stats: { segments; numDocs; totalLen; df; io: { rounds; ranges; bytes }; ms } };
+	stats: { docsIo?; timing: { total; dense; lexical; docs } };
+}
+```
+
+`index.lexicalSearch(text, k)` is the BM25 list alone, `index.tokenize(text)` the query's tokens, `index.docs(ids,
+{text})` the document store (`Map<id, {id, meta, text?}>`, newest live copy of each id, tombstone-aware).
+`index.lexConfig`, `index.segments` and `index.hasDense` describe the generation.
+
 ### `index.refresh(): Promise<boolean>`
 
 Re-reads `current.json` (or the generation's head) and switches to the new revision if it changed (true when it
@@ -171,10 +205,18 @@ afterwards.
 ### Write path (`@experimental`)
 
 ```ts
-const r = await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], attrs: [5, 6], payloads: ["a", "b"] });
-// { gen, rev, seq, count, cells, distinctCells, keys: { delta, tombstones, manifest }, bytes, conflicts, casConflicts, currentUpdated, ms }
-await index.delete([1000]);   // { gen, rev, count, key, conflicts, ... }
+await index.configureLexical({ text: true, lengths: "exact", bucketTerms: 256 });   // once: manifest.lex (a revision)
+const r = await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: ["...", "..."], metas: ["Title A", "Title B"], attrs: [5, 6] });
+// { gen, rev, seq, count, cells, distinctCells, keys: { delta, segment, tombstones, manifest }, bytes, conflicts, casConflicts, currentUpdated, ms }
+await index.upsert({ ids: [1002], texts: ["text-only document"], metas: ["C"] });   // no vector: found by text alone
+await index.delete([1000]);           // { gen, rev, count, key, conflicts, ... } (hides the vector, the text and the doc)
+await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
+await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only generation (no dense index)
 ```
+
+`manifest.lex` (`LexConfig`): `tokenizer` (frozen once a segment exists), `k1`, `b`, `lengths: "exact" | "byte"`,
+`bucketTerms`, `docs`, `text`, `bucketDocs`, `defaults: {rrfK, recallK, weights}`; see docs/lexical.md for what
+each one trades.
 
 Implemented against [docs/update-path.md](../docs/update-path.md): an upsert encodes one delta segment
 (`DeltaJob`: primary cell + residual codes, PQ codes with the generation's codebook) and, unless
@@ -223,6 +265,9 @@ prefixes and uses the rest of the object instead of re-reading it.
   the runtime ("connection limit") and are retried once.
 - An isolate serving several indexes keeps one base per index; `close()` what you no longer need, or keep one
   `ThreadIndex` per store at module level (the example does).
+- Lexical segments: one wasm `SegmentReader` per segment per isolate holds the container table, section headers
+  and directories (a few KB per segment) plus up to `lexTransientBytes` (8 MB) of recently read buckets and posting
+  lists before they are evicted. The wasm module is ~750 KB with the tokenizer, stemmer and lexical kernels.
 - Payloads: `returnPayload` reads them with one (multi-)range request per slab; keep payloads small or store
   them elsewhere keyed by id.
 
@@ -237,6 +282,8 @@ prefixes and uses the rest of the object instead of re-reading it.
 | `deleteByIds(ids)` | `index.delete(ids)` |
 | `getByIds` | not available (no id -> slab map; keep ids -> data in your own store) |
 | metadata filters | not available; `attrs` is returned per hit for client-side filtering |
+| `returnMetadata` | `search({ docs: true })`: the `docs` store's metadata string (and text) per hit |
+| (no equivalent) | `search({ text })`: BM25 and hybrid search over the same ids |
 | `describe()` | `index.manifest`, `index.dim`, `index.cells`, `index.defaults` |
 | namespaces | one index per `prefix` (or per bucket) |
 | cosine / euclidean / dot | cosine only (vectors are normalized) |

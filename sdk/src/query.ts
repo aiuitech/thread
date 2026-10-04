@@ -11,7 +11,7 @@
 import type { BlobRange, BlobStore, BlobTrace } from "./store.js";
 import { newTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
-import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SlabRow, type TombState, type IndexFiles } from "./wire.js";
+import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SegmentRef, type SlabRow, type TombState, type IndexFiles } from "./wire.js";
 
 export interface QueryOptions {
 	/** Results to return (default 10). */
@@ -108,6 +108,8 @@ export interface RevState {
 	/** Per-cell slab layout (formats 2/3); null for v1 generations, whose slabs are read whole. */
 	slabs: SlabRow[] | null;
 	deltas: DeltaRef[];
+	/** Lexical / docs segments, oldest first. */
+	segments: SegmentRef[];
 	tomb: TombState | null;
 	baseKey: string;
 }

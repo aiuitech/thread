@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Build-time "parts": the intermediate output of an assign job.
 //!
 //! An assign job streams a batch of vectors and, for each coarse group `g`,

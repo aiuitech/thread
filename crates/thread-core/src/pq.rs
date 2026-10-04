@@ -1,3 +1,5 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! Product quantization of residuals (`x - cell mean`) for the v3 scan tier.
 //!
 //! The residual space of dimension `dim` is split into `m` subspaces of

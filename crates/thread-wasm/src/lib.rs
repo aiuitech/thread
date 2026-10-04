@@ -1,5 +1,9 @@
+// Dense-side file written before rustfmt was adopted; kept as is (`cargo fmt` skips it).
+#![cfg_attr(rustfmt, rustfmt::skip)]
 //! wasm-bindgen surface over `thread-core`. Pure compute; the host (a Cloudflare
-//! Worker in TypeScript) does all storage I/O and hands byte buffers in.
+//! Worker in TypeScript) does all storage I/O and hands byte buffers in. The dense
+//! side is below; the lexical side (tokenizer, segments, paged reader, fusion,
+//! excerpts) is in `lex.rs`.
 //!
 //! Vector batches are `Float32Array`s of `n * dim` unit vectors.
 
@@ -18,6 +22,9 @@ use thread_core::slab::{SlabHeader, SlabView, SlabWriter, SLAB_HEADER};
 use thread_core::tomb::Tombstones;
 use thread_core::topk::{merge_dedup, pack_hits, unpack_hits, TopK};
 use wasm_bindgen::prelude::*;
+
+mod lex;
+pub use lex::*;
 
 #[wasm_bindgen]
 extern "C" {

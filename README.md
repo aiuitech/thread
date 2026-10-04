@@ -1,8 +1,12 @@
-# thread: a blob-native vector index
+# thread: a blob-native search index (dense + lexical)
 
-Cosine-similarity search over vector embeddings where the index lives in object
-storage (Cloudflare R2) and queries run in RAM-constrained environments
-(Cloudflare Workers, 128 MB). The build also runs inside Workers.
+Cosine-similarity search over vector embeddings and BM25 search over text, over one
+document id space and fused by rank, where the index lives in object storage
+(Cloudflare R2) and queries run in RAM-constrained environments (Cloudflare Workers,
+128 MB). The build also runs inside Workers. The dense side is described below; the
+lexical side (BM25 segments, the unified document store, fusion) is in
+[docs/lexical.md](docs/lexical.md) and summarized in
+[Lexical search and unified docs](#lexical-search-and-unified-docs).
 
 ## Design in one paragraph
 
@@ -24,7 +28,16 @@ exceeds the generation's compaction thresholds; cells that outgrow a cap are spl
 Everything numeric is in Rust (`crates/thread-core`), exposed to JS through
 wasm-bindgen (`crates/thread-wasm`). The Worker (`worker/`) is an I/O shell that
 streams R2 objects through the wasm kernels so no stage holds more than a few
-tens of MB.
+tens of MB; the SDK (`sdk/`) is the same query path as a library, plus the lexical
+side, the write path and the fused `search`.
+
+Text lives in **segments** next to the slabs: immutable `THREADIX` containers holding
+BM25 postings (a bucketed term table carrying each term's `df` and posting range, lists
+of `gap/tf/length` varints) and a `docs` store (id -> metadata, optionally the text),
+read by range requests in two rounds per query. Segments share the slabs' u32 ids and
+tombstone sets, so one upsert adds a vector, its text and its metadata, and one delete
+hides all of them; a compaction merges segments into one base. A query can be a vector,
+a text or both (Reciprocal Rank Fusion), and hits resolve through the one `docs` store.
 
 ## Results so far (dbpedia-openai-1M-1536-angular, 975k vectors, top-10, warm edge cache)
 
@@ -268,23 +281,66 @@ Writes run in the `writer` build slot (the Worker forwards `/upsert` and `/delet
 write must not run in an isolate that serves queries. (Until g4 the benchmarks sent writes to vib-bench-0 of the
 build pool for the same reason.)
 
+## Lexical search and unified docs
+
+Details: [docs/lexical.md](docs/lexical.md). The lexical side was ported from Wiper's `thread` engine
+(`../wiper/rust/thread`: demand-paged `ByteSource`/`Prefetched`, `THREADIX` container, bm25s-compatible
+tokenizer with Snowball 3.1 English, CJK bigrams and technical identifiers, RRF, excerpts, judge-side rank
+fusion) and reshaped for blob storage with sparse ids: no term ids or vocabulary table (a `terms` bucket entry
+carries `df` and the posting range), document lengths inline in the postings (no corpus-sized array per query),
+a `docs` store bucketed by id, segments + tombstones instead of whole-file appends.
+
+- **Objects.** `idx/{gen}/seg/{seq}.thread` per upsert with texts/metadata (the `seq` of its dense delta),
+  `idx/{gen}/seg/base.{rev}.thread` after a compaction; listed in the manifest as `segments` with the
+  configuration in `manifest.lex` (`index.configureLexical` on a dense generation, or `createLexicalGeneration`
+  for a text-only index without base files).
+- **Query.** Tokenize with the index's config; per segment, one round for the query terms' buckets and one for
+  their posting lists (one multi-range Cache API request each), all segments concurrently; scored with
+  corpus-wide `N`, `avg_len` and `df` summed over the segments, so segments score exactly like one index; merged,
+  and fused with the dense list by RRF when both are given. Docs resolve newest segment first, tombstone-aware.
+- **Tuning** (per generation, `manifest.lex`): `lengths: "exact" | "byte"` (exact scores vs ~1 byte less per
+  posting), `bucketTerms` / `bucketDocs` (resident directory size vs bytes per lookup), `docs` / `text` (store
+  metadata, store texts), the tokenizer (stemming, stopwords, CJK bigrams, identifiers), RRF defaults.
+  Measured on a 20k-document synthetic corpus: 3.63 B/posting exact, 2.69 B/posting byte lengths, 2.5 KB
+  resident directory per 30k terms, a 4-term query in 4.6 ms natively.
+- **Updates.** `index.upsert({ids, vectors?, texts?, metas?})`, `index.delete(ids)` (shared tombstone sets:
+  a segment added at rev `a` is filtered by the sets with `rev > a`, the delta rule), `index.compactSegments()`
+  (merge to one base; byte-identical to a fresh build over the live documents). The Worker's compaction keeps a
+  tombstone set while any segment predates it, and its GC keeps every listed segment.
+- **CLI.** `thread seg build|inspect|search|merge`, `thread tokenize` on local files (`crates/thread-cli`):
+  a segment built locally is what an upsert writes.
+
+```ts
+await index.configureLexical({ text: true });
+await index.upsert({ ids, vectors, texts, metas });
+const { hits } = await index.search({ text: "deploy failed", vector: embedding, topK: 10, docs: "text" });
+// hits[i]: { id, score, dense?: {rank, score}, lexical?: {rank, score}, doc?: {id, meta, text} }
+```
+
 ## Layout
 
-- `crates/thread-core`   format, quantization, k-means accumulators, router, scan
+- `crates/thread-core`   format, quantization, k-means accumulators, router, scan; lexical side: `source`
+                      (demand paging), `container`, `tokenize`, `lex` (terms/postings), `docs`, `segment`,
+                      `fusion`, `excerpts`, `rerank`
 - `crates/thread-wasm`   wasm-bindgen jobs: FlatKmeansJob, TreeKmeansJob, IncKmeansJob, Reducer, AssignJob, SlabJob, Searcher, cell_neighbors,
                       PQ: residuals_for, pq_init_codebook, PqTrainJob, PqReducer, PqCodebook, PqTable, scan_pq,
                       updates: DeltaJob, scan_delta, delta_info/cells/records_for_cell/payload, slab_to_records,
                       tombstones_merge, filter_hits, cell splits: split_slab, split_slab_records, split_part_records,
                       reencode_records,
                       centroid tree: build_centroid_tree, centroid_tree_info, Searcher.set_tree/route_beam/cell_dots_for/
-                      tree_recall/tree_recall_top, DeltaJob.set_tree, AssignJob.set_tree (not used by the driver yet)
-- `crates/thread-cli`    native CLI (placeholder)
+                      tree_recall/tree_recall_top, DeltaJob.set_tree, AssignJob.set_tree (not used by the driver yet),
+                      lexical (`src/lex.rs`): LexTokenizer, SegmentJob, SegmentReader (paged), merge_segments, rrf_fuse,
+                      best_doc_ranks, rerank_fuse, Lines, Excerpter
+- `crates/thread-cli`    native CLI: `seg build|inspect|search|merge`, `tokenize`, slab/scan benchmarks
+- `sdk/`              `thread-sdk`: the query path as a library (R2/S3/memory stores, Cache API), the lexical index,
+                      `search` (dense, lexical, hybrid), the write path (upsert with texts, delete, segment compaction)
 - `worker/`           `cf`-managed Worker: build-stage endpoints, `/query`, `/upsert`, `/delete`, compaction (manual and
                       automatic), cell splits, `/index/status`, rollback, gc (`src/index.ts`); `src/main.ts` runs build
                       stages and writes in build slots (Worker Loader); see `worker/README.md`
 - `spikes/worker-loader/` the spike that showed dynamic Workers give each slot its own isolate (FINDINGS.md)
 - `bench/`            dataset prep, shard upload, build driver, query benchmark, compaction driver, update benchmark
-- `docs/`             `update-path.md`: the update path (revisions, deltas, tombstones, compaction) in detail
+- `docs/`             `update-path.md`: the update path (revisions, deltas, tombstones, compaction) in detail;
+                      `lexical.md`: the lexical index, the docs store and fusion
 - `data/`             (gitignored) dataset and prep output
 
 ## Build pipeline (all stages run in the Worker, driven from a laptop)
@@ -440,7 +496,20 @@ curl -H "authorization: Bearer $TOKEN" "$URL/index/status?gen=g4"   # deltas, to
 values the server used (`server params: nprobe=10 (manifest) ...`).
 
 `--experimental-reset-state-function` makes wasm-bindgen emit `__wbg_reset_state()`,
-which the Worker uses to recover from a trap.
+which the Worker uses to recover from a trap. After rebuilding the wasm, `sdk/scripts/sync-wasm.sh` copies it into
+the SDK (`cd sdk && npm test`). Lexical segments on local files (`thread --help` and `thread <command> --help`
+describe every command and option):
+
+```sh
+cargo build --release -p thread-cli
+target/release/thread seg build --out seg.thread --docs docs.jsonl --text        # {"id", "text", "meta"} per line
+target/release/thread seg search --text "deploy failed" --k 10 --with-docs seg.thread
+```
+
+Checks before a commit: `cargo test --workspace`, `cargo check -p thread-core -p thread-wasm --target
+wasm32-unknown-unknown`, `cargo fmt --all --check` (the dense-side files predate rustfmt and carry
+`#![cfg_attr(rustfmt, rustfmt::skip)]`, so the formatter touches only the lexical modules and new code),
+`cargo clippy --all-targets`, and `cd sdk && npm run typecheck && npm test`.
 
 ### Build flags (`bench/driver.mjs`)
 

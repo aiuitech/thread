@@ -17,7 +17,9 @@ idx/{gen}/manifest.{rev}.json           rev >= 1
 idx/{gen}/slabs.json | slabs.{rev}.json per-cell [scanLen, rerankOff, count, bytes, slabRev?] (slabRev absent = 0)
 idx/{gen}/slab/{cell:05}                slab revision 0 (finalize)
 idx/{gen}/slab/{cell:05}.{slabRev}      slab written by a compaction that read manifest rev slabRev - 1
-idx/{gen}/delta/{seq}.vibd              one delta segment per upsert
+idx/{gen}/delta/{seq}.vibd              one delta segment per upsert (vectors)
+idx/{gen}/seg/{seq}.thread              one lexical/docs segment per upsert with texts or metadata (docs/lexical.md)
+idx/{gen}/seg/base.{rev}.thread         the merged segment a segment compaction wrote
 idx/{gen}/tombstones.{rev}.u32          sorted unique u32 LE ids deleted/replaced AT rev (one set per rev, not cumulative)
 idx/{gen}/tree.{rev}.bin                centroid tree over the fine means (publish / publish-rev with `tree`, or a
                                         compaction that split cells); inherited
@@ -187,8 +189,9 @@ node bench/compact.mjs [--gen g4] [--purge 1] [--cells a,b] [--maxCellEntries N]
 - **Commit** (commitRev on the head, which may be newer than baseRev): fails with 409 if another compaction
   changed the slabs table or a folded delta disappeared; writes `slabs.{rev}.json` with the new rows, drops the
   folded deltas (deltas added since baseRev stay), and drops a tombstone set only when nothing can reference it:
-  no remaining delta predates it, no slab with slabRev in (0, set.rev] remains, and none of its ids is a build id
-  (rev-0 slabs hold ids [0, manifest.vectors), the driver's id space). Otherwise the set is kept.
+  no remaining delta predates it, no lexical/docs segment (`manifest.segments`, see docs/lexical.md) predates it,
+  no slab with slabRev in (0, set.rev] remains, and none of its ids is a build id (rev-0 slabs hold ids
+  [0, manifest.vectors), the driver's id space). Otherwise the set is kept.
 - **Splits:** see [Cell splitting](#cell-splitting).
 - Concurrency: compactions must not run concurrently on one generation (the second one's commit fails with 409;
   their slab objects would have identical bytes, since both read the same base). Automatic runs serialize on
