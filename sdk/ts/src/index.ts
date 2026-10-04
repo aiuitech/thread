@@ -29,7 +29,7 @@ export * from "./pack.js";
 export * from "./warm.js";
 export type { Base, BaseStat, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
-export { Limiter, QUERY_INFLIGHT, executeQuery } from "./query.js";
+export { CROSS_SLAB_GAP, Limiter, QUERY_INFLIGHT, executeQuery, planCrossSlab } from "./query.js";
 export type { CompactSegmentsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
 export { createLexicalGeneration } from "./write.js";
 

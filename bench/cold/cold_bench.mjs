@@ -173,7 +173,7 @@ async function child() {
 				query: st.io.bytes,
 			},
 			warm,
-			stats: { scanned: st.scanned, scanBytes: st.scanBytes, slabBytes: st.slabBytes, rerankSlabs: st.rerankSlabs, rerankReads: st.rerankReads, rerankBytes: st.rerankBytes, rerankLocal: st.rerankLocal, specRecords: st.specRecords, specUsed: st.specUsed, cacheHits: st.io.hits, cacheMisses: st.io.misses, baseFiles: withOpen ? os.base.files : null },
+			stats: { scanned: st.scanned, scanBytes: st.scanBytes, slabBytes: st.slabBytes, rerankSlabs: st.rerankSlabs, rerankReads: st.rerankReads, rerankBytes: st.rerankBytes, rerankLocal: st.rerankLocal, specRecords: st.specRecords, specUsed: st.specUsed, cacheHits: st.io.hits, cacheMisses: st.io.misses, coalescedReads: st.coalesced?.reads ?? null, coalescedSlabs: st.coalesced?.slabs ?? null, coalescedBytes: st.coalesced?.bytes ?? null, baseFiles: withOpen ? os.base.files : null },
 			proxy,
 		});
 	};
