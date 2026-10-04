@@ -356,11 +356,16 @@ class ThreadIndex:
         if not self.store.remote and not isinstance(self.store, CachedBlobStore):
             return out
         left = [self._prefetch_bytes if budget is None else budget]
+        # A slab costs its scan prefix, or the whole slab when a miss reads it whole (the "whole" policy).
+        whole = isinstance(self.store, CachedBlobStore) and self.store.miss_policy == "whole"
         prefix_of: dict[str, int] = {}
+        cost_of: dict[str, int] = {}
         if rev.slabs is not None:
             for cell, row in enumerate(rev.slabs):
                 if row:
-                    prefix_of[keys.slab(rev.gen, cell, slab_rev_of(row))] = row[0]
+                    k = keys.slab(rev.gen, cell, slab_rev_of(row))
+                    prefix_of[k] = row[0]
+                    cost_of[k] = row[3] if whole else row[0]
         budgeted = {d["key"] for d in rev.deltas} | {s["key"] for s in rev.segments}
         todo = list(keys_ if keys_ is not None else snapshot_keys(rev))
         lock = threading.Lock()
@@ -393,7 +398,7 @@ class ThreadIndex:
                     out["objects"] += 1
                     out["bytes"] += len(b)
                     if is_budgeted:
-                        left[0] -= scan_len if scan_len is not None else len(b)
+                        left[0] -= cost_of[k] if scan_len is not None else len(b)
 
         threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, workers))]
         for t in threads:

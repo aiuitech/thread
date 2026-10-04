@@ -448,8 +448,10 @@ export class ThreadIndex {
 		const out = { objects: 0, bytes: 0, skipped: 0 };
 		if (!this.store.remote && !(this.store instanceof CachedBlobStore)) return out;
 		let budget = opts.budget ?? this.opts.prefetchBytes ?? DEFAULT_PREFETCH_BYTES;
-		const slabPrefix = new Map<string, number>();
-		if (rev.slabs) rev.slabs.forEach((row, cell) => row && slabPrefix.set(keys.slab(rev.gen, cell, slabRevOf(row)), row[0]));
+		// A slab costs its scan prefix, or the whole slab when a miss reads it whole (the "whole" policy).
+		const whole = this.store instanceof CachedBlobStore && this.store.missPolicy === "whole";
+		const slabPrefix = new Map<string, [number, number]>();
+		if (rev.slabs) rev.slabs.forEach((row, cell) => row && slabPrefix.set(keys.slab(rev.gen, cell, slabRevOf(row)), [row[0], whole ? row[3] : row[0]]));
 		const budgeted = new Set([...rev.deltas.map((d) => d.key), ...rev.segments.map((s) => s.key)]);
 		const todo = [...(want ?? snapshotKeys(rev))];
 		const trace = newTrace();
@@ -459,7 +461,7 @@ export class ThreadIndex {
 					out.skipped++;
 					continue;
 				}
-				const scanLen = slabPrefix.get(k);
+				const [scanLen, cost] = slabPrefix.get(k) ?? [undefined, undefined];
 				const isBudgeted = scanLen !== undefined || budgeted.has(k);
 				if (isBudgeted && budget <= 0) {
 					out.skipped++;
@@ -469,7 +471,7 @@ export class ThreadIndex {
 				if (!b) continue;
 				out.objects++;
 				out.bytes += b.byteLength;
-				if (isBudgeted) budget -= scanLen ?? b.byteLength;
+				if (isBudgeted) budget -= cost ?? b.byteLength;
 			}
 		};
 		await Promise.all(Array.from({ length: Math.max(1, opts.concurrency ?? 4) }, worker));

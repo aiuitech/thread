@@ -91,7 +91,9 @@ const index = await thread.open({ store: new MemoryBlobStore() });
 ```
 
 Whatever the store, `open` puts a `CachedBlobStore` (Workers Cache API, `caches.default`) in front of it unless
-`cache: false`. Pass `waitUntil` so background cache fills outlive the response.
+`cache: false`. Pass `waitUntil` so background cache fills outlive the response. Outside Workers (Node) there is no
+Cache API: a remote store (`S3BlobStore`) gets an in-process `MemoryCache` (256 MB) instead, and a `DiskCache`
+from `thread-sdk/node` survives restarts (see "Caches and the cold path").
 
 ## API
 
@@ -112,10 +114,15 @@ once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 | `bucket` / `store` | required | an R2 binding, or any `BlobStore` |
 | `prefix` | `""` | key prefix in front of `idx/` (several indexes in one bucket) |
 | `gen`, `rev` | `idx/current.json` | read a specific generation / revision; with both, the index is pinned and never refreshes |
-| `cache` | `caches.default` | a `Cache` to put in front of the store; `false` disables it |
+| `cache` | `caches.default`; in Node a `MemoryCache` for remote stores | the Cache API (`CacheLike`) or a `BlobCache` (`MemoryCache`, `DiskCache`) in front of the store; `false` disables it |
 | `cacheOrigin` | `https://vib-sdk.cache/` | synthetic origin of the cache keys (`${origin}idx/...`); use one per store |
-| `waitUntil` | - | `ctx.waitUntil`, keeps background cache writes alive |
-| `refreshInterval` | 30 000 ms | a query older than this re-reads `current.json` first (0 = only `refresh()`) |
+| `missPolicy` | `"whole"` (Cache API), `"range+warm"` (`MemoryCache` / `DiskCache`) | what a slab-prefix cache miss reads: the whole slab, the range, or the range now and the whole slab in the background |
+| `warmConcurrency` | 2 | `"range+warm"`: background whole-slab fetches at once (1 while the query's own reads are in flight) |
+| `waitUntil` | - | `ctx.waitUntil`, keeps background cache writes and warm fetches alive |
+| `warmup` | on for remote stores outside Workers | open connections during `open` (`true` = the store's `inflight`, 32 against S3 from Node; a number; `false`) |
+| `coldPolicy` | off | `{ nprobe?, rerank?, threshold? }` for queries whose probed slabs are mostly not cached (see `query`) |
+| `refreshInterval` | 30 000 ms | how often a query checks `current.json` for a new revision, in the background (0 = only `refresh()`) |
+| `prefetchBytes` | 64 MB | slab prefixes / delta and lexical segments a revision switch prefetches into the cache |
 | `deltaCacheBytes` | 40 MB | delta segments kept in memory across queries (per index) |
 
 `open` reads `current.json` (a pointer without `rev` means rev 0 = the legacy `idx/{gen}/manifest.json`), the
@@ -147,8 +154,11 @@ manifest, slabs table, deltas, tombstone state).
 | `rerank` | manifest default | scan-tier candidates re-scored with the int8 tier (`T = max(topK, rerank)`); 0 = scan-tier scores only. Formats 2/3; format 1 never reranks |
 | `pc` | manifest default | coarse groups to probe (two-level indexes); 0 = flat routing over all cells |
 | `returnPayload` | false | also return each hit's payload bytes (one extra range read per slab with payloads not already in memory) |
-| `inflight` | 12 | reads in flight per query |
+| `inflight` | the store's: 12 (Cache API), 32 (S3 from Node), 6 (S3 inside a Worker) | reads in flight per query |
 | `speculate` | true | read the running top-T's rerank records while the last 6 slabs are still scanning |
+| `coalesceBytes` | the store's, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while the range stays within this many bytes |
+| `spanBytes` | the store's, else 0 (off) | phase 2: read a slab's records as ONE range from the first to the last wanted record when that span is at most this |
+| `coldPolicy` | `OpenOptions.coldPolicy` | `{ nprobe?, rerank?, threshold? }`: when more than `threshold` (default 0.5) of the probed slabs are not cached, scan only the best `nprobe` of them and rerank `rerank` (each capped at the query's value); `false` disables it for this query |
 
 Manifests without `defaults` (g1, g2) use `nprobe 1, rerank 32, pc 0`; `params.source` says where each value
 came from (`query`, `manifest`, `legacy`).
@@ -162,7 +172,9 @@ interface QueryResult {
 		scanned; scanBytes; slabBytes;                                   // phase 1
 		rerank; rerankCandidates; rerankSlabs; rerankReads; rerankBytes; rerankLocal; specRecords; specUsed;  // phase 2
 		deltas; deltaBytes; deltaScanned; deltaHits; deltaDropped; deltaTop; tombstones; tombSets; tombDropped;
-		io: { reads; hits; misses; r206; r200; bytes };                   // store accounting (cache hits/misses, origin reads)
+		io: { reads; hits; misses; r206; r200; bytes; warms };            // store accounting (cache hits/misses, origin reads, background warms queued)
+		wholeSlabs; inflight; coalesceBytes; spanBytes;                   // slabs read whole (records local); the I/O knobs used
+		cold?: { misses; probed; applied };                              // with a cold policy: probed slabs not cached, and whether it applied
 		limiterRetries; attempt; wasmResets; wasmMemMB;
 		timing: { total; route; phase1; phase2; payload };               // ms; CPU-only phases read ~0 in Workers
 		timeline: { route; phase1; phase2; payload; base? };             // PhaseStat per phase (below)
@@ -214,10 +226,22 @@ interface SearchResult {
 ### `index.refresh(): Promise<boolean>`
 
 Re-reads `current.json` (or the generation's head) and switches to the new revision if it changed (true when it
-did). Revisions are immutable, so everything else is cached per index: the parsed manifest, slabs table and
-tombstone sets per revision; the routing table/codebook per generation (reloaded only when the revision names
-other base files); delta segments by key. New data is visible within `refreshInterval`, or at once after
-`refresh()`, or at once on the handle that wrote it.
+did). Before switching it loads what the first query on the new revision would otherwise wait for: the manifest,
+slabs table and tombstone sets, the routing table/codebook when the revision names other base files, and the new
+delta segments; then it warms the rest of what the new revision adds (`snapshotKeys(new)` minus `snapshotKeys(old)`:
+new slab revisions as scan prefixes, lexical segments) into the cache in the background, within `prefetchBytes`.
+Revisions are immutable, so everything is cached per index. The periodic check (`refreshInterval`) runs this in the
+background: the query that notices a new revision answers from the current one instead of waiting (on g4 through a
+25 ms-RTT S3, ~120 ms saved on that query), and the next queries read the new one. New data is visible within
+`refreshInterval` (plus the load), at once after `await refresh()`, or at once on the handle that wrote it.
+
+### `index.warm(keys?, { budget?, concurrency? })`
+
+Reads `keys` (default: every object of the current revision) through the store so its cache holds them: slabs as a
+`fill` read of their scan prefix (the miss policy decides whether the whole slab is cached now or in the
+background), everything else whole, skipping cached keys and stopping slab prefixes / segments at `budget` bytes.
+Returns `{ objects, bytes, skipped }`. To fill a `DiskCache` with a whole revision ahead of time, copy instead:
+`copyObjects(s3, diskCache, snapshotKeys(index.revision))`.
 
 ### `index.close()`
 
@@ -263,14 +287,20 @@ interface BlobStore {
 ```
 
 - `R2BlobStore(bucket)`: the binding (`R2BucketLike`, structural). Conditional puts use `onlyIf`.
-- `S3BlobStore({ endpoint, bucket, region, accessKeyId, secretAccessKey, sessionToken?, pathStyle? })`: plain
-  `fetch` + SigV4 (WebCrypto), single-range GETs, HEAD, PUT with `If-None-Match: *` / `If-Match`, ListObjectsV2.
-  S3 has no multi-range GET, so without a cache in front the rerank reads one range per record run.
-- `CachedBlobStore(inner, cache, { origin, waitUntil, cacheable })`: Cache API in front of any store. Objects
-  under `idx/` are immutable, so they are stored for a year under `${origin}${key}` (`current.json` is never
-  cached). Range requests are answered from the cached full object with a 206 (`multipart/byteranges` for several
-  ranges, parsed by the SDK). A phase-1 miss reads the whole slab (`fill`), caches it in the background and keeps
-  the local winners' rerank records, so phase 2 costs nothing for that slab.
+- `S3BlobStore({ endpoint, bucket, region, accessKeyId, secretAccessKey, sessionToken?, pathStyle?, fetch?, inflight?,
+  coalesceBytes?, spanBytes? })`: plain `fetch` + SigV4 (WebCrypto), single-range GETs, HEAD, PUT with
+  `If-None-Match: *` / `If-Match`, ListObjectsV2. S3 has no multi-range GET, so a rerank read costs one request per
+  record run. The derived signing key is cached per (date, region, service) (`SigningKeyCache`): a request costs
+  one SHA-256 and one HMAC (26 us in Node instead of 130 us). `inflight` defaults to 32 (Node: no connection cap)
+  or 6 inside a Worker. `store.warmup(n)` opens `n` connections with HEADs of `idx/current.json`.
+- `CachedBlobStore(inner, cache, { origin, waitUntil, cacheable, missPolicy, warmConcurrency, warmQueue })`: a cache
+  in front of any store, either the Workers Cache API or an in-process `BlobCache`. Objects under `idx/` are
+  immutable, so they are cached whole (Cache API: for a year under `${origin}${key}`; `current.json` is never
+  cached) and ranges are served from them (the Cache API answers a 206, `multipart/byteranges` for several ranges,
+  parsed by the SDK). A phase-1 miss follows `missPolicy` (next section). `store.drain()` resolves once background
+  warms are done; `store.warmStats` counts them.
+- `MemoryCache(maxBytes = 256 MB)`: an LRU of whole objects in memory (objects over a quarter of it are not kept).
+  A hit is a view into the cached slab, so the query also has that slab's rerank records.
 - `MemoryBlobStore()`: a Map, with etags and conditions (tests, tiny local indexes).
 - `PrefixedBlobStore(inner, prefix)`: what `open({ prefix })` wraps.
 - `PackedBlobStore.open(inner, key)`: the objects of a pack (one file holding a whole snapshot) under their
@@ -279,10 +309,61 @@ interface BlobStore {
 - From `thread-sdk/node` (Node only): `FileBlobStore(root)`, an index in a directory (the layout Python's
   `FileBlobStore` reads and writes; atomic puts, create-only via hard link, CAS under a lock directory);
   `storeAt(path)`, a `FileBlobStore` for a directory or a `PackedBlobStore` for a pack file;
-  `packIndexToFile(store, file, { gen?, rev? })`.
+  `packIndexToFile(store, file, { gen?, rev? })`; `DiskCache(dir, { maxBytes = 4 GB, missPolicy })`, a size-bounded
+  cache of whole objects on disk (next section); `nodeFetch({ keepAliveTimeout, allowH2, connections })`, a `fetch`
+  for `S3BlobStore` with a longer keep-alive.
 
-A store may return views into a larger buffer (the whole object on a miss); the SDK detects that for slab
-prefixes and uses the rest of the object instead of re-reading it.
+### Caches and the cold path
+
+A cold query is one whose slabs are not cached. What its misses read is the cache's **miss policy**:
+
+| `missPolicy` | a slab-prefix miss reads | phase 2 for that slab | right for |
+|---|---|---|---|
+| `"whole"` (Cache API default) | the whole slab (~1.7 MB on g4), cached | free: the winners' records are in memory | a cache many requests share: the edge cache pays the transfer once for everybody |
+| `"range"` | exactly the scan prefix (~200 KB), nothing cached | one range read per record run | no caching at all (measurement, memory-starved processes) |
+| `"range+warm"` (`MemoryCache`/`DiskCache` default) | the prefix now; the whole slab into the cache in the background | one range read per record run | an in-process cache: the first query does not wait for 57 MB, later queries hit |
+
+Background warms are deduplicated, bounded (`warmConcurrency`, default 2, only 1 while foreground reads are in
+flight; `warmQueue` 1024) and handed to `waitUntil`. Reads without `fill` (rerank records, postings) never fetch whole
+objects; `PackedBlobStore` translates every read, whole-object warms included, into a range of the pack (it never
+asks its own store for the pack).
+
+What each runtime gets by default:
+
+| | cache | miss policy | `inflight` | warm-up |
+|---|---|---|---|---|
+| Worker, R2 binding or S3 | Cache API | `"whole"` | 12 | off |
+| Worker, `cache: false`, S3 directly | none | - | 6 | off |
+| Node, `S3BlobStore` | `MemoryCache` 256 MB | `"range+warm"` | 32 | `inflight` connections |
+| Node, `FileBlobStore` / pack file | none | - | 12 | - |
+
+Before this, Node put no cache in front of S3 (`caches` does not exist there), so every query was cold.
+
+**Disk cache.** `new DiskCache(dir)` keeps whole objects as files in the bucket layout (`{dir}/idx/g4/slab/00123`),
+the same layout Python's `DiskCache` uses (the two SDKs can share a directory), evicting least recently used
+objects beyond `maxBytes` (order in memory, and in the files' mtimes across restarts). A process restart is then not
+a cold start. A `DiskCache` is also a `FileBlobStore`, so warming a laptop from a bucket is a copy:
+
+```ts
+import { DiskCache, FileBlobStore } from "thread-sdk/node";
+const disk = new DiskCache("/var/cache/thread", { maxBytes: 8 << 30 });
+await copyObjects(s3, disk, snapshotKeys(index.revision));            // one revision, ~7 GB on g4
+const index = await thread.open({ store: s3, cache: disk });           // or offline: { store: new FileBlobStore(dir), gen, rev }
+```
+
+**Connections.** Node's `fetch` (undici) speaks HTTP/1.1 (no HTTP/2 unless an `Agent` with `allowH2` is used), one
+connection per request in flight, and keeps idle connections for 4 s. A cold query with `inflight` 32 opens up to 32
+connections; `open` warms them while it loads the index (`warmup`) so the first query does not pay 32 TLS
+handshakes. Queries more than 4 s apart reconnect: `new S3BlobStore({ ..., fetch: await nodeFetch({ keepAliveTimeout:
+60_000 }) })` keeps connections for a minute.
+
+**Cold-path policy.** `coldPolicy: { nprobe: 20, rerank: 100 }` (on `open` or per query) scans fewer slabs when most
+probed slabs are not cached (`threshold`, default more than half), trading recall for latency only on cold
+queries; `stats.cold` says whether it applied. Off by default. Residency is known for in-process caches; for the
+Cache API only for keys this isolate has seen, and a store without a cache counts as cold when remote.
+
+A store may return views into a larger buffer (the whole object on a miss or a memory-cache hit); the SDK detects
+that for slab prefixes and uses the rest of the object instead of re-reading it (`stats.wholeSlabs`).
 
 ### Snapshots and packs
 
@@ -308,10 +389,12 @@ directory or a bucket to write on top of it. Format and rationale: [docs/portabi
 
 - The wasm linear memory never shrinks. Routing table 25 MB (4096 x 1536) + codebook 1.5 MB per generation, one
   PqTable (192 x 256 x 4 B) per query, one slab prefix (~200 KB at nprobe 34 on g4) copied into wasm per `scan`
-  call and freed right after. A query holds its prefixes only until scanned; on a cold cache every slab is read
-  whole (~1.7 MB each on g4), so a cold query transfers ~57 MB and keeps ~T x 1.5 KB of rerank records.
-- `inflight` 12 Cache API reads per query is safe; origin (R2/S3) reads beyond 6 in flight may be cancelled by
-  the runtime ("connection limit") and are retried once.
+  call and freed right after. A query holds its prefixes only until scanned; on a cold Cache API (`"whole"`) every
+  slab is read whole (~1.7 MB each on g4), so a cold query transfers ~57 MB and keeps ~T x 1.5 KB of rerank
+  records; with `"range+warm"` it transfers the prefixes and records (~6.5 MB) and the slabs follow in the
+  background into the `MemoryCache` (256 MB holds ~150 g4 slabs).
+- `inflight` 12 Cache API reads per query is safe; origin (R2/S3) reads beyond 6 in flight inside a Worker may be
+  cancelled by the runtime ("connection limit") and are retried once, hence the default of 6 for S3 there.
 - An isolate serving several indexes keeps one base per index; `close()` what you no longer need, or keep one
   `ThreadIndex` per store at module level (the example does).
 - Lexical segments: one wasm `SegmentReader` per segment per isolate holds the container table, section headers
