@@ -7,6 +7,7 @@ if you want to use it.
 | page | what it covers |
 |---|---|
 | [architecture.md](architecture.md) | the design in one sitting: slabs, two tiers, routing, segments, why it is cheap, where the code lives |
+| [cold-start.md](cold-start.md) | cold-start cost against S3 for both SDKs: the `bench/cold/` harness (fake S3 proxy with a network model, benches, packs), the open/query timeline in the SDK stats, the baseline and where the time goes |
 | [benchmarks.md](benchmarks.md) | thread vs Cloudflare Vectorize on dbpedia-openai-1M, generation history, update and compaction numbers, offline diagnostics |
 | [query-path.md](query-path.md) | slab formats, the two-phase query (scan, rerank, speculative reads), caching of revisions and bases, wasm trap recovery, the centroid tree and beam routing |
 | [profiles.md](profiles.md) | the `edge` and `local` layouts, what each knob trades, manifest query defaults and how to change them |

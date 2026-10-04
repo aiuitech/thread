@@ -15,6 +15,10 @@ prep/             dataset -> data/prep/ -> R2 ingest/ (run once)
   update_bench.mjs  upsert / delete / compaction latency and self-retrieval
   split_bench.mjs   splits the largest cells, recall and latency before and after
 
+cold/             cold-start benches of both SDKs against S3 (no Worker): fake_s3.mjs proxy with a network
+                  model, cold_bench.mjs / cold_bench.py, warm-up, packs, run_baseline.sh; see cold/README.md
+                  and docs/cold-start.md
+
 offline/          numpy experiments on local files only (g1 era; data/idx-g1, data/vectors.npy)
   diagnose_recall.py  routing vs quantization recall loss
   quant_experiment.py residual encodings for the scan tier

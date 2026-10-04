@@ -477,7 +477,7 @@ def parent() -> None:
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "w") as f:
             f.write(json.dumps(meta) + "\n")
-    pc = f" (rtt {proxy_config['rttMs']} ms, {proxy_config['mbps']} Mbps, conn +{proxy_config['connMs']} ms, jitter {proxy_config['jitterMs']} ms)" if proxy_config else ""
+    pc = f" (rtt {proxy_config['rttMs']} ms, {proxy_config['mbps']} Mbps, conn +{proxy_config['connMs']} ms, jitter {proxy_config['jitterMs']} ms" + (f", link {proxy_config['linkMbps']} Mbps shared" if proxy_config.get('linkMbps') else "") + ")" if proxy_config else ""
     print(f"cold_bench py store={STORE} {meta['endpoint']}{pc} n={N} queries {meta['queries']['used']}  "
           f"sign_v4 {meta['signUsPerRequest']} us/request ({meta['signUsPerRequestCached']} with the key cache)  "
           f"config {json.dumps(CONFIG)}", flush=True)
