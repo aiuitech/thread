@@ -40,10 +40,24 @@ const dist = path.join(root, "sdk/ts/dist");
 const nowMs = () => performance.now();
 const r1 = (x) => (x === null || x === undefined ? null : Math.round(x * 10) / 10);
 
+/**
+ * Admin calls to the proxy over node:http (imported on first use), never fetch: Node loads its fetch/Response globals
+ * lazily (13-18 ms in a cold process), wasm-bindgen's init touches `Response`, and whoever touches them first pays.
+ * The child makes its first admin call only after `Thread.init`, so that cost stays in `wasmInit` for every store,
+ * as in a real process.
+ */
 async function proxyCall(method, p) {
-	const r = await fetch(PROXY + p, { method });
-	if (!r.ok) throw new Error(`proxy ${method} ${p}: HTTP ${r.status}`);
-	return r.json();
+	const http = await import("node:http");
+	return new Promise((resolve, reject) => {
+		const req = http.request(PROXY + p, { method }, (res) => {
+			let body = "";
+			res.setEncoding("utf8");
+			res.on("data", (d) => (body += d));
+			res.on("end", () => (res.statusCode === 200 ? resolve(JSON.parse(body)) : reject(new Error(`proxy ${method} ${p}: HTTP ${res.statusCode}`))));
+		});
+		req.on("error", reject);
+		req.end();
+	});
 }
 const proxyStats = (s) => (s ? { requests: s.requests, bytes: s.bytes, newConnections: s.newConnections, upstreamFetches: s.upstreamFetches, byStatus: s.byStatus } : null);
 
@@ -54,7 +68,6 @@ async function child() {
 	const spawnAt = Number(args["spawn-at"]);
 	const trial = Number(args.trial);
 	const useProxy = STORE !== "r2s3";
-	if (useProxy) await proxyCall("POST", "/__reset");
 	const ms = { boot: tEntry - spawnAt };
 	let t = nowMs();
 	const sdk = await import(path.join(dist, "index.js"));
@@ -66,6 +79,7 @@ async function child() {
 	ms.wasmCompile = nowMs() - t;
 	const thread = await sdk.Thread.init({ wasmModule });
 	ms.wasmInit = thread.initMs;
+	if (useProxy) await proxyCall("POST", "/__reset"); // nothing above talks to the store
 	const s3 = useProxy
 		? new sdk.S3BlobStore({ endpoint: PROXY, bucket: env.S3_BUCKET ?? "vib-bench", region: "auto", accessKeyId: "fake", secretAccessKey: "fake" })
 		: new sdk.S3BlobStore({ endpoint: env.S3_ENDPOINT, bucket: env.S3_BUCKET, region: "auto", accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY });
@@ -216,7 +230,7 @@ async function parent() {
 		fs.mkdirSync(path.dirname(out), { recursive: true });
 		fs.writeFileSync(out, JSON.stringify(meta) + "\n");
 	}
-	console.log(`cold_bench ts store=${STORE} ${meta.endpoint}${proxyConfig ? ` (rtt ${proxyConfig.rttMs} ms, ${proxyConfig.mbps} Mbps, conn +${proxyConfig.connMs} ms, jitter ${proxyConfig.jitterMs} ms)` : ""} n=${N} queries ${meta.queries.used}  signV4 ${meta.signUsPerRequest} us/request`);
+	console.log(`cold_bench ts store=${STORE} ${meta.endpoint}${proxyConfig ? ` (rtt ${proxyConfig.rttMs} ms, ${proxyConfig.mbps} Mbps, conn +${proxyConfig.connMs} ms, jitter ${proxyConfig.jitterMs} ms${proxyConfig.linkMbps ? `, link ${proxyConfig.linkMbps} Mbps shared` : ""})` : ""} n=${N} queries ${meta.queries.used}  signV4 ${meta.signUsPerRequest} us/request`);
 	for (let t = 0; t < N; t++) {
 		const got = await runChild(t);
 		for (const r of got) {

@@ -93,5 +93,5 @@ const listOk = keysOf(lr2) === keysOf(lpx);
 if (!listOk) bad++;
 rows.push({ key: `idx/${cur.gen}/manifest.17*`, case: "ListObjectsV2", r2: `${lr2.status} ${keysOf(lr2).split(",").length} keys`, proxy: `${lpx.status} ${keysOf(lpx).split(",").length} keys`, match: listOk ? "yes" : "NO" });
 console.table(rows);
-console.log(bad ? `${bad} case(s) differ` : "proxy matches R2 on every must-match case");
+console.log(bad ? `${bad} case(s) differ` : "proxy matches R2 on every case");
 process.exit(bad ? 1 : 0);
