@@ -109,9 +109,13 @@ end - 10      2       flags                u16 = 0
 end - 8       8       magic   "THRDPACK"
 ```
 
-The directory is `{"entries":[[key, offset, length], ...], ...meta}`, entries in the order written (`packIndex`
-writes `idx/current.json` first, then `snapshotKeys` in key order), offsets absolute. `packIndex` records
-`"gen"` and `"rev"` as metadata; `PackWriter` takes any JSON-serializable `meta`. A reader does one `head` for the
+The directory is `{"entries":[[key, offset, length], ...], ...meta}`, entries in the order written, offsets
+absolute. `packIndex` writes `idx/current.json` first, then the objects a cold open reads (`baseKeys`: the
+manifest, slabs table, tombstone sets, `coarse.f32`, `pq.bin`, the centroid tree and the smallest routing table),
+then the rest of `snapshotKeys` in key order, and records `"gen"`, `"rev"` and `"base": [offset, length]`, the
+range from `idx/current.json` to the end of the base objects: opening an index on a `PackedBlobStore` reads that
+range with ONE range read (`PackedBlobStore.readBase` / `read_base`) and serves the open from it, so a cold open of a
+pack in a bucket is head + tail + one range, then the first query; `PackWriter` takes any JSON-serializable `meta`. A reader does one `head` for the
 size, one range read of the last 64 KB (footer and, usually, the whole directory), and a second range read only if
 the directory is larger than that.
 
@@ -128,3 +132,15 @@ a reader must reject a version it does not know.
 A pack and a directory are plain files, so the usual tools work: `rsync -a laptop/idx/ bucket-mirror/`, `aws s3
 sync`, `rclone`. Copy `idx/{gen}/` before `idx/current.json` if readers may open the destination while the copy is
 running, since `current.json` is the only pointer they follow.
+
+## Base packs
+
+A **base pack** is a pack of just what a cold open reads, written per revision by publish / publish-rev next to the
+index: `idx/{gen}/base.{rev}.threadpack` holds the manifest, slabs table, tombstone sets, `coarse.f32`, `pq.bin`,
+the centroid tree and one routing table (default the smallest, `fine.i8`); `idx/{gen}/base.cold.{rev}.threadpack`
+leaves the routing table out, for `coldRouting: "tree"`. Directory metadata `{gen, rev, kind: "base" | "base-cold",
+routing}`. The SDKs know its key from `idx/current.json`, so a cold open is two round trips: `current.json`, then
+one whole GET of the pack (with the manifest read alongside in case there is none). Its objects are byte-identical
+copies of the separate files and keyed by them, so loading from a pack gives the same state as loading the files.
+`buildBasePack` / `build_base_pack` write the same bytes in both SDKs (the interop test checks). Details and
+numbers: [query-path.md](query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs).

@@ -245,7 +245,7 @@ def load_cold_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, beam
     if router.k != k or router.dim != m["dim"] or router.groups != g["groups"] or router.row_bytes != g["rowBytes"]:
         raise ThreadError(f"{g['tree']} (k {router.k}, dim {router.dim}, {router.groups} groups) does not match "
                           f"{g['key']} / the manifest (k {k}, dim {m['dim']}, {g['groups']} groups)")
-    cold = ColdRouting(store, router, g, b)
+    cold = ColdRouting(store, router, g, b, io)
     t2 = time.perf_counter()
     if loaded is not None:
         loaded["stat"] = {**phase_stat((t2 - t0) * 1000, trace), "fetch": round((t1 - t0) * 1000, 3),

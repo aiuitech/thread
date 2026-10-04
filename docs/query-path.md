@@ -67,6 +67,15 @@ freed only in the instance (epoch) that created them. The centroid tree is not p
 that adds or changes a tree reuses the loaded means, and the tree it names is installed (`Searcher.set_tree`)
 right before the query routes.
 
+A cold open (`thread.open` / `open_index`) does not keep a base around: see
+[Cold opens](#cold-opens-compact-routing-cold-tree-routing-base-packs) for the compact routing tables, cold tree
+routing and base packs. None of them changes the base key: it stays `gen|coarse|fine|pq`, where `fine` is the f32
+means the loaded table was made from (`files.fine`), so a revision that adds f16 / i8 tables or a base pack reuses the
+loaded base, and the table variant (`base.routing`) is a loading detail. A cold base (tree + codebook, cold routing)
+is keyed by the base key plus the grouped table's key and is dropped once the full base of the same key is in.
+The open reads through a prefetching view (`PrefetchStore`): with a base pack its objects are served from the pack,
+without one every base object is requested as soon as the manifest is in; the view is dropped after the open.
+
 ## Recovering from a wasm trap
 
 The wasm instance installs a panic hook after init. If a request hits a wasm trap (`WebAssembly.RuntimeError`),
@@ -113,3 +122,99 @@ Beam 8 costs 0.6-0.8 points of recall; beam 16/32 keep recall within 0.2 points 
 measurably (routing is ~1-2 ms of CPU in a 26-34 ms server time spent mostly on Cache API reads, and the 34 probes
 stay the same). So **flat stays the default** (g4 rev 103: `defaults.route: "flat"`, `defaults.beam: 32` for
 queries that ask for `route=beam`); the tree pays on the write path.
+
+## Cold opens: compact routing, cold tree routing, base packs
+
+A fresh process or isolate must get the routing table before its first query can pick cells: `fine.f32` is
+4103 x 1536 f32 = 25.2 MB on g4, and with `pq.bin` (1.5 MB) it was ~60% of a cold first query's time against S3
+([cold-start.md](cold-start.md)). The global table only routes (picks the `nprobe` nearest cells) and gives delta
+segments their base score `q·mean`; every slab carries its own f32 mean, so slab scores never depend on it. Three
+independent levers cut what a cold open must read, all opt-in on the reader and written by publish:
+
+1. **Compact routing tables** (`open({routing})`, `open_index(routing=)`): `fine.f16` (IEEE half, 12.6 MB) or
+   `fine.i8` (6.3 MB: the f32 centre of all means, then per row `[scale f32][i8 * dim]` residuals from it), decoded
+   to f32 once on load (`Searcher.from_table`), so the hot path is unchanged. `"auto"` = the smallest the revision
+   has. Centring matters: cell means share a large common component (|centre| = 0.83 of a mean norm of 0.90 on g4,
+   one dimension at 0.66), and a per-row scale over the raw means spends its 8 bits on it (96.9% probe overlap with
+   f32 routing instead of 99.8%).
+2. **Cold tree routing** (`coldRouting: "tree"`, `coldBeam`): the open loads the centroid tree (0.8 MB) and the
+   codebook only. A query scores the tree's 128 group means, range-reads the rows of its best `beam` groups from the
+   tree-grouped table `fine.grouped.{rev}.i8` (rows in tree member order, so group g is `[dataOff + offsets[g] *
+   rowBytes, +n * rowBytes)`; ~32 cells x 1540 B per group; the first read also brings the table's 23 KB head with
+   the centre) and ranks those groups' cells exactly as `route_beam` does over the full table (`ColdRouter` /
+   `PartialRouter`). Loaded groups stay loaded; delta segments get exact `q·mean` for their cells (their rows read
+   by row). The full table (`routing`) loads in the background and takes over (`routingState`, `whenFullRouting`).
+3. **Base packs** (`basePack`, default on): `idx/{gen}/base.{rev}.threadpack` is a pack of everything a cold open
+   reads (manifest, slabs table, tombstone sets, coarse, codebook, tree, `fine.i8`; 8.8 MB on g4), found by its
+   conventional key from `current.json`'s (gen, rev): the open is `current.json` + one GET (the manifest is read
+   alongside in case there is no pack). `base.cold.{rev}.threadpack` (2.5 MB) leaves the routing table out, for cold
+   routing. An open with `routing` f32 / f16 does not fetch a pack (it would download `fine.i8` for nothing); every
+   open without a pack requests all base objects as soon as the manifest is in (3 round trips instead of 4). An index
+   pack (`packIndex`) now stores these base objects first and records their range, so an open on a `PackedBlobStore`
+   reads it with one range read, after a single suffix-range read for the footer and directory (`getTail`).
+
+### Probe agreement (2000 queries, g4 rev 180, nprobe 34, no slab reads)
+
+`bench/cold/routing_agreement.mjs`: each mode's 34 probed cells against flat routing over `fine.f32`. Overlap =
+mean |cells ∩ f32 cells| / 34; identical = queries with the same set; first cell = the top cell agrees; `q·mean`
+error = what the table changes in a delta entry's base score (over the f32 probes).
+
+| mode | table / bytes read before routing | probe overlap | identical | first cell | `q·mean` error mean / max |
+|---|---|---:|---:|---:|---|
+| flat f32 | `fine.f32` 25.2 MB | 100% | 100% | 100% | 0 |
+| flat f16 | `fine.f16` 12.6 MB | 99.98% | 99.2% | 100% | 7.8e-5 / 1.8e-4 |
+| flat i8 | `fine.i8` 6.3 MB | 99.82% | 93.8% | 99.9% | 6.0e-5 / 6.0e-4 |
+| tree beam 8, f32 means | tree 0.8 MB + 2.0 MB of f32 rows | 90.60% | 22.5% | 99.3% | exact for loaded cells |
+| tree beam 16, f32 means | + 3.9 MB | 95.99% | 44.5% | 99.9% | |
+| tree beam 32, f32 means | + 7.4 MB | 98.81% | 74.8% | 100% | |
+| cold beam 8, i8 rows | tree 0.8 MB + 0.50 MB | 90.57% | 21.3% | 99.2% | as flat i8 |
+| cold beam 16, i8 rows | tree 0.8 MB + 0.97 MB | 95.90% | 41.7% | 99.8% | |
+| cold beam 32, i8 rows | tree 0.8 MB + 1.86 MB | 98.67% | 70.3% | 99.9% | |
+
+(f16 rows route like f32 rows within 0.02 points at every beam, at twice the bytes of i8 rows.) The beam, not the
+row precision, decides cold routing's agreement: beam 8 misses ~3 of 34 cells, beam 32 fewer than 1.
+
+### Bytes and time before the first query (g4 rev 180, fake S3 proxy)
+
+`bench/cold/run_base.sh` (TypeScript SDK, Node, no cache; `cold_bench.mjs` process-cold scenario: spawn, wasm, open,
+one query; n = 10, queries 0..19, medians). The objects of `make_routing.mjs` / `make_base_pack.mjs` are served from
+a local overlay over the proxy's R2 cache; nothing was written to R2. Modes: `-seq` = `basePack: false` (the open's
+reads one after another, as before this change); without the suffix the default `basePack: true` (a base pack for i8
+and cold opens, the files requested together for f32 / f16).
+
+**rtt 25 ms, 200 Mbps per response** (baseline f32 process e2e: 1925 ms, [cold-start.md](cold-start.md))
+
+| mode | requests / MB before the first slab read | open ms | first query ms | process e2e ms | recall@10 (10 queries) |
+|---|---|---:|---:|---:|---:|
+| f32 (`-seq`, as before) | 6 / 25.66 | 1278 | 564 | 1900 | 88% |
+| f32 | 6 / 25.66 | 1251 | 558 | 1881 | 88% |
+| f16 | 6 / 13.64 | 744 | 548 | 1363 | 88% |
+| i8 `-seq` | 6 / 7.65 | 514 | 581 | 1176 | 88% |
+| i8 (base pack) | 2 / 8.42 | 556 | 579 | 1200 | 88% |
+| cold beam 8 (cold pack) | 11 / 2.92 | 276 | 691 | 1030 | 84% |
+| cold beam 16 | 17 / 3.42 | 275 | 697 | 1033 | 87% |
+| cold beam 32 | 28 / 4.27 | 278 | 672 | 1021 | 88% |
+| cold beam 16 `-seq` | 20 / 3.41 | 300 | 677 | 1037 | 87% |
+
+Process e2e, the other profiles (f32-seq / f16 / i8-seq / i8 / cold 8 / 16 / 32, ms): **rtt 60 ms, 100 Mbps**:
+3802 / 2714 / 2281 / 2373 / 2040 / 2043 / 2071; **rtt 25 ms with all responses sharing a 500 Mbps link**:
+1949 / 1413 / 1178 / 1233 / 1077 / 1070 / 1093. **rtt 90 ms, 400 Mbps** (closer to R2 from this host: serial
+requests 75-105 ms, ~380 Mbps per stream), f32-seq / f32 / i8-seq / i8 / cold16 / cold16-seq: open 1313 / 1222 /
+928 / 783 / 626 / 799 ms, process e2e 3051 / 2919 / 2680 / 2538 / 2538 / 2753 ms.
+
+Python SDK (`cold_bench.py`, 256 MB `MemoryCache` default), rtt 25 ms / 200 Mbps: f32-seq open 1247 ms, e2e 1802;
+i8-seq 485 / 1035; i8 (base pack) 479 / 1025; cold16 (cold pack) 213 / 810; cold16-seq 282 / 856.
+
+Reading the numbers:
+
+- The routing table is the cold open: f32 -> i8 cuts 18 MB and ~0.75 s at 200 Mbps (1.5 s at 100 Mbps) off every
+  cold start, for 0.18 points of probe overlap and no measurable recall change (below).
+- Cold tree routing makes the open itself 2.5-3.5 MB and ~0.28 s, but the first query pays one round trip more for
+  its groups (route ~100 ms at rtt 25, ~300 ms at rtt 90) and, at beam 8 / 16, routes slightly worse; the second
+  query already routes with the full table (it was in after ~0.5 s). Best when bandwidth is the limit (rtt 25: e2e
+  1030 vs 1200 ms for i8), no better than i8 + base pack when latency is (rtt 90: 2538 ms both).
+- Base packs save round trips, not bytes: on the per-response bandwidth model at 25-60 ms RTT one 8.4 MB response is
+  ~40 ms slower than six parallel ones, at 90 ms RTT the pack is 145 ms faster (783 vs 928 ms open), and for cold
+  routing it saves 25-170 ms. Against R2 (75-105 ms per serial request) every saved round trip is ~0.1 s.
+- f32 opens do not fetch a base pack: they would download `fine.i8` for nothing (1.61 s instead of 1.28 s open at
+  rtt 25 when they did); they get the "files" prefetch instead (all base objects once the manifest is in, -30 ms).

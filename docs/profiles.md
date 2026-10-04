@@ -36,6 +36,33 @@ slab (7 to 13) and 1.6 KB per record.
 
 The full comparison against Vectorize and the generation history are in [benchmarks.md](benchmarks.md).
 
+## Routing objects and base packs
+
+Publish writes, next to `fine.f32`, the compact routing tables a cold reader can load instead (`fine.f16`, half the
+bytes; `fine.i8`, a quarter: int8 residuals from the means' common centre with one scale per row), the means in
+centroid-tree group order (`fine.grouped.{rev}.i8`, for cold routing; only with a tree) and one **base pack** per
+revision (`base.{rev}.threadpack`: manifest, slabs table, tombstone sets, coarse, codebook, tree and `fine.i8`, 8.8 MB
+on g4; `base.cold.{rev}.threadpack` without the routing table, 2.5 MB). The manifest names them:
+
+```json
+"routing": {"fine": "idx/g4/fine.105.f32",
+            "f16": {"key": "idx/g4/fine.105.f16", "bytes": 12604416},
+            "i8": {"key": "idx/g4/fine.105.i8", "bytes": 6324764},
+            "grouped": {"key": "idx/g4/fine.grouped.180.i8", "tree": "idx/g4/tree.105.bin", "elem": "i8", "groups": 128,
+                        "rows": 4103, "dataOff": 23104, "rowBytes": 1540, "bytes": 6341724}},
+"files": {..., "base": "idx/g4/base.180.threadpack", "baseCold": "idx/g4/base.cold.180.threadpack"}
+```
+
+| publish / publish-rev option | default | writes |
+|---|---|---|
+| `routing: {tables, grouped}` | publish: `{}` (f16 + i8, grouped i8 when there is a tree); publish-rev: none | `fine{.r}.f16`, `fine{.r}.i8`, `fine.grouped.{rev}.{elem}`; `routing: null` removes them; a new tree rebuilds the grouped table, a split commit rewrites all of them for the new means |
+| `basePack: {routing, cold}` | `{}` (the smallest table, and the cold pack when there is a grouped table) | `base.{rev}.threadpack`, `base.cold.{rev}.threadpack` after the commit; `false` = none |
+
+To add them to a generation that has none: `POST /build/publish-rev {"gen": "g4", "routing": {}}` (the base packs
+come with it). Readers choose with `open({routing, coldRouting, basePack})`; what each mode costs and saves, measured
+on g4: [query-path.md](query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs). The query defaults are
+not involved: these objects only change how fast a cold reader gets its routing table.
+
 ## Overriding a profile
 
 Explicit driver flags override the profile (`--m`, `--k2`, `--format`, `--tiers`, `--pqM`, `--pqIters`,

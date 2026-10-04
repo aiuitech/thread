@@ -3,7 +3,7 @@
 # serving data/cold/base-overlay (the objects make_routing.mjs and make_base_pack.mjs wrote for g4 rev 180) over the
 # proxy's R2 cache. Start the proxy first, on a port of its own:
 #   node bench/cold/fake_s3.mjs --port 9761 --overlay data/cold/base-overlay --log data/cold/base-proxy.jsonl
-#   PORT=9761 TAG=base N=10 PROFILE="25 200 0" bench/cold/run_base.sh
+#   PORT=9761 TAG=base N=10 PROFILE="25 200 0" bench/cold/run_base.sh          # SDK=py for the Python SDK
 # PROFILE = "rtt-ms mbps link-mbps" (set on the proxy with /__config for the run); WARM=1 first runs every mode once
 # at full speed so the proxy's cache holds every slab the measured runs touch. Outputs data/cold/$TAG-*.jsonl/.txt.
 set -euo pipefail
@@ -15,6 +15,9 @@ WARM=${WARM:-1}
 read -r RTT MBPS LINK <<<"${PROFILE:-25 200 0}"
 PROXY="http://127.0.0.1:$PORT"
 MODES=${MODES:-"f32-seq f32 f16 i8-seq i8 cold8 cold16 cold32 cold16-seq"}
+SDK=${SDK:-ts}   # ts | py
+PY=${PY:-sdk/python/.venv/bin/python}
+bench() { if [ "$SDK" = ts ]; then node bench/cold/cold_bench.mjs "$@"; else "$PY" bench/cold/cold_bench.py "$@"; fi; }
 args_of() {
 	case $1 in
 	f32-seq) echo "--routing f32 --base-pack 0" ;;
@@ -34,12 +37,12 @@ if [ "$WARM" = 1 ]; then
 	config 0 0 0
 	for m in $MODES; do
 		# shellcheck disable=SC2046
-		node bench/cold/cold_bench.mjs --store proxy --proxy "$PROXY" --n "$N" $(args_of "$m") >/dev/null
+		bench --store proxy --proxy "$PROXY" --n "$N" $(args_of "$m") >/dev/null
 	done
 fi
 config "$RTT" "$MBPS" "$LINK"
 for m in $MODES; do
-	out="data/cold/$TAG-ts-$m-rtt$RTT-$MBPS${LINK:+-link$LINK}"
+	out="data/cold/$TAG-$SDK-$m-rtt$RTT-$MBPS${LINK:+-link$LINK}"
 	# shellcheck disable=SC2046
-	node bench/cold/cold_bench.mjs --store proxy --proxy "$PROXY" --n "$N" --label "$TAG $m rtt$RTT/$MBPS/$LINK" --out "$out.jsonl" $(args_of "$m") | tee "$out.txt"
+	bench --store proxy --proxy "$PROXY" --n "$N" --label "$TAG $m rtt$RTT/$MBPS/$LINK" --out "$out.jsonl" $(args_of "$m") | tee "$out.txt"
 done

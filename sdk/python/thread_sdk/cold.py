@@ -8,7 +8,7 @@ their rows are read the same way, so delta scores match the full table's."""
 from __future__ import annotations
 
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Executor, Future
 from typing import Any, Callable
 
 from . import _native
@@ -37,8 +37,12 @@ def _coalesce(runs: list[tuple[int, int]]) -> list[tuple[int, int]]:
 class ColdRouting:
     """The cold router of one revision's base and the reads that feed it. Thread-safe."""
 
-    def __init__(self, store: BlobStore, router: _native.ColdRouter, ref: dict[str, Any], beam: int) -> None:
+    def __init__(self, store: BlobStore, router: _native.ColdRouter, ref: dict[str, Any], beam: int,
+                 io: Executor | None = None) -> None:
         self.store = store
+        #: Reads of several runs go in parallel on this pool (a store without multi-range requests); the caller is
+        #: never a pool thread itself (queries call in from their own thread).
+        self.io = io
         self.router = router
         self.ref = ref
         self.beam = beam
@@ -58,7 +62,10 @@ class ColdRouting:
         got = self.store.get_ranges(key, ranges, trace=trace) if multi else None
         reads = 1
         if got is None:
-            got = [self.store.get(key, r, trace=trace) for r in ranges]
+            if self.io is not None and len(ranges) > 1 and self.store.remote:
+                got = list(self.io.map(lambda r: self.store.get(key, r, trace=trace), ranges))
+            else:
+                got = [self.store.get(key, r, trace=trace) for r in ranges]
             reads = len(ranges)
         if head:
             h = got[0]
