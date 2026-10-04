@@ -58,7 +58,7 @@ const { hits } = await index.query(embedding, { topK: 10 });     // [{ id, score
 
 // text, vectors, or both (fused by Reciprocal Rank Fusion), with the stored document
 const r = await index.search({ text: "deploy failed", vector: embedding, topK: 10, docs: true });
-// r.hits[0] = { id, score, dense?: { rank, score }, lexical?: { rank, score }, doc?: { id, meta } }
+// r.hits[0] = { id, score, dense?: { rank, score }, lexical?: { rank, score }, doc?: { id, meta, attrs } }
 
 // filter by attributes (named fields packed into each document's 32-bit word; see docs/filtering.md)
 await index.configureAttrs({ tenant: { bits: 12 }, lang: { values: ["en", "fr", "de"] }, public: "bool" });
@@ -80,6 +80,7 @@ from thread_sdk import FileBlobStore, S3BlobStore, open_index
 store = S3BlobStore.r2(account_id, "my-bucket", access_key_id, secret_access_key)   # or FileBlobStore("/data/idx")
 with open_index(store) as index:
     hits = index.query(embedding, top_k=10).hits
+    index.configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr", "de"]}, public="bool")   # once
     r = index.search(text="deploy failed", vector=embedding, top_k=10, docs=True, filter={"tenant": 42})
     index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["A", "B"], attrs=[{"tenant": 42}, {"tenant": 7}])
 ```
@@ -112,6 +113,7 @@ methodology: [docs/benchmarks.md](docs/benchmarks.md).
 | cost, 1M vectors + 10M queries/month | ~$111 | ~$10 | |
 | index size | managed | 5.1 GB in R2 | |
 | upsert of 2000 vectors | | 3.3 s, visible within 30 s | |
+| metadata filtering | indexed properties | fields packed into a 32-bit word, tested inside the scan; selective filters widen the probes | |
 
 Where it is a near drop-in for Vectorize: `query`, `upsert`, `delete`, `topK`, metadata returned per hit, and
 metadata filters (`$eq`, `$ne`, `$in`, `$nin`, `$lt`, `$lte`, `$gt`, `$gte`) over fields packed into a 32-bit
@@ -151,10 +153,13 @@ filters.
 
 ## Status
 
-Version 0.1.0. The query path, the lexical index and hybrid search are tested end to end from both SDKs and the
-Worker, including a cross-check that Python and TypeScript return the same results from the same bucket. The SDK
-write path is marked experimental: it writes the same objects the Worker does, but the two have not yet been
-cross-verified against each other in production. Compaction and GC of slabs run in the Worker only.
+Version 0.1.0. The query path, the lexical index, hybrid search, attribute filtering and packs are tested end to
+end from both SDKs and the Worker, including a cross-check that Python and TypeScript return the same results
+(ids, scores, documents, compiled filters and the cells a filtered query scans) from the same bucket or pack. The
+SDK write path is marked experimental: it writes the same objects the Worker does, but the two have not yet been
+cross-verified against each other in production. Compaction and GC of slabs run in the Worker only. Filtering is
+new in this version: the attribute word is bounded to 32 bits, text queries post-filter through the document
+store, and there is no `$or` ([docs/filtering.md](docs/filtering.md#not-done)).
 
 ## Development
 
