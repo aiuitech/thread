@@ -282,7 +282,9 @@ def execute_query(
         """Reads records `idxs` of one slab: inline for a local store; on the pool as one task trying a multi-range
         request, or, for a store without them, one task per run (in parallel)."""
         runs = coalesce_runs(idxs, rec_len, coalesce_v, span_v)
-        multi = store.supports_ranges and len(runs) > 1
+        # One multi-range request when the store can serve it: not for a remote object a cache in front does not hold
+        # (the miss would fall back to reading the runs one after another inside one task).
+        multi = store.supports_ranges and len(runs) > 1 and not (store.remote and store.contains(slab_keys[cell]) is False)
         if not parallel:
             read_records(cell, rerank_off, rec_len, runs, low, multi)
             return []
