@@ -10,7 +10,8 @@ export const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "
 export const SCHEMA = "thread-cold/1";
 export const SCENARIOS = ["process-cold", "slab-cold", "warm"];
 
-export function parseArgs(argv) {
+/** `--k v` pairs, `--flag` alone (or listed in `booleans`) = "true", everything else in `_`. */
+export function parseArgs(argv, booleans = []) {
 	const out = {};
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
@@ -19,7 +20,7 @@ export function parseArgs(argv) {
 			continue;
 		}
 		const v = argv[i + 1];
-		if (v === undefined || v.startsWith("--")) out[a.slice(2)] = "true";
+		if (v === undefined || v.startsWith("--") || booleans.includes(a.slice(2))) out[a.slice(2)] = "true";
 		else (out[a.slice(2)] = v), i++;
 	}
 	return out;
@@ -164,6 +165,27 @@ export function compare(runs) {
 			if (cells.some((c) => c !== "-")) rows.push([label, ...cells]);
 		}
 		out.push(`== ${s} (medians; recall@10 mean)\n` + table(["metric", ...runs.map((r) => r.name)], rows));
+	}
+	return out.join("\n\n");
+}
+
+/** Markdown tables, one per scenario: a row per metric, a column per run, cells "median / p90" (recall: "mean / min"). */
+export function markdown(runs, scenarios = SCENARIOS) {
+	const out = [];
+	for (const s of scenarios) {
+		const rows = [];
+		for (const [label, get, kind] of METRICS) {
+			const cells = runs.map(({ rows: rs }) => {
+				const xs = rs.filter((r) => r.kind === "trial" && r.scenario === s).map(get).filter((v) => v !== null && v !== undefined);
+				if (!xs.length) return "-";
+				if (kind === "pct") return `${fmtVal(xs.reduce((a, b) => a + b, 0) / xs.length, kind)} / ${fmtVal(Math.min(...xs), kind)}`;
+				const a = fmtVal(median(xs), kind);
+				const b = fmtVal(pct(xs, 0.9), kind);
+				return a === b ? a : `${a} / ${b}`;
+			});
+			if (cells.some((c) => c !== "-")) rows.push(`| ${label.trim()} | ${cells.join(" | ")} |`);
+		}
+		out.push(`**${s}** (median / p90; recall@10: mean / min)\n\n| metric | ${runs.map((r) => r.name).join(" | ")} |\n|---|${runs.map(() => "---:").join("|")}|\n${rows.join("\n")}`);
 	}
 	return out.join("\n\n");
 }
