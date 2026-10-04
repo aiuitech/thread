@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /**
- * Tables for the store-option matrix (bench/cold/run_store.sh): one row per config, per profile and SDK, with the
- * cold (process-cold and slab-cold) and warm query latency, the query's origin requests and bytes (the SDK's own
- * counters: foreground reads only) and what the proxy saw (including background warms), and recall@10.
+ * Tables for the store-option matrix (bench/cold/run_store.sh), markdown: one row per config, per profile and SDK,
+ * with the baseline run of docs/cold-start.md first (data/cold/baseline-{sdk}-proxy-{profile}.jsonl, or -r2s3).
+ * Columns: process-cold e2e and query, slab-cold query (median / p90) with its phase 1 / phase 2 split, the slab-cold
+ * query's requests (phase 1 / phase 2, the SDK's foreground counters), its MB (SDK / what the proxy saw, which
+ * includes background warms), the warm query, and recall@10 over the cold queries.
  *
- *   node bench/cold/store_table.mjs [--dir data/cold-store] [--profiles rtt25,rtt60,r2s3] [--sdks ts,py] [--md]
+ *   node bench/cold/store_table.mjs [--dir data/cold-store] [--profiles rtt25,rtt25link500,rtt60,r2s3] [--sdks ts,py]
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -12,40 +14,44 @@ import { median, parseArgs, pct, root } from "./lib.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const dir = path.resolve(root, args.dir ?? "data/cold-store");
-const profiles = (args.profiles ?? "rtt25,rtt60,r2s3").split(",");
+const profiles = (args.profiles ?? "rtt25,rtt25link500,rtt60,r2s3").split(",");
 const sdks = (args.sdks ?? "ts,py").split(",");
 const MB = 1048576;
-const f1 = (x) => (x === null || x === undefined || Number.isNaN(x) ? "-" : x >= 100 ? x.toFixed(0) : x.toFixed(1));
+const f = (x, d = 0) => (x === null || x === undefined || Number.isNaN(x) ? "-" : x.toFixed(d));
 const order = fs.readFileSync(path.join(root, "bench/cold/run_store.sh"), "utf8").match(/^([a-z0-9-]+)\|/gm).map((s) => s.slice(0, -1));
+const load = (file) => (fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.kind === "trial") : null);
+
+function row(name, recs) {
+	const sc = (s) => recs.filter((r) => r.scenario === s);
+	const m = (s, g) => median(sc(s).map(g).filter((v) => v !== null && v !== undefined));
+	const p = (s, g) => pct(sc(s).map(g).filter((v) => v !== null && v !== undefined), 0.9);
+	const cold = [...sc("process-cold"), ...sc("slab-cold")];
+	const recall = cold.reduce((a, r) => a + r.recall, 0) / cold.length;
+	return [
+		name,
+		f(m("process-cold", (r) => r.ms.e2e)),
+		f(m("process-cold", (r) => r.ms.query)),
+		`${f(m("slab-cold", (r) => r.ms.query))} / ${f(p("slab-cold", (r) => r.ms.query))}`,
+		`${f(m("slab-cold", (r) => r.ms.phase1))} / ${f(m("slab-cold", (r) => r.ms.phase2))}`,
+		`${f(m("slab-cold", (r) => r.reqs.phase1))} / ${f(m("slab-cold", (r) => r.reqs.phase2))}`,
+		`${f(m("slab-cold", (r) => r.bytes.query / MB), 1)} / ${f(m("slab-cold", (r) => (r.proxy ? r.proxy.bytes / MB : null)), 1)}`,
+		f(m("warm", (r) => r.ms.query), 1),
+		`${(100 * recall).toFixed(1)}%`,
+	];
+}
 
 for (const profile of profiles)
 	for (const sdk of sdks) {
 		const rows = [];
+		const base = load(path.join(root, "data/cold", profile === "r2s3" ? `baseline-${sdk}-r2s3.jsonl` : `baseline-${sdk}-proxy-${profile}.jsonl`));
+		if (base) rows.push(row("baseline (docs)", base));
 		for (const name of order) {
-			const file = path.join(dir, `${profile}-${sdk}-${name}.jsonl`);
-			if (!fs.existsSync(file)) continue;
-			const recs = fs.readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((r) => r.kind === "trial");
-			const sc = (s) => recs.filter((r) => r.scenario === s);
-			const m = (s, f) => median(sc(s).map(f).filter((v) => v !== null && v !== undefined));
-			const p = (s, f) => pct(sc(s).map(f).filter((v) => v !== null && v !== undefined), 0.9);
-			const cold = [...sc("process-cold"), ...sc("slab-cold")];
-			const recall = cold.reduce((a, r) => a + r.recall, 0) / cold.length;
-			rows.push([
-				name,
-				`${f1(m("process-cold", (r) => r.ms.query))} / ${f1(p("process-cold", (r) => r.ms.query))}`,
-				`${f1(m("process-cold", (r) => r.ms.e2e))}`,
-				`${f1(m("slab-cold", (r) => r.ms.query))} / ${f1(p("slab-cold", (r) => r.ms.query))}`,
-				`${f1(m("warm", (r) => r.ms.query))} / ${f1(p("warm", (r) => r.ms.query))}`,
-				`${f1(m("slab-cold", (r) => r.reqs.query))}`,
-				`${f1(m("slab-cold", (r) => r.bytes.query / MB))}`,
-				`${f1(m("slab-cold", (r) => r.proxy?.requests))}`,
-				`${f1(m("slab-cold", (r) => (r.proxy ? r.proxy.bytes / MB : null)))}`,
-				`${(100 * recall).toFixed(1)}%`,
-			]);
+			const recs = load(path.join(dir, `${profile}-${sdk}-${name}.jsonl`));
+			if (recs) rows.push(row(name, recs));
 		}
-		if (!rows.length) continue;
-		const header = ["config", "process-cold query med/p90", "e2e med", "slab-cold med/p90", "warm med/p90", "slab-cold req", "slab-cold MB", "proxy req", "proxy MB", "recall@10 (cold)"];
-		console.log(`\n### ${profile}, ${sdk === "ts" ? "TypeScript (Node)" : "Python"}\n`);
+		if (rows.length < 2) continue;
+		const header = ["config", "process-cold e2e", "process-cold query", "slab-cold query med / p90", "slab-cold phase1 / phase2 ms", "slab-cold req phase1 / phase2", "slab-cold MB SDK / proxy", "warm query", "recall@10"];
+		console.log(`\n#### ${profile}, ${sdk === "ts" ? "TypeScript (Node)" : "Python"}\n`);
 		console.log(`| ${header.join(" | ")} |`);
 		console.log(`|${header.map((_, i) => (i ? "---:" : "---")).join("|")}|`);
 		for (const r of rows) console.log(`| ${r.join(" | ")} |`);

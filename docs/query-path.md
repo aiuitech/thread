@@ -67,6 +67,32 @@ freed only in the instance (epoch) that created them. The centroid tree is not p
 that adds or changes a tree reuses the loaded means, and the tree it names is installed (`Searcher.set_tree`)
 right before the query routes.
 
+## Caching and the cold path (SDKs)
+
+The SDKs read through a cache of the immutable index objects: the Workers Cache API in a Worker, an in-process
+`MemoryCache` (or a `DiskCache`, both SDKs, same directory layout) elsewhere. What a phase-1 miss does is the cache's
+**miss policy**:
+
+| policy | a slab-prefix miss reads | phase 2 for that slab | default for |
+|---|---|---|---|
+| `whole` | the whole slab (~1.4 MB median on g4), cached; the local winners' records stay in memory | no request | the Workers Cache API (an edge cache shared by every isolate pays the transfer once) |
+| `range+warm` | the scan prefix (~170 KB) now; the whole slab is fetched into the cache in the background (deduplicated, 2 at a time, 1 while the query's own reads are in flight, `waitUntil` when given) | one range read per record run | `MemoryCache` / `DiskCache` (an in-process cache: the first query does not wait for 8x the bytes) |
+| `range` | the prefix, nothing cached | one range read per record run | - |
+
+Phase 2 reads the winners' records from the store when phase 1 read only the prefix (`stats.wholeSlabs` counts the
+slabs whose records were local, `stats.io.warms` the background fetches a query queued). Against S3 (no multi-range
+GET) each record run is one request, so the store's knobs matter: `inflight` (reads in flight per query: 12 for the
+Cache API, 32 against S3 from Node or Python, 6 against S3 inside a Worker), `coalesceBytes` (records of one slab
+merged into runs of up to this many bytes: 128 KB for `S3BlobStore`, 4 KB elsewhere) and `spanBytes` (one range
+from a slab's first to last wanted record when the span is at most this; off by default). `S3BlobStore` also splits
+whole-object GETs above 8 MiB into 4 parallel range GETs (the 25 MB routing table), caches its SigV4 signing key per
+day, and `open` warms its connections. An opt-in `coldPolicy: {nprobe, rerank, threshold}` lowers nprobe/rerank for
+a query whose probed slabs are mostly not cached. When `refresh()` (or the periodic `current.json` check, which now
+runs in the background) sees a new revision, it loads the new manifest, slabs table, tombstones, base files (if they
+changed) and delta segments before switching, then warms the rest of `snapshotKeys(new) - snapshotKeys(old)` into the
+cache (slabs as prefixes, within `prefetchBytes`). Measurements of every option against the baseline:
+[cold-start.md](cold-start.md#store-level-optimizations).
+
 ## Recovering from a wasm trap
 
 The wasm instance installs a panic hook after init. If a request hits a wasm trap (`WebAssembly.RuntimeError`),
