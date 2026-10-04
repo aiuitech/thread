@@ -10,8 +10,8 @@
  */
 import type { BlobRange, BlobStore, BlobTrace } from "./store.js";
 import { newTrace } from "./store.js";
-import type * as W from "./wasm/vib.js";
-import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, VibError, type DeltaRef, type Manifest, type SlabRow, type TombState, type IndexFiles } from "./wire.js";
+import type * as W from "./wasm/thread.js";
+import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SlabRow, type TombState, type IndexFiles } from "./wire.js";
 
 export interface QueryOptions {
 	/** Results to return (default 10). */
@@ -200,15 +200,15 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const { w, store, rev, base } = ctx;
 	const { manifest, gen, format, tomb, deltas } = rev;
 	const tStart = Date.now();
-	if (qRaw.length !== manifest.dim) throw new VibError(`query dim ${qRaw.length} != index dim ${manifest.dim}`, 400);
+	if (qRaw.length !== manifest.dim) throw new ThreadError(`query dim ${qRaw.length} != index dim ${manifest.dim}`, 400);
 	const k = o.topK ?? 10;
-	if (!Number.isInteger(k) || k < 1) throw new VibError("topK must be an integer >= 1", 400);
+	if (!Number.isInteger(k) || k < 1) throw new ThreadError("topK must be an integer >= 1", 400);
 	const defaults = manifest.defaults ?? { nprobe: 1, rerank: 32, pc: 0 };
 	const src = (v: number | undefined): ParamSource => (v !== undefined ? "query" : manifest.defaults ? "manifest" : "legacy");
 	const nprobe = o.nprobe ?? defaults.nprobe;
 	const pc = o.pc ?? defaults.pc;
 	const rerankParam = o.rerank ?? defaults.rerank;
-	for (const [name, v, min] of [["nprobe", nprobe, 1], ["pc", pc, 0], ["rerank", rerankParam, 0]] as const) if (!Number.isInteger(v) || v < min) throw new VibError(`${name} must be an integer >= ${min}`, 400);
+	for (const [name, v, min] of [["nprobe", nprobe, 1], ["pc", pc, 0], ["rerank", rerankParam, 0]] as const) if (!Number.isInteger(v) || v < min) throw new ThreadError(`${name} must be an integer >= ${min}`, 400);
 	const params: QueryParams = { topK: k, nprobe, rerank: rerankParam, pc, source: { nprobe: src(o.nprobe), rerank: src(o.rerank), pc: src(o.pc) } };
 	const speculate = o.speculate ?? true;
 	const dim = manifest.dim;
@@ -231,7 +231,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const tRoute = Date.now();
 
 	const packed: Uint8Array[] = [];
-	/** Best scan-tier copy per id (the rule vib.merge applies), remembering where it lives. */
+	/** Best scan-tier copy per id (the rule thread.merge applies), remembering where it lives. */
 	const cand = new Map<number, Cand>();
 	/** Rerank records of local winners from slabs that were read whole: `${cell}:${idx}`. */
 	const local = new Map<string, Uint8Array>();
@@ -280,7 +280,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			runs.map(async (run) => {
 				const r = rangeOf(run);
 				const bytes = await lim.read(() => store.get(si.key, r, { trace }), low);
-				if (!bytes) throw new VibError(`missing slab ${si.key}`, 404);
+				if (!bytes) throw new ThreadError(`missing slab ${si.key}`, 404);
 				rerankReads++;
 				if (low) specReadN++;
 				rerankBytes += r.length;
@@ -315,16 +315,16 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		if (!rev.slabs) {
 			const key = keys.slab(gen, cell);
 			const buf = await lim.read(() => store.get(key, undefined, { trace }));
-			if (!buf) throw new VibError(`missing slab ${key}`, 404);
+			if (!buf) throw new ThreadError(`missing slab ${key}`, 404);
 			return { prefix: buf, full: buf, key, slabRev: 0 };
 		}
 		const meta = rev.slabs[cell];
-		if (!meta) throw new VibError(`${rev.files.slabs} has no entry for cell ${cell}`);
+		if (!meta) throw new ThreadError(`${rev.files.slabs} has no entry for cell ${cell}`);
 		const slabRev = slabRevOf(meta);
 		const key = keys.slab(gen, cell, slabRev);
 		const scanLen = meta[0];
 		const bytes = await lim.read(() => store.get(key, { offset: 0, length: scanLen }, { trace, fill: true }));
-		if (!bytes) throw new VibError(`missing slab ${key}`, 404);
+		if (!bytes) throw new ThreadError(`missing slab ${key}`, 404);
 		// A store that fetched the whole object (cache miss, or a 200 to a Range request) returns a view into it.
 		const full = bytes.byteOffset === 0 && bytes.buffer.byteLength === meta[3] && meta[3] > scanLen ? new Uint8Array(bytes.buffer) : null;
 		return { prefix: bytes, full, key, slabRev };
@@ -342,7 +342,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			const scanStats = new Uint32Array(2);
 			let hits: Uint8Array;
 			if (hdr.version === 3) {
-				if (!table) throw new VibError(`slab ${cell} is v3 but ${gen} has no PQ codebook`);
+				if (!table) throw new ThreadError(`slab ${cell} is v3 but ${gen} has no PQ codebook`);
 				hits = w.scan_pq(prefix, table, q, T, tombs, scanStats);
 			} else hits = w.scan(prefix, q, T, tombs, scanStats);
 			tombDropped += scanStats[1];
@@ -351,7 +351,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			packed.push(hits);
 			const rerankable = doRerank && hdr.version >= 2;
 			if (rerankable) {
-				if (hdr.recLen !== 4 + dim) throw new VibError(`slab ${cell}: rerank record length ${hdr.recLen} != ${4 + dim}`);
+				if (hdr.recLen !== 4 + dim) throw new ThreadError(`slab ${cell}: rerank record length ${hdr.recLen} != ${4 + dim}`);
 				slabInfo.set(cell, { centroid: slabCentroid(prefix, hdr), rerankOff: hdr.rerankOff, recLen: hdr.recLen, payloadOff: hdr.payloadOff, key });
 			}
 			for (const h of parseHits(hits)) {
@@ -413,7 +413,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			const byCell = new Map<number, { id: number; idx: number }[]>();
 			for (const h of merged) {
 				const c = cand.get(h.id);
-				if (!c) throw new VibError(`merge returned unknown id ${h.id}`);
+				if (!c) throw new ThreadError(`merge returned unknown id ${h.id}`);
 				let list = byCell.get(c.cell);
 				if (!list) byCell.set(c.cell, (list = []));
 				list.push({ id: h.id, idx: c.idx });
@@ -527,7 +527,7 @@ async function fetchPayloads(top: (Hit & { cand?: Cand })[], slabInfo: Map<numbe
 			continue;
 		}
 		const si = slabInfo.get(c.cell);
-		if (!si) throw new VibError(`payload of id ${h.id}: slab ${c.cell} was read without its layout`);
+		if (!si) throw new ThreadError(`payload of id ${h.id}: slab ${c.cell} was read without its layout`);
 		let l = bySlab.get(si.key);
 		if (!l) bySlab.set(si.key, (l = []));
 		l.push({ hit: h, range: { offset: si.payloadOff + c.payloadOff, length: c.payloadLen } });
@@ -538,7 +538,7 @@ async function fetchPayloads(top: (Hit & { cand?: Cand })[], slabInfo: Map<numbe
 			const got = (store.getRanges && items.length > 1 ? await lim.read(() => store.getRanges!(key, ranges, { trace })) : null) ?? (await Promise.all(ranges.map((r) => lim.read(() => store.get(key, r, { trace })))));
 			items.forEach((it, i) => {
 				const b = got[i];
-				if (!b) throw new VibError(`missing slab ${key}`, 404);
+				if (!b) throw new ThreadError(`missing slab ${key}`, 404);
 				it.hit.payload = b.slice();
 			});
 		}),

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/vib-core", "crates/vib-wasm", "crates/vib-cli"]
+members = ["crates/thread-core", "crates/thread-wasm", "crates/thread-cli"]
 
 [workspace.package]
 version = "0.1.0"

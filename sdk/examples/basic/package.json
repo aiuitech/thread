@@ -1,5 +1,5 @@
 {
-	"name": "vib-sdk-example",
+	"name": "thread-sdk-example",
 	"private": true,
 	"type": "module",
 	"scripts": {
@@ -9,7 +9,7 @@
 		"typecheck": "cf workers types && tsc"
 	},
 	"dependencies": {
-		"vib-sdk": "file:../.."
+		"thread-sdk": "file:../.."
 	},
 	"devDependencies": {
 		"@cloudflare/vite-plugin": "beta",

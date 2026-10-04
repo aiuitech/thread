@@ -4,7 +4,7 @@
  * Everything except the forwarding below is src/index.ts (`app`): queries, upserts/deletes and every build stage.
  * Heavy work does not run in the isolates that serve queries. It runs in dynamic Workers (Worker Loader binding),
  * one per *slot*: `/build/<stage>?slot=N` and the write routes are forwarded to the dynamic Worker
- * `vib-build:<bundle hash>:slot-<N>`, which runs the same code (a second bundle of src/index.ts, see vite.config.ts)
+ * `thread-build:<bundle hash>:slot-<N>`, which runs the same code (a second bundle of src/index.ts, see vite.config.ts)
  * in its own isolate with its own 128 MB and `limits.cpuMs` 300,000. Each slot id is one isolate: send at most one
  * job at a time per slot (bench/driver.mjs keeps a free list of slot ids). Concurrent requests to one slot share its
  * 128 MB, which is exactly the failure the old vib-bench-0..7 pool existed to avoid.
@@ -14,7 +14,7 @@
  *                              never lands in a query isolate (wasm memory never shrinks); `?slot=local` runs here
  *   everything else            this isolate (app.fetch)
  *
- * Slot ids in use: driver and bench/compact.mjs jobs `0`..`N-1` (VIB_SLOTS), compact.mjs commit/plan `admin`,
+ * Slot ids in use: driver and bench/compact.mjs jobs `0`..`N-1` (THREAD_SLOTS), compact.mjs commit/plan `admin`,
  * writes `writer`, automatic compaction slices `auto-0`..`auto-3` (dispatched from the writer through SlotRpc).
  *
  * R2 cannot be passed into a dynamic Worker's env (DataCloneError), so slots get `BUCKET_RPC` (BucketRpc below,
@@ -23,8 +23,8 @@
  * plus length and go to R2 through a FixedLengthStream, so this isolate never holds a whole object.
  */
 import { WorkerEntrypoint } from "cloudflare:workers";
-import wasmModule from "../pkg/vib_bg.wasm";
-import stageBundle from "virtual:vib-stage-bundle";
+import wasmModule from "../pkg/thread_bg.wasm";
+import stageBundle from "virtual:thread-stage-bundle";
 import app from "./index.ts";
 
 interface Env {
@@ -185,14 +185,14 @@ export default {
 
 /** The dynamic Worker of `slot` (created on first use; the loader caches it by id, the id includes the bundle hash). */
 function slotStub(env: Env, ctx: ExecutionContext, slot: string, loaded?: { cold: boolean }): WorkerStub {
-	return env.LOADER.get(`vib-build:${stageBundle.hash}:slot-${slot}`, () => {
+	return env.LOADER.get(`thread-build:${stageBundle.hash}:slot-${slot}`, () => {
 		if (loaded) loaded.cold = true;
 		const exp = loopback(ctx);
 		return {
 			compatibilityDate: COMPAT_DATE,
 			mainModule: "shim.js",
 			modules: { "shim.js": SLOT_SHIM, "bundle.js": stageBundle.source, [stageBundle.wasmPath]: wasmModule },
-			env: { BUILD_TOKEN: env.BUILD_TOKEN, VIB_SLOT: slot, BUCKET_RPC: exp.BucketRpc({ props: {} }), SLOTS: exp.SlotRpc({ props: {} }) },
+			env: { BUILD_TOKEN: env.BUILD_TOKEN, THREAD_SLOT: slot, BUCKET_RPC: exp.BucketRpc({ props: {} }), SLOTS: exp.SlotRpc({ props: {} }) },
 			limits: { cpuMs: SLOT_CPU_MS },
 		} as WorkerLoaderWorkerCode;
 	});
@@ -209,7 +209,7 @@ export class SlotRpc extends WorkerEntrypoint<Env> {
 	async stage(slot: string, stage: string, body: unknown): Promise<{ status: number; data: any }> {
 		if (!SLOT_RE.test(slot) || slot === "local") throw new Error(`bad slot ${slot}`);
 		try {
-			const req = new Request(`https://vib-slot/build/${stage}`, {
+			const req = new Request(`https://thread-slot/build/${stage}`, {
 				method: "POST",
 				headers: { authorization: `Bearer ${this.env.BUILD_TOKEN}`, "content-type": "application/json" },
 				body: JSON.stringify(body),

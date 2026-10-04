@@ -5,7 +5,7 @@ import * as entrypoint from "./src/main.ts" with { type: "cf-worker" };
 // (LOADER, one isolate per slot id; see src/main.ts), which replaced the vib-bench-0..7 pool.
 export default defineConfig({
 	worker: {
-		name: process.env.VIB_WORKER_NAME ?? "vib-bench",
+		name: process.env.THREAD_WORKER_NAME ?? "vib-bench",
 		compatibilityDate: "2026-10-01",
 		entrypoint,
 		// Build stages are CPU heavy; the Paid plan allows up to 5 minutes (slots set the same limit explicitly).

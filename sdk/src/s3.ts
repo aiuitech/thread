@@ -6,7 +6,7 @@
  * per rerank range (put a `CachedBlobStore` in front for multi-range reads from the edge cache).
  */
 import type { BlobHead, BlobRange, BlobStore, GetOptions, PutOptions } from "./store.js";
-import { VibError } from "./wire.js";
+import { ThreadError } from "./wire.js";
 
 export interface S3BlobStoreOptions {
 	/** `https://<account>.r2.cloudflarestorage.com`, `https://s3.us-east-1.amazonaws.com`, `http://localhost:9000`, ... */
@@ -111,7 +111,7 @@ export class S3BlobStore implements BlobStore {
 		this.fetchFn = opts.fetch ?? ((input, init) => fetch(input, init));
 		this.retries = opts.retries ?? 1;
 		this.now = opts.now ?? Date.now;
-		if (!opts.accessKeyId || !opts.secretAccessKey) throw new VibError("S3BlobStore needs accessKeyId and secretAccessKey", 400);
+		if (!opts.accessKeyId || !opts.secretAccessKey) throw new ThreadError("S3BlobStore needs accessKeyId and secretAccessKey", 400);
 	}
 
 	/** Host and canonical path of an object (or of the bucket when `key` is empty). */
@@ -134,7 +134,7 @@ export class S3BlobStore implements BlobStore {
 				const r = await this.fetchFn(url, { method, headers: signedHeaders, body: body ? (body as Uint8Array<ArrayBuffer>) : undefined });
 				if (r.status >= 500 && attempt < this.retries && method !== "PUT") {
 					await r.body?.cancel();
-					lastErr = new VibError(`S3 ${method} ${key}: HTTP ${r.status}`, r.status);
+					lastErr = new ThreadError(`S3 ${method} ${key}: HTTP ${r.status}`, r.status);
 					continue;
 				}
 				return r;
@@ -142,12 +142,12 @@ export class S3BlobStore implements BlobStore {
 				lastErr = e;
 			}
 		}
-		throw lastErr instanceof Error ? lastErr : new VibError(`S3 ${method} ${key} failed: ${String(lastErr)}`);
+		throw lastErr instanceof Error ? lastErr : new ThreadError(`S3 ${method} ${key} failed: ${String(lastErr)}`);
 	}
 
 	private async fail(r: Response, what: string): Promise<never> {
 		const text = (await r.text().catch(() => "")).slice(0, 300);
-		throw new VibError(`S3 ${what}: HTTP ${r.status} ${text}`, r.status === 403 ? 403 : 502);
+		throw new ThreadError(`S3 ${what}: HTTP ${r.status} ${text}`, r.status === 403 ? 403 : 502);
 	}
 
 	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
@@ -165,7 +165,7 @@ export class S3BlobStore implements BlobStore {
 		}
 		if (range) {
 			if (r.status === 200) b = b.subarray(range.offset, range.offset + range.length); // Range ignored
-			if (b.byteLength !== range.length) throw new VibError(`${key} [${range.offset}, +${range.length}): got ${b.byteLength} bytes`);
+			if (b.byteLength !== range.length) throw new ThreadError(`${key} [${range.offset}, +${range.length}): got ${b.byteLength} bytes`);
 		}
 		return b;
 	}
@@ -174,7 +174,7 @@ export class S3BlobStore implements BlobStore {
 		const r = await this.send("HEAD", key, {});
 		await r.body?.cancel();
 		if (r.status === 404) return null;
-		if (!r.ok) throw new VibError(`S3 HEAD ${key}: HTTP ${r.status}`, 502);
+		if (!r.ok) throw new ThreadError(`S3 HEAD ${key}: HTTP ${r.status}`, 502);
 		return { size: Number(r.headers.get("content-length") ?? 0), etag: stripQuotes(r.headers.get("etag")) };
 	}
 
@@ -191,7 +191,7 @@ export class S3BlobStore implements BlobStore {
 		const r = await this.send("PUT", key, headers, body);
 		await r.body?.cancel();
 		if (r.status === 412 || r.status === 409) return null;
-		if (!r.ok) throw new VibError(`S3 PUT ${key}: HTTP ${r.status}`, 502);
+		if (!r.ok) throw new ThreadError(`S3 PUT ${key}: HTTP ${r.status}`, 502);
 		return { size: body.byteLength, etag: stripQuotes(r.headers.get("etag")) };
 	}
 

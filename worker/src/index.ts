@@ -8,7 +8,7 @@
  *
  * The deployed entry is src/main.ts: it serves queries with this module and forwards build stages and writes to
  * dynamic "slot" Workers (Worker Loader) that run a second bundle of this same module (vite.config.ts), each in
- * its own isolate. In a slot, env.BUCKET is an R2Bucket-shaped shim over RPC, env.VIB_SLOT names the slot, and
+ * its own isolate. In a slot, env.BUCKET is an R2Bucket-shaped shim over RPC, env.THREAD_SLOT names the slot, and
  * env.SLOTS (also given to ?slot=local requests) lets the automatic compaction spread its cells over other slots.
  *
  * R2 key layout:
@@ -44,8 +44,8 @@
  * (defaults: {nprobe, rerank, pc, route?}) that /query uses for absent parameters, the centroid tree (tree: {key,
  * groups, beam, ...}) and, from rev 1 on, its files, deltas and tombstone sets. See docs/update-path.md.
  */
-import wasmModule from "../pkg/vib_bg.wasm";
-import init, * as vib from "../pkg/vib.js";
+import wasmModule from "../pkg/thread_bg.wasm";
+import init, * as thread from "../pkg/thread.js";
 
 interface Env {
 	BUCKET: R2Bucket;
@@ -53,7 +53,7 @@ interface Env {
 	/** Runs a stage in another dynamic slot (src/main.ts SlotRpc); absent when this module runs on its own. */
 	SLOTS?: SlotsRpc;
 	/** The slot this isolate is (absent: the orchestrator / query isolate). */
-	VIB_SLOT?: string;
+	THREAD_SLOT?: string;
 }
 
 interface SlotsRpc {
@@ -68,11 +68,11 @@ let wasmReady: Promise<unknown> | null = null;
 let wasmEpoch = 0;
 let wasmResets = 0;
 /** Raw wasm exports (for the wasm memory size reported in query stats). */
-let wasmRaw: vib.InitOutput | null = null;
+let wasmRaw: thread.InitOutput | null = null;
 function initWasm(): Promise<unknown> {
 	return init({ module_or_path: wasmModule }).then((w) => {
 		wasmRaw = w;
-		vib.init_panic_hook();
+		thread.init_panic_hook();
 	});
 }
 function ensureWasm(): Promise<unknown> {
@@ -94,7 +94,7 @@ function resetWasm(reason: unknown) {
 	wasmResets++;
 	wasmEpoch++;
 	console.error(`wasm trap, resetting instance (reset #${wasmResets}): ${reason instanceof Error ? `${reason.message}\n${reason.stack ?? ""}` : String(reason)}`);
-	vib.__wbg_reset_state();
+	thread.__wbg_reset_state();
 	// init() returns the new instance's exports once the glue holds an instance.
 	const p = initWasm();
 	wasmReady = p;
@@ -292,7 +292,7 @@ async function stageKmeansFlat(env: Env, body: KmeansFlatReq) {
 	const epoch = wasmEpoch;
 	const { centroidsKey, inputKeys, k, dim, outKey } = body;
 	const prev = await getF32(env.BUCKET, centroidsKey);
-	const job = new vib.FlatKmeansJob(dim, k, prev);
+	const job = new thread.FlatKmeansJob(dim, k, prev);
 	let vectors = 0;
 	const bytes = await streamObjects(env.BUCKET, inputKeys, 2, (b) => {
 		vectors += job.add_batch(new Float32Array(b));
@@ -317,7 +317,7 @@ interface InitFineReq {
 async function stageInitFine(env: Env, body: InitFineReq) {
 	await ensureWasm();
 	const { coarseKey, sampleKeys, k1, k2, dim, seed, outKey } = body;
-	const job = new vib.FineInitJob(dim, k1, k2, await getF32(env.BUCKET, coarseKey), seed >>> 0);
+	const job = new thread.FineInitJob(dim, k1, k2, await getF32(env.BUCKET, coarseKey), seed >>> 0);
 	let vectors = 0;
 	await streamObjects(env.BUCKET, sampleKeys, 1, (b) => {
 		vectors += job.add_batch(new Float32Array(b));
@@ -389,7 +389,7 @@ async function stageKmeansTreeMap(env: Env, body: KmeansTreeMapReq) {
 	// Centroid buffers are scoped so the JS copies are collectable once wasm owns them.
 	const job = await (async () => {
 		const [coarse, fine] = await Promise.all([getF32(env.BUCKET, coarseKey), getF32(env.BUCKET, fineKey)]);
-		return new vib.TreeKmeansJob(dim, k1, k2, coarse, fine, probeCoarse);
+		return new thread.TreeKmeansJob(dim, k1, k2, coarse, fine, probeCoarse);
 	})();
 	let vectors = 0;
 	const writes: Promise<void>[] = [];
@@ -445,7 +445,7 @@ async function stageKmeansIncMap(env: Env, body: KmeansIncMapReq) {
 		const [means, neighbors] = await Promise.all([getF32(env.BUCKET, fineKey), getU32(env.BUCKET, neighborsKey)]);
 		if (means.length !== k * dim) throw new HttpError(400, `${fineKey} has ${means.length / dim} means, expected ${k}`);
 		if (neighbors.length !== k * nNeigh) throw new HttpError(400, `${neighborsKey} has ${neighbors.length} ids, expected ${k}x${nNeigh}`);
-		return new vib.IncKmeansJob(dim, k, means, neighbors, nNeigh);
+		return new thread.IncKmeansJob(dim, k, means, neighbors, nNeigh);
 	})();
 	let vectors = 0;
 	let changed = 0;
@@ -494,7 +494,7 @@ async function stageCellNeighbors(env: Env, body: CellNeighborsReq) {
 	const rows = await (async () => {
 		const means = await getF32(env.BUCKET, fineKey);
 		if (means.length !== k * dim) throw new HttpError(400, `${fineKey} has ${means.length / dim} means, expected ${k}`);
-		return vib.cell_neighbors(means, dim, first, count, n);
+		return thread.cell_neighbors(means, dim, first, count, n);
 	})();
 	await putBytes(env.BUCKET, outKey, rows);
 	return { outKey, first, count, n, bytes: rows.byteLength };
@@ -517,8 +517,8 @@ async function stageKmeansReduce(env: Env, body: KmeansReduceReq) {
 	await ensureWasm();
 	const epoch = wasmEpoch;
 	const { partialKeys, prevFineKey, dim, firstCell, nCells, outKey } = body;
-	const [off, len] = vib.accum_record_range(dim, firstCell, nCells);
-	const reducer = new vib.Reducer(nCells, dim);
+	const [off, len] = thread.accum_record_range(dim, firstCell, nCells);
+	const reducer = new thread.Reducer(nCells, dim);
 	const prevPromise = getF32(env.BUCKET, prevFineKey, { offset: firstCell * dim * 4, length: nCells * dim * 4 });
 	const bytes = await streamObjects(
 		env.BUCKET,
@@ -585,7 +585,7 @@ interface PqResidualsReq {
 
 /**
  * PQ training residuals: for each shard, the first `perShard` vectors minus the mean of their final
- * k-means cell (`vib.residuals_for`), concatenated (f32 LE) into outKey. Also reports the residual
+ * k-means cell (`thread.residuals_for`), concatenated (f32 LE) into outKey. Also reports the residual
  * energy (mean squared norm), the reference for the PQ mean_sq_err.
  */
 async function stagePqResiduals(env: Env, body: PqResidualsReq) {
@@ -610,7 +610,7 @@ async function stagePqResiduals(env: Env, body: PqResidualsReq) {
 		// The last shard may hold fewer than perShard vectors.
 		const n = Math.min(v.length / dim, a.length);
 		for (let x = 0; x < n; x++) if (a[x] >= k) throw new HttpError(500, `shard ${shards[i].index}: cell ${a[x]} >= k ${k}`);
-		const r = vib.residuals_for(v.subarray(0, n * dim), means, a.subarray(0, n), dim);
+		const r = thread.residuals_for(v.subarray(0, n * dim), means, a.subarray(0, n), dim);
 		for (let x = 0; x < r.length; x++) sumSq += r[x] * r[x];
 		out.set(r, rows * dim);
 		rows += n;
@@ -640,8 +640,8 @@ async function stagePqInit(env: Env, body: PqInitReq) {
 		o += p.byteLength / 4;
 	}
 	parts.length = 0;
-	const codebook = vib.pq_init_codebook(res, dim, m, seed >>> 0);
-	const info = vib.pq_codebook_info(codebook);
+	const codebook = thread.pq_init_codebook(res, dim, m, seed >>> 0);
+	const info = thread.pq_codebook_info(codebook);
 	await putBytes(env.BUCKET, outKey, codebook);
 	return { outKey, rows: res.length / dim, bytes: codebook.byteLength, info: Array.from(info) };
 }
@@ -659,7 +659,7 @@ async function stagePqTrainMap(env: Env, body: PqTrainMapReq) {
 	await ensureWasm();
 	const epoch = wasmEpoch;
 	const { codebookKey, residualKeys, dim, m, outKey } = body;
-	const job = new vib.PqTrainJob(dim, m, new Uint8Array(await getBuffer(env.BUCKET, codebookKey)));
+	const job = new thread.PqTrainJob(dim, m, new Uint8Array(await getBuffer(env.BUCKET, codebookKey)));
 	try {
 		const bytes = await streamObjects(env.BUCKET, residualKeys, 1, (b) => {
 			job.add_residuals(new Float32Array(b));
@@ -685,7 +685,7 @@ async function stagePqTrainReduce(env: Env, body: PqTrainReduceReq) {
 	await ensureWasm();
 	const epoch = wasmEpoch;
 	const { partialKeys, prevCodebookKey, dim, m, outKey } = body;
-	const reducer = new vib.PqReducer(dim, m);
+	const reducer = new thread.PqReducer(dim, m);
 	try {
 		const prevPromise = getBuffer(env.BUCKET, prevCodebookKey);
 		const bytes = await streamObjects(env.BUCKET, partialKeys, 4, (b) => reducer.add_partial(new Uint8Array(b)));
@@ -744,10 +744,10 @@ async function stageAssign(env: Env, body: AssignReq) {
 		if (candidates) {
 			const [fine, neighbors] = await Promise.all([getF32(env.BUCKET, fineKey), getU32(env.BUCKET, neighborsKey!)]);
 			if (neighbors.length !== k2 * nNeigh!) throw new HttpError(400, `${neighborsKey} has ${neighbors.length} ids, expected ${k2}x${nNeigh}`);
-			return vib.AssignJob.with_candidates(dim, k2, fine, neighbors, nNeigh!, m);
+			return thread.AssignJob.with_candidates(dim, k2, fine, neighbors, nNeigh!, m);
 		}
 		const [coarse, fine] = await Promise.all([getF32(env.BUCKET, coarseKey), getF32(env.BUCKET, fineKey)]);
-		return new vib.AssignJob(dim, k1, k2, coarse, fine, probeCoarse, m);
+		return new thread.AssignJob(dim, k1, k2, coarse, fine, probeCoarse, m);
 	})();
 	if (codebookKey) {
 		try {
@@ -857,15 +857,15 @@ async function stageFinalize(env: Env, body: FinalizeReq) {
 	}
 	const first = js[0];
 	const count = js.length;
-	const dirLen = vib.part_directory_len(k2);
+	const dirLen = thread.part_directory_len(k2);
 
 	// Pass 1: directories. Keep per part only the chunk's span and its cells' [off, len].
 	const tDir = Date.now();
 	const [dirs, means] = await Promise.all([
 		pmap(partKeys, conc, async (key) => {
-			const d = vib.part_directory(new Uint8Array(await getBuffer(env.BUCKET, key, { offset: 0, length: dirLen })));
+			const d = thread.part_directory(new Uint8Array(await getBuffer(env.BUCKET, key, { offset: 0, length: dirLen })));
 			if (d[0] !== k2 || d[1] !== dim) throw new HttpError(500, `part ${key}: k2/dim ${d[0]}/${d[1]} != ${k2}/${dim}`);
-			const [spanOff, spanLen] = vib.part_span(d, first, count);
+			const [spanOff, spanLen] = thread.part_span(d, first, count);
 			const ent = new Uint32Array(count * 2);
 			for (let x = 0; x < count; x++) {
 				ent[x * 2] = d[2 + (first + x) * 3 + 1];
@@ -895,8 +895,8 @@ async function stageFinalize(env: Env, body: FinalizeReq) {
 	const tSpan = Date.now();
 	for (const [a, b] of batches) {
 		const epoch = wasmEpoch;
-		const slabs: vib.SlabJob[] = Array.from({ length: b - a }, (_, i) => new vib.SlabJob(dim, g * k2 + first + a + i, means.subarray((a + i) * dim, (a + i + 1) * dim), format));
-		const live = new Set<vib.SlabJob>(slabs);
+		const slabs: thread.SlabJob[] = Array.from({ length: b - a }, (_, i) => new thread.SlabJob(dim, g * k2 + first + a + i, means.subarray((a + i) * dim, (a + i + 1) * dim), format));
+		const live = new Set<thread.SlabJob>(slabs);
 		try {
 			if (slabs[0].format() !== format) throw new HttpError(500, `SlabJob writes format ${slabs[0].format()}, asked for ${format}`);
 			await pmap(dirs, conc, async (p) => {
@@ -930,7 +930,7 @@ async function stageFinalize(env: Env, body: FinalizeReq) {
 				const n = s.len();
 				live.delete(s);
 				const bytes = s.finish(); // consumes
-				const info = vib.slab_info(bytes);
+				const info = thread.slab_info(bytes);
 				await putBytes(env.BUCKET, `idx/${gen}/slab/${pad5(cell)}`, bytes);
 				results.push({ cell, count: n, bytes: bytes.byteLength, scanLen: info[5], rerankOff: info[6], ...(format === 3 ? { pqM: info[8] } : {}) });
 			}
@@ -1082,9 +1082,9 @@ async function buildTree(env: Env, gen: string, m: { dim: number; k1: number; k2
 		// fineData: the means already in memory (a split commit builds the tree before its fine object is cached).
 		const fine = fineData ?? (await getF32(env.BUCKET, fineKey));
 		if (fine.length !== k * m.dim) throw new HttpError(500, `${fineKey} has ${fine.length / m.dim} means, expected ${k}`);
-		bytes = vib.build_centroid_tree(fine, m.dim, groups, iters, seed);
+		bytes = thread.build_centroid_tree(fine, m.dim, groups, iters, seed);
 	}
-	const [tDim, tK, tGroups] = vib.centroid_tree_info(bytes);
+	const [tDim, tK, tGroups] = thread.centroid_tree_info(bytes);
 	if (tDim !== m.dim || tK !== k) throw new HttpError(500, `tree is dim ${tDim} k ${tK}, expected ${m.dim} / ${k}`);
 	// (No timings: Date.now() does not advance during CPU work in Workers; the caller sees the request time.)
 	const ref: Omit<TreeRef, "key"> = { groups: tGroups, beam, iters, seed, bytes: bytes.byteLength };
@@ -1110,7 +1110,7 @@ async function buildTree(env: Env, gen: string, m: { dim: number; k1: number; k2
 				o += len;
 			}
 			const [coarse, fine] = await Promise.all([getF32(env.BUCKET, coarseKey), fineData ?? getF32(env.BUCKET, fineKey)]);
-			const searcher = new vib.Searcher(m.dim, m.k1, m.k2, coarse, fine);
+			const searcher = new thread.Searcher(m.dim, m.k1, m.k2, coarse, fine);
 			try {
 				searcher.set_tree(bytes);
 				ref.nearestRecall = +searcher.tree_recall(sample, beam).toFixed(5);
@@ -1144,7 +1144,7 @@ async function stagePublish(env: Env, body: PublishReq) {
 	if (codebookKey) {
 		await ensureWasm();
 		codebook = await getBuffer(env.BUCKET, codebookKey);
-		const [cbDim, cbM] = vib.pq_codebook_info(new Uint8Array(codebook));
+		const [cbDim, cbM] = thread.pq_codebook_info(new Uint8Array(codebook));
 		if (cbDim !== body.dim) throw new HttpError(400, `codebook dim ${cbDim} != ${body.dim}`);
 		pqM = cbM;
 	}
@@ -1477,9 +1477,9 @@ async function resolveTarget(env: Env, genParam: string | null, revParam: number
 interface LoadedBase {
 	key: string;
 	gen: string;
-	searcher: vib.Searcher;
+	searcher: thread.Searcher;
 	/** Format 3: the parsed PQ codebook; each query builds its PqTable from it. */
-	pq: vib.PqCodebook | null;
+	pq: thread.PqCodebook | null;
 	/**
 	 * The centroid tree installed in `searcher` (route_beam), or null. Not part of the base key: revisions that add
 	 * or change a tree share the loaded means (no second 25 MB Searcher), and the tree a query's revision names is
@@ -1551,7 +1551,7 @@ const deltaCache = new Map<string, Promise<Uint8Array>>();
 const deltaCacheSizes = new Map<string, number>();
 let deltaCacheBytes = 0;
 const DELTA_CACHE_LIMIT = 40 * 1024 * 1024;
-/** Distinct cells of each delta segment (from vib.delta_cells), by key: what beam-routed queries compute dots for. */
+/** Distinct cells of each delta segment (from thread.delta_cells), by key: what beam-routed queries compute dots for. */
 const deltaCellsCache = new Map<string, Uint32Array>();
 const DELTA_CELLS_CACHE_SIZE = 256;
 
@@ -1562,7 +1562,7 @@ function deltaCellsOf(key: string, bytes: Uint8Array): Uint32Array {
 		lruTouch(deltaCellsCache, key, cells);
 		return cells;
 	}
-	const pairs = vib.delta_cells(bytes);
+	const pairs = thread.delta_cells(bytes);
 	cells = new Uint32Array(pairs.length / 2);
 	for (let i = 0; i < cells.length; i++) cells[i] = pairs[2 * i];
 	deltaCellsCache.set(key, cells);
@@ -1770,9 +1770,9 @@ function useTree(base: LoadedBase, tree: TreeRef) {
 }
 
 /** Parses a PQ codebook and checks it against the manifest. */
-function parseCodebook(buf: ArrayBuffer, m: Manifest, key: string): vib.PqCodebook {
+function parseCodebook(buf: ArrayBuffer, m: Manifest, key: string): thread.PqCodebook {
 	const epoch = wasmEpoch;
-	const pq = new vib.PqCodebook(new Uint8Array(buf));
+	const pq = new thread.PqCodebook(new Uint8Array(buf));
 	if (pq.dim() !== m.dim || (m.pq && pq.m() !== m.pq.m)) {
 		const msg = `${key} is dim ${pq.dim()} m ${pq.m()}, manifest dim ${m.dim} pq ${JSON.stringify(m.pq)}`;
 		safeFree(pq, epoch);
@@ -1800,9 +1800,9 @@ async function buildBase(env: Env, ctx: ExecutionContext, rs: RevState): Promise
 	}
 	if ((manifest.format ?? 1) === 3 && !pqObj) throw new HttpError(500, `format 3 generation ${rs.gen} has no PQ codebook`);
 	const pq = pqObj ? parseCodebook(pqObj.buf, manifest, files.pq!) : null;
-	let searcher: vib.Searcher | null = null;
+	let searcher: thread.Searcher | null = null;
 	try {
-		searcher = new vib.Searcher(manifest.dim, manifest.k1, manifest.k2, new Float32Array(c.buf), new Float32Array(f.buf));
+		searcher = new thread.Searcher(manifest.dim, manifest.k1, manifest.k2, new Float32Array(c.buf), new Float32Array(f.buf));
 		if (tree && treeObj) {
 			searcher.set_tree(treeObj.buf);
 			if (searcher.tree_groups() !== tree.groups) throw new HttpError(500, `${tree.key} has ${searcher.tree_groups()} groups, manifest says ${tree.groups}`);
@@ -2036,7 +2036,7 @@ interface ScanSource {
  *   mode=fetchonly   phase 1 reads every prefix and drops it (no scan, no phase 2)
  *   mode=noop        return right after routing (fixed cost: RTT, upload, dispatch, index lookup)
  *   scanRepeat=N     scan each prefix N times (client latency delta / (N-1) = scan CPU per query)
- *   copyRepeat=N     N extra vib.slab_info(prefix) calls per slab: each copies the prefix into wasm memory
+ *   copyRepeat=N     N extra thread.slab_info(prefix) calls per slab: each copies the prefix into wasm memory
  *   copy=1           header + centroid read through wasm (slab_info/slab_centroid copy the whole prefix in);
  *                    copy=0 parses them in JS from the first bytes
  *   inflight=N       per-request in-flight subrequest limit (default 6)
@@ -2132,7 +2132,7 @@ function parseSlabHeader(b: Uint8Array): SlabHdr {
 }
 
 function slabHdrFromWasm(prefix: Uint8Array): SlabHdr {
-	const a = vib.slab_info(prefix);
+	const a = thread.slab_info(prefix);
 	return { version: a[4], dim: a[0], count: a[1], centroidOff: 64, scanLen: a[5], rerankOff: a[6], recLen: a[7], pqM: a[8] };
 }
 
@@ -2366,7 +2366,7 @@ async function handleQuery(request: Request, env: Env, ctx: ExecutionContext, ur
 
 /** Per-query wasm objects freed when the query ends (only in the epoch they were created in). */
 interface QueryScratch {
-	table: vib.PqTable | null;
+	table: thread.PqTable | null;
 	epoch: number;
 }
 
@@ -2396,7 +2396,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	// Bounded by the index shape (route_from_dots / route allocate per probe); rejected, not clamped.
 	if (nprobe > manifest.k1 * manifest.k2) throw new HttpError(400, `nprobe must be <= ${manifest.k1 * manifest.k2} (k1*k2)`);
 	if (probeCoarse > manifest.k1) throw new HttpError(400, `pc must be <= ${manifest.k1} (k1)`);
-	const q = vib.normalize_vector(qRaw);
+	const q = thread.normalize_vector(qRaw);
 	const dim = manifest.dim;
 	const format = manifest.format ?? (rv.slabs ? 2 : 1);
 	// Format 1 slabs have no rerank tier: phase 2 is skipped whatever rerank says.
@@ -2443,7 +2443,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 		return qc;
 	};
 	// Format 3: one asymmetric-distance table (m x 256 f32) per query, shared by every probed slab.
-	const table = base.pq && dbg.mode !== "noop" ? (scratch.table = vib.PqTable.from_codebook(q, base.pq)) : null;
+	const table = base.pq && dbg.mode !== "noop" ? (scratch.table = thread.PqTable.from_codebook(q, base.pq)) : null;
 	const tFetch = Date.now();
 	if (dbg.mode === "noop") {
 		return json({ gen, rev: rv.rev, ids: [], scores: [], cells, stats: { scanned: 0, slabBytes: 0, cacheHits: 0, cacheMisses: 0, debug: dbg }, timing: { total: Date.now() - tStart, gen: tGen - tStart, load: tRoute - tStart, fetch: 0 } });
@@ -2453,7 +2453,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	// buffer can be dropped while the remaining reads are in flight.
 	const rs: RangeStats = { r206: 0, r200: 0, miss: 0 };
 	const packed: Uint8Array[] = [];
-	/** Best scan-tier copy per id (same rule as vib.merge), remembering its cell. */
+	/** Best scan-tier copy per id (same rule as thread.merge), remembering its cell. */
 	const cand = new Map<number, { cell: number; idx: number; score: number }>();
 	/** Rerank records of local winners from slabs that were read whole: `${cell}:${idx}`. */
 	const local = new Map<string, Uint8Array>();
@@ -2470,7 +2470,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	let rerankMultipart = 0;
 	let specReadN = 0;
 	let tombDropped = 0;
-	// Out-parameter of vib.scan/scan_pq/scan_delta: [scanned, tombstoned entries skipped]. Shared: each scan is
+	// Out-parameter of thread.scan/scan_pq/scan_delta: [scanned, tombstoned entries skipped]. Shared: each scan is
 	// synchronous and read right after the call.
 	const scanStats = new Uint32Array(2);
 	const noTomb = new Uint8Array(0);
@@ -2561,9 +2561,9 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			}
 			const prefix = src.prefix;
 			scanBytes += prefix.byteLength;
-			// copy=0 (default): header and centroid are read in JS; only vib.scan copies the prefix into wasm.
+			// copy=0 (default): header and centroid are read in JS; only thread.scan copies the prefix into wasm.
 			const info = dbg.copy ? slabHdrFromWasm(prefix) : parseSlabHeader(prefix);
-			for (let r = 0; r < dbg.copyRepeat; r++) vib.slab_info(prefix);
+			for (let r = 0; r < dbg.copyRepeat; r++) thread.slab_info(prefix);
 			// Tombstones: ids deleted or replaced at a rev >= this slab's revision (every set for rev-0 slabs) are
 			// skipped inside the scan, before top-T insertion, so they never take a candidate slot.
 			const slabRev = rv.slabs ? slabRevOf(rv.slabs[cell]) : 0;
@@ -2571,14 +2571,14 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			let hits: Uint8Array;
 			if (info.version === 3) {
 				if (!table) throw new HttpError(500, `slab ${cell} is v3 but ${gen} has no PQ codebook`);
-				hits = vib.scan_pq(prefix, table, q, T, skip, scanStats);
-				for (let r = 1; r < dbg.scanRepeat; r++) hits = vib.scan_pq(prefix, table, q, T, skip, scanStats);
+				hits = thread.scan_pq(prefix, table, q, T, skip, scanStats);
+				for (let r = 1; r < dbg.scanRepeat; r++) hits = thread.scan_pq(prefix, table, q, T, skip, scanStats);
 			} else {
-				hits = vib.scan(prefix, q, T, skip, scanStats);
-				for (let r = 1; r < dbg.scanRepeat; r++) hits = vib.scan(prefix, q, T, skip, scanStats);
+				hits = thread.scan(prefix, q, T, skip, scanStats);
+				for (let r = 1; r < dbg.scanRepeat; r++) hits = thread.scan(prefix, q, T, skip, scanStats);
 			}
 			tombDropped += scanStats[1];
-			const centroid = doRerank && info.version >= 2 ? (dbg.copy ? vib.slab_centroid(prefix) : centroidFromBytes(prefix, info)) : null;
+			const centroid = doRerank && info.version >= 2 ? (dbg.copy ? thread.slab_centroid(prefix) : centroidFromBytes(prefix, info)) : null;
 			versions.add(info.version);
 			scanned += info.count;
 			packed.push(hits);
@@ -2616,7 +2616,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			deltaBytes += bytes.byteLength;
 			deltaScanned += d.count;
 			// Sets with rev > addedRev (revs are integers) = tombFor(addedRev + 1); compactCells' deltaTomb is the same union.
-			const hits = vib.scan_delta(bytes, q, deltaQc(d, bytes), T, tomb ? tombFor(tomb, d.addedRev + 1) : noTomb, scanStats);
+			const hits = thread.scan_delta(bytes, q, deltaQc(d, bytes), T, tomb ? tombFor(tomb, d.addedRev + 1) : noTomb, scanStats);
 			deltaDropped += scanStats[1];
 			for (const h of parseHits(hits)) deltaHits.push({ id: h.id, score: h.score, seq: d.seq });
 			tDeltaEnd = Date.now();
@@ -2630,7 +2630,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 		o += b.byteLength;
 	}
 	packed.length = 0;
-	const merged = all.byteLength === 0 ? [] : parseHits(vib.merge(all, T));
+	const merged = all.byteLength === 0 ? [] : parseHits(thread.merge(all, T));
 	const tPhase1 = Date.now();
 
 	// ---- phase 2: re-score the global top-T with the int8 tier.
@@ -2679,7 +2679,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 					false,
 				);
 				for (const pos of remote) records.set(got.get(ws[pos].idx)!, pos * recLen);
-				const scores = vib.rerank(q, si.centroid, records, ws.length);
+				const scores = thread.rerank(q, si.centroid, records, ws.length);
 				ws.forEach((w, i) => rescored.push({ id: w.id, score: scores[i] }));
 			}),
 		);
@@ -3222,8 +3222,8 @@ async function encodeDelta(env: Env, ctx: ExecutionContext, m: Manifest, files: 
 	let pqBuf: { buf: ArrayBuffer } | null = loads[2];
 	let meansBuf: { buf: ArrayBuffer } | null = loads[3];
 	(loads as unknown[]).length = 0;
-	let pq: vib.PqCodebook | null = loaded && loaded.epoch === wasmEpoch && !slot!.evicted ? loaded.pq : null;
-	let ownPq: vib.PqCodebook | null = null;
+	let pq: thread.PqCodebook | null = loaded && loaded.epoch === wasmEpoch && !slot!.evicted ? loaded.pq : null;
+	let ownPq: thread.PqCodebook | null = null;
 	if (format === 3 && !pq) pq = ownPq = parseCodebook(pqBuf?.buf ?? (await getCached(env, ctx, files.pq!)).buf, m, files.pq!);
 	pqBuf = null;
 	if (slot) slot.users++;
@@ -3232,7 +3232,7 @@ async function encodeDelta(env: Env, ctx: ExecutionContext, m: Manifest, files: 
 			const means = new Float32Array(meansBuf!.buf);
 			meansBuf = null; // the JS copy is collectable once DeltaJob holds its own
 			if (means.length !== m.k1 * m.k2 * m.dim) throw new HttpError(500, `${files.fine} has ${means.length / m.dim} means, expected ${m.k1 * m.k2}`);
-			return new vib.DeltaJob(m.dim, m.k1 * m.k2, means, seq);
+			return new thread.DeltaJob(m.dim, m.k1 * m.k2, means, seq);
 		})();
 		const loadMs = Date.now() - tLoad;
 		let finished = false;
@@ -3271,7 +3271,7 @@ async function encodeDelta(env: Env, ctx: ExecutionContext, m: Manifest, files: 
 			if (!finished) safeFree(job, epoch);
 		}
 		const encodeMs = Date.now() - tEnc;
-		const nCells = vib.delta_cells(bytes).length / 2;
+		const nCells = thread.delta_cells(bytes).length / 2;
 		const tPut = Date.now();
 		const key = await putUnique(env, deltaKey(gen, seq), bytes);
 		return { seq, key, count: ids.length, bytes: bytes.byteLength, cells, nCells, filesKey: deltaFilesKey(files, m), tree: m.tree ? { groups: m.tree.groups, beam: m.tree.beam } : null, encodeMs, loadMs, putMs: Date.now() - tPut };
@@ -3420,7 +3420,7 @@ async function loadDeltaCells(env: Env, deltas: DeltaRef[], keepBytes: boolean):
 	const out = new Map<string, DeltaCells>();
 	await pmap(deltas, SUBREQUEST_CONCURRENCY, async (d) => {
 		const bytes = new Uint8Array(await getBuffer(env.BUCKET, d.key));
-		const dc = vib.delta_cells(bytes);
+		const dc = thread.delta_cells(bytes);
 		const counts = new Map<number, number>();
 		for (let i = 0; i < dc.length; i += 2) if (dc[i + 1] > 0) counts.set(dc[i], dc[i + 1]);
 		out.set(d.key, { ref: d, counts, ...(keepBytes ? { bytes } : {}) });
@@ -3568,7 +3568,7 @@ async function compactCells(env: Env, b: CompactBase, cells: number[], concurren
 		const pre = opts.preloaded?.get(d.key);
 		if (pre?.bytes) return { ref: d, bytes: pre.bytes, counts: pre.counts };
 		const bytes = new Uint8Array(await getBuffer(env.BUCKET, d.key));
-		const dc = vib.delta_cells(bytes);
+		const dc = thread.delta_cells(bytes);
 		const counts = new Map<number, number>();
 		for (let i = 0; i < dc.length; i += 2) counts.set(dc[i], dc[i + 1]);
 		return { ref: d, bytes, counts };
@@ -3600,7 +3600,7 @@ async function compactCells(env: Env, b: CompactBase, cells: number[], concurren
 	let deltaEntries = 0;
 	/** A slab of `cell` with `mean` from record chunks; `added[i]` = records taken from chunk i. */
 	const buildSlab = (cell: number, mean: Float32Array, records: Uint8Array[]) => {
-		const job = new vib.SlabJob(dim, cell, mean, format);
+		const job = new thread.SlabJob(dim, cell, mean, format);
 		let finished = false;
 		try {
 			const added = records.map((r) => job.add_records(r));
@@ -3614,7 +3614,7 @@ async function compactCells(env: Env, b: CompactBase, cells: number[], concurren
 	/** Builds a slab from records and writes it as `cell`'s slab revision slabRev. */
 	const writeSlab = async (cell: number, mean: Float32Array, records: Uint8Array[]) => {
 		const { out, n, added } = buildSlab(cell, mean, records);
-		const oi = vib.slab_info(out);
+		const oi = thread.slab_info(out);
 		await putBytes(env.BUCKET, slabKey(gen, cell, slabRev), out);
 		writtenBytes += out.byteLength;
 		newEntries += n;
@@ -3629,14 +3629,14 @@ async function compactCells(env: Env, b: CompactBase, cells: number[], concurren
 		if (oldRev >= slabRev) throw new HttpError(409, `cell ${cell} already has slabRev ${oldRev} >= ${slabRev}`);
 		const old = new Uint8Array(await getBuffer(env.BUCKET, slabKey(gen, cell, oldRev)));
 		readBytes += old.byteLength;
-		const info = vib.slab_info(old);
+		const info = thread.slab_info(old);
 		if (info[2] !== cell) throw new HttpError(500, `slab ${slabKey(gen, cell, oldRev)} is for cell ${info[2]}`);
 		oldEntries += info[1];
-		const mean = vib.slab_centroid(old);
-		const records = [vib.slab_to_records(old, slabTomb(oldRev))];
+		const mean = thread.slab_centroid(old);
+		const records = [thread.slab_to_records(old, slabTomb(oldRev))];
 		for (const d of deltas) {
 			if (!d.counts.has(cell)) continue;
-			const r = vib.delta_records_for_cell(d.bytes, cell, deltaTomb(d.ref.addedRev));
+			const r = thread.delta_records_for_cell(d.bytes, cell, deltaTomb(d.ref.addedRev));
 			records.push(r);
 		}
 		const newCell = splitOf.get(cell);
@@ -3651,13 +3651,13 @@ async function compactCells(env: Env, b: CompactBase, cells: number[], concurren
 		deltaEntries += added.slice(1).reduce((x, y) => x + y, 0);
 		records.length = 0;
 		let means2: Float32Array;
-		if (n >= 2) means2 = vib.split_slab(merged, new Float32Array(0), cell + 1);
+		if (n >= 2) means2 = thread.split_slab(merged, new Float32Array(0), cell + 1);
 		else {
 			means2 = new Float32Array(2 * dim);
 			means2.set(mean);
 			means2.set(mean, dim);
 		}
-		const packed = vib.split_slab_records(merged, new Uint8Array(0), means2, codebook);
+		const packed = thread.split_slab_records(merged, new Uint8Array(0), means2, codebook);
 		const la = new DataView(packed.buffer, packed.byteOffset, 4).getUint32(0, true);
 		const a = (await writeSlab(cell, means2.slice(0, dim), [packed.subarray(4, 4 + la)])).n;
 		const bn = (await writeSlab(newCell, means2.slice(dim), [packed.subarray(4 + la)])).n;
@@ -3802,7 +3802,7 @@ async function compactCommit(env: Env, body: CompactCommitReq) {
 	const deltaCellsMemo = new Map<string, Uint32Array>();
 	const cellsOfDelta = async (key: string) => {
 		let dc = deltaCellsMemo.get(key);
-		if (!dc) deltaCellsMemo.set(key, (dc = vib.delta_cells(new Uint8Array(await getBuffer(env.BUCKET, key)))));
+		if (!dc) deltaCellsMemo.set(key, (dc = thread.delta_cells(new Uint8Array(await getBuffer(env.BUCKET, key)))));
 		return dc;
 	};
 	await pmap([...folded], SUBREQUEST_CONCURRENCY, async (key) => {
@@ -4335,9 +4335,9 @@ async function stageProbe(env: Env, body: { waitUntilMs?: number; tag?: string }
 	if (body.waitUntilMs) {
 		const key = `tmp/probe/${body.tag ?? isolateId}`;
 		const t0 = Date.now();
-		ctx.waitUntil(sleep(Math.min(body.waitUntilMs, 60_000)).then(() => env.BUCKET.put(key, JSON.stringify({ slot: env.VIB_SLOT ?? "local", iso: isolateId, delayMs: Date.now() - t0 }))));
+		ctx.waitUntil(sleep(Math.min(body.waitUntilMs, 60_000)).then(() => env.BUCKET.put(key, JSON.stringify({ slot: env.THREAD_SLOT ?? "local", iso: isolateId, delayMs: Date.now() - t0 }))));
 	}
-	return { slot: env.VIB_SLOT ?? "local", iso: isolateId, served: probesServed, wasmMemMB: wasmRaw ? Math.round(wasmRaw.memory.buffer.byteLength / 1048576) : null, basesLoaded, cacheApi: edgeCache() !== null, slotsRpc: !!env.SLOTS };
+	return { slot: env.THREAD_SLOT ?? "local", iso: isolateId, served: probesServed, wasmMemMB: wasmRaw ? Math.round(wasmRaw.memory.buffer.byteLength / 1048576) : null, basesLoaded, cacheApi: edgeCache() !== null, slotsRpc: !!env.SLOTS };
 }
 
 // ---------- router ----------

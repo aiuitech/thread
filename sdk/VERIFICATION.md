@@ -1,4 +1,4 @@
-# vib-sdk verification
+# thread-sdk verification
 
 Date: 2026-10-03. Index: `vib-bench` bucket, generation **g4** revision **79** (edge profile, format 3
 `pq192+sq8`, k2 4096, m 3, 975 000 vectors of dim 1536, 0 delta segments, 0 tombstone sets after the last

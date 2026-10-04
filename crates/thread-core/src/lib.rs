@@ -1,4 +1,4 @@
-//! vib-core: a blob-native IVF vector index.
+//! thread-core: a blob-native IVF vector index.
 //!
 //! Everything here operates on byte slices and `f32` slices. There is no I/O:
 //! the caller (a Cloudflare Worker, a CLI, a test) fetches bytes from wherever

@@ -4,9 +4,9 @@
  *
  *   node bench/driver.mjs --gen g4 [--profile edge|local] [--start=<stage>] [--k2 4096 --m 3 ...] [--gcBuild 0]
  *
- * Every stage call goes to the orchestrator (VIB_ORCH, default https://vib-bench.aiuitech.workers.dev) as
+ * Every stage call goes to the orchestrator (THREAD_ORCH, default https://vib-bench.aiuitech.workers.dev) as
  * POST /build/<stage>?slot=<id>; the Worker runs it in the dynamic Worker of that slot (Worker Loader: one isolate
- * with its own 128 MB per slot id). The driver keeps a free list of VIB_SLOTS (default 8) slot ids 0..N-1 and sends
+ * with its own 128 MB per slot id). The driver keeps a free list of THREAD_SLOTS (default 8) slot ids 0..N-1 and sends
  * at most one job per slot at a time: concurrent jobs in one slot would share its 128 MB.
  * After a successful publish the intermediate outputs nothing reads any more (build/{gen}/partials/, parts/,
  * pq/partials/) are deleted (`--gcBuild 0` keeps them, e.g. to rerun finalize).
@@ -72,9 +72,9 @@ for (let i = 2; i < process.argv.length; i++) {
 	else args[m[1]] = "true";
 }
 // Build slots: each slot id is one dynamic Worker isolate (own 128 MB), so one heavy job per slot keeps every job
-// inside the memory limit while running VIB_SLOTS wide.
-const ORCH = process.env.VIB_ORCH ?? "https://vib-bench.aiuitech.workers.dev";
-const POOL = Array.from({ length: Number(process.env.VIB_SLOTS ?? 8) }, (_, i) => String(i));
+// inside the memory limit while running THREAD_SLOTS wide.
+const ORCH = process.env.THREAD_ORCH ?? "https://vib-bench.aiuitech.workers.dev";
+const POOL = Array.from({ length: Number(process.env.THREAD_SLOTS ?? 8) }, (_, i) => String(i));
 const freeSlots = [...POOL];
 const waiters = [];
 async function acquireSlot() {

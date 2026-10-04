@@ -1,12 +1,12 @@
 [package]
-name = "vib-cli"
+name = "thread-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "vib"
+name = "thread"
 path = "src/main.rs"
 
 [dependencies]
-vib-core = { path = "../vib-core" }
+thread-core = { path = "../thread-core" }

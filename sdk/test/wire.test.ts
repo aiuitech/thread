@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTombState, idUnion, keys, manifestFiles, parseCurrent, parseDeltaHeader, parseHits, parseManifest, parseSlabHeader, parseSlabsTable, slabCentroid, slabEntry, slabRevOf, tombFor, tombForDelta, VibError } from "../src/wire.js";
+import { buildTombState, idUnion, keys, manifestFiles, parseCurrent, parseDeltaHeader, parseHits, parseManifest, parseSlabHeader, parseSlabsTable, slabCentroid, slabEntry, slabRevOf, tombFor, tombForDelta, ThreadError } from "../src/wire.js";
 
 function packHits(hits: { id: number; score: number; idx: number }[]): Uint8Array {
 	const b = new Uint8Array(4 + hits.length * 12);
@@ -80,7 +80,7 @@ describe("packed hits", () => {
 	});
 	it("rejects truncated buffers", () => {
 		const b = packHits([{ id: 1, score: 1, idx: 0 }]).subarray(0, 10);
-		expect(() => parseHits(b)).toThrow(VibError);
+		expect(() => parseHits(b)).toThrow(ThreadError);
 	});
 });
 

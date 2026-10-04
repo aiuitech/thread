@@ -49,12 +49,12 @@ for (let i = 2; i < process.argv.length; i++) {
 	else if (process.argv[i + 1] && !process.argv[i + 1].startsWith("--")) args[m[1]] = process.argv[++i];
 	else args[m[1]] = "true";
 }
-const BASE = process.env.VIB_URL ?? "https://vib-bench.aiuitech.workers.dev";
+const BASE = process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
 // Writes run in the `writer` build slot (a dynamic Worker of the same deployment that serves no queries): an
 // upsert's DeltaJob needs ~50 MB of transient wasm memory, which a query isolate would keep (wasm memory never
-// shrinks). The Worker forwards /upsert and /delete there by default; VIB_WRITE_SLOT=local runs them in the query
+// shrinks). The Worker forwards /upsert and /delete there by default; THREAD_WRITE_SLOT=local runs them in the query
 // isolates instead (A/B).
-const WRITE_SLOT = process.env.VIB_WRITE_SLOT ?? "writer";
+const WRITE_SLOT = process.env.THREAD_WRITE_SLOT ?? "writer";
 const WRITE = `${BASE} (slot ${WRITE_SLOT})`;
 const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
 const prep = JSON.parse(fs.readFileSync(path.join(root, "data/prep/manifest.json"), "utf8"));

@@ -1,15 +1,15 @@
-# vib vs Cloudflare Vectorize: benchmark summary
+# thread vs Cloudflare Vectorize: benchmark summary
 
 Dataset: dbpedia-openai-1M-1536-angular (975,000 vectors, 1536 dims, cosine, top-10 against the
 dataset's exact ground truth). Vectorize numbers are Cloudflare's published figures for this dataset
-(warm cache, concurrency 300 via a Worker binding). vib numbers are measured against the deployed
+(warm cache, concurrency 300 via a Worker binding). thread numbers are measured against the deployed
 Worker `vib-bench` reading R2 bucket `vib-bench`, warm edge cache, client in Montreal, using
 `bench/query_bench.mjs` (warm pass, then measured pass). Ranges are across sessions; network
 variance between sessions was up to ~30%.
 
 ## Headline: serving configuration (g4 rev 103) vs Vectorize
 
-| metric | Cloudflare Vectorize (published) | vib g4, concurrency 300 | vib g4, concurrency 50 |
+| metric | Cloudflare Vectorize (published) | thread g4, concurrency 300 | thread g4, concurrency 50 |
 |---|---:|---:|---:|
 | recall@10 ("precision") | 95.4% | 95.1% | 94.9-95.1% |
 | p50 latency | 31 ms | 83-85 ms | 70-73 ms |
@@ -86,7 +86,7 @@ is g1 with flat routing. g2's spread reflects Worker-side improvements made whil
 | entries scanned for 95% recall, any layout tried | 20k-28k |
 | centroid tree 128 groups, beam 8: exact nearest cell found | 99.35% at ~11% of the exhaustive cost |
 
-SDK: `vib-sdk` returns identical top-10 to the Worker (300/300 via the R2 binding, 50/50 via the S3-compatible store against R2's S3 endpoint); cold S3-store query 457 ms with 15 signed origin reads, warm 93 ms.
+SDK: `thread-sdk` returns identical top-10 to the Worker (300/300 via the R2 binding, 50/50 via the S3-compatible store against R2's S3 endpoint); cold S3-store query 457 ms with 15 signed origin reads, warm 93 ms.
 
 Sources: `data/bench-*.txt`, `data/diagnosis-g1.md`, `data/quant-experiment.md`,
 `sdk/VERIFICATION.md`.

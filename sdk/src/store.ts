@@ -4,7 +4,7 @@
  * (`MemoryBlobStore`, tests and small local indexes) and, in front of any of them, the Workers Cache API
  * (`CachedBlobStore`: immutable objects cached for a year, served with single- and multi-range requests).
  */
-import { VibError } from "./wire.js";
+import { ThreadError } from "./wire.js";
 
 export interface BlobRange {
 	offset: number;
@@ -93,7 +93,7 @@ export class R2BlobStore implements BlobStore {
 		const obj = await this.bucket.get(key, range ? { range } : undefined);
 		if (!obj) return null;
 		const b = new Uint8Array(await obj.arrayBuffer());
-		if (range && b.byteLength !== range.length) throw new VibError(`${key} [${range.offset}, +${range.length}): got ${b.byteLength} bytes`);
+		if (range && b.byteLength !== range.length) throw new ThreadError(`${key} [${range.offset}, +${range.length}): got ${b.byteLength} bytes`);
 		if (opts?.trace) {
 			opts.trace.reads++;
 			opts.trace.bytes += b.byteLength;
@@ -134,7 +134,7 @@ export class MemoryBlobStore implements BlobStore {
 		const o = this.objects.get(key);
 		if (!o) return null;
 		const b = range ? o.bytes.slice(range.offset, range.offset + range.length) : o.bytes;
-		if (range && b.byteLength !== range.length) throw new VibError(`${key} [${range.offset}, +${range.length}) is outside the object (${o.bytes.byteLength} bytes)`);
+		if (range && b.byteLength !== range.length) throw new ThreadError(`${key} [${range.offset}, +${range.length}) is outside the object (${o.bytes.byteLength} bytes)`);
 		if (opts?.trace) {
 			opts.trace.reads++;
 			opts.trace.bytes += b.byteLength;
@@ -206,15 +206,15 @@ export function parseMultipart(body: Uint8Array, boundary: string): RangePart[] 
 		const after = pos + delim.length;
 		if (body[after] === 45 && body[after + 1] === 45) break; // closing "--"
 		const hdrEnd = find(crlf2, after);
-		if (hdrEnd < 0) throw new VibError("multipart: unterminated part headers");
+		if (hdrEnd < 0) throw new ThreadError("multipart: unterminated part headers");
 		const headers = latin1.decode(body.subarray(after, hdrEnd));
 		const m = headers.match(/content-range:\s*bytes\s+(\d+)-(\d+)\//i);
-		if (!m) throw new VibError(`multipart: part without Content-Range: ${headers.slice(0, 200)}`);
+		if (!m) throw new ThreadError(`multipart: part without Content-Range: ${headers.slice(0, 200)}`);
 		const start = Number(m[1]);
 		const end = Number(m[2]);
 		const dataStart = hdrEnd + 4;
 		const dataEnd = dataStart + (end - start + 1);
-		if (dataEnd > body.length) throw new VibError("multipart: part runs past the body");
+		if (dataEnd > body.length) throw new ThreadError("multipart: part runs past the body");
 		parts.push({ start, end, bytes: body.subarray(dataStart, dataEnd) });
 		pos = find(delim, dataEnd);
 	}
@@ -228,12 +228,12 @@ export function parseMultipart(body: Uint8Array, boundary: string): RangePart[] 
 export function responseParts(status: number, contentType: string | null, contentRange: string | null, body: Uint8Array): { parts: RangePart[]; kind: "multipart" | "single" | "full" } {
 	if (status === 206 && /multipart\/byteranges/i.test(contentType ?? "")) {
 		const b = (contentType ?? "").match(/boundary=("?)([^";]+)\1/i);
-		if (!b) throw new VibError(`multipart without boundary: ${contentType}`);
+		if (!b) throw new ThreadError(`multipart without boundary: ${contentType}`);
 		return { parts: parseMultipart(body, b[2]), kind: "multipart" };
 	}
 	if (status === 206) {
 		const m = (contentRange ?? "").match(/bytes\s+(\d+)-(\d+)\//);
-		if (!m) throw new VibError("206 without Content-Range");
+		if (!m) throw new ThreadError("206 without Content-Range");
 		return { parts: [{ start: Number(m[1]), end: Number(m[2]), bytes: body }], kind: "single" };
 	}
 	return { parts: [{ start: 0, end: body.length - 1, bytes: body }], kind: "full" };
@@ -243,7 +243,7 @@ export function responseParts(status: number, contentType: string | null, conten
 export function sliceRanges(parts: RangePart[], ranges: BlobRange[], key: string): Uint8Array[] {
 	return ranges.map((rg) => {
 		const p = parts.find((p) => p.start <= rg.offset && rg.offset + rg.length - 1 <= p.end);
-		if (!p) throw new VibError(`range ${rg.offset}+${rg.length} of ${key} missing from the response (${parts.length} parts)`);
+		if (!p) throw new ThreadError(`range ${rg.offset}+${rg.length} of ${key} missing from the response (${parts.length} parts)`);
 		return p.bytes.subarray(rg.offset - p.start, rg.offset - p.start + rg.length);
 	});
 }
@@ -279,7 +279,7 @@ export class CachedBlobStore implements BlobStore {
 		const resp = new Response(bytes.slice(), {
 			headers: { "content-type": "application/octet-stream", "content-length": String(bytes.byteLength), "cache-control": this.cacheControl, "accept-ranges": "bytes" },
 		});
-		const p = this.cache.put(this.request(key), resp).catch((e: unknown) => console.error(`vib-sdk: cache.put ${key} failed: ${e instanceof Error ? e.message : String(e)}`));
+		const p = this.cache.put(this.request(key), resp).catch((e: unknown) => console.error(`thread-sdk: cache.put ${key} failed: ${e instanceof Error ? e.message : String(e)}`));
 		this.waitUntil?.(p);
 	}
 
@@ -288,7 +288,7 @@ export class CachedBlobStore implements BlobStore {
 		if (!full) return null;
 		this.store(key, full);
 		if (!ranges) return [full];
-		for (const r of ranges) if (r.offset + r.length > full.byteLength) throw new VibError(`${key} is ${full.byteLength} bytes, need ${r.offset + r.length}`);
+		for (const r of ranges) if (r.offset + r.length > full.byteLength) throw new ThreadError(`${key} is ${full.byteLength} bytes, need ${r.offset + r.length}`);
 		return ranges.map((r) => full.subarray(r.offset, r.offset + r.length));
 	}
 
@@ -305,11 +305,11 @@ export class CachedBlobStore implements BlobStore {
 			if (!range) return body;
 			if (r.status === 206) {
 				if (trace) trace.r206++;
-				if (body.byteLength !== range.length) throw new VibError(`cache range ${key} [${range.offset}, +${range.length}) returned ${body.byteLength} bytes`);
+				if (body.byteLength !== range.length) throw new ThreadError(`cache range ${key} [${range.offset}, +${range.length}) returned ${body.byteLength} bytes`);
 				return body;
 			}
 			if (trace) trace.r200++;
-			if (body.byteLength < range.offset + range.length) throw new VibError(`cached ${key} is ${body.byteLength} bytes, need ${range.offset + range.length}`);
+			if (body.byteLength < range.offset + range.length) throw new ThreadError(`cached ${key} is ${body.byteLength} bytes, need ${range.offset + range.length}`);
 			return body.subarray(range.offset, range.offset + range.length);
 		}
 		if (trace) trace.misses++;
@@ -344,12 +344,12 @@ export class CachedBlobStore implements BlobStore {
 	}
 
 	async put(key: string, data: Uint8Array | string, opts?: PutOptions): Promise<BlobHead | null> {
-		if (!this.inner.put) throw new VibError("the underlying store is read-only", 400);
+		if (!this.inner.put) throw new ThreadError("the underlying store is read-only", 400);
 		return this.inner.put(key, data, opts);
 	}
 
 	async list(prefix: string): Promise<string[]> {
-		if (!this.inner.list) throw new VibError("the underlying store cannot list", 400);
+		if (!this.inner.list) throw new ThreadError("the underlying store cannot list", 400);
 		return this.inner.list(prefix);
 	}
 }
@@ -370,11 +370,11 @@ export class PrefixedBlobStore implements BlobStore {
 		return this.inner.head(this.prefix + key);
 	}
 	put(key: string, data: Uint8Array | string, opts?: PutOptions) {
-		if (!this.inner.put) throw new VibError("the underlying store is read-only", 400);
+		if (!this.inner.put) throw new ThreadError("the underlying store is read-only", 400);
 		return this.inner.put(this.prefix + key, data, opts);
 	}
 	async list(prefix: string) {
-		if (!this.inner.list) throw new VibError("the underlying store cannot list", 400);
+		if (!this.inner.list) throw new ThreadError("the underlying store cannot list", 400);
 		return (await this.inner.list(this.prefix + prefix)).map((k) => k.slice(this.prefix.length));
 	}
 }

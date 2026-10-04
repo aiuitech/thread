@@ -1,17 +1,17 @@
 /**
- * Wire formats shared with the vib Worker: packed hits, slab and delta-segment headers, the manifest
+ * Wire formats shared with the thread Worker: packed hits, slab and delta-segment headers, the manifest
  * (revisions, deltas, tombstone sets), the slabs table and the R2 key layout. Everything here is plain
  * JS over `Uint8Array`s (no wasm), so headers can be parsed without copying a slab into wasm memory.
  */
 
-export class VibError extends Error {
+export class ThreadError extends Error {
 	constructor(
 		message: string,
 		/** HTTP-like status: 400 bad input, 404 missing object, 409 write conflict, 500 corrupt index. */
 		public readonly status = 500,
 	) {
 		super(message);
-		this.name = "VibError";
+		this.name = "ThreadError";
 	}
 }
 
@@ -29,7 +29,7 @@ export function parseHits(packed: Uint8Array): PackedHit[] {
 	if (packed.byteLength < 4) return [];
 	const dv = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
 	const n = dv.getUint32(0, true);
-	if (packed.byteLength < 4 + n * 12) throw new VibError(`packed hits: ${n} hits need ${4 + n * 12} bytes, have ${packed.byteLength}`);
+	if (packed.byteLength < 4 + n * 12) throw new ThreadError(`packed hits: ${n} hits need ${4 + n * 12} bytes, have ${packed.byteLength}`);
 	const out: PackedHit[] = new Array(n);
 	for (let i = 0; i < n; i++) {
 		const o = 4 + i * 12;
@@ -78,9 +78,9 @@ export interface SlabHeader {
 }
 
 export function parseSlabHeader(b: Uint8Array): SlabHeader {
-	if (b.byteLength < 64) throw new VibError(`slab header needs 64 bytes, have ${b.byteLength}`);
+	if (b.byteLength < 64) throw new ThreadError(`slab header needs 64 bytes, have ${b.byteLength}`);
 	const dv = new DataView(b.buffer, b.byteOffset, 64);
-	if (dv.getUint32(0, true) !== SLAB_MAGIC) throw new VibError("bad slab magic");
+	if (dv.getUint32(0, true) !== SLAB_MAGIC) throw new ThreadError("bad slab magic");
 	const version = dv.getUint16(4, true);
 	const dim = dv.getUint32(8, true);
 	const count = dv.getUint32(12, true);
@@ -95,13 +95,13 @@ export function parseSlabHeader(b: Uint8Array): SlabHeader {
 		const payloadOff = dv.getUint32(36, true);
 		return { version, dim, count, cell, centroidOff, entriesOff, rerankOff: 0, payloadOff, payloadLen: dv.getUint32(40, true), scanLen: payloadOff, recLen: 0, pqM: 0 };
 	}
-	throw new VibError(`unknown slab version ${version}`);
+	throw new ThreadError(`unknown slab version ${version}`);
 }
 
 /** The cell mean stored in a slab prefix (copied out, so it outlives the prefix). */
 export function slabCentroid(b: Uint8Array, h: SlabHeader): Float32Array {
 	const end = h.centroidOff + h.dim * 4;
-	if (b.byteLength < end) throw new VibError(`slab prefix too short for the centroid (${b.byteLength} < ${end})`);
+	if (b.byteLength < end) throw new ThreadError(`slab prefix too short for the centroid (${b.byteLength} < ${end})`);
 	return new Float32Array(b.slice(h.centroidOff, end).buffer);
 }
 
@@ -115,7 +115,7 @@ export interface SlabEntry {
 /** Entry `i` of the slab entry table (inside the scan prefix). */
 export function slabEntry(b: Uint8Array, h: SlabHeader, i: number): SlabEntry {
 	const o = h.entriesOff + i * SLAB_ENTRY_BYTES;
-	if (i >= h.count || b.byteLength < o + SLAB_ENTRY_BYTES) throw new VibError(`slab entry ${i} out of range`);
+	if (i >= h.count || b.byteLength < o + SLAB_ENTRY_BYTES) throw new ThreadError(`slab entry ${i} out of range`);
 	const dv = new DataView(b.buffer, b.byteOffset + o, SLAB_ENTRY_BYTES);
 	return { id: dv.getUint32(0, true), payloadOff: dv.getUint32(4, true), payloadLen: dv.getUint32(8, true), attrs: dv.getUint32(12, true) };
 }
@@ -139,11 +139,11 @@ export interface DeltaHeader {
 }
 
 export function parseDeltaHeader(b: Uint8Array): DeltaHeader {
-	if (b.byteLength < 64) throw new VibError(`delta header needs 64 bytes, have ${b.byteLength}`);
+	if (b.byteLength < 64) throw new ThreadError(`delta header needs 64 bytes, have ${b.byteLength}`);
 	const dv = new DataView(b.buffer, b.byteOffset, 64);
-	if (dv.getUint32(0, true) !== DELTA_MAGIC) throw new VibError("bad delta magic");
+	if (dv.getUint32(0, true) !== DELTA_MAGIC) throw new ThreadError("bad delta magic");
 	const version = dv.getUint16(4, true);
-	if (version !== 1) throw new VibError(`unknown delta version ${version}`);
+	if (version !== 1) throw new ThreadError(`unknown delta version ${version}`);
 	return { version, dim: dv.getUint32(8, true), count: dv.getUint32(12, true), pqM: dv.getUint32(16, true), seq: dv.getUint32(20, true), entriesOff: dv.getUint32(24, true), rerankOff: dv.getUint32(28, true), payloadOff: dv.getUint32(44, true), payloadLen: dv.getUint32(48, true) };
 }
 
@@ -153,7 +153,7 @@ export interface DeltaEntry extends SlabEntry {
 
 export function deltaEntry(b: Uint8Array, h: DeltaHeader, i: number): DeltaEntry {
 	const o = h.entriesOff + i * DELTA_ENTRY_BYTES;
-	if (i >= h.count || b.byteLength < o + DELTA_ENTRY_BYTES) throw new VibError(`delta entry ${i} out of range`);
+	if (i >= h.count || b.byteLength < o + DELTA_ENTRY_BYTES) throw new ThreadError(`delta entry ${i} out of range`);
 	const dv = new DataView(b.buffer, b.byteOffset + o, DELTA_ENTRY_BYTES);
 	return { id: dv.getUint32(0, true), cell: dv.getUint32(4, true), attrs: dv.getUint32(8, true), payloadOff: dv.getUint32(12, true), payloadLen: dv.getUint32(16, true) };
 }
@@ -263,24 +263,24 @@ export const decodeJson = <T>(b: Uint8Array): T => JSON.parse(utf8.decode(b)) as
 /** Parses `idx/current.json`; a pointer without `rev` (older publishes) means rev 0. */
 export function parseCurrent(b: Uint8Array): CurrentPointer {
 	const j = decodeJson<{ gen?: unknown; rev?: unknown }>(b);
-	if (typeof j.gen !== "string" || !j.gen) throw new VibError("current.json has no gen");
+	if (typeof j.gen !== "string" || !j.gen) throw new ThreadError("current.json has no gen");
 	const rev = j.rev === undefined ? 0 : Number(j.rev);
-	if (!Number.isInteger(rev) || rev < 0) throw new VibError(`current.json has a bad rev ${String(j.rev)}`);
+	if (!Number.isInteger(rev) || rev < 0) throw new ThreadError(`current.json has a bad rev ${String(j.rev)}`);
 	return { gen: j.gen, rev };
 }
 
 /** Parses a manifest and checks it is for `gen`; fills `rev` (absent in rev-0 manifests). */
 export function parseManifest(b: Uint8Array, gen: string, rev: number): Manifest {
 	const m = decodeJson<Manifest>(b);
-	if (m.gen !== gen) throw new VibError(`manifest for ${gen} rev ${rev} is for generation ${m.gen}`);
-	for (const f of ["k1", "k2", "dim", "vectors"] as const) if (!Number.isInteger(m[f])) throw new VibError(`manifest ${gen} rev ${rev}: missing ${f}`);
-	if ((m.rev ?? 0) !== rev) throw new VibError(`manifest ${gen} rev ${rev} says rev ${m.rev}`);
+	if (m.gen !== gen) throw new ThreadError(`manifest for ${gen} rev ${rev} is for generation ${m.gen}`);
+	for (const f of ["k1", "k2", "dim", "vectors"] as const) if (!Number.isInteger(m[f])) throw new ThreadError(`manifest ${gen} rev ${rev}: missing ${f}`);
+	if ((m.rev ?? 0) !== rev) throw new ThreadError(`manifest ${gen} rev ${rev} says rev ${m.rev}`);
 	return { ...m, rev };
 }
 
 export function parseSlabsTable(b: Uint8Array, cells: number, key: string): SlabRow[] {
 	const t = decodeJson<unknown>(b);
-	if (!Array.isArray(t) || t.length !== cells) throw new VibError(`${key} has ${Array.isArray(t) ? t.length : "no"} rows, expected ${cells}`);
+	if (!Array.isArray(t) || t.length !== cells) throw new ThreadError(`${key} has ${Array.isArray(t) ? t.length : "no"} rows, expected ${cells}`);
 	return t as SlabRow[];
 }
 

@@ -1,5 +1,5 @@
 /**
- * Example Worker for vib-sdk: a Vectorize-like `POST /search` over a vib index in R2.
+ * Example Worker for thread-sdk: a Vectorize-like `POST /search` over a thread index in R2.
  *
  *   POST /search            JSON {vector: number[], topK?, nprobe?, rerank?, pc?, returnPayload?, store?: "r2" | "s3"}
  *                           or an f32 LE body (content-type application/octet-stream) with the options as query
@@ -9,10 +9,10 @@
  *   POST /refresh           re-read current.json now (?store=)
  *
  * The wasm module is imported through the bundler (the Cloudflare Vite plugin turns the .wasm into a
- * WebAssembly.Module) and handed to the SDK once per isolate; one VibIndex per store is kept across requests.
+ * WebAssembly.Module) and handed to the SDK once per isolate; one ThreadIndex per store is kept across requests.
  */
-import wasmModule from "vib-sdk/wasm/vib_bg.wasm";
-import { R2BlobStore, S3BlobStore, Vib, VibError, type BlobStore, type QueryOptions, type VibIndex } from "vib-sdk";
+import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
+import { R2BlobStore, S3BlobStore, Thread, ThreadError, type BlobStore, type QueryOptions, type ThreadIndex } from "thread-sdk";
 
 interface Env {
 	BUCKET: R2Bucket;
@@ -25,31 +25,31 @@ interface Env {
 
 type StoreKind = "r2" | "s3";
 
-let vibPromise: Promise<Vib> | null = null;
-const indexes = new Map<StoreKind, Promise<VibIndex>>();
+let threadPromise: Promise<Thread> | null = null;
+const indexes = new Map<StoreKind, Promise<ThreadIndex>>();
 
-function getVib(): Promise<Vib> {
-	if (!vibPromise) {
-		vibPromise = Vib.init({ wasmModule });
-		vibPromise.catch(() => (vibPromise = null));
+function getThread(): Promise<Thread> {
+	if (!threadPromise) {
+		threadPromise = Thread.init({ wasmModule });
+		threadPromise.catch(() => (threadPromise = null));
 	}
-	return vibPromise;
+	return threadPromise;
 }
 
 const configured = (v: string | undefined): v is string => !!v && v !== "-";
 
 function makeStore(env: Env, kind: StoreKind): BlobStore {
 	if (kind === "r2") return new R2BlobStore(env.BUCKET);
-	if (!configured(env.S3_ENDPOINT) || !configured(env.S3_ACCESS_KEY_ID) || !configured(env.S3_SECRET_ACCESS_KEY)) throw new VibError("the S3 store is not configured (S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY)", 400);
+	if (!configured(env.S3_ENDPOINT) || !configured(env.S3_ACCESS_KEY_ID) || !configured(env.S3_SECRET_ACCESS_KEY)) throw new ThreadError("the S3 store is not configured (S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY)", 400);
 	return new S3BlobStore({ endpoint: env.S3_ENDPOINT, bucket: configured(env.S3_BUCKET) ? env.S3_BUCKET : "vib-bench", region: "auto", accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY });
 }
 
 /** The index for a store kind, opened once per isolate (its routing table lives in wasm memory). */
-function getIndex(env: Env, ctx: ExecutionContext, kind: StoreKind): Promise<VibIndex> {
+function getIndex(env: Env, ctx: ExecutionContext, kind: StoreKind): Promise<ThreadIndex> {
 	let p = indexes.get(kind);
 	if (!p) {
-		p = getVib().then((vib) =>
-			vib.open({
+		p = getThread().then((thread) =>
+			thread.open({
 				store: makeStore(env, kind),
 				// Cache API in front of the store (default caches.default); keep each store's cache keys apart.
 				cacheOrigin: `https://vib-sdk-example.cache/${kind}/`,
@@ -68,7 +68,7 @@ function intParam(url: URL, name: string): number | undefined {
 	const v = url.searchParams.get(name);
 	if (v === null || v === "") return undefined;
 	const n = Number(v);
-	if (!Number.isInteger(n) || n < 0) throw new VibError(`${name} must be a non-negative integer`, 400);
+	if (!Number.isInteger(n) || n < 0) throw new ThreadError(`${name} must be a non-negative integer`, 400);
 	return n;
 }
 
@@ -91,12 +91,12 @@ async function handleSearch(request: Request, env: Env, ctx: ExecutionContext, u
 		opts = { topK: intParam(url, "topK") ?? intParam(url, "k"), nprobe: intParam(url, "nprobe"), rerank: intParam(url, "rerank"), pc: intParam(url, "pc"), returnPayload: url.searchParams.get("returnPayload") === "1" };
 	} else {
 		const body = (await request.json().catch(() => null)) as SearchBody | null;
-		if (!body || !Array.isArray(body.vector)) throw new VibError("body must be JSON {vector: number[], ...}", 400);
+		if (!body || !Array.isArray(body.vector)) throw new ThreadError("body must be JSON {vector: number[], ...}", 400);
 		vector = Float32Array.from(body.vector);
 		opts = { topK: body.topK, nprobe: body.nprobe, rerank: body.rerank, pc: body.pc, returnPayload: body.returnPayload };
 		if (body.store) kind = body.store;
 	}
-	if (kind !== "r2" && kind !== "s3") throw new VibError("store must be r2 or s3", 400);
+	if (kind !== "r2" && kind !== "s3") throw new ThreadError("store must be r2 or s3", 400);
 	const t0 = Date.now();
 	const index = await getIndex(env, ctx, kind);
 	const tOpen = Date.now();
@@ -136,7 +136,7 @@ export default {
 			}
 			return json({ error: "not found" }, 404);
 		} catch (e) {
-			if (e instanceof VibError) return json({ error: e.message }, e.status >= 400 && e.status < 600 ? e.status : 500);
+			if (e instanceof ThreadError) return json({ error: e.message }, e.status >= 400 && e.status < 600 ? e.status : 500);
 			console.error(e instanceof Error ? e.stack : String(e));
 			return json({ error: e instanceof Error ? e.message : String(e) }, 500);
 		}

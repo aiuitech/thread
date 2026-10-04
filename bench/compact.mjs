@@ -4,13 +4,13 @@
  *
  *   node bench/compact.mjs [--gen g4] [--cells all|1,2,3] [--purge 1] [--maxCellEntries N] [--chunk 48] [--concurrency 8] [--cellConcurrency 3] [--gc 0|1]
  *
- * Every stage runs in a build slot of the orchestrator (VIB_ORCH, default https://vib-bench.aiuitech.workers.dev):
+ * Every stage runs in a build slot of the orchestrator (THREAD_ORCH, default https://vib-bench.aiuitech.workers.dev):
  * POST /build/<stage>?slot=<id>, one dynamic Worker isolate per slot id (see worker/src/main.ts).
  *
  * 1. compact-plan   (slot admin): head rev = baseRev, the cells to rewrite: cells of every delta segment, plus,
  *                    with --purge, the cells an earlier compaction rewrote at a rev <= the newest tombstone set
  *                    (they may hold ids a set hides; rewriting them lets the commit drop the sets).
- * 2. compact-cells  (slots cmp-0..cmp-{N-1}, N = --concurrency / VIB_SLOTS (8), one job per slot at a time, `--chunk`
+ * 2. compact-cells  (slots cmp-0..cmp-{N-1}, N = --concurrency / THREAD_SLOTS (8), one job per slot at a time, `--chunk`
  *                    cells per job, `--cellConcurrency` cells in flight per job; the slot ids differ from the
  *                    driver's 0..N-1 so a compaction never shares an isolate with a running build job):
  *                    old slab records minus tombstones + the cell's records from the folded deltas
@@ -34,8 +34,8 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
-const ORCH = process.env.VIB_ORCH ?? process.env.VIB_URL ?? "https://vib-bench.aiuitech.workers.dev";
-const POOL = Array.from({ length: Number(process.env.VIB_SLOTS ?? 8) }, (_, i) => `cmp-${i}`);
+const ORCH = process.env.THREAD_ORCH ?? process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
+const POOL = Array.from({ length: Number(process.env.THREAD_SLOTS ?? 8) }, (_, i) => `cmp-${i}`);
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
 /** POST {ORCH}/build/{stage}?slot={slot}. */

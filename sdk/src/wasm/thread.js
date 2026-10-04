@@ -1,4 +1,4 @@
-/* @ts-self-types="./vib.d.ts" */
+/* @ts-self-types="./thread.d.ts" */
 
 /**
  * Assign job: multi-assigns each vector to its `m` nearest fine cells (within
@@ -1281,31 +1281,6 @@ export class Searcher {
         return this;
     }
     /**
-     * Global ids of the `nprobe` fine cells to scan for unit query `q`.
-     * `probe_coarse == 0` (or `>= k1`) ranks all fine cells directly (flat routing);
-     * otherwise only the fine cells of the `probe_coarse` best coarse groups are ranked.
-     * @param {Float32Array} q
-     * @param {number} probe_coarse
-     * @param {number} nprobe
-     * @returns {Uint32Array}
-     */
-    route(q, probe_coarse, nprobe) {
-        if (this.__wbg_inst !== undefined && this.__wbg_inst !== __wbg_instance_id) {
-            throw new Error('Invalid stale object from previous Wasm instance');
-        }
-        const ptr0 = passArrayF32ToWasm0(q, wasm.__wbindgen_malloc);
-        const len0 = WASM_VECTOR_LEN;
-        let ret;
-        __wbg_call_guard();
-        ret = wasm.searcher_route(this.__wbg_ptr, ptr0, len0, probe_coarse, nprobe);
-        if (ret[3]) {
-            throw takeFromExternrefTable0(ret[2]);
-        }
-        var v2 = getArrayU32FromWasm0(ret[0], ret[1]).slice();
-        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
-        return v2;
-    }
-    /**
      * Pruned flat routing: global ids of the `nprobe` best fine cells (by
      * cosine, descending) among the members of the tree's best `beam` groups.
      * `beam >= groups` equals `route_flat(q, nprobe)`. Error without `set_tree`.
@@ -1323,6 +1298,31 @@ export class Searcher {
         let ret;
         __wbg_call_guard();
         ret = wasm.searcher_route_beam(this.__wbg_ptr, ptr0, len0, beam, nprobe);
+        if (ret[3]) {
+            throw takeFromExternrefTable0(ret[2]);
+        }
+        var v2 = getArrayU32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v2;
+    }
+    /**
+     * Global ids of the `nprobe` fine cells to scan for unit query `q`.
+     * `probe_coarse == 0` (or `>= k1`) ranks all fine cells directly (flat routing);
+     * otherwise only the fine cells of the `probe_coarse` best coarse groups are ranked.
+     * @param {Float32Array} q
+     * @param {number} probe_coarse
+     * @param {number} nprobe
+     * @returns {Uint32Array}
+     */
+    route(q, probe_coarse, nprobe) {
+        if (this.__wbg_inst !== undefined && this.__wbg_inst !== __wbg_instance_id) {
+            throw new Error('Invalid stale object from previous Wasm instance');
+        }
+        const ptr0 = passArrayF32ToWasm0(q, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        let ret;
+        __wbg_call_guard();
+        ret = wasm.searcher_route(this.__wbg_ptr, ptr0, len0, probe_coarse, nprobe);
         if (ret[3]) {
             throw takeFromExternrefTable0(ret[2]);
         }
@@ -2509,7 +2509,7 @@ function __wbg_get_imports() {
         __wbg___wbindgen_throw_41e9ee4f547fc59a: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
-        __wbg_error_9cf5d0367d002490: function(arg0, arg1) {
+        __wbg_error_7b401e87950b0819: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
         __wbindgen_generic_0000000000000001: function(arg0, arg1) {
@@ -2529,7 +2529,7 @@ function __wbg_get_imports() {
     };
     return {
         __proto__: null,
-        "./vib_bg.js": import0,
+        "./thread_bg.js": import0,
     };
 }
 
@@ -2790,7 +2790,7 @@ async function __wbg_init(module_or_path) {
     }
 
     if (module_or_path === undefined) {
-        module_or_path = new URL('vib_bg.wasm', import.meta.url);
+        module_or_path = new URL('thread_bg.wasm', import.meta.url);
     }
     const imports = __wbg_get_imports();
 

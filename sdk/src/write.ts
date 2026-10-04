@@ -5,12 +5,12 @@
  * create-only put of `manifest.{rev+1}.json` (the lock) and advance `idx/current.json` with a compare-and-swap.
  * The Worker's own implementation landed concurrently; the two must stay wire-compatible (see README).
  */
-import type { Vib } from "./index.js";
+import type { Thread } from "./index.js";
 import { asF32 } from "./index.js";
 import { safeFree } from "./query.js";
 import type { BlobStore } from "./store.js";
-import type * as W from "./wasm/vib.js";
-import { idUnion, keys, manifestFiles, parseCurrent, parseManifest, VibError, type CurrentPointer, type IndexFiles, type Manifest } from "./wire.js";
+import type * as W from "./wasm/thread.js";
+import { idUnion, keys, manifestFiles, parseCurrent, parseManifest, ThreadError, type CurrentPointer, type IndexFiles, type Manifest } from "./wire.js";
 
 export interface UpsertInput {
 	ids: ArrayLike<number>;
@@ -57,7 +57,7 @@ export interface DeleteResult {
 }
 
 export interface WriterContext {
-	vib: Vib;
+	thread: Thread;
 	w: typeof W;
 	store: BlobStore;
 	gen: string;
@@ -72,7 +72,7 @@ const DELTA_ADD_CHUNK = 256;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function writable(store: BlobStore): Required<Pick<BlobStore, "put">> & BlobStore {
-	if (!store.put) throw new VibError("this store is read-only (no put)", 400);
+	if (!store.put) throw new ThreadError("this store is read-only (no put)", 400);
 	return store as Required<Pick<BlobStore, "put">> & BlobStore;
 }
 
@@ -89,7 +89,7 @@ async function putUnique(store: BlobStore, key: string, data: Uint8Array | strin
 		const alt = `${key.slice(0, dot)}.${crypto.randomUUID().slice(0, 8)}${key.slice(dot)}`;
 		if (await putIfAbsent(store, alt, data)) return alt;
 	}
-	throw new VibError(`could not write a unique key for ${key}`);
+	throw new ThreadError(`could not write a unique key for ${key}`);
 }
 
 async function readCurrent(store: BlobStore): Promise<{ cur: CurrentPointer; etag: string } | null> {
@@ -116,19 +116,19 @@ async function advanceCurrent(store: BlobStore, gen: string, rev: number): Promi
 		conflicts++;
 		await sleep(20 + Math.random() * 50);
 	}
-	throw new VibError(`idx/current.json: gave up after ${conflicts} CAS conflicts`, 409);
+	throw new ThreadError(`idx/current.json: gave up after ${conflicts} CAS conflicts`, 409);
 }
 
 /** The newest manifest revision in the store (a crashed writer's manifest beyond current.json counts). */
 async function latestRev(store: BlobStore, gen: string): Promise<number> {
-	if (!store.list) throw new VibError("this store cannot list objects, which the writer needs after a lost race", 400);
+	if (!store.list) throw new ThreadError("this store cannot list objects, which the writer needs after a lost race", 400);
 	const prefix = `idx/${gen}/manifest.`;
 	let head = -1;
 	for (const key of await store.list(prefix)) {
 		const m = key.slice(prefix.length).match(/^(?:(\d+)\.)?json$/);
 		if (m) head = Math.max(head, m[1] ? Number(m[1]) : 0);
 	}
-	if (head < 0) throw new VibError(`no manifest for generation ${gen}`, 404);
+	if (head < 0) throw new ThreadError(`no manifest for generation ${gen}`, 404);
 	return head;
 }
 
@@ -155,7 +155,7 @@ async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifes
 		const cur = await readCurrent(store);
 		const head = !useList && cur && cur.cur.gen === gen ? cur.cur.rev : await latestRev(store, gen);
 		const mb = await store.get(keys.manifest(gen, head));
-		if (!mb) throw new VibError(`no manifest ${keys.manifest(gen, head)}`, 404);
+		if (!mb) throw new ThreadError(`no manifest ${keys.manifest(gen, head)}`, 404);
 		const base = parseManifest(mb, gen, head);
 		const next = await make({ rev: head, manifest: base, files: manifestFiles(base) });
 		const rev = head + 1;
@@ -170,7 +170,7 @@ async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifes
 		useList = true;
 		await sleep(10 + Math.random() * 40 * attempt);
 	}
-	throw new VibError(`${gen}: lost the manifest race ${conflicts} times`, 409);
+	throw new ThreadError(`${gen}: lost the manifest race ${conflicts} times`, 409);
 }
 
 /** The fields a new revision inherits (build notes and the previous change stay with their revision). */
@@ -180,7 +180,7 @@ function inherit(m: Manifest): Manifest {
 }
 
 function u32(a: ArrayLike<number>, name: string): Uint32Array {
-	for (let i = 0; i < a.length; i++) if (!Number.isInteger(a[i]) || a[i] < 0 || a[i] > 0xffffffff) throw new VibError(`${name}[${i}] is not a u32`, 400);
+	for (let i = 0; i < a.length; i++) if (!Number.isInteger(a[i]) || a[i] < 0 || a[i] > 0xffffffff) throw new ThreadError(`${name}[${i}] is not a u32`, 400);
 	return Uint32Array.from(a as ArrayLike<number>);
 }
 
@@ -188,35 +188,35 @@ function u32(a: ArrayLike<number>, name: string): Uint32Array {
 function prepareBatch(input: UpsertInput, dim: number): { ids: Uint32Array; vectors: Float32Array; attrs: Uint32Array | null; payloads: Uint8Array[] | null } {
 	const ids = u32(input.ids, "ids");
 	const n = ids.length;
-	if (n === 0) throw new VibError("empty batch", 400);
-	if (n > MAX_UPSERT) throw new VibError(`at most ${MAX_UPSERT} vectors per upsert`, 400);
-	if (new Set(ids).size !== n) throw new VibError("duplicate ids in the batch", 400);
+	if (n === 0) throw new ThreadError("empty batch", 400);
+	if (n > MAX_UPSERT) throw new ThreadError(`at most ${MAX_UPSERT} vectors per upsert`, 400);
+	if (new Set(ids).size !== n) throw new ThreadError("duplicate ids in the batch", 400);
 	const v = input.vectors;
 	let vectors: Float32Array;
 	if (Array.isArray(v) && v.length && typeof v[0] !== "number") {
 		const rows = v as (Float32Array | number[])[];
-		if (rows.length !== n) throw new VibError(`${rows.length} vectors for ${n} ids`, 400);
+		if (rows.length !== n) throw new ThreadError(`${rows.length} vectors for ${n} ids`, 400);
 		vectors = new Float32Array(n * dim);
 		rows.forEach((r, i) => {
-			if (r.length !== dim) throw new VibError(`vector ${i} has ${r.length} dims, index dim is ${dim}`, 400);
+			if (r.length !== dim) throw new ThreadError(`vector ${i} has ${r.length} dims, index dim is ${dim}`, 400);
 			vectors.set(r, i * dim);
 		});
 	} else {
 		vectors = Float32Array.from(v as ArrayLike<number>);
-		if (vectors.length !== n * dim) throw new VibError(`vectors has ${vectors.length} floats, expected ${n} x ${dim}`, 400);
+		if (vectors.length !== n * dim) throw new ThreadError(`vectors has ${vectors.length} floats, expected ${n} x ${dim}`, 400);
 	}
 	for (let i = 0; i < n; i++) {
 		let ss = 0;
 		for (let j = i * dim; j < (i + 1) * dim; j++) ss += vectors[j] * vectors[j];
-		if (!(ss > 0) || !Number.isFinite(ss)) throw new VibError(`vector ${i} (id ${ids[i]}) has zero or non-finite norm`, 400);
+		if (!(ss > 0) || !Number.isFinite(ss)) throw new ThreadError(`vector ${i} (id ${ids[i]}) has zero or non-finite norm`, 400);
 		const inv = 1 / Math.sqrt(ss);
 		for (let j = i * dim; j < (i + 1) * dim; j++) vectors[j] *= inv;
 	}
 	const attrs = input.attrs ? u32(input.attrs, "attrs") : null;
-	if (attrs && attrs.length !== n) throw new VibError(`${attrs.length} attrs for ${n} vectors`, 400);
+	if (attrs && attrs.length !== n) throw new ThreadError(`${attrs.length} attrs for ${n} vectors`, 400);
 	const enc = new TextEncoder();
 	const payloads = input.payloads ? input.payloads.map((p) => (typeof p === "string" ? enc.encode(p) : p)) : null;
-	if (payloads && payloads.length !== n) throw new VibError(`${payloads.length} payloads for ${n} vectors`, 400);
+	if (payloads && payloads.length !== n) throw new ThreadError(`${payloads.length} payloads for ${n} vectors`, 400);
 	return { ids, vectors, attrs, payloads };
 }
 
@@ -240,21 +240,21 @@ interface EncodedDelta {
 async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b: ReturnType<typeof prepareBatch>): Promise<EncodedDelta> {
 	const { w, store, gen } = ctx;
 	const format = m.format ?? 1;
-	if (format === 3 && !files.pq) throw new VibError(`format 3 generation ${gen} has no PQ codebook`);
+	if (format === 3 && !files.pq) throw new ThreadError(`format 3 generation ${gen} has no PQ codebook`);
 	const baseKey = `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}`;
 	const borrowed = ctx.borrowPq(baseKey);
 	const [seq, meansBytes, pqBytes] = await Promise.all([allocSeq(store, gen, m.nextSeq ?? 1), store.get(files.fine), format === 3 && !borrowed ? store.get(files.pq!) : Promise.resolve(null)]);
-	if (!meansBytes) throw new VibError(`missing ${files.fine}`, 404);
+	if (!meansBytes) throw new ThreadError(`missing ${files.fine}`, 404);
 	const k = m.k1 * m.k2;
 	const means = asF32(meansBytes, files.fine);
-	if (means.length !== k * m.dim) throw new VibError(`${files.fine} has ${means.length / m.dim} means, expected ${k}`);
+	if (means.length !== k * m.dim) throw new ThreadError(`${files.fine} has ${means.length / m.dim} means, expected ${k}`);
 	let ownPq: W.PqCodebook | null = null;
 	if (format === 3 && !borrowed) {
-		if (!pqBytes) throw new VibError(`missing ${files.pq}`, 404);
+		if (!pqBytes) throw new ThreadError(`missing ${files.pq}`, 404);
 		ownPq = new w.PqCodebook(pqBytes);
 	}
-	const epoch = ctx.vib.epoch;
-	const free = (o: { free(): void }) => epoch === ctx.vib.epoch && safeFree(o);
+	const epoch = ctx.thread.epoch;
+	const free = (o: { free(): void }) => epoch === ctx.thread.epoch && safeFree(o);
 	const job = new w.DeltaJob(m.dim, k, means, seq); // DeltaJob holds its own copy of the means (~k*dim*4 bytes)
 	let finished = false;
 	let bytes: Uint8Array;
@@ -278,7 +278,7 @@ async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b
 				}
 				c = job.add_with_payloads(v, b.ids.subarray(a, e), attrs, cat, lens);
 			} else c = job.add(v, b.ids.subarray(a, e), attrs);
-			if (c.length !== e - a) throw new VibError(`DeltaJob added ${c.length} of ${e - a} vectors`);
+			if (c.length !== e - a) throw new ThreadError(`DeltaJob added ${c.length} of ${e - a} vectors`);
 			cells.set(c, a);
 		}
 		finished = true;
@@ -300,7 +300,7 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 	const { store, gen, w } = ctx;
 	writable(store);
 	const replace = input.replace ?? true;
-	return ctx.vib.withRecovery("upsert", async () => {
+	return ctx.thread.withRecovery("upsert", async () => {
 		const st: { batch: ReturnType<typeof prepareBatch> | null; delta: EncodedDelta | null; tombKey: string | null; tombBytes: number } = { batch: null, delta: null, tombKey: null, tombBytes: 0 };
 		const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
 			const batch = (st.batch ??= prepareBatch(input, manifest.dim));
@@ -319,7 +319,7 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 			}
 			next.deltas!.push({ seq: delta.seq, key: delta.key, count: batch.ids.length, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
 			next.nextSeq = Math.max(next.nextSeq ?? 1, delta.seq + 1);
-			return { ...next, change: { op: "upsert", seq: delta.seq, count: batch.ids.length, replace, writer: "vib-sdk" } };
+			return { ...next, change: { op: "upsert", seq: delta.seq, count: batch.ids.length, replace, writer: "thread-sdk" } };
 		});
 		const d = st.delta!;
 		return {
@@ -344,14 +344,14 @@ export async function deleteIds(ctx: WriterContext, idsIn: ArrayLike<number>): P
 	const { store, gen, w } = ctx;
 	writable(store);
 	const ids = u32(idsIn, "ids");
-	if (!ids.length) throw new VibError("no ids", 400);
+	if (!ids.length) throw new ThreadError("no ids", 400);
 	const tb = tombBytes(w, ids);
 	let key = "";
 	const c = await commitRev(ctx, async ({ rev, manifest }) => {
 		const next = inherit(manifest);
 		key = await putUnique(store, keys.tombstones(gen, rev + 1), tb);
 		next.tombstones!.push({ rev: rev + 1, key, count: tb.byteLength / 4 });
-		return { ...next, change: { op: "delete", count: tb.byteLength / 4, writer: "vib-sdk" } };
+		return { ...next, change: { op: "delete", count: tb.byteLength / 4, writer: "thread-sdk" } };
 	});
 	return { gen, rev: c.rev, count: tb.byteLength / 4, key, conflicts: c.conflicts, casConflicts: c.casConflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
 }

@@ -1,12 +1,12 @@
 //! Recall/latency of `route::CentroidTree` against exhaustive search on real
 //! centroids. Usage:
-//! `cargo run --release -p vib-core --example tree_bench -- <means.f32> <sample.f32> <dim> [groups,..] [iters]`
+//! `cargo run --release -p thread-core --example tree_bench -- <means.f32> <sample.f32> <dim> [groups,..] [iters]`
 //! (`means.f32`: k x dim f32 LE raw cell means; `sample.f32`: n x dim unit vectors.)
 
 use std::time::Instant;
-use vib_core::error::f32s_from_le;
-use vib_core::math::{argmax_dot_scaled, inv_norms, top_n_dot_scaled};
-use vib_core::route::CentroidTree;
+use thread_core::error::f32s_from_le;
+use thread_core::math::{argmax_dot_scaled, inv_norms, top_n_dot_scaled};
+use thread_core::route::CentroidTree;
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();

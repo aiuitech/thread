@@ -1,4 +1,4 @@
-# vib: a blob-native vector index
+# thread: a blob-native vector index
 
 Cosine-similarity search over vector embeddings where the index lives in object
 storage (Cloudflare R2) and queries run in RAM-constrained environments
@@ -21,8 +21,8 @@ and/or tombstone set plus a new manifest *revision*; compaction folds them into 
 revisions (see [Updates](#updates-manifest-revisions-deltas-tombstones-compaction)), automatically once a revision
 exceeds the generation's compaction thresholds; cells that outgrow a cap are split in two.
 
-Everything numeric is in Rust (`crates/vib-core`), exposed to JS through
-wasm-bindgen (`crates/vib-wasm`). The Worker (`worker/`) is an I/O shell that
+Everything numeric is in Rust (`crates/thread-core`), exposed to JS through
+wasm-bindgen (`crates/thread-wasm`). The Worker (`worker/`) is an I/O shell that
 streams R2 objects through the wasm kernels so no stage holds more than a few
 tens of MB.
 
@@ -82,16 +82,16 @@ the values used and where each came from (`query`, `manifest`, `tree` or `legacy
    206 from a cached full object). On a cache miss the Worker GETs the whole object
    from R2, caches it in the background, and keeps the rerank records of that slab's
    local winners in memory. Each prefix is scanned for the top `T = max(k, rerank)`:
-   format 3 with `vib.scan_pq(prefix, table, q, T)`, where `table = PqTable.from_codebook(q, codebook)`
+   format 3 with `thread.scan_pq(prefix, table, q, T)`, where `table = PqTable.from_codebook(q, codebook)`
    is built once per query (192 x 256 dot products) and freed when the query ends;
-   format 2 with `vib.scan`. Reads are issued as a sliding window of 12 in flight per
+   format 2 with `thread.scan`. Reads are issued as a sliding window of 12 in flight per
    query (`QUERY_INFLIGHT`). Cache API reads are not held to the Workers limit of 6
    open connections (measured in `data/bench-latency.txt`); R2 reads are retried once
    if the runtime cancels them for the connection limit.
 2. **Rerank.** The global top-T (after `merge`) is grouped by slab, and the winners of
    each slab are read with ONE multi-range Cache API request (`Range: bytes=a-b, c-d, ...`,
    one range per record, adjacent records within 4 KB merged; the 206 multipart/byteranges
-   answer is parsed in `cacheMatchMulti`), then re-scored with `vib.rerank`. The top k by
+   answer is parsed in `cacheMatchMulti`), then re-scored with `thread.rerank`. The top k by
    reranked score are returned. **Speculative reads:** once only 6 slabs remain to be
    scanned, the running top-T is read the same way at low priority (only when no prefix
    read is waiting), so phase 2 usually finds every record already in memory and costs
@@ -128,7 +128,7 @@ is installed (`Searcher.set_tree`) right before the query routes.
 
 Flat routing scores the query against all 4096 cell means (`cell_dots`, 4096 x 1536 multiply-adds),
 and an upsert used to do the same per vector to find its primary cell. A **centroid tree** prunes that
-search: `vib.build_centroid_tree(fineMeans, dim, groups, iters, seed)` clusters the cell means into
+search: `thread.build_centroid_tree(fineMeans, dim, groups, iters, seed)` clusters the cell means into
 `groups` group means (spherical k-means over the means), and a lookup scores the group means first, then
 only the cells of the best `beam` groups (~128 + beam x 32 dot products at 128 groups).
 
@@ -270,15 +270,15 @@ build pool for the same reason.)
 
 ## Layout
 
-- `crates/vib-core`   format, quantization, k-means accumulators, router, scan
-- `crates/vib-wasm`   wasm-bindgen jobs: FlatKmeansJob, TreeKmeansJob, IncKmeansJob, Reducer, AssignJob, SlabJob, Searcher, cell_neighbors,
+- `crates/thread-core`   format, quantization, k-means accumulators, router, scan
+- `crates/thread-wasm`   wasm-bindgen jobs: FlatKmeansJob, TreeKmeansJob, IncKmeansJob, Reducer, AssignJob, SlabJob, Searcher, cell_neighbors,
                       PQ: residuals_for, pq_init_codebook, PqTrainJob, PqReducer, PqCodebook, PqTable, scan_pq,
                       updates: DeltaJob, scan_delta, delta_info/cells/records_for_cell/payload, slab_to_records,
                       tombstones_merge, filter_hits, cell splits: split_slab, split_slab_records, split_part_records,
                       reencode_records,
                       centroid tree: build_centroid_tree, centroid_tree_info, Searcher.set_tree/route_beam/cell_dots_for/
                       tree_recall/tree_recall_top, DeltaJob.set_tree, AssignJob.set_tree (not used by the driver yet)
-- `crates/vib-cli`    native CLI (placeholder)
+- `crates/thread-cli`    native CLI (placeholder)
 - `worker/`           `cf`-managed Worker: build-stage endpoints, `/query`, `/upsert`, `/delete`, compaction (manual and
                       automatic), cell splits, `/index/status`, rollback, gc (`src/index.ts`); `src/main.ts` runs build
                       stages and writes in build slots (Worker Loader); see `worker/README.md`
@@ -323,9 +323,9 @@ PQ: one 12 MB residual object, a 1.5 MB codebook and a 1.8 MB partial).
 The driver needs many heavy jobs in parallel (k-means map and assign use 60-100 MB each), but concurrent requests
 to one Worker can share a single 128 MB isolate. Until g4 that meant a pool of eight identical scripts
 (vib-bench-0..7). Now there is one deployment: `worker/src/main.ts` forwards `POST /build/<stage>?slot=<id>` to
-the dynamic Worker `vib-build:<bundle hash>:slot-<id>` (`env.LOADER.get`), which runs a second bundle of the
+the dynamic Worker `thread-build:<bundle hash>:slot-<id>` (`env.LOADER.get`), which runs a second bundle of the
 same `worker/src/index.ts` in its own isolate with its own 128 MB and `limits.cpuMs` 300,000. The driver keeps a
-free list of slot ids `0..VIB_SLOTS-1` (default 8) and sends one job per slot at a time; retries, bodies and auth
+free list of slot ids `0..THREAD_SLOTS-1` (default 8) and sends one job per slot at a time; retries, bodies and auth
 are unchanged. R2 reaches the slots through a loopback RPC entrypoint (`BucketRpc`; an R2 binding cannot be put in a
 dynamic Worker's env) and a shim that gives the bundle an R2Bucket-shaped `env.BUCKET`; object bodies stream
 through the orchestrator in both directions. Writes (`/upsert`, `/delete`) run in the `writer` slot and the
@@ -347,7 +347,7 @@ driver then deletes the intermediates nothing reads any more, `build/{gen}/parti
 22 GB for g5.) Per-job times are bimodal (~21 s or ~53 s for the same 10-shard k-means map job) on either setup:
 host contention, not the slot mechanism.
 
-The query Worker was chosen over a sibling `vib-build` Worker: one deployment instead of two, the slots' code is
+The query Worker was chosen over a sibling `thread-build` Worker: one deployment instead of two, the slots' code is
 guaranteed to be the version that serves queries (same build, same wasm module), and writes keep working on the
 query URL. The orchestrator isolates only forward requests and pump RPC streams (no object is buffered there).
 
@@ -360,9 +360,9 @@ runs on residuals of the k-means sample against the **final** k-means cells:
 1. `pq-residuals` (one job per sample group, the first `pqSampleObjects` = 30 groups of
    the sample stage): reads the first `perShard` (336) vectors of each of the group's ~6
    shards and the first `perShard` entries of their final assignment
-   (`assign/{fineIters}/{shard}.u32`), and writes `vib.residuals_for(vectors, means, assign)`
+   (`assign/{fineIters}/{shard}.u32`), and writes `thread.residuals_for(vectors, means, assign)`
    (~60k rows, 370 MB in total). It also reports the mean residual energy `|r|^2`.
-2. `pq-init`: `vib.pq_init_codebook` over the first two residual objects (~4000 rows).
+2. `pq-init`: `thread.pq_init_codebook` over the first two residual objects (~4000 rows).
 3. `pqIters` (12) Lloyd iterations: 8 `pq-train-map` jobs (`PqTrainJob`, ~4 residual
    objects each) write partial sums, one `pq-train-reduce` (`PqReducer`, partials streamed
    one at a time) writes the next codebook and reports `mean_sq_err` (the error under the
@@ -410,12 +410,12 @@ consecutive batches, each with its own smaller spans.
 bench/upload_shards.sh 6
 
 # build wasm and deploy the worker
-cargo build --release --target wasm32-unknown-unknown -p vib-wasm
-wasm-bindgen --target web --experimental-reset-state-function --out-dir worker/pkg --out-name vib target/wasm32-unknown-unknown/release/vib_wasm.wasm
+cargo build --release --target wasm32-unknown-unknown -p thread-wasm
+wasm-bindgen --target web --experimental-reset-state-function --out-dir worker/pkg --out-name thread target/wasm32-unknown-unknown/release/thread_wasm.wasm
 (cd worker && cf deploy --secrets-file .env.secrets)   # run from worker/, not the repo root
 # That is the only deployment: build stages and writes run in build slots (dynamic Workers of vib-bench,
 # one isolate per slot id, see "Build slots" above and worker/README.md). The stage bundle the slots run is
-# built by the same `cf deploy` (vite plugin in worker/vite.config.ts). VIB_ORCH / VIB_SLOTS point the
+# built by the same `cf deploy` (vite plugin in worker/vite.config.ts). THREAD_ORCH / THREAD_SLOTS point the
 # drivers at another deployment / change the build width (default 8).
 
 # build an index generation (edge profile), then benchmark queries

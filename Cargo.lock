@@ -56,29 +56,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "thread-cli"
+version = "0.1.0"
+dependencies = [
+ "thread-core",
+]
+
+[[package]]
+name = "thread-core"
+version = "0.1.0"
+
+[[package]]
+name = "thread-wasm"
+version = "0.1.0"
+dependencies = [
+ "thread-core",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
-
-[[package]]
-name = "vib-cli"
-version = "0.1.0"
-dependencies = [
- "vib-core",
-]
-
-[[package]]
-name = "vib-core"
-version = "0.1.0"
-
-[[package]]
-name = "vib-wasm"
-version = "0.1.0"
-dependencies = [
- "vib-core",
- "wasm-bindgen",
-]
 
 [[package]]
 name = "wasm-bindgen"

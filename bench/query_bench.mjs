@@ -32,7 +32,7 @@ for (let i = 2; i < process.argv.length; i++) {
 	else if (process.argv[i + 1] && !process.argv[i + 1].startsWith("--")) args[m[1]] = process.argv[++i];
 	else args[m[1]] = "true";
 }
-const BASE = process.env.VIB_URL ?? "https://vib-bench.aiuitech.workers.dev";
+const BASE = process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
 const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "data/prep/manifest.json"), "utf8"));
 const dim = manifest.dim;

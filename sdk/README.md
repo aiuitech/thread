@@ -1,41 +1,41 @@
-# vib-sdk
+# thread-sdk
 
-Query (and, experimentally, update) a [vib](../README.md) blob-native vector index from a Cloudflare
+Query (and, experimentally, update) a [thread](../README.md) blob-native vector index from a Cloudflare
 Worker. The index lives as immutable objects in R2 (or any S3-compatible store); the SDK streams the probed
 slabs through the Rust/wasm kernels and returns the top-k, like a Vectorize binding but with the index in
 your own bucket, readable through the Workers Cache API at the edge.
 
 ```ts
-import wasmModule from "vib-sdk/wasm/vib_bg.wasm";
-import { Vib } from "vib-sdk";
+import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
+import { Thread } from "thread-sdk";
 
-const vib = await Vib.init({ wasmModule });                   // once per isolate
-const index = await vib.open({ bucket: env.BUCKET, waitUntil: (p) => ctx.waitUntil(p) });
+const thread = await Thread.init({ wasmModule });                   // once per isolate
+const index = await thread.open({ bucket: env.BUCKET, waitUntil: (p) => ctx.waitUntil(p) });
 const { hits } = await index.query(embedding, { topK: 10 });  // [{ id, score, attrs, source }, ...]
 ```
 
 ## Install
 
 ```sh
-npm install vib-sdk
+npm install thread-sdk
 ```
 
 No runtime dependencies: the package ships its TypeScript build (`dist/`) and the wasm-bindgen output of
-`crates/vib-wasm` (`dist/wasm/vib_bg.wasm`, ~240 KB). Node >= 20 for the tests; the SDK itself targets the
+`crates/thread-wasm` (`dist/wasm/thread_bg.wasm`, ~240 KB). Node >= 20 for the tests; the SDK itself targets the
 Workers runtime (WebCrypto, `fetch`, Cache API) and runs in Node for tests and tooling.
 
 ### Importing the wasm
 
 The SDK is bundler-agnostic: you import the `.wasm` through your bundler, which turns it into a
-`WebAssembly.Module`, and hand it to `Vib.init`. The SDK handles instantiation, the panic hook and recovery
+`WebAssembly.Module`, and hand it to `Thread.init`. The SDK handles instantiation, the panic hook and recovery
 from traps.
 
 **Cloudflare Vite plugin** (`cf init workers`, `@cloudflare/vite-plugin`): import the file by a specifier ending
-in `.wasm` so the plugin's `CompiledWasm` rule applies (a bare `vib-sdk/wasm` is taken over by Vite's own wasm
+in `.wasm` so the plugin's `CompiledWasm` rule applies (a bare `thread-sdk/wasm` is taken over by Vite's own wasm
 handling and fails):
 
 ```ts
-import wasmModule from "vib-sdk/wasm/vib_bg.wasm";
+import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
 ```
 
 ```ts
@@ -49,22 +49,22 @@ declare module "*.wasm" {
 **Wrangler** bundles `*.wasm` imports as `CompiledWasm` modules by default; the same import works. With a
 custom `rules` list keep `{ type: "CompiledWasm", globs: ["**/*.wasm"] }`.
 
-**Node** (tests, scripts): `new WebAssembly.Module(fs.readFileSync("node_modules/vib-sdk/dist/wasm/vib_bg.wasm"))`.
+**Node** (tests, scripts): `new WebAssembly.Module(fs.readFileSync("node_modules/thread-sdk/dist/wasm/thread_bg.wasm"))`.
 
 ### Pointing at the index
 
-The index layout under the bucket is the one `vib`'s build pipeline writes (`idx/current.json`,
+The index layout under the bucket is the one `thread`'s build pipeline writes (`idx/current.json`,
 `idx/{gen}/manifest[.rev].json`, `slabs[.rev].json`, `slab/{cell:05}[.rev]`, `delta/{seq}.vibd`,
 `tombstones.{rev}.u32`, `coarse.f32`, `fine.f32`, `pq.bin`). Three ways to reach it:
 
 ```ts
 // 1. R2 binding (fastest: no auth, no TLS, same-colo reads)
-const index = await vib.open({ bucket: env.BUCKET });
+const index = await thread.open({ bucket: env.BUCKET });
 // equivalent, explicit:
-const index = await vib.open({ store: new R2BlobStore(env.BUCKET) });
+const index = await thread.open({ store: new R2BlobStore(env.BUCKET) });
 
 // 2. Any S3-compatible endpoint, e.g. R2's S3 API from a Worker (or from anywhere)
-const index = await vib.open({
+const index = await thread.open({
 	store: new S3BlobStore({
 		endpoint: "https://<account-id>.r2.cloudflarestorage.com",
 		bucket: "vib-bench",
@@ -76,7 +76,7 @@ const index = await vib.open({
 });
 
 // 3. Your own BlobStore (the "local profile": a disk, a KV, a test fixture) - see "BlobStore" below
-const index = await vib.open({ store: new MemoryBlobStore() });
+const index = await thread.open({ store: new MemoryBlobStore() });
 ```
 
 Whatever the store, `open` puts a `CachedBlobStore` (Workers Cache API, `caches.default`) in front of it unless
@@ -84,17 +84,17 @@ Whatever the store, `open` puts a `CachedBlobStore` (Workers Cache API, `caches.
 
 ## API
 
-### `Vib.init({ wasmModule }): Promise<Vib>`
+### `Thread.init({ wasmModule }): Promise<Thread>`
 
 Instantiates the wasm once per isolate (wasm-bindgen keeps a single instance per module scope; a second `init`
-with another module is a no-op). `vib.wasm` exposes the raw bindings for advanced use (build jobs, slab tools).
+with another module is a no-op). `thread.wasm` exposes the raw bindings for advanced use (build jobs, slab tools).
 
-On a wasm trap (`WebAssembly.RuntimeError`) the instance is poisoned: `vib.withRecovery` (used by `query`,
-`upsert`, `delete`) calls `__wbg_reset_state()`, reinstalls the panic hook, bumps `vib.epoch`, invalidates every
+On a wasm trap (`WebAssembly.RuntimeError`) the instance is poisoned: `thread.withRecovery` (used by `query`,
+`upsert`, `delete`) calls `__wbg_reset_state()`, reinstalls the panic hook, bumps `thread.epoch`, invalidates every
 index's wasm objects (they are rebuilt from the cached base files on the next query) and retries the operation
-once. `vib.resets` counts resets; `stats.attempt` is 2 on a retried query.
+once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 
-### `vib.open(options): Promise<VibIndex>`
+### `thread.open(options): Promise<ThreadIndex>`
 
 | option | default | meaning |
 |---|---|---|
@@ -222,13 +222,13 @@ prefixes and uses the rest of the object instead of re-reading it.
 - `inflight` 12 Cache API reads per query is safe; origin (R2/S3) reads beyond 6 in flight may be cancelled by
   the runtime ("connection limit") and are retried once.
 - An isolate serving several indexes keeps one base per index; `close()` what you no longer need, or keep one
-  `VibIndex` per store at module level (the example does).
+  `ThreadIndex` per store at module level (the example does).
 - Payloads: `returnPayload` reads them with one (multi-)range request per slab; keep payloads small or store
   them elsewhere keyed by id.
 
 ## Vectorize mapping
 
-| Vectorize | vib-sdk |
+| Vectorize | thread-sdk |
 |---|---|
 | `env.VECTORIZE.query(vector, { topK, returnMetadata })` | `index.query(vector, { topK, returnPayload })`: `hits[].id/score`; `attrs` (u32) and `payload` (bytes) are the metadata |
 | `matches[].id` (string) | `hits[].id` (u32) |
@@ -247,7 +247,7 @@ prefixes and uses the rest of the object instead of re-reading it.
 - `upsert` / `delete`: the SDK writes delta segments, tombstone sets and manifest revisions exactly as
   docs/update-path.md specifies and as its own tests check (Node, MemoryBlobStore, wasm), but it has not yet
   been run against a revision written by the Worker and vice versa. Points to reconcile: the Worker writes
-  `change.op` fields the SDK copies (`upsert`/`delete` + `writer: "vib-sdk"`); the Worker's `/upsert` also
+  `change.op` fields the SDK copies (`upsert`/`delete` + `writer: "thread-sdk"`); the Worker's `/upsert` also
   accepts `firstId`, base64 vectors and `{b64}` payloads, which the SDK does not need; compaction and GC are
   Worker-only (`POST /build/compact`, `/build/gc`).
 - Spec notes from the implementation: (1) `scan`/`scan_pq`/`scan_delta` now take the tombstone buffer and apply
@@ -265,7 +265,7 @@ prefixes and uses the rest of the object instead of re-reading it.
 
 ```sh
 npm install
-npm run sync-wasm      # copy worker/pkg/{vib.js,vib.d.ts,vib_bg.wasm,...} into src/wasm
+npm run sync-wasm      # copy worker/pkg/{thread.js,thread.d.ts,thread_bg.wasm,...} into src/wasm
 npm test               # vitest: wire formats, stores, SigV4, end-to-end with the wasm in Node
 npm run build          # dist/ (tsc + wasm assets)
 cd examples/basic && npm install && cf deploy --secrets-file .env.secrets

@@ -7,13 +7,13 @@
  *   GET  /r2test?slot=N&key=K   reads K from a dynamic Worker, once with the R2 binding passed directly
  *                               in env and once through the BucketRpc entrypoint stub
  *   POST /cleanup               deletes build/spike/*
- *   POST /build/<stage>?slot=N  runs a real build stage in dynamic Worker `vib-build:<bundle>:slot-N`,
+ *   POST /build/<stage>?slot=N  runs a real build stage in dynamic Worker `thread-build:<bundle>:slot-N`,
  *                               which runs the vib-bench bundle (build-bundle/, copied from worker/)
  * Query `gen=<string>` is mixed into the dynamic Worker id, to force fresh isolates between runs.
  */
 import { WorkerEntrypoint } from "cloudflare:workers";
 import bundleSource from "../build-bundle/index.js?raw";
-import vibWasm from "../build-bundle/assets/vib_bg-Ddd4raaf.wasm";
+import threadWasm from "../build-bundle/assets/vib_bg-Ddd4raaf.wasm";
 import { MEM_MODULE, SHIM_MODULE } from "./dynamic.ts";
 
 interface Env {
@@ -183,7 +183,7 @@ export default {
 			if (url.pathname.startsWith("/build/") && request.method === "POST") {
 				const slot = slotOf(url);
 				const loaded = { cold: false, codeMs: 0 };
-				const stub = env.LOADER.get(`vib-build:${BUNDLE_VERSION}:${gen}:slot-${slot}`, () => {
+				const stub = env.LOADER.get(`thread-build:${BUNDLE_VERSION}:${gen}:slot-${slot}`, () => {
 					const tc = Date.now();
 					loaded.cold = true;
 					const code: WorkerLoaderWorkerCode = {
@@ -192,7 +192,7 @@ export default {
 						modules: {
 							"shim.js": SHIM_MODULE,
 							"index.js": bundleSource,
-							"assets/vib_bg-Ddd4raaf.wasm": vibWasm,
+							"assets/vib_bg-Ddd4raaf.wasm": threadWasm,
 						},
 						env: { BUILD_TOKEN: env.BUILD_TOKEN, BUCKET_RPC: exportsAny.BucketRpc({ props: {} }) },
 					};
@@ -202,7 +202,7 @@ export default {
 					return code;
 				});
 				// Strip orchestrator-only query params before the bundle sees the request.
-				const fwdUrl = new URL(url.pathname, "https://vib-dyn");
+				const fwdUrl = new URL(url.pathname, "https://thread-dyn");
 				const fwd = new Request(fwdUrl, request);
 				return await forward(stub, fwd, loaded, t0);
 			}

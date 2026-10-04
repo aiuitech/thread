@@ -6,13 +6,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { MemoryBlobStore, Vib, VibIndex, keys, type Manifest, type SlabRow } from "../src/index.js";
+import { MemoryBlobStore, Thread, ThreadIndex, keys, type Manifest, type SlabRow } from "../src/index.js";
 
 // Node has a constructible WebAssembly.Module (the workers-types declaration is abstract, hence the cast).
-const wasmBytes = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/wasm/vib_bg.wasm"));
+const wasmBytes = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/wasm/thread_bg.wasm"));
 const wasmModule = new (WebAssembly as unknown as { Module: new (b: BufferSource) => WebAssembly.Module }).Module(wasmBytes);
-const vib = await Vib.init({ wasmModule });
-const w = vib.wasm;
+const thread = await Thread.init({ wasmModule });
+const w = thread.wasm;
 
 function rng(seed: number): () => number {
 	let s = seed >>> 0;
@@ -115,7 +115,7 @@ async function buildGen(gen: string, format: 1 | 2 | 3, opts: { dim?: number; k2
 	return { store, vectors, dim };
 }
 
-async function recall(index: VibIndex, b: Built, nq: number, k: number, qopts: Parameters<VibIndex["query"]>[1] = {}): Promise<number> {
+async function recall(index: ThreadIndex, b: Built, nq: number, k: number, qopts: Parameters<ThreadIndex["query"]>[1] = {}): Promise<number> {
 	const r = rng(7);
 	let hit = 0;
 	for (let i = 0; i < nq; i++) {
@@ -133,7 +133,7 @@ async function recall(index: VibIndex, b: Built, nq: number, k: number, qopts: P
 describe("end to end (wasm in node, MemoryBlobStore)", () => {
 	it("v3 (PQ scan + int8 rerank): manifest defaults, params, stats, recall", async () => {
 		const b = await buildGen("g3", 3);
-		const index = await vib.open({ store: b.store, cache: false });
+		const index = await thread.open({ store: b.store, cache: false });
 		expect(index.gen).toBe("g3");
 		expect(index.rev).toBe(0);
 		expect(index.dim).toBe(16);
@@ -165,7 +165,7 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 
 	it("v2 (4-bit scan + int8 rerank) and queryMany", async () => {
 		const b = await buildGen("g2", 2);
-		const index = await vib.open({ store: b.store, cache: false });
+		const index = await thread.open({ store: b.store, cache: false });
 		expect(index.format).toBe(2);
 		expect(await recall(index, b, 20, 10, { nprobe: 8 })).toBeGreaterThanOrEqual(0.95);
 		const many = await index.queryMany([b.vectors.subarray(0, 16), b.vectors.subarray(32, 48)], { topK: 1, nprobe: 8 });
@@ -175,7 +175,7 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 
 	it("v1 legacy generation (no slabs table, no rev in current.json): slabs read whole, no phase 2", async () => {
 		const b = await buildGen("g1", 1, { legacy: true });
-		const index = await vib.open({ store: b.store, cache: false });
+		const index = await thread.open({ store: b.store, cache: false });
 		expect(index.format).toBe(1);
 		expect(index.revision.slabs).toBeNull();
 		const res = await index.query(b.vectors.subarray(48, 64), { nprobe: 8 });
@@ -188,8 +188,8 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 
 	it("upsert / delete: delta segments, tombstones, replace semantics, refresh on another handle", async () => {
 		const b = await buildGen("gu", 3);
-		const a = await vib.open({ store: b.store, cache: false });
-		const other = await vib.open({ store: b.store, cache: false, refreshInterval: 0 });
+		const a = await thread.open({ store: b.store, cache: false });
+		const other = await thread.open({ store: b.store, cache: false, refreshInterval: 0 });
 		const r = rng(99);
 		const fresh = unitRows(2, b.dim, r);
 		const up = await a.upsert({ ids: [1000, 1001], vectors: fresh, attrs: [5, 6], payloads: ["p-1000", new TextEncoder().encode("p-1001")] });
@@ -240,12 +240,12 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 		expect(q5.stats.deltaDropped).toBe(1);
 		expect(q5.stats.tombSets).toBe(3);
 		// a fresh open sees the head revision through current.json
-		const c = await vib.open({ store: b.store, cache: false });
+		const c = await thread.open({ store: b.store, cache: false });
 		expect(c.rev).toBe(3);
 		expect(c.manifest.nextSeq).toBe(3);
 		expect(c.manifest.change).toMatchObject({ op: "delete", count: 1 });
 		// pinned open of rev 0 ignores everything
-		const pinned = await vib.open({ store: b.store, cache: false, gen: "gu", rev: 0 });
+		const pinned = await thread.open({ store: b.store, cache: false, gen: "gu", rev: 0 });
 		expect((await pinned.query(old3, { topK: 1, nprobe: 8 })).hits[0].id).toBe(3);
 		expect(await pinned.refresh()).toBe(false);
 		for (const ix of [a, other, c, pinned]) ix.close();
@@ -253,7 +253,7 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 
 	it("write conflicts: a lost manifest race is retried on the new head", async () => {
 		const b = await buildGen("gc", 2);
-		const a = await vib.open({ store: b.store, cache: false });
+		const a = await thread.open({ store: b.store, cache: false });
 		// Another writer took rev 1 behind our back (current.json still says rev 0, as after a crash before the CAS).
 		const head = JSON.parse(new TextDecoder().decode((await b.store.get(keys.manifest("gc", 0)))!)) as Manifest;
 		await b.store.put(keys.manifest("gc", 1), JSON.stringify({ ...head, rev: 1, parentRev: 0, deltas: [], tombstones: [], nextSeq: 5 }));
@@ -267,21 +267,21 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 
 	it("wasm reset: the routing table is rebuilt and the query retried", async () => {
 		const b = await buildGen("gr", 3);
-		const index = await vib.open({ store: b.store, cache: false });
-		const before = vib.resets;
-		vib.reset("test");
+		const index = await thread.open({ store: b.store, cache: false });
+		const before = thread.resets;
+		thread.reset("test");
 		const res = await index.query(b.vectors.subarray(0, 16), { nprobe: 8 });
 		expect(res.hits[0].id).toBe(0);
-		expect(vib.resets).toBe(before + 1);
+		expect(thread.resets).toBe(before + 1);
 		let calls = 0;
-		const out = await vib.withRecovery("t", async (attempt) => {
+		const out = await thread.withRecovery("t", async (attempt) => {
 			calls++;
 			if (attempt === 1) throw new WebAssembly.RuntimeError("unreachable");
 			return (await index.query(b.vectors.subarray(16, 32), { nprobe: 8 })).hits[0].id;
 		});
 		expect(out).toBe(1);
 		expect(calls).toBe(2);
-		expect(vib.resets).toBe(before + 2);
+		expect(thread.resets).toBe(before + 2);
 		index.close();
 	});
 });

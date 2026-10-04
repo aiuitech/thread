@@ -1,18 +1,18 @@
-//! Native helper CLI for vib.
+//! Native helper CLI for thread.
 //!
-//!   vib bench-scan [n_vectors] [dim] [pq_m]   time v1 (int8), v2 (4-bit + int8 rerank) and v3 (PQ + int8 rerank) scans of a synthetic slab
-//!   vib bench-route [k1] [k2] [dim] [nprobe]  time flat vs two-level routing
-//!   vib bench-neighbors [k] [dim] [count] [n]  time one cell_neighbors range (cells [0, count))
-//!   vib inspect <slab-file>            print slab header info
+//!   thread bench-scan [n_vectors] [dim] [pq_m]   time v1 (int8), v2 (4-bit + int8 rerank) and v3 (PQ + int8 rerank) scans of a synthetic slab
+//!   thread bench-route [k1] [k2] [dim] [nprobe]  time flat vs two-level routing
+//!   thread bench-neighbors [k] [dim] [count] [n]  time one cell_neighbors range (cells [0, count))
+//!   thread inspect <slab-file>            print slab header info
 
 use std::time::Instant;
-use vib_core::math::{dot, normalize, Rng};
-use vib_core::pq::{self, Codebook, PqAccum, QueryTable};
-use vib_core::quant::{encode_residual_sq4, encode_residual_sq8};
-use vib_core::route::Router;
-use vib_core::search::{rerank_records, scan_slab, scan_slab_pq};
-use vib_core::slab::{SlabBuilder, SlabBuilderV1, SlabBuilderV3, SlabView};
-use vib_core::topk::{Hit, TopK};
+use thread_core::math::{dot, normalize, Rng};
+use thread_core::pq::{self, Codebook, PqAccum, QueryTable};
+use thread_core::quant::{encode_residual_sq4, encode_residual_sq8};
+use thread_core::route::Router;
+use thread_core::search::{rerank_records, scan_slab, scan_slab_pq};
+use thread_core::slab::{SlabBuilder, SlabBuilderV1, SlabBuilderV3, SlabView};
+use thread_core::topk::{Hit, TopK};
 
 fn rand_unit(rng: &mut Rng, dim: usize) -> Vec<f32> {
     let mut v: Vec<f32> = (0..dim).map(|_| rng.below(20001) as f32 / 10000.0 - 1.0).collect();
@@ -222,9 +222,9 @@ fn bench_route(k1: usize, k2: usize, dim: usize, nprobe: usize) {
 fn bench_neighbors(k: usize, dim: usize, count: usize, n: usize) {
     let mut rng = Rng::new(9);
     let means: Vec<f32> = (0..k).flat_map(|_| rand_unit(&mut rng, dim)).collect();
-    let _ = vib_core::kmeans::cell_neighbors(&means, dim, 0, 16.min(count), n); // warm
+    let _ = thread_core::kmeans::cell_neighbors(&means, dim, 0, 16.min(count), n); // warm
     let t = Instant::now();
-    let nb = vib_core::kmeans::cell_neighbors(&means, dim, 0, count, n);
+    let nb = thread_core::kmeans::cell_neighbors(&means, dim, 0, count, n);
     let s = t.elapsed().as_secs_f64();
     let macs = (count * k * dim) as f64;
     println!(
@@ -279,6 +279,6 @@ fn main() {
             bench_neighbors(a(2, 4096), a(3, 1536), a(4, 512), a(5, 64));
         }
         Some("inspect") => inspect(args.get(2).expect("slab path")),
-        _ => eprintln!("usage: vib bench-scan [n] [dim] [pq_m] | vib bench-route [k1] [k2] [dim] [nprobe] | vib bench-neighbors [k] [dim] [count] [n] | vib inspect <slab>"),
+        _ => eprintln!("usage: thread bench-scan [n] [dim] [pq_m] | thread bench-route [k1] [k2] [dim] [nprobe] | thread bench-neighbors [k] [dim] [count] [n] | thread inspect <slab>"),
     }
 }

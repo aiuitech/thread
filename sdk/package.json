@@ -1,7 +1,7 @@
 {
-  "name": "vib-sdk",
+  "name": "thread-sdk",
   "version": "0.1.0",
-  "description": "Query and update a vib blob-native vector index (slabs in R2 or any S3-compatible store) from Cloudflare Workers",
+  "description": "Query and update a thread blob-native vector index (slabs in R2 or any S3-compatible store) from Cloudflare Workers",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -11,17 +11,17 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
-    "./wasm/vib_bg.wasm": {
+    "./wasm/thread_bg.wasm": {
       "types": "./dist/wasm/module.d.ts",
-      "default": "./dist/wasm/vib_bg.wasm"
+      "default": "./dist/wasm/thread_bg.wasm"
     },
     "./wasm": {
       "types": "./dist/wasm/module.d.ts",
-      "default": "./dist/wasm/vib_bg.wasm"
+      "default": "./dist/wasm/thread_bg.wasm"
     },
-    "./wasm/vib.js": {
-      "types": "./dist/wasm/vib.d.ts",
-      "default": "./dist/wasm/vib.js"
+    "./wasm/thread.js": {
+      "types": "./dist/wasm/thread.d.ts",
+      "default": "./dist/wasm/thread.js"
     },
     "./package.json": "./package.json"
   },
@@ -43,7 +43,7 @@
   ],
   "scripts": {
     "sync-wasm": "scripts/sync-wasm.sh",
-    "build": "rm -rf dist && tsc -p tsconfig.build.json && mkdir -p dist/wasm && cp src/wasm/vib.js src/wasm/vib.d.ts src/wasm/vib_bg.wasm src/wasm/vib_bg.wasm.d.ts src/wasm/module.d.ts dist/wasm/",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && mkdir -p dist/wasm && cp src/wasm/thread.js src/wasm/thread.d.ts src/wasm/thread_bg.wasm src/wasm/thread_bg.wasm.d.ts src/wasm/module.d.ts dist/wasm/",
     "typecheck": "tsc -p tsconfig.json",
     "test": "vitest run",
     "prepack": "npm run build"

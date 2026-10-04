@@ -1,22 +1,22 @@
-//! wasm-bindgen surface over `vib-core`. Pure compute; the host (a Cloudflare
+//! wasm-bindgen surface over `thread-core`. Pure compute; the host (a Cloudflare
 //! Worker in TypeScript) does all storage I/O and hands byte buffers in.
 //!
 //! Vector batches are `Float32Array`s of `n * dim` unit vectors.
 
-use vib_core::delta::{DeltaEncoder, DeltaView};
-use vib_core::kmeans::{
+use thread_core::delta::{DeltaEncoder, DeltaView};
+use thread_core::kmeans::{
     assign_candidates, assign_candidates_top_m, assign_flat, assign_tree, assign_tree_top_m, check_neighbors,
     effective_probe_coarse, Accum, BucketReservoir,
 };
-use vib_core::math::{inv_norms, normalize};
-use vib_core::part::{span_sub_range, DirEntry, PartBuilder};
-use vib_core::pq::{Codebook, PqAccum, QueryTable};
-use vib_core::quant::{decode_residual_sq8, encode_residual_sq4, encode_residual_sq8};
-use vib_core::route::{CentroidTree, Router};
-use vib_core::search::{rerank_records, scan_delta as scan_delta_core, scan_slab, scan_slab_pq, ScanStats};
-use vib_core::slab::{SlabHeader, SlabView, SlabWriter, SLAB_HEADER};
-use vib_core::tomb::Tombstones;
-use vib_core::topk::{merge_dedup, pack_hits, unpack_hits, TopK};
+use thread_core::math::{inv_norms, normalize};
+use thread_core::part::{span_sub_range, DirEntry, PartBuilder};
+use thread_core::pq::{Codebook, PqAccum, QueryTable};
+use thread_core::quant::{decode_residual_sq8, encode_residual_sq4, encode_residual_sq8};
+use thread_core::route::{CentroidTree, Router};
+use thread_core::search::{rerank_records, scan_delta as scan_delta_core, scan_slab, scan_slab_pq, ScanStats};
+use thread_core::slab::{SlabHeader, SlabView, SlabWriter, SLAB_HEADER};
+use thread_core::tomb::Tombstones;
+use thread_core::topk::{merge_dedup, pack_hits, unpack_hits, TopK};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -36,7 +36,7 @@ pub fn init_panic_hook() {
     static SET: Once = Once::new();
     SET.call_once(|| {
         std::panic::set_hook(Box::new(|info| {
-            error(&format!("vib-wasm panic: {info}"));
+            error(&format!("thread-wasm panic: {info}"));
         }));
     });
 }
@@ -337,7 +337,7 @@ pub fn cell_neighbors(means: &[f32], dim: u32, first: u32, count: u32, n: u32) -
     if n == 0 || n > k {
         return Err(js_err(format!("n = {n} must be in 1..={k}")));
     }
-    Ok(vib_core::kmeans::cell_neighbors(means, dim, first, count, n))
+    Ok(thread_core::kmeans::cell_neighbors(means, dim, first, count, n))
 }
 
 /// Byte range `[offset, length]` inside a serialized partial accumulator that
@@ -599,7 +599,7 @@ impl AssignJob {
                 for i in 0..x.len() {
                     self.resid[i] = x[i] - mean[i];
                 }
-                vib_core::pq::encode(&self.resid, cb, &mut self.pq);
+                thread_core::pq::encode(&self.resid, cb, &mut self.pq);
             }
             let g = cell / self.router.k2;
             let j = cell % self.router.k2;
@@ -671,7 +671,7 @@ impl SlabJob {
 /// Parses a part directory: returns `[k2, dim, count0, off0, len0, count1, ...]`.
 #[wasm_bindgen]
 pub fn part_directory(bytes: &[u8]) -> Result<Vec<u32>, JsValue> {
-    let (k2, dim, dir) = vib_core::part::parse_directory(bytes).map_err(js_err)?;
+    let (k2, dim, dir) = thread_core::part::parse_directory(bytes).map_err(js_err)?;
     let mut out = Vec::with_capacity(2 + dir.len() * 3);
     out.push(k2 as u32);
     out.push(dim as u32);
@@ -695,13 +695,13 @@ pub fn part_span(dir: &[u32], first_cell: u32, count: u32) -> Result<Vec<u32>, J
     }
     let entries: Vec<DirEntry> =
         dir[2..].chunks_exact(3).map(|e| DirEntry { count: e[0], off: e[1], len: e[2] }).collect();
-    let (off, len) = vib_core::part::span(&entries, first_cell as usize, count as usize).map_err(js_err)?;
+    let (off, len) = thread_core::part::span(&entries, first_cell as usize, count as usize).map_err(js_err)?;
     Ok(vec![off, len])
 }
 
 #[wasm_bindgen]
 pub fn part_directory_len(k2: u32) -> u32 {
-    vib_core::part::directory_len(k2 as usize) as u32
+    thread_core::part::directory_len(k2 as usize) as u32
 }
 
 /// Query-side: routing table plus slab scanning.
@@ -925,7 +925,7 @@ pub fn rerank(q: &[f32], centroid: &[f32], records: &[u8], n: u32) -> Result<Vec
 /// sample batch and its cell assignment into PQ training residuals.
 #[wasm_bindgen]
 pub fn residuals_for(vectors: &[f32], means: &[f32], assign: &[u32], dim: u32) -> Result<Vec<f32>, JsValue> {
-    vib_core::pq::residuals(vectors, means, assign, dim as usize).map_err(js_err)
+    thread_core::pq::residuals(vectors, means, assign, dim as usize).map_err(js_err)
 }
 
 /// Initial PQ codebook (serialized, "VIBQ"): per subspace, the subvectors of
@@ -1361,7 +1361,7 @@ pub fn split_slab(slab_bytes: &[u8], mean: &[f32], seed: u32) -> Result<Vec<f32>
     for (i, x) in xs.chunks_exact_mut(v.dim).enumerate() {
         decode_residual_sq8(v.code8(i), v.scale8(i), mean, x);
     }
-    Ok(vib_core::kmeans::split_cell(&xs, v.dim, seed as u64).0)
+    Ok(thread_core::kmeans::split_cell(&xs, v.dim, seed as u64).0)
 }
 
 /// Optional PQ codebook argument: empty bytes = none.
@@ -1401,7 +1401,7 @@ pub fn split_slab_records(slab_bytes: &[u8], tombstones: &[u8], means2: &[f32], 
     let dim = SlabView::parse(slab_bytes).map_err(js_err)?.dim;
     let t = tombstones_arg(tombstones)?;
     let cb = codebook_arg(codebook_bytes, dim)?;
-    let (a, b) = vib_core::slab::split_records(slab_bytes, t.as_ref(), means2, cb.as_ref()).map_err(js_err)?;
+    let (a, b) = thread_core::slab::split_records(slab_bytes, t.as_ref(), means2, cb.as_ref()).map_err(js_err)?;
     pack_split(a, b)
 }
 
@@ -1412,7 +1412,7 @@ pub fn split_slab_records(slab_bytes: &[u8], tombstones: &[u8], means2: &[f32], 
 #[wasm_bindgen]
 pub fn split_part_records(records: &[u8], old_mean: &[f32], means2: &[f32], codebook_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
     let cb = codebook_arg(codebook_bytes, old_mean.len())?;
-    let (a, b) = vib_core::part::split_part_records(records, old_mean, means2, cb.as_ref()).map_err(js_err)?;
+    let (a, b) = thread_core::part::split_part_records(records, old_mean, means2, cb.as_ref()).map_err(js_err)?;
     pack_split(a, b)
 }
 
@@ -1422,7 +1422,7 @@ pub fn split_part_records(records: &[u8], old_mean: &[f32], means2: &[f32], code
 #[wasm_bindgen]
 pub fn reencode_records(records: &[u8], old_mean: &[f32], new_mean: &[f32], codebook_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
     let cb = codebook_arg(codebook_bytes, old_mean.len())?;
-    vib_core::part::reencode_records(records, old_mean, new_mean, cb.as_ref()).map_err(js_err)
+    thread_core::part::reencode_records(records, old_mean, new_mean, cb.as_ref()).map_err(js_err)
 }
 
 /// Native tests of the job wrappers (success paths only: building a `JsValue`
@@ -1430,7 +1430,7 @@ pub fn reencode_records(records: &[u8], old_mean: &[f32], new_mean: &[f32], code
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vib_core::math::{normalized_rows, Rng};
+    use thread_core::math::{normalized_rows, Rng};
 
     fn rows(rng: &mut Rng, n: usize, dim: usize) -> Vec<f32> {
         (0..n * dim).map(|_| rng.below(20001) as f32 / 10000.0 - 1.0).collect()

@@ -317,17 +317,17 @@ export class Searcher {
     dim(): number;
     constructor(dim: number, k1: number, k2: number, coarse_means: Float32Array, fine_means: Float32Array);
     /**
-     * Global ids of the `nprobe` fine cells to scan for unit query `q`.
-     * `probe_coarse == 0` (or `>= k1`) ranks all fine cells directly (flat routing);
-     * otherwise only the fine cells of the `probe_coarse` best coarse groups are ranked.
-     */
-    route(q: Float32Array, probe_coarse: number, nprobe: number): Uint32Array;
-    /**
      * Pruned flat routing: global ids of the `nprobe` best fine cells (by
      * cosine, descending) among the members of the tree's best `beam` groups.
      * `beam >= groups` equals `route_flat(q, nprobe)`. Error without `set_tree`.
      */
     route_beam(q: Float32Array, beam: number, nprobe: number): Uint32Array;
+    /**
+     * Global ids of the `nprobe` fine cells to scan for unit query `q`.
+     * `probe_coarse == 0` (or `>= k1`) ranks all fine cells directly (flat routing);
+     * otherwise only the fine cells of the `probe_coarse` best coarse groups are ranked.
+     */
+    route(q: Float32Array, probe_coarse: number, nprobe: number): Uint32Array;
     /**
      * Flat routing: global ids of the `nprobe` best fine cells over all `k1 * k2`.
      */

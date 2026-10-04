@@ -1,17 +1,17 @@
 /**
- * vib-sdk: query (and, experimentally, update) a vib blob-native vector index from a Cloudflare Worker.
+ * thread-sdk: query (and, experimentally, update) a thread blob-native vector index from a Cloudflare Worker.
  *
- *   import wasmModule from "vib-sdk/wasm/vib_bg.wasm";
- *   import { Vib } from "vib-sdk";
- *   const vib = await Vib.init({ wasmModule });                 // once per isolate
- *   const index = await vib.open({ bucket: env.BUCKET, waitUntil: ctx.waitUntil.bind(ctx) });
+ *   import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
+ *   import { Thread } from "thread-sdk";
+ *   const thread = await Thread.init({ wasmModule });                 // once per isolate
+ *   const index = await thread.open({ bucket: env.BUCKET, waitUntil: ctx.waitUntil.bind(ctx) });
  *   const { hits } = await index.query(vector, { topK: 10 });
  */
-import init, * as W from "./wasm/vib.js";
+import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, PrefixedBlobStore, R2BlobStore, type BlobStore, type BlobTrace, type CacheLike, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { deleteIds, upsert, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
-import { buildTombState, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, VibError, type CurrentPointer, type DeltaRef, type Manifest, type QueryDefaults } from "./wire.js";
+import { buildTombState, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, ThreadError, type CurrentPointer, type DeltaRef, type Manifest, type QueryDefaults } from "./wire.js";
 
 export * from "./wire.js";
 export * from "./store.js";
@@ -22,8 +22,8 @@ export type { DeleteResult, UpsertInput, UpsertResult } from "./write.js";
 /** The raw wasm-bindgen bindings (advanced use: build jobs, slab tools). */
 export type WasmBindings = typeof W;
 
-export interface VibInitOptions {
-	/** The compiled `vib_bg.wasm` (`import wasmModule from "vib-sdk/wasm"` with the Cloudflare Vite plugin or Wrangler). */
+export interface ThreadInitOptions {
+	/** The compiled `thread_bg.wasm` (`import wasmModule from "thread-sdk/wasm"` with the Cloudflare Vite plugin or Wrangler). */
 	wasmModule: WebAssembly.Module;
 }
 
@@ -50,8 +50,8 @@ export interface OpenOptions {
 	deltaCacheBytes?: number;
 }
 
-/** One wasm instance per isolate. `Vib.init` once, then `open` indexes. */
-export class Vib {
+/** One wasm instance per isolate. `Thread.init` once, then `open` indexes. */
+export class Thread {
 	/** Bumped on every reset; wasm objects created under an older epoch are invalid and must not be freed. */
 	epoch = 0;
 	resets = 0;
@@ -59,8 +59,8 @@ export class Vib {
 	private readonly resetListeners = new Set<() => void>();
 	private constructor(readonly module: WebAssembly.Module) {}
 
-	static async init(opts: VibInitOptions): Promise<Vib> {
-		const v = new Vib(opts.wasmModule);
+	static async init(opts: ThreadInitOptions): Promise<Thread> {
+		const v = new Thread(opts.wasmModule);
 		// wasm-bindgen keeps one instance per module scope: a second init() with another module is a no-op.
 		v.raw = await init({ module_or_path: opts.wasmModule });
 		W.init_panic_hook();
@@ -90,7 +90,7 @@ export class Vib {
 	reset(reason: unknown): void {
 		this.resets++;
 		this.epoch++;
-		console.error(`vib-sdk: wasm trap, resetting instance (reset #${this.resets}): ${reason instanceof Error ? `${reason.message}\n${reason.stack ?? ""}` : String(reason)}`);
+		console.error(`thread-sdk: wasm trap, resetting instance (reset #${this.resets}): ${reason instanceof Error ? `${reason.message}\n${reason.stack ?? ""}` : String(reason)}`);
 		W.__wbg_reset_state();
 		W.init_panic_hook();
 		for (const fn of this.resetListeners) fn();
@@ -105,13 +105,13 @@ export class Vib {
 			const trap = e instanceof WebAssembly.RuntimeError;
 			if (!trap && epoch === this.epoch) throw e;
 			if (trap && epoch === this.epoch) this.reset(e);
-			else console.error(`vib-sdk: ${label}: retrying after a concurrent wasm reset: ${e instanceof Error ? e.message : String(e)}`);
+			else console.error(`thread-sdk: ${label}: retrying after a concurrent wasm reset: ${e instanceof Error ? e.message : String(e)}`);
 			return await fn(2);
 		}
 	}
 
-	open(opts: OpenOptions): Promise<VibIndex> {
-		return VibIndex.open(this, opts);
+	open(opts: OpenOptions): Promise<ThreadIndex> {
+		return ThreadIndex.open(this, opts);
 	}
 }
 
@@ -121,7 +121,7 @@ interface BaseSlot extends Base {
 }
 
 /** An opened index: one (gen, rev) snapshot plus the generation's routing table in wasm memory. */
-export class VibIndex {
+export class ThreadIndex {
 	readonly store: BlobStore;
 	private revState: RevState;
 	private base: BaseSlot | null = null;
@@ -136,7 +136,7 @@ export class VibIndex {
 	private readonly unsubscribe: () => void;
 
 	private constructor(
-		readonly vib: Vib,
+		readonly thread: Thread,
 		store: BlobStore,
 		rev: RevState,
 		private readonly opts: OpenOptions,
@@ -147,7 +147,7 @@ export class VibIndex {
 		this.refreshInterval = opts.refreshInterval ?? 30_000;
 		this.deltaBudget = opts.deltaCacheBytes ?? 40 * 1024 * 1024;
 		this.lastCheck = Date.now();
-		this.unsubscribe = vib.onReset(() => {
+		this.unsubscribe = thread.onReset(() => {
 			// The Searcher/PqCodebook belong to the dead instance: drop them without free().
 			if (this.base) this.base.dropped = true;
 			this.base = null;
@@ -155,15 +155,15 @@ export class VibIndex {
 		});
 	}
 
-	static async open(vib: Vib, opts: OpenOptions): Promise<VibIndex> {
+	static async open(thread: Thread, opts: OpenOptions): Promise<ThreadIndex> {
 		let store: BlobStore | undefined = opts.store ?? (opts.bucket ? new R2BlobStore(opts.bucket) : undefined);
-		if (!store) throw new VibError("open: pass a `bucket` (R2 binding) or a `store`", 400);
+		if (!store) throw new ThreadError("open: pass a `bucket` (R2 binding) or a `store`", 400);
 		if (opts.prefix) store = new PrefixedBlobStore(store, opts.prefix);
 		const cache = opts.cache === false ? null : (opts.cache ?? ((globalThis as { caches?: { default?: CacheLike } }).caches?.default ?? null));
 		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil });
 		const target = await resolveTarget(store, opts.gen, opts.rev);
 		const rev = await loadRevState(store, target.gen, target.rev);
-		const ix = new VibIndex(vib, store, rev, opts);
+		const ix = new ThreadIndex(thread, store, rev, opts);
 		await ix.acquireBase().then((s) => ix.releaseBase(s));
 		return ix;
 	}
@@ -202,7 +202,7 @@ export class VibIndex {
 	 * Returns true when the revision changed. A pinned index (`gen` and `rev` given) never changes.
 	 */
 	refresh(): Promise<boolean> {
-		if (this.closed) throw new VibError("index is closed", 400);
+		if (this.closed) throw new ThreadError("index is closed", 400);
 		if (this.pinned) return Promise.resolve(false);
 		if (this.refreshing) return this.refreshing;
 		const p = (async () => {
@@ -230,10 +230,10 @@ export class VibIndex {
 
 	/** Searches for the nearest neighbours of `vector` (any norm; it is normalized). */
 	async query(vector: Float32Array | number[], opts: QueryOptions = {}): Promise<QueryResult> {
-		if (this.closed) throw new VibError("index is closed", 400);
+		if (this.closed) throw new ThreadError("index is closed", 400);
 		const q = vector instanceof Float32Array ? vector : Float32Array.from(vector);
-		if (this.refreshInterval > 0 && !this.pinned && Date.now() - this.lastCheck > this.refreshInterval) await this.refresh().catch((e: unknown) => console.error(`vib-sdk: refresh failed: ${e instanceof Error ? e.message : String(e)}`));
-		return this.vib.withRecovery("query", async (attempt) => {
+		if (this.refreshInterval > 0 && !this.pinned && Date.now() - this.lastCheck > this.refreshInterval) await this.refresh().catch((e: unknown) => console.error(`thread-sdk: refresh failed: ${e instanceof Error ? e.message : String(e)}`));
+		return this.thread.withRecovery("query", async (attempt) => {
 			const base = await this.acquireBase();
 			try {
 				const rev = this.revState;
@@ -243,9 +243,9 @@ export class VibIndex {
 						store: this.store,
 						rev,
 						base,
-						epoch: () => this.vib.epoch,
-						wasmResets: this.vib.resets,
-						wasmMemBytes: () => this.vib.memoryBytes(),
+						epoch: () => this.thread.epoch,
+						wasmResets: this.thread.resets,
+						wasmMemBytes: () => this.thread.memoryBytes(),
 						getDelta: (ref, trace) => this.getDelta(ref, trace),
 					},
 					q,
@@ -293,15 +293,15 @@ export class VibIndex {
 	// ---- internals ----
 
 	private writer(): WriterContext {
-		if (this.closed) throw new VibError("index is closed", 400);
-		return { vib: this.vib, w: W, store: this.store, gen: this.revState.gen, borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.vib.epoch ? this.base.pq : null) };
+		if (this.closed) throw new ThreadError("index is closed", 400);
+		return { thread: this.thread, w: W, store: this.store, gen: this.revState.gen, borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.thread.epoch ? this.base.pq : null) };
 	}
 
 	private async getDelta(ref: DeltaRef, trace: BlobTrace): Promise<Uint8Array> {
 		const hit = this.deltaCache.get(ref.key);
 		if (hit) return hit;
 		const p = this.store.get(ref.key, undefined, { trace }).then((b) => {
-			if (!b) throw new VibError(`missing delta segment ${ref.key}`, 404);
+			if (!b) throw new ThreadError(`missing delta segment ${ref.key}`, 404);
 			return b;
 		});
 		const total = this.revState.deltas.reduce((a, d) => a + d.bytes, 0);
@@ -313,13 +313,13 @@ export class VibIndex {
 	}
 
 	private acquireBase(): Promise<BaseSlot> {
-		if (this.base && this.base.epoch === this.vib.epoch && !this.base.dropped) {
+		if (this.base && this.base.epoch === this.thread.epoch && !this.base.dropped) {
 			this.base.users++;
 			return Promise.resolve(this.base);
 		}
 		if (!this.basePromise) {
 			const rev = this.revState;
-			const p = loadBase(this.store, rev, this.vib.epoch).then((b) => {
+			const p = loadBase(this.store, rev, this.thread.epoch).then((b) => {
 				const slot: BaseSlot = { ...b, users: 0, dropped: false };
 				if (this.basePromise === p && !this.closed) this.base = slot;
 				else slot.dropped = true; // superseded while loading
@@ -336,7 +336,7 @@ export class VibIndex {
 
 	private releaseBase(slot: BaseSlot): void {
 		slot.users--;
-		if (slot.dropped && slot.users === 0 && slot.epoch === this.vib.epoch) {
+		if (slot.dropped && slot.users === 0 && slot.epoch === this.thread.epoch) {
 			safeFree(slot.searcher);
 			if (slot.pq) safeFree(slot.pq);
 		}
@@ -348,7 +348,7 @@ export class VibIndex {
 		this.basePromise = null;
 		if (!b || b.dropped) return;
 		b.dropped = true;
-		if (b.users === 0 && b.epoch === this.vib.epoch) {
+		if (b.users === 0 && b.epoch === this.thread.epoch) {
 			safeFree(b.searcher);
 			if (b.pq) safeFree(b.pq);
 		}
@@ -359,7 +359,7 @@ export class VibIndex {
 
 async function getRequired(store: BlobStore, key: string): Promise<Uint8Array> {
 	const b = await store.get(key);
-	if (!b) throw new VibError(`missing object ${key}`, 404);
+	if (!b) throw new ThreadError(`missing object ${key}`, 404);
 	return b;
 }
 
@@ -372,7 +372,7 @@ export async function headRevision(store: BlobStore, gen: string): Promise<numbe
 		const m = key.slice(prefix.length).match(/^(?:(\d+)\.)?json$/);
 		if (m) head = Math.max(head, m[1] ? Number(m[1]) : 0);
 	}
-	if (head < 0) throw new VibError(`no manifest for generation ${gen}`, 404);
+	if (head < 0) throw new ThreadError(`no manifest for generation ${gen}`, 404);
 	return head;
 }
 
@@ -385,7 +385,7 @@ export async function resolveTarget(store: BlobStore, gen?: string, rev?: number
 	if (gen !== undefined && rev !== undefined) return { gen, rev };
 	const cur = await store.get(keys.current());
 	if (!cur) {
-		if (gen === undefined) throw new VibError("no published index (idx/current.json missing)", 404);
+		if (gen === undefined) throw new ThreadError("no published index (idx/current.json missing)", 404);
 		return { gen, rev: await headRevision(store, gen) };
 	}
 	const c = parseCurrent(cur);
@@ -396,7 +396,7 @@ export async function resolveTarget(store: BlobStore, gen?: string, rev?: number
 /** Loads a revision: manifest (falling back to nothing else: rev 0 is `manifest.json`), slabs table, tombstone sets. */
 export async function loadRevState(store: BlobStore, gen: string, rev: number): Promise<RevState> {
 	const mb = await store.get(keys.manifest(gen, rev));
-	if (!mb) throw new VibError(`no manifest ${keys.manifest(gen, rev)}`, 404);
+	if (!mb) throw new ThreadError(`no manifest ${keys.manifest(gen, rev)}`, 404);
 	const manifest = parseManifest(mb, gen, rev);
 	const files = manifestFiles(manifest);
 	const format = manifest.format ?? 1;
@@ -407,24 +407,24 @@ export async function loadRevState(store: BlobStore, gen: string, rev: number): 
 			const b = await store.get(files.slabs);
 			// v1 generations may predate slabs tables: their slabs are read whole.
 			if (!b && format < 2 && !manifest.files) return null;
-			if (!b) throw new VibError(`missing ${files.slabs}`, 404);
+			if (!b) throw new ThreadError(`missing ${files.slabs}`, 404);
 			return parseSlabsTable(b, cells, files.slabs);
 		})(),
 		Promise.all(
 			(manifest.tombstones ?? []).map(async (t) => {
 				const b = await getRequired(store, t.key);
-				if (b.byteLength % 4 !== 0) throw new VibError(`${t.key} is not u32-aligned`);
+				if (b.byteLength % 4 !== 0) throw new ThreadError(`${t.key} is not u32-aligned`);
 				return { rev: t.rev, ids: new Uint32Array(b.slice().buffer) };
 			}),
 		),
 	]);
-	if (format >= 2 && !slabs) throw new VibError(`${files.slabs} missing for format ${format}`);
+	if (format >= 2 && !slabs) throw new ThreadError(`${files.slabs} missing for format ${format}`);
 	return { gen, rev, manifest, files, format, slabs, deltas: manifest.deltas ?? [], tomb: sets.length ? buildTombState(sets) : null, baseKey: `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}` };
 }
 
 /** A view of `b` as f32 (copying when the view is not 4-byte aligned). */
 export function asF32(b: Uint8Array, what: string): Float32Array {
-	if (b.byteLength % 4 !== 0) throw new VibError(`${what} is not f32-aligned`);
+	if (b.byteLength % 4 !== 0) throw new ThreadError(`${what} is not f32-aligned`);
 	return b.byteOffset % 4 === 0 ? new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4) : new Float32Array(b.slice().buffer);
 }
 
@@ -432,14 +432,14 @@ export function asF32(b: Uint8Array, what: string): Float32Array {
 export async function loadBase(store: BlobStore, rev: RevState, epoch: number): Promise<Base> {
 	const { manifest, files } = rev;
 	const [c, f, p] = await Promise.all([getRequired(store, files.coarse), getRequired(store, files.fine), files.pq ? getRequired(store, files.pq) : Promise.resolve(null)]);
-	if (rev.format === 3 && !p) throw new VibError(`format 3 generation ${rev.gen} has no PQ codebook`);
+	if (rev.format === 3 && !p) throw new ThreadError(`format 3 generation ${rev.gen} has no PQ codebook`);
 	let pq: W.PqCodebook | null = null;
 	if (p) {
 		pq = new W.PqCodebook(p);
 		if (pq.dim() !== manifest.dim || (manifest.pq && pq.m() !== manifest.pq.m)) {
 			const msg = `${files.pq} is dim ${pq.dim()} m ${pq.m()}, manifest dim ${manifest.dim} pq ${JSON.stringify(manifest.pq)}`;
 			safeFree(pq);
-			throw new VibError(msg);
+			throw new ThreadError(msg);
 		}
 	}
 	try {

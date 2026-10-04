@@ -58,8 +58,8 @@ regardless of orchestrator isolate: host CPU contention, also visible in the poo
 
 ## Recommendation
 Replace the 8-script pool with one orchestrator Worker plus dynamic slots:
-1. Add the loader to `vib-bench` (or a sibling `vib-build`); `/build/*` forwards to
-   `env.LOADER.get(\`vib-build:${BUNDLE_HASH}:slot-${slot}\`, ...)`. Produce the stage bundle with a
+1. Add the loader to `vib-bench` (or a sibling `thread-build`); `/build/*` forwards to
+   `env.LOADER.get(\`thread-build:${BUNDLE_HASH}:slot-${slot}\`, ...)`. Produce the stage bundle with a
    second vite build, import it `?raw`, hash it at build time.
 2. Always set `limits.cpuMs = 300000`.
 3. Use the BucketRpc + shim pattern with streamed puts.
