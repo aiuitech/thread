@@ -86,6 +86,20 @@ describe("S3BlobStore", () => {
 		const get = calls.find((c) => c.method === "GET" && c.headers.range)!;
 		expect(get.headers.authorization).toContain("SignedHeaders=host;range;x-amz-content-sha256;x-amz-date");
 	});
+	it("whole-object GETs of large objects are split into parallel range GETs", async () => {
+		const chunked = new S3BlobStore({ endpoint: "https://acct.r2.cloudflarestorage.com", bucket: "bucket", accessKeyId: "AK", secretAccessKey: "SK", fetch: fetchFn, chunkBytes: 100, chunkConcurrency: 2 });
+		const data = Uint8Array.from({ length: 350 }, (_, i) => (i * 3) & 0xff);
+		await chunked.put("idx/g4/fine.f32", data);
+		const n0 = calls.length;
+		const trace = { reads: 0, hits: 0, misses: 0, r206: 0, r200: 0, bytes: 0 };
+		expect(await chunked.get("idx/g4/fine.f32", undefined, { trace })).toEqual(data);
+		const gets = calls.slice(n0).map((c) => c.headers.range);
+		expect(gets.sort()).toEqual(["bytes=0-99", "bytes=100-199", "bytes=200-299", "bytes=300-349"]);
+		expect(trace).toMatchObject({ reads: 4, bytes: 350 });
+		await chunked.put("idx/small", new Uint8Array([1, 2, 3]));
+		expect(await chunked.get("idx/small")).toEqual(new Uint8Array([1, 2, 3]));
+		expect(await chunked.get("idx/none")).toBeNull();
+	});
 	it("virtual-hosted style and session tokens", async () => {
 		const vh = new S3BlobStore({ endpoint: "https://s3.us-east-1.amazonaws.com", bucket: "bucket", region: "us-east-1", accessKeyId: "AK", secretAccessKey: "SK", sessionToken: "tok", pathStyle: false, fetch: fetchFn });
 		expect(await vh.get("idx/current.json")).not.toBeNull();

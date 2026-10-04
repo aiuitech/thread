@@ -12,17 +12,19 @@ costs one HMAC per request: the derived signing key of each (date, region, servi
 
 from __future__ import annotations
 
+import builtins
 import hashlib
+import re
 import hmac
 import http.client
 import threading
 import time
 import xml.etree.ElementTree as ET
-from concurrent.futures import Executor, Future
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from typing import Callable, Mapping
 from urllib.parse import quote, urlsplit
 
-from .store import BlobHead, BlobStore, _encode, _trace_read
+from .store import BlobHead, BlobRange, BlobStore, BlobTrace, _encode, _trace_read
 from .wire import ThreadError
 
 __all__ = ["S3BlobStore", "SigningKeyCache", "sign_v4", "derive_signing_key", "aws_encode", "amz_date_of",
@@ -165,6 +167,8 @@ class S3BlobStore(BlobStore):
         span_bytes: int | None = None,
         max_connections: int | None = None,
         warmup: int = 0,
+        chunk_bytes: int = 8 * 1024 * 1024,
+        chunk_concurrency: int = 4,
     ) -> None:
         if not access_key_id or not secret_access_key:
             raise ThreadError("S3BlobStore needs access_key_id and secret_access_key", 400)
@@ -190,6 +194,11 @@ class S3BlobStore(BlobStore):
         self._pool_cond = threading.Condition()
         #: Connections opened over the store's life (tests, benchmarks).
         self.stats = {"opened": 0}
+        #: Whole-object GETs of objects larger than this become parallel range GETs (0 = one GET).
+        self.chunk_bytes = chunk_bytes
+        self.chunk_concurrency = max(1, chunk_concurrency)
+        self._chunk_pool: ThreadPoolExecutor | None = None
+        self._chunk_lock = threading.Lock()
         if warmup > 0:  # open connections right away (background threads); they join the shared pool
             self.warmup(warmup)
         self.signing_keys = SigningKeyCache(secret_access_key)
@@ -284,6 +293,50 @@ class S3BlobStore(BlobStore):
         return ThreadError(f"S3 {what}: HTTP {r.status} {text}", 403 if r.status == 403 else 502)
 
     def get(self, key, range=None, *, trace=None, fill=False):
+        if range is None and self.chunk_bytes > 0:
+            return self._get_chunked(key, trace)
+        return self._get_one(key, range, trace)
+
+    def _get_chunked(self, key: str, trace: BlobTrace | None) -> bytes | None:
+        """A whole object as parallel range GETs: the first `chunk_bytes` (whose Content-Range gives the size), then
+        the rest in chunks, `chunk_concurrency` at a time. One S3 stream is bandwidth-bound, and the 25 MB routing
+        table is most of a cold open."""
+        c = self.chunk_bytes
+        r = self._send("GET", key, {"range": f"bytes=0-{c - 1}"})
+        if r.status == 404:
+            return None
+        if r.status == 416:  # an empty object: R2 refuses any range of it
+            return self._get_one(key, None, trace)
+        if not 200 <= r.status < 300:
+            raise self._fail(r, f"GET {key}")
+        first = r.body
+        _trace_read(trace, len(first))
+        if r.status != 206:
+            return first
+        m = re.search(r"/(\d+)$", r.headers.get("content-range", ""))
+        if not m:
+            raise ThreadError(f"S3 GET {key}: 206 without a usable Content-Range")
+        total = int(m.group(1))
+        if total <= len(first):
+            return first
+        out = bytearray(total)
+        out[: len(first)] = first
+        offs = list(builtins.range(len(first), total, c))
+
+        def one(off: int) -> None:
+            b = self._get_one(key, BlobRange(off, min(c, total - off)), trace)
+            if b is None:
+                raise ThreadError(f"{key} disappeared while being read", 404)
+            out[off : off + len(b)] = b
+
+        with self._chunk_lock:
+            if self._chunk_pool is None:
+                self._chunk_pool = ThreadPoolExecutor(max_workers=self.chunk_concurrency, thread_name_prefix="thread-s3")
+        for f in [self._chunk_pool.submit(one, off) for off in offs]:
+            f.result()
+        return bytes(out)
+
+    def _get_one(self, key: str, range: BlobRange | None, trace: BlobTrace | None) -> bytes | None:
         headers = {"range": f"bytes={range.offset}-{range.offset + range.length - 1}"} if range else {}
         if range is not None and range.length == 0:
             return b""

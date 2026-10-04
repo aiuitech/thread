@@ -325,3 +325,20 @@ def test_s3_connection_pool_is_shared_and_bounded(s3_server):
         got = list(ex.map(lambda i: bytes(s.get("idx/x", BlobRange(i, 10))), range(200)))
     assert got == [(b"0123456789" * 100)[i:i + 10] for i in range(200)]
     assert s._open <= 4 and s.stats["opened"] - opened <= 4
+
+
+def test_s3_whole_gets_are_chunked(s3_server):
+    s = S3BlobStore(s3_server, "bucket", "AK", "SK", chunk_bytes=100, chunk_concurrency=2)
+    body = bytes((i * 3) & 0xFF for i in range(350))
+    s.put("idx/g4/fine.f32", body)
+    n0 = len(FakeS3.calls)
+    t = BlobTrace()
+    assert s.get("idx/g4/fine.f32", trace=t) == body
+    assert sorted(c[2]["range"] for c in FakeS3.calls[n0:]) == ["bytes=0-99", "bytes=100-199", "bytes=200-299",
+                                                                 "bytes=300-349"]
+    assert (t.reads, t.bytes) == (4, 350)
+    s.put("idx/small", b"abc")
+    assert s.get("idx/small") == b"abc"
+    s.put("idx/empty", b"")
+    assert s.get("idx/empty") == b""
+    assert s.get("idx/none") is None

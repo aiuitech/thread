@@ -38,6 +38,13 @@ export interface S3BlobStoreOptions {
 	coalesceBytes?: number;
 	spanBytes?: number;
 	/**
+	 * Whole-object GETs of objects larger than this are split into parallel range GETs of this size (default 8 MiB;
+	 * 0 = one GET). Speeds up the routing table (25 MB on g4) on a cold open.
+	 */
+	chunkBytes?: number;
+	/** Parallel range GETs of one chunked object (default 4). */
+	chunkConcurrency?: number;
+	/**
 	 * Open this many connections right away (`warmup(n)`), e.g. while the wasm compiles: create the store before
 	 * `Thread.init`. In Node the first `fetch` also loads the lazy `fetch`/`Response` globals (13-18 ms) here
 	 * instead of inside `Thread.init`. `open` then skips its own warm-up. Default 0.
@@ -173,6 +180,8 @@ export class S3BlobStore implements BlobStore {
 	readonly coalesceBytes: number | undefined;
 	readonly spanBytes: number | undefined;
 	readonly signingKeys: SigningKeyCache;
+	readonly chunkBytes: number;
+	readonly chunkConcurrency: number;
 	private readonly fetchFn: typeof fetch;
 	private readonly retries: number;
 	private readonly now: () => number;
@@ -181,6 +190,8 @@ export class S3BlobStore implements BlobStore {
 		this.coalesceBytes = opts.coalesceBytes;
 		this.spanBytes = opts.spanBytes;
 		this.signingKeys = new SigningKeyCache(opts.secretAccessKey);
+		this.chunkBytes = opts.chunkBytes ?? 8 * 1024 * 1024;
+		this.chunkConcurrency = Math.max(1, opts.chunkConcurrency ?? 4);
 		this.endpoint = new URL(opts.endpoint);
 		this.bucket = opts.bucket;
 		this.region = opts.region ?? "auto";
@@ -230,7 +241,12 @@ export class S3BlobStore implements BlobStore {
 		throw new ThreadError(`S3 ${what}: HTTP ${r.status} ${text}`, r.status === 403 ? 403 : 502);
 	}
 
-	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+	get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+		return !range && this.chunkBytes > 0 ? this.getChunked(key, opts) : this.getOne(key, range, opts);
+	}
+
+	/** One GET (of `range`, else of the whole object). */
+	private async getOne(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
 		const headers: Record<string, string> = range ? { range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : {};
 		const r = await this.send("GET", key, headers);
 		if (r.status === 404) {
@@ -264,6 +280,51 @@ export class S3BlobStore implements BlobStore {
 		const p = Promise.all(Array.from({ length: Math.max(0, n) }, () => this.get(key, { offset: 0, length: 1 }).catch(() => null))).then(() => {});
 		this.warming = { n, at: Date.now(), p };
 		return p;
+	}
+
+	/**
+	 * A whole object as parallel range GETs: the first `chunkBytes` (whose Content-Range gives the size), then the
+	 * rest in chunks, `chunkConcurrency` at a time. One S3 stream is bandwidth-bound (~380 Mbps from R2 to one
+	 * client, 200 Mbps per response in the proxy model), and the 25 MB routing table is most of a cold open.
+	 */
+	private async getChunked(key: string, opts?: GetOptions): Promise<Uint8Array | null> {
+		const c = this.chunkBytes;
+		const r = await this.send("GET", key, { range: `bytes=0-${c - 1}` });
+		if (r.status === 404) {
+			await settle(r);
+			return null;
+		}
+		if (r.status === 416) {
+			await settle(r); // an empty object: R2 refuses any range of it
+			return this.getOne(key, undefined, opts);
+		}
+		if (!r.ok) return this.fail(r, `GET ${key}`);
+		const first = new Uint8Array(await r.arrayBuffer());
+		const count = (b: number) => {
+			if (opts?.trace) {
+				opts.trace.reads++;
+				opts.trace.bytes += b;
+			}
+		};
+		count(first.byteLength);
+		const total = r.status === 206 ? Number((r.headers.get("content-range") ?? "").match(/\/(\d+)$/)?.[1] ?? NaN) : first.byteLength;
+		if (!Number.isFinite(total)) throw new ThreadError(`S3 GET ${key}: 206 without a usable Content-Range`);
+		if (total <= first.byteLength) return first;
+		const out = new Uint8Array(total);
+		out.set(first, 0);
+		const todo: number[] = [];
+		for (let off = first.byteLength; off < total; off += c) todo.push(off);
+		const worker = async () => {
+			for (let off = todo.shift(); off !== undefined; off = todo.shift()) {
+				const len = Math.min(c, total - off);
+				const b = await this.getOne(key, { offset: off, length: len });
+				if (!b) throw new ThreadError(`${key} disappeared while being read`, 404);
+				count(b.byteLength);
+				out.set(b, off);
+			}
+		};
+		await Promise.all(Array.from({ length: Math.min(this.chunkConcurrency, todo.length) }, worker));
+		return out;
 	}
 
 	async head(key: string): Promise<BlobHead | null> {
