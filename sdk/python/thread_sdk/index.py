@@ -644,6 +644,8 @@ class ThreadIndex:
         if self._closed:
             return
         self._closed = True
+        if self.warm is not None:
+            self.warm.close()
         self._io.shutdown(wait=False, cancel_futures=True)
         self._jobs.shutdown(wait=False, cancel_futures=True)
         with self._lock:

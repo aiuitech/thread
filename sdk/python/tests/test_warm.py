@@ -12,6 +12,8 @@ import pytest
 
 from thread_sdk import (
     BlobRange,
+    CachedBlobStore,
+    MemoryCache,
     BlobTrace,
     MemoryBlobStore,
     PackedBlobStore,
@@ -121,6 +123,23 @@ def test_prefix_layer():
     assert layer.hits == 2
     layer.retain(lambda k: False)
     assert layer.size == (0, 0)
+
+
+def test_prefix_layer_fills_the_cache_behind_it():
+    m = Counting()
+    m.put("idx/g/slab/00001", data(1000, 5))
+    cache = MemoryCache()
+    layer = WarmPrefixStore(CachedBlobStore(m, cache))
+    layer.seed_prefix("idx/g/slab/00001", data(1000, 5)[:100])
+    assert bytes(layer.get("idx/g/slab/00001", BlobRange(0, 100), fill=True)) == data(1000, 5)[:100]
+    layer.get("idx/g/slab/00001", BlobRange(0, 100), fill=True)
+    layer.get("idx/g/slab/00001", BlobRange(0, 50))  # no fill asked
+    layer.drain()
+    assert layer.fills == {"queued": 1, "done": 1, "failed": 0}
+    assert m.reads == [("idx/g/slab/00001", None)]
+    trace = BlobTrace()
+    assert bytes(layer.get("idx/g/slab/00001", BlobRange(500, 10), trace=trace)) == data(1000, 5)[500:510]
+    assert trace.as_dict()["reads"] == 0 and trace.as_dict()["hits"] == 1
 
 
 @pytest.mark.parametrize("remote", [False, True])

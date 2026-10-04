@@ -12,7 +12,7 @@
  */
 import { MemorySink, PACK_FOOTER_BYTES, PACK_HEADER_BYTES, PackWriter, isPackHeader, parsePackDirectory, parsePackFooter, type PackSink } from "./pack.js";
 import type { RevState } from "./query.js";
-import { newTrace, nowMs, phaseStat, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PhaseStat, type PutOptions } from "./store.js";
+import { CachedBlobStore, newTrace, nowMs, phaseStat, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PhaseStat, type PutOptions } from "./store.js";
 import { keys, slabRevOf, ThreadError } from "./wire.js";
 
 export const WARM_PACK_KIND = "warm";
@@ -103,18 +103,44 @@ export interface PrefixSeed {
 	seedPrefix(key: string, bytes: Uint8Array): void;
 }
 
+export interface WarmPrefixStoreOptions {
+	/** Keeps background fills alive (`ctx.waitUntil`). */
+	waitUntil?: (p: Promise<unknown>) => void;
+	/** Whole-object fills behind a cache running at once (default 2; 0 disables them). */
+	fillConcurrency?: number;
+}
+
 /**
  * A store in front of another one that holds object PREFIXES in memory: a read of a range inside a held prefix is
- * served from memory (counted as a cache hit in the trace), every other read goes to the inner store unchanged.
- * Prefixes are views into the warm pack they came from (no copies).
+ * served from memory (counted as a cache hit in the trace), every other read goes to the inner store unchanged
+ * (without an extra await, so pass-through reads keep their timing). Prefixes are views into the warm pack they came
+ * from (no copies).
+ *
+ * When the inner store is a cache (`CachedBlobStore`) and a served read asked for `fill` (a slab's scan prefix, which
+ * on a cache miss would have fetched the whole slab into the cache), the whole object is fetched into the cache in the
+ * background instead, so later queries find the slab's rerank records there: the warm pack takes the first touch off
+ * the critical path without keeping the cache cold.
  */
 export class WarmPrefixStore implements BlobStore, PrefixSeed {
 	private readonly prefixes = new Map<string, Uint8Array>();
 	/** Reads served from a prefix, and their bytes. */
 	hits = 0;
 	hitBytes = 0;
+	/** Background whole-object fills behind a cache: queued, done, failed. */
+	readonly fills = { queued: 0, done: 0, failed: 0 };
+	private readonly fillQ: string[] = [];
+	private readonly filling = new Set<string>();
+	private fillActive = 0;
+	private readonly fillConcurrency: number;
+	private readonly waitUntil: ((p: Promise<unknown>) => void) | undefined;
 
-	constructor(public readonly inner: BlobStore) {}
+	constructor(
+		public readonly inner: BlobStore,
+		opts: WarmPrefixStoreOptions = {},
+	) {
+		this.fillConcurrency = opts.fillConcurrency ?? 2;
+		this.waitUntil = opts.waitUntil;
+	}
 
 	seedPrefix(key: string, bytes: Uint8Array): void {
 		const cur = this.prefixes.get(key);
@@ -147,26 +173,68 @@ export class WarmPrefixStore implements BlobStore, PrefixSeed {
 			opts.trace.hits++;
 			opts.trace.bytes += b.byteLength;
 		}
+		if (opts?.fill) this.fillBehind(key);
 		return b;
 	}
 
-	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
-		if (range && this.holds(key, range)) return this.serve(key, range, opts);
+	/** Fetches `key` whole into the cache behind this layer, in the background (once per key, bounded). */
+	private fillBehind(key: string): void {
+		if (!(this.inner instanceof CachedBlobStore) || this.fillConcurrency <= 0 || this.filling.has(key)) return;
+		this.filling.add(key);
+		this.fillQ.push(key);
+		this.fills.queued++;
+		this.pumpFills();
+	}
+
+	private pumpFills(): void {
+		while (this.fillActive < this.fillConcurrency && this.fillQ.length) {
+			const key = this.fillQ.shift()!;
+			this.fillActive++;
+			const p = this.inner
+				.get(key) // a whole-object read through the cache: a miss fills it
+				.then(
+					() => void this.fills.done++,
+					(e: unknown) => {
+						this.fills.failed++;
+						this.filling.delete(key); // may be retried by a later hit
+						console.error(`thread-sdk: background fill of ${key} failed: ${e instanceof Error ? e.message : String(e)}`);
+					},
+				)
+				.finally(() => {
+					this.fillActive--;
+					this.pumpFills();
+				});
+			this.waitUntil?.(p);
+		}
+	}
+
+	get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+		if (range && this.holds(key, range)) return Promise.resolve(this.serve(key, range, opts));
 		return this.inner.get(key, range, opts);
 	}
 
-	async getRanges(key: string, ranges: BlobRange[], opts?: GetOptions): Promise<Uint8Array[] | null> {
-		if (ranges.length && ranges.every((r) => this.holds(key, r))) {
-			const out = ranges.map((r) => this.prefixes.get(key)!.subarray(r.offset, r.offset + r.length));
-			this.hits++;
-			this.hitBytes += out.reduce((a, b) => a + b.byteLength, 0);
-			if (opts?.trace) {
-				opts.trace.hits++;
-				opts.trace.bytes += out.reduce((a, b) => a + b.byteLength, 0);
+	/**
+	 * Present only when the inner store has `getRanges` (a store without it must not gain one that answers null at
+	 * once: the query path would take and release a read slot for nothing). Phase 2 never reads inside a prefix.
+	 */
+	get getRanges(): ((key: string, ranges: BlobRange[], opts?: GetOptions) => Promise<Uint8Array[] | null>) | undefined {
+		const inner = this.inner;
+		if (!inner.getRanges) return undefined;
+		return (key, ranges, opts) => {
+			if (ranges.length && ranges.every((r) => this.holds(key, r))) {
+				const p = this.prefixes.get(key)!;
+				const out = ranges.map((r) => p.subarray(r.offset, r.offset + r.length));
+				const n = out.reduce((a, b) => a + b.byteLength, 0);
+				this.hits++;
+				this.hitBytes += n;
+				if (opts?.trace) {
+					opts.trace.hits++;
+					opts.trace.bytes += n;
+				}
+				return Promise.resolve(out);
 			}
-			return out;
-		}
-		return this.inner.getRanges ? this.inner.getRanges(key, ranges, opts) : null;
+			return inner.getRanges!(key, ranges, opts);
+		};
 	}
 
 	head(key: string): Promise<BlobHead | null> {

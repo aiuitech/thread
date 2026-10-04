@@ -12,21 +12,24 @@ else (the rerank records phase 2 reads, a whole-object read) goes to the store a
 from __future__ import annotations
 
 import io
+import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Callable, Protocol, Sequence
 
 from .pack import PACK_FOOTER_BYTES, PACK_HEADER_BYTES, PackWriter, is_pack_header, parse_pack_directory_full, \
     parse_pack_footer
 from .query import RevState
-from .store import BlobRange, BlobStore, BlobTrace, Bytes, phase_stat
+from .store import BlobRange, BlobStore, BlobTrace, Bytes, CachedBlobStore, phase_stat
 from .wire import ThreadError, keys, slab_rev_of
 
 __all__ = ["WARM_PACK_KIND", "WarmEntry", "parse_warm_pack", "write_warm_pack", "build_warm_pack", "WarmPackResult",
            "PrefixSeed", "WarmPrefixStore", "seed_warm_pack", "revision_slab_keys"]
 
 WARM_PACK_KIND = "warm"
+log = logging.getLogger("thread_sdk")
 
 
 @dataclass
@@ -112,10 +115,21 @@ class PrefixSeed(Protocol):
 
 class WarmPrefixStore(BlobStore):
     """A store in front of another one that holds object PREFIXES in memory: a read of a range inside a held prefix is
-    served from memory (a cache hit in the trace), every other read goes to the inner store unchanged."""
+    served from memory (a cache hit in the trace), every other read goes to the inner store unchanged.
 
-    def __init__(self, inner: BlobStore) -> None:
+    When the inner store is a cache (`CachedBlobStore`, `open_index`'s default for a remote store) and a served read
+    asked for `fill` (a slab's scan prefix, which on a cache miss would have fetched the whole slab into the cache),
+    the whole object is fetched into the cache in the background instead (`fill_workers` at once, once per key), so
+    later queries find the slab's rerank records there: the warm pack takes the first touch off the critical path
+    without keeping the cache cold."""
+
+    def __init__(self, inner: BlobStore, *, fill_workers: int = 2) -> None:
         self.inner = inner
+        self._fill_workers = fill_workers
+        self._fill_pool: ThreadPoolExecutor | None = None
+        self._filling: set[str] = set()
+        #: Background whole-object fills behind a cache: queued, done, failed.
+        self.fills = {"queued": 0, "done": 0, "failed": 0}
         self.supports_put = inner.supports_put
         self.supports_list = inner.supports_list
         self.supports_ranges = inner.supports_ranges
@@ -161,11 +175,59 @@ class WarmPrefixStore(BlobStore):
         if trace is not None:
             trace.add(hits=1, bytes=n)
 
+    def _fill_behind(self, key: str) -> None:
+        if not isinstance(self.inner, CachedBlobStore) or self._fill_workers <= 0:
+            return
+        with self._lock:
+            if key in self._filling:
+                return
+            self._filling.add(key)
+            self.fills["queued"] += 1
+            if self._fill_pool is None:
+                self._fill_pool = ThreadPoolExecutor(max_workers=self._fill_workers,
+                                                     thread_name_prefix="thread-warm-fill")
+            pool = self._fill_pool
+
+        def run() -> None:
+            try:
+                self.inner.get(key)  # a whole-object read through the cache: a miss fills it
+                with self._lock:
+                    self.fills["done"] += 1
+            except Exception as e:  # noqa: BLE001 - a later hit may retry
+                with self._lock:
+                    self.fills["failed"] += 1
+                    self._filling.discard(key)
+                log.error("thread_sdk: background fill of %s failed: %s", key, e)
+
+        try:
+            pool.submit(run)
+        except RuntimeError:  # closed
+            pass
+
+    def drain(self) -> None:
+        """Waits for the queued background fills (tests, benchmarks)."""
+        with self._lock:
+            pool = self._fill_pool
+            self._fill_pool = None
+        if pool is not None:
+            pool.shutdown(wait=True)
+
+    def close(self) -> None:
+        """Drops queued background fills (running ones finish)."""
+        with self._lock:
+            pool = self._fill_pool
+            self._fill_pool = None
+            self._fill_workers = 0
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def get(self, key, range=None, *, trace=None, fill=False):
         if range is not None:
             p = self._held(key, range)
             if p is not None:
                 self._count(range.length, trace)
+                if fill:
+                    self._fill_behind(key)
                 return memoryview(p)[range.offset:range.offset + range.length]
         return self.inner.get(key, range, trace=trace, fill=fill)
 

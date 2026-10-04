@@ -4,8 +4,8 @@
  * hot prefixes from memory with the same answers.
  */
 import { describe, expect, it } from "vitest";
-import { buildWarmPack, keys, MemoryBlobStore, MemorySink, PackedBlobStore, PackWriter, parsePackDirectory, parsePackFooter, parseWarmPack, PACK_FOOTER_BYTES, seedWarmPack, slabRevOf, WarmPrefixStore, type BlobRange, type BlobStore, type GetOptions } from "../src/index.js";
-import { buildGen, thread, unitRows, rng } from "./helpers.js";
+import { buildWarmPack, CachedBlobStore, keys, MemoryBlobStore, MemorySink, PackedBlobStore, PackWriter, parsePackDirectory, parsePackFooter, parseWarmPack, PACK_FOOTER_BYTES, seedWarmPack, slabRevOf, WarmPrefixStore, type BlobRange, type BlobStore, type GetOptions } from "../src/index.js";
+import { buildGen, FakeCache, thread, unitRows, rng } from "./helpers.js";
 
 const bytes = (n: number, seed = 0) => Uint8Array.from({ length: n }, (_, i) => (i * 31 + seed) & 0xff);
 
@@ -88,18 +88,44 @@ describe("prefix layer", () => {
 		layer.seedPrefix("k", bytes(1000, 7).subarray(0, 100));
 		const trace = { reads: 0, hits: 0, misses: 0, r206: 0, r200: 0, bytes: 0 };
 		expect(await layer.get("k", { offset: 0, length: 100 }, { trace })).toEqual(bytes(1000, 7).subarray(0, 100));
-		expect(await layer.getRanges("k", [{ offset: 0, length: 4 }, { offset: 50, length: 4 }])).toEqual([bytes(1000, 7).subarray(0, 4), bytes(1000, 7).subarray(50, 54)]);
+		expect(await layer.getRanges!("k", [{ offset: 0, length: 4 }, { offset: 50, length: 4 }])).toEqual([bytes(1000, 7).subarray(0, 4), bytes(1000, 7).subarray(50, 54)]);
 		expect(inner.reads).toHaveLength(0);
 		expect(trace).toMatchObject({ reads: 0, hits: 1, bytes: 100 });
 		// past the prefix, the whole object, a range list crossing the prefix: the store
 		expect(await layer.get("k", { offset: 90, length: 20 })).toEqual(bytes(1000, 7).subarray(90, 110));
 		expect(await layer.get("k")).toEqual(bytes(1000, 7));
-		await layer.getRanges("k", [{ offset: 0, length: 4 }, { offset: 500, length: 4 }]);
+		await layer.getRanges!("k", [{ offset: 0, length: 4 }, { offset: 500, length: 4 }]);
 		expect(inner.reads.map((r) => r.key)).toEqual(["k", "k", "k"]);
 		expect(layer.hits).toBe(2);
 		layer.retain(() => false);
 		expect(layer.size).toEqual({ prefixes: 0, bytes: 0 });
 		expect(layer.put).toBeUndefined();
+		// no getRanges on the inner store: none on the layer either
+		expect(new WarmPrefixStore({ get: m.get.bind(m), head: m.head.bind(m) }).getRanges).toBeUndefined();
+	});
+});
+
+describe("prefix layer in front of a cache", () => {
+	it("a hit of a fill read fetches the whole object into the cache in the background, once", async () => {
+		const m = new MemoryBlobStore();
+		await m.put("idx/g/slab/00001", bytes(1000, 5));
+		const inner = new CountingStore(m);
+		const cache = new FakeCache();
+		const pending: Promise<unknown>[] = [];
+		const layer = new WarmPrefixStore(new CachedBlobStore(inner, cache), { waitUntil: (p) => pending.push(p) });
+		layer.seedPrefix("idx/g/slab/00001", bytes(1000, 5).subarray(0, 100));
+		expect(await layer.get("idx/g/slab/00001", { offset: 0, length: 100 }, { fill: true })).toEqual(bytes(1000, 5).subarray(0, 100));
+		await layer.get("idx/g/slab/00001", { offset: 0, length: 100 }, { fill: true });
+		await layer.get("idx/g/slab/00001", { offset: 0, length: 50 }); // no fill asked: nothing queued
+		await Promise.all(pending);
+		await Promise.all(pending);
+		expect(layer.fills).toEqual({ queued: 1, done: 1, failed: 0 });
+		expect(inner.reads).toEqual([{ key: "idx/g/slab/00001", range: undefined }]);
+		expect(cache.puts).toBe(1);
+		// later phase-2 style reads of that slab are cache hits
+		const trace = { reads: 0, hits: 0, misses: 0, r206: 0, r200: 0, bytes: 0 };
+		expect(await layer.get("idx/g/slab/00001", { offset: 500, length: 10 }, { trace })).toEqual(bytes(1000, 5).subarray(500, 510));
+		expect(trace).toMatchObject({ reads: 0, hits: 1 });
 	});
 });
 

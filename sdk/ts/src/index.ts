@@ -278,7 +278,7 @@ export class ThreadIndex {
 			const source = opts.store instanceof PackedBlobStore ? opts.store.inner : store;
 			const got = fetchWarmPack(source, opts.warmPack, t0);
 			got.catch(() => {});
-			warm = { layer: new WarmPrefixStore(store), got };
+			warm = { layer: new WarmPrefixStore(store, { waitUntil: opts.waitUntil }), got };
 			store = warm.layer;
 		}
 		const tl: RevTimeline = {};

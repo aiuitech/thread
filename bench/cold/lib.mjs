@@ -103,6 +103,8 @@ export const METRICS = [
 	["MB phase2", (r) => r.bytes.phase2, "mb"],
 	["MB query", (r) => r.bytes.query, "mb"],
 	["cache hits (query)", (r) => r.stats.cacheHits, "n"],
+	["warm pack ready at query start (1/0)", (r) => (r.warm ? (r.warm.state === "ready" ? 1 : 0) : undefined), "n"],
+	["ms warm pack seeded (since open start)", (r) => r.warm?.readyMs, "ms"],
 	["scan prefix MB", (r) => r.stats.scanBytes, "mb"],
 	["slab MB transferred", (r) => r.stats.slabBytes, "mb"],
 	["rerank reads", (r) => r.stats.rerankReads, "n"],
