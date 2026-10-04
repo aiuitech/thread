@@ -260,6 +260,51 @@ def test_hybrid_on_dense_generation():
     index.close()
 
 
+def test_attribute_filters_lexical_and_hybrid():
+    """Filters on the lexical list (resolved through the docs store), hybrid search and docs; a replace rewrites
+    the word and a compaction keeps it."""
+    b = build_gen("gl", 3)
+    with open_index(b.store, cache=False) as index:
+        index.configure_lexical(text=True)
+        index.configure_attrs(lang={"values": ["en", "fr"]}, public="bool")
+        fresh = unit_rows(4, b.dim, rng(8))
+        index.upsert([1000, 1001, 1002, 1003], fresh,
+                     texts=["alpha bravo", "alpha bravo charlie", "alpha", "alpha bravo delta"],
+                     metas=["A", "B", "C", "D"],
+                     attrs=[{"lang": "en", "public": True}, {"lang": "fr", "public": True}, {"lang": "en"}, {"lang": "fr"}])
+        # a text-only document carries attrs too (they live in the docs store)
+        index.upsert([2000], texts=["alpha alpha alpha bravo"], metas=["T"], attrs=[{"lang": "en", "public": True}])
+        assert [h.id for h in index.search(text="alpha bravo", top_k=10).hits] == [1000, 2000, 1001, 1003, 1002]
+        en = index.search(text="alpha bravo", top_k=10, filter={"lang": "en"}, docs=True)
+        assert [h.id for h in en.hits] == [1000, 2000, 1002]
+        assert [index.unpack_attrs(h.doc.attrs)["lang"] for h in en.hits] == ["en", "en", "en"]
+        assert en.lexical.stats["filter_dropped"] == 2 and en.lexical.stats["depth"] == 40
+        assert [h.id for h in index.search(text="alpha", top_k=2, filter={"public": True, "lang": "fr"}).hits] == [1001]
+        # the list deepens until k match: with a depth of 1 the first round sees one candidate (1000), which fails
+        fr = index.compile_filter({"lang": "fr"})
+        deep = index._lex_index().search("alpha bravo", 2, filter=fr, filter_depth=1)
+        assert [h.id for h in deep.hits] == [1001, 1003] and deep.stats["depth"] == 8
+        assert index._lex_index().search("alpha", 1, filter=fr, filter_depth=1, max_depth=1).hits == []
+        assert [h.id for h in index.lexical_search("alpha bravo", 5, filter={"lang": "fr"}).hits] == [1001, 1003]
+        # hybrid: both lists filtered, so the fused result holds only matching ids; docs carry the word
+        hy = index.search(text="alpha bravo", vector=row(fresh, 0, 16), top_k=5, dense={"nprobe": 8},
+                          filter={"lang": "fr"}, docs=True)
+        assert hy.mode == "hybrid"
+        assert sorted(h.id for h in hy.hits) == [1001, 1003]
+        assert all(index.unpack_attrs(h.doc.attrs)["lang"] == "fr" for h in hy.hits)
+        assert all(h.id in (1001, 1003) for h in hy.dense.hits)
+        assert [h.id for h in hy.lexical.hits] == [1001, 1003]
+        pub = index.search(vector=row(fresh, 0, 16), top_k=5, dense={"nprobe": 8}, filter={"public": True})
+        assert sorted(h.id for h in pub.hits) == [1000, 1001]
+        assert index.docs([1002, 2000])[2000].attrs == index.pack_attrs({"lang": "en", "public": True})
+        index.upsert([1002], texts=["alpha"], metas=["C2"], attrs=[{"lang": "fr", "public": True}])
+        assert sorted(h.id for h in index.search(text="alpha", top_k=10, filter={"lang": "fr", "public": True}).hits) == [1001, 1002]
+        index.compact_segments()
+        assert sorted(h.id for h in index.search(text="alpha", top_k=10, filter={"lang": "fr", "public": True}).hits) == [1001, 1002]
+        d = index.docs([1002])[1002]
+        assert (d.meta, d.attrs) == ("C2", index.pack_attrs({"lang": "fr", "public": True}))
+
+
 def test_manifest_round_trip():
     b = build_gen("gm", 2)
     with open_index(b.store) as index:
@@ -320,7 +365,7 @@ def test_segment_paging():
     assert e.value.ranges[0][0] == 0 and e.value.ranges[0][1] > 0
     d = LexIo()
     got = seg.run(lambda: seg.reader.docs_get([3, 4, 8997], True), d, trace)
-    assert got[0] == (3, "meta 1", rows[1])
+    assert got[0] == (3, "meta 1", rows[1], 0)
     assert got[1] is None
     assert got[2][1] == "meta 2999"
     assert d.rounds <= 2

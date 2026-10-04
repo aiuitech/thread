@@ -40,6 +40,8 @@ recover from a trap. After rebuilding the wasm, `sdk/ts/scripts/sync-wasm.sh` co
 node bench/driver.mjs --gen g4 --profile edge
 node bench/query_bench.mjs --gen g4 --n 1000 --concurrency 50          # manifest defaults
 node bench/query_bench.mjs --gen g4 --n 1000 --concurrency 50 --nprobe 22 --rerank 100
+# filtered queries (g4's words are all 0, so only {"attrs":0} or {"attrs":{"$none":...}} match; a schema'd index takes field conditions)
+node bench/query_bench.mjs --gen g4 --n 1000 --concurrency 50 --filter '{"attrs":{"$lt":1}}' --maxNprobe 68
 
 # change a generation's query defaults (new manifest revision; isolates pick it up within 30 s)
 curl -X POST -H "authorization: Bearer $TOKEN" $URL/build/publish-rev -d '{"gen":"g4","defaults":{"nprobe":34,"rerank":150}}'

@@ -297,6 +297,12 @@ impl<'a> DeltaView<'a> {
         rd_u32(self.buf, self.entries_off + i * DELTA_ENTRY_BYTES + 4)
     }
 
+    /// The `attrs` word of entry `i` (the attribute filter's input).
+    #[inline]
+    pub fn attrs(&self, i: usize) -> u32 {
+        rd_u32(self.buf, self.entries_off + i * DELTA_ENTRY_BYTES + 8)
+    }
+
     /// Rerank record `i` (`[scale8 f32][code8 i8 * dim]`, same layout as a slab's).
     #[inline]
     pub fn rerank_record(&self, i: usize) -> &'a [u8] {

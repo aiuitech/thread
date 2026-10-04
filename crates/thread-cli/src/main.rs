@@ -72,7 +72,7 @@ fn bench_scan(n: usize, dim: usize, pq_m: usize) {
 
     let scan = |v: &SlabView<'_>, k: usize| {
         let mut top = TopK::new(k);
-        scan_slab(v, &q, &mut top, None);
+        scan_slab(v, &q, &mut top, None, None);
         top.into_sorted()
     };
     // 4-bit scan of the prefix, then one rerank record per candidate (as the host would range-read them)
@@ -152,7 +152,7 @@ fn bench_scan(n: usize, dim: usize, pq_m: usize) {
     let table = QueryTable::new(&q, &cb).unwrap();
     let scan3 = |k: usize| {
         let mut top = TopK::new(k);
-        scan_slab_pq(&v3, &table, &q, &mut top, None).unwrap();
+        scan_slab_pq(&v3, &table, &q, &mut top, None, None).unwrap();
         top.into_sorted()
     };
     let t3 = time_ms(|| scan3(K).len());

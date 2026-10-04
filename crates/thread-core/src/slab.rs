@@ -768,6 +768,12 @@ impl<'a> SlabView<'a> {
         rd_u32(self.buf, self.entries_off + i * ENTRY_BYTES)
     }
 
+    /// The `attrs` word of entry `i` (the attribute filter's input).
+    #[inline]
+    pub fn attrs(&self, i: usize) -> u32 {
+        rd_u32(self.buf, self.entries_off + i * ENTRY_BYTES + 12)
+    }
+
     /// v2: packed 4-bit code of entry `i` (`dim/2` bytes).
     #[inline]
     pub fn code4(&self, i: usize) -> &'a [u8] {

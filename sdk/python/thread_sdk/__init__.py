@@ -11,6 +11,7 @@ kernels are the same Rust code (`thread-core`) the Worker and the TypeScript SDK
 """
 
 from . import _native
+from .attrs import compile_filter, define_attrs, filter_matches, pack_attrs, unpack_attrs, validate_schema
 from .fusion import DEFAULT_RRF_K, rrf
 from .index import Rank, SearchHit, SearchResult, ThreadIndex, head_revision, load_rev_state, open_index, resolve_target
 from .lex import DocRecord, LexHit, LexIndex, LexSearchResult, LexSegment
@@ -33,6 +34,7 @@ from .wire import ResolvedLexConfig, ThreadError, keys
 from .write import (
     MAX_UPSERT,
     CompactSegmentsResult,
+    ConfigureAttrsResult,
     ConfigureLexicalResult,
     DeleteResult,
     UpsertResult,
@@ -58,8 +60,15 @@ __all__ = [
     "UpsertResult",
     "DeleteResult",
     "ConfigureLexicalResult",
+    "ConfigureAttrsResult",
     "CompactSegmentsResult",
     "create_lexical_generation",
+    "define_attrs",
+    "validate_schema",
+    "pack_attrs",
+    "unpack_attrs",
+    "compile_filter",
+    "filter_matches",
     "MAX_UPSERT",
     "QUERY_INFLIGHT",
     "BlobStore",

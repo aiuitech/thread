@@ -273,16 +273,18 @@ impl SegmentJob {
         })
     }
 
-    /// Adds a document (`text` indexed and, when the segment stores texts, kept; `meta` stored
-    /// in `docs`). Returns the tokens indexed. Errors on a duplicate id (nothing added).
+    /// Adds a document (`text` indexed and, when the segment stores texts, kept; `meta` and
+    /// `attrs`, the document's attribute word (default 0), stored in `docs`). Returns the tokens
+    /// indexed. Errors on a duplicate id (nothing added).
     pub fn add(
         &mut self,
         id: u32,
         text: Option<String>,
         meta: Option<String>,
+        attrs: Option<u32>,
     ) -> Result<u32, JsValue> {
         self.b
-            .add(id, text.as_deref(), meta.as_deref())
+            .add(id, text.as_deref(), meta.as_deref(), attrs.unwrap_or(0))
             .map(|n| n as u32)
             .map_err(|e| index_error(&e))
     }
@@ -847,9 +849,9 @@ impl SegmentReader {
         Ok(ranges_value(plan.ranges()))
     }
 
-    /// `[{id, meta, text} | null]` for `ids` (`text` is `null` unless `with_text` and the
-    /// segment stores texts). One round cold after the directory for the entries, one more for
-    /// the texts.
+    /// `[{id, meta, text, attrs} | null]` for `ids` (`text` is `null` unless `with_text` and the
+    /// segment stores texts; `attrs` is the document's attribute word, 0 when the section stores
+    /// none). One round cold after the directory for the entries, one more for the texts.
     pub fn docs_get(&mut self, ids: &[u32], with_text: bool) -> Result<JsValue, JsValue> {
         if !self.seg()?.has_docs() {
             return Ok(json_parse(&format!(
@@ -883,10 +885,11 @@ impl SegmentReader {
                         .map(|t| json_str(&t))
                         .unwrap_or_else(|| "null".into());
                     s.push_str(&format!(
-                        r#"{{"id":{},"meta":{},"text":{}}}"#,
+                        r#"{{"id":{},"meta":{},"text":{},"attrs":{}}}"#,
                         e.id,
                         json_str(&e.meta),
-                        text
+                        text,
+                        e.attrs
                     ));
                 }
             }

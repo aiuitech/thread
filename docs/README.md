@@ -12,6 +12,7 @@ if you want to use it.
 | [profiles.md](profiles.md) | the `edge` and `local` layouts, what each knob trades, manifest query defaults and how to change them |
 | [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual and automatic), cell splitting, GC |
 | [lexical.md](lexical.md) | BM25 segments, the `docs` store, the tokenizer, fusion, size-vs-speed tuning, the native CLI |
+| [filtering.md](filtering.md) | attribute filters: the 32-bit word and its schema, filter expressions and their compiled clauses, pre-filtering inside the scan with probe widening, post-filtering of text queries |
 | [build-pipeline.md](build-pipeline.md) | the build stages, build slots (Worker Loader), PQ codebook training, incremental k-means, finalize |
 | [build-flags.md](build-flags.md) | every `bench/driver.mjs` flag, and the commands that built g1 and g2 |
 | [operations.md](operations.md) | dataset prep, wasm build, deploy, build a generation, benchmarks, compaction, checks before a commit |

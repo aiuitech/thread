@@ -1,0 +1,54 @@
+{
+  "_": "Shared by sdk/ts/test/attrs.test.ts and sdk/python/tests/test_attrs.py: both SDKs must compile these expressions to exactly these words (thread-core/src/filter.rs wire form) and pack these values to these words.",
+  "spec": { "tenant": { "bits": 12 }, "lang": { "values": ["en", "fr", "de"] }, "public": "bool", "year": { "bits": 7, "min": 1970 } },
+  "schema": {
+    "fields": [
+      { "name": "tenant", "type": "number", "offset": 0, "bits": 12 },
+      { "name": "lang", "type": "enum", "offset": 12, "bits": 2, "values": ["en", "fr", "de"] },
+      { "name": "public", "type": "bool", "offset": 14, "bits": 1 },
+      { "name": "year", "type": "number", "offset": 15, "bits": 7, "min": 1970 }
+    ]
+  },
+  "pack": [
+    { "values": { "tenant": 5, "lang": "fr", "public": true, "year": 2001 }, "word": 1040389 },
+    { "values": { "tenant": 4095, "lang": "de", "public": false, "year": 2097 }, "word": 4177919 },
+    { "values": { "year": 1970 }, "word": 0 },
+    { "values": {}, "word": 0 },
+    { "values": 77, "word": 77 }
+  ],
+  "packErrors": [{ "tenant": 4096 }, { "tenant": -1 }, { "lang": "xx" }, { "nope": 1 }, { "year": 1969 }, { "year": 2098 }, { "public": 2 }, { "tenant": 1.5 }],
+  "filters": [
+    { "expr": { "tenant": 5 }, "words": [1, 4095, 0, 5, 0, 0] },
+    { "expr": { "tenant": { "$eq": 5 } }, "words": [1, 4095, 0, 5, 0, 0] },
+    { "expr": { "lang": { "$in": ["fr", "en", "xx"] } }, "words": [1, 12288, 2, 0, 0, 2, 4096, 8192] },
+    { "expr": { "public": true, "year": { "$gte": 2000, "$lt": 2010 } }, "words": [2, 16384, 0, 16384, 0, 0, 4161536, 4, 983040, 1277952, 0] },
+    { "expr": { "tenant": { "$ne": 7, "$gt": 100 } }, "words": [2, 4095, 1, 7, 0, 0, 4095, 4, 101, 4095, 0] },
+    { "expr": { "lang": "xx" }, "words": [1, 0, 4, 1, 0, 0] },
+    { "expr": { "lang": { "$ne": "xx" } }, "words": [] },
+    { "expr": { "lang": { "$in": ["xx"] } }, "words": [1, 0, 4, 1, 0, 0] },
+    { "expr": { "year": { "$lt": 1970 } }, "words": [1, 0, 4, 1, 0, 0] },
+    { "expr": { "year": { "$gte": 1900, "$lte": 3000 } }, "words": [] },
+    { "expr": { "year": { "$lte": 1970 } }, "words": [1, 4161536, 4, 0, 0, 0] },
+    { "expr": { "tenant": { "$any": 3, "$none": 4 } }, "words": [2, 3, 5, 0, 0, 0, 4, 7, 0, 0, 0] },
+    { "expr": { "tenant": { "$all": 5 } }, "words": [1, 5, 6, 0, 0, 0] },
+    { "expr": { "tenant": { "$any": 0 } }, "words": [1, 0, 4, 1, 0, 0] },
+    { "expr": { "tenant": { "$nin": [1, 5000, 1] } }, "words": [1, 4095, 3, 0, 0, 1, 1] },
+    { "expr": { "tenant": { "$nin": [5000] } }, "words": [] },
+    { "expr": { "public": false }, "words": [1, 16384, 0, 0, 0, 0] },
+    { "expr": { "lang": { "$nin": ["de"] }, "public": true }, "words": [2, 12288, 3, 0, 0, 1, 12288, 16384, 0, 16384, 0, 0] },
+    { "expr": {}, "words": [] }
+  ],
+  "filtersRaw": [
+    { "expr": { "attrs": { "$in": [3, 1] } }, "words": [1, 4294967295, 2, 0, 0, 2, 1, 3] },
+    { "expr": { "attrs": 7 }, "words": [1, 4294967295, 0, 7, 0, 0] },
+    { "expr": { "attrs": { "$any": 4294967295 } }, "words": [1, 4294967295, 5, 0, 0, 0] },
+    { "expr": { "attrs": { "$gt": 10, "$lte": 20 } }, "words": [1, 4294967295, 4, 11, 20, 0] }
+  ],
+  "filterErrors": [{ "nope": 1 }, { "tenant": { "$foo": 1 } }, { "$or": [] }, { "year": { "$lt": "x" } }, { "lang": { "$gt": 1 } }, { "lang": { "$any": 1 } }, { "tenant": { "$in": 5 } }, { "tenant": null }],
+  "matches": [
+    { "expr": { "tenant": 5 }, "words": [1040389, 5, 1040384, 4194309], "pass": [true, true, false, true] },
+    { "expr": { "public": true, "year": { "$gte": 2000, "$lt": 2010 } }, "words": [1040389, 1023997, 1335301, 1294336], "pass": [true, false, false, true] },
+    { "expr": { "lang": { "$in": ["fr", "en"] } }, "words": [4096, 8192, 12288, 0], "pass": [true, true, false, false] },
+    { "expr": { "tenant": { "$any": 3, "$none": 4 } }, "words": [1, 6, 8, 2], "pass": [true, false, false, true] }
+  ]
+}

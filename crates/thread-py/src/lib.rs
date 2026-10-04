@@ -15,6 +15,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::fmt::Display;
 use thread_core::delta::{DeltaEncoder, DeltaView};
+use thread_core::filter::AttrFilter;
 use thread_core::kmeans::{assign_tree_top_m, effective_probe_coarse};
 use thread_core::math::normalize;
 use thread_core::part::PartBuilder;
@@ -200,6 +201,40 @@ fn tomb_arg(bytes: &[u8]) -> Result<Option<Tombstones>, String> {
     Tombstones::from_bytes(bytes).map(Some).map_err(err_s)
 }
 
+/// A compiled attribute filter argument: its `u32` wire words (a sequence of ints or a u32
+/// buffer, see `thread_core::filter`), None or empty = no filter.
+pub(crate) fn filter_arg(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<AttrFilter>> {
+    let Some(obj) = obj else { return Ok(None) };
+    if obj.is_none() {
+        return Ok(None);
+    }
+    let words = u32_vec(obj)?;
+    AttrFilter::from_words(&words).map_err(|e| value_err(format!("filter: {e}")))
+}
+
+/// Validates a compiled attribute filter and returns its clause count (0 = no filter).
+#[pyfunction]
+#[pyo3(signature = (filter = None))]
+fn filter_check(filter: Option<&Bound<'_, PyAny>>) -> PyResult<usize> {
+    Ok(filter_arg(filter)?.map_or(0, |f| f.clauses().len()))
+}
+
+/// Applies a compiled attribute filter to attribute words: one bool per word (True = passes).
+/// No filter passes everything.
+#[pyfunction]
+#[pyo3(signature = (filter, attrs))]
+fn filter_matches(
+    filter: Option<&Bound<'_, PyAny>>,
+    attrs: &Bound<'_, PyAny>,
+) -> PyResult<Vec<bool>> {
+    let f = filter_arg(filter)?;
+    let words = u32_vec(attrs)?;
+    Ok(words
+        .iter()
+        .map(|&a| f.as_ref().is_none_or(|f| f.matches(a)))
+        .collect())
+}
+
 fn check_batch(len: usize, dim: usize) -> PyResult<usize> {
     if dim == 0 || !len.is_multiple_of(dim) {
         return Err(value_err(format!(
@@ -381,26 +416,34 @@ impl Searcher {
 fn scan_result<'py>(
     py: Python<'py>,
     r: Result<(Vec<u8>, ScanStats), String>,
-) -> PyResult<(Bound<'py, PyBytes>, usize, usize)> {
+) -> PyResult<(Bound<'py, PyBytes>, usize, usize, usize)> {
     let (packed, st) = r.map_err(value_err)?;
-    Ok((PyBytes::new(py, &packed), st.scanned, st.skipped))
+    Ok((
+        PyBytes::new(py, &packed),
+        st.scanned,
+        st.skipped,
+        st.filtered,
+    ))
 }
 
 /// Scans one slab (its `[0, scan_len)` prefix, or the whole object) for a prepared query; v3 slabs
-/// need a query built with the PQ codebook. Tombstoned ids (`u32` LE, sorted unique) are skipped
-/// before top-k insertion. Returns `(packed hits, scanned, skipped)`; packed hits are
+/// need a query built with the PQ codebook. Tombstoned ids (`u32` LE, sorted unique) and entries
+/// whose attrs word fails `filter` (compiled wire words) are skipped before top-k insertion.
+/// Returns `(packed hits, scanned, skipped, filtered)`; packed hits are
 /// `[count u32][id u32, score f32, idx u32]*`.
 #[pyfunction]
-#[pyo3(signature = (slab, query, k, tombstones = None))]
+#[pyo3(signature = (slab, query, k, tombstones = None, filter = None))]
 fn scan<'py>(
     py: Python<'py>,
     slab: Buf,
     query: &Bound<'py, Query>,
     k: usize,
     tombstones: Option<Buf>,
-) -> PyResult<(Bound<'py, PyBytes>, usize, usize)> {
+    filter: Option<&Bound<'py, PyAny>>,
+) -> PyResult<(Bound<'py, PyBytes>, usize, usize, usize)> {
     let q = query.get();
     let (slab, tomb) = (slab.as_slice(), opt_slice(&tombstones));
+    let f = filter_arg(filter)?;
     let r = py.detach(|| {
         let view = SlabView::parse(slab).map_err(err_s)?;
         if view.dim != q.q.len() {
@@ -413,9 +456,9 @@ fn scan<'py>(
                 .table
                 .as_ref()
                 .ok_or("v3 (PQ) slab: prepare the query with the PQ codebook")?;
-            scan_slab_pq(&view, table, &q.q, &mut top, t.as_ref()).map_err(err_s)?
+            scan_slab_pq(&view, table, &q.q, &mut top, t.as_ref(), f.as_ref()).map_err(err_s)?
         } else {
-            scan_slab(&view, &q.q, &mut top, t.as_ref())
+            scan_slab(&view, &q.q, &mut top, t.as_ref(), f.as_ref())
         };
         Ok((pack_hits(&top.into_sorted()), st))
     });
@@ -424,26 +467,28 @@ fn scan<'py>(
 
 /// Scans a whole delta segment with its int8 records (`q·mean[cell] + scale8 * (q·code8)`); the
 /// query must carry its cell dots. Scores are on the reranked scale. Returns
-/// `(packed hits, scanned, skipped)`.
+/// `(packed hits, scanned, skipped, filtered)`.
 #[pyfunction]
-#[pyo3(signature = (delta, query, k, tombstones = None))]
+#[pyo3(signature = (delta, query, k, tombstones = None, filter = None))]
 fn scan_delta<'py>(
     py: Python<'py>,
     delta: Buf,
     query: &Bound<'py, Query>,
     k: usize,
     tombstones: Option<Buf>,
-) -> PyResult<(Bound<'py, PyBytes>, usize, usize)> {
+    filter: Option<&Bound<'py, PyAny>>,
+) -> PyResult<(Bound<'py, PyBytes>, usize, usize, usize)> {
     let q = query.get();
     let qc =
         q.qc.as_ref()
             .ok_or_else(|| value_err("scan_delta needs a query prepared with dots=True"))?;
     let (delta, tomb) = (delta.as_slice(), opt_slice(&tombstones));
+    let f = filter_arg(filter)?;
     let r = py.detach(|| {
         let v = DeltaView::parse(delta).map_err(err_s)?;
         let t = tomb_arg(tomb)?;
         let mut top = TopK::new(k);
-        let st = scan_delta_core(&v, &q.q, qc, &mut top, t.as_ref()).map_err(err_s)?;
+        let st = scan_delta_core(&v, &q.q, qc, &mut top, t.as_ref(), f.as_ref()).map_err(err_s)?;
         Ok((pack_hits(&top.into_sorted()), st))
     });
     scan_result(py, r)
@@ -880,6 +925,29 @@ fn pq_init_codebook<'py>(
     Ok(PyBytes::new(py, &cb.to_bytes()))
 }
 
+/// Part records (for `SlabJob.add_records`) of every entry of `cell` in a delta segment whose id is
+/// not tombstoned (`tombstones`: `u32` LE ids, or None): what a compaction feeds a slab writer.
+#[pyfunction]
+#[pyo3(signature = (delta, cell, tombstones = None))]
+fn delta_records_for_cell<'py>(
+    py: Python<'py>,
+    delta: Buf,
+    cell: u32,
+    tombstones: Option<Buf>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let (delta, tomb) = (delta.as_slice(), opt_slice(&tombstones));
+    let out = py
+        .detach(|| {
+            let v = DeltaView::parse(delta).map_err(err_s)?;
+            let t = tomb_arg(tomb)?;
+            let mut out = Vec::new();
+            v.records_for_cell(cell, t.as_ref(), &mut out);
+            Ok::<_, String>(out)
+        })
+        .map_err(value_err)?;
+    Ok(PyBytes::new(py, &out))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
@@ -896,11 +964,14 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<run::QueryRun>()?;
     m.add_function(wrap_pyfunction!(scan, m)?)?;
     m.add_function(wrap_pyfunction!(scan_delta, m)?)?;
+    m.add_function(wrap_pyfunction!(filter_check, m)?)?;
+    m.add_function(wrap_pyfunction!(filter_matches, m)?)?;
     m.add_function(wrap_pyfunction!(merge, m)?)?;
     m.add_function(wrap_pyfunction!(rerank, m)?)?;
     m.add_function(wrap_pyfunction!(normalize_rows, m)?)?;
     m.add_function(wrap_pyfunction!(delta_info, m)?)?;
     m.add_function(wrap_pyfunction!(delta_cells, m)?)?;
+    m.add_function(wrap_pyfunction!(delta_records_for_cell, m)?)?;
     m.add_function(wrap_pyfunction!(tombstones_merge, m)?)?;
     m.add_function(wrap_pyfunction!(part_directory, m)?)?;
     m.add_function(wrap_pyfunction!(slab_info, m)?)?;

@@ -12,7 +12,8 @@
 //! thread tokenize [--tokenizer <json|file>] "text" ["text" ...]
 //! ```
 //!
-//! `docs.jsonl`: one JSON object per line with an integer `id` (u32), a `text` and optionally a `meta` (a string, or
+//! `docs.jsonl`: one JSON object per line with an integer `id` (u32), a `text`, optionally an `attrs` (u32, the
+//! document's attribute word for filtering) and optionally a `meta` (a string, or
 //! any JSON value stored as its text). Field names change with `--id-field` etc. `thread <command> --help` prints
 //! each command's options; `USAGE` the overview.
 
@@ -172,7 +173,19 @@ pub fn build(a: &Args) -> Result<Value, String> {
             })? as u32;
         let text = v.get(text_f).map(meta_string);
         let meta = v.get(meta_f).map(meta_string);
-        b.add(id, text.as_deref(), meta.as_deref())
+        let attrs = match v.get("attrs") {
+            None | Some(Value::Null) => 0,
+            Some(a) => a
+                .as_u64()
+                .filter(|&x| x <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    format!(
+                        "{docs_path}:{}: `attrs` must be an integer in [0, 2^32)",
+                        i + 1
+                    )
+                })? as u32,
+        };
+        b.add(id, text.as_deref(), meta.as_deref(), attrs)
             .map_err(|e| format!("{docs_path}:{}: {e}", i + 1))?;
         rows += 1;
     }

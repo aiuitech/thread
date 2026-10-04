@@ -68,8 +68,12 @@ class Built:
 
 
 def build_gen(gen: str, fmt: int, *, dim: int = 16, k2: int = 8, m: int = 2, n: int = 400, legacy: bool = False,
-              store: BlobStore | None = None) -> Built:
-    """A generation like the Worker's publish, with a slabs table unless `legacy`."""
+              store: BlobStore | None = None, attrs=None) -> Built:
+    """A generation like the Worker's publish, with a slabs table unless `legacy`. With `attrs` (a word per vector
+    index), the slabs are built the way a compaction builds them, from a delta segment's records (one primary cell
+    per vector, so `m` is 1), since the assign job writes no attrs."""
+    if attrs is not None:
+        m = 1
     r = rng(42)
     fine = unit_rows(k2, dim, r)
     vectors = unit_rows(n, dim, r, fine, 0.6)
@@ -82,15 +86,24 @@ def build_gen(gen: str, fmt: int, *, dim: int = 16, k2: int = 8, m: int = 2, n: 
         assign = array("I", [max(range(k2), key=lambda c: dot(vectors, fine, i * dim, c * dim, dim)) for i in range(n)])
         codebook = _native.pq_init_codebook(_native.residuals_for(vectors, fine, assign, dim), dim, pq_m, 7)
         job.set_codebook(codebook)
-    assert job.add_batch(vectors, 0) == n
-    part = job.take_part(0)
-    pk2, pdim, directory = _native.part_directory(part)
-    assert (pk2, pdim) == (k2, dim)
+    if attrs is not None:
+        dj = _native.DeltaJob(dim, k2, fine, 1)
+        if codebook is not None:
+            dj.set_pq_codebook(_native.PqCodebook(codebook))
+        assert len(dj.add(vectors, array("I", range(n)), array("I", [attrs(i) for i in range(n)]))) == n
+        delta = dj.finish()
+        records = [_native.delta_records_for_cell(delta, cell, None) for cell in range(k2)]
+    else:
+        assert job.add_batch(vectors, 0) == n
+        part = job.take_part(0)
+        pk2, pdim, directory = _native.part_directory(part)
+        assert (pk2, pdim) == (k2, dim)
+        records = [part[off : off + ln] for _, off, ln in directory]
     rows = []
-    for cell, (count, off, ln) in enumerate(directory):
+    for cell, recs in enumerate(records):
         sj = _native.SlabJob(dim, cell, fine[cell * dim : (cell + 1) * dim], fmt)
-        if ln:
-            assert sj.add_records(part[off : off + ln]) == count
+        if len(recs):
+            assert sj.add_records(recs) > 0
         b = sj.finish()
         info = _native.slab_info(b)
         assert info[4] == fmt

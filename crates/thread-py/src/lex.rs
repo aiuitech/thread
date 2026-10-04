@@ -236,16 +236,18 @@ impl SegmentJob {
         })
     }
 
-    /// Adds a document. Returns the tokens indexed. Errors on a duplicate id (nothing added).
-    #[pyo3(signature = (id, text = None, meta = None))]
+    /// Adds a document (`attrs`: its attribute word, stored in `docs`). Returns the tokens indexed. Errors on a
+    /// duplicate id (nothing added).
+    #[pyo3(signature = (id, text = None, meta = None, attrs = 0))]
     fn add(
         &mut self,
         py: Python<'_>,
         id: u32,
         text: Option<&str>,
         meta: Option<&str>,
+        attrs: u32,
     ) -> PyResult<u32> {
-        let r = self.builder()?.add(id, text, meta);
+        let r = self.builder()?.add(id, text, meta, attrs);
         r.map(|n| n as u32).map_err(|e| LexErr::from(e).into_py(py))
     }
 
@@ -747,8 +749,9 @@ impl SegmentReader {
         Ok(PyBytes::new(py, &packed))
     }
 
-    /// `[(id, meta, text | None) | None]` for `ids` (`text` only with `with_text` and a segment that
-    /// stores texts). One round cold after the directory for the entries, one more for the texts.
+    /// `[(id, meta, text | None, attrs) | None]` for `ids` (`text` only with `with_text` and a segment
+    /// that stores texts; `attrs` the document's attribute word, 0 when the section stores none). One
+    /// round cold after the directory for the entries, one more for the texts.
     fn docs_get<'py>(
         &self,
         py: Python<'py>,
@@ -779,7 +782,7 @@ impl SegmentReader {
                 None => out.append(py.None())?,
                 Some(e) => {
                     let text = tx.as_mut().and_then(|it| it.next());
-                    out.append((e.id, e.meta, text))?;
+                    out.append((e.id, e.meta, text, e.attrs))?;
                 }
             }
         }

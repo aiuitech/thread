@@ -8,6 +8,7 @@
 //! Vector batches are `Float32Array`s of `n * dim` unit vectors.
 
 use thread_core::delta::{DeltaEncoder, DeltaView};
+use thread_core::filter::AttrFilter;
 use thread_core::kmeans::{
     assign_candidates, assign_candidates_top_m, assign_flat, assign_tree, assign_tree_top_m, check_neighbors,
     effective_probe_coarse, Accum, BucketReservoir,
@@ -837,12 +838,32 @@ impl Searcher {
     }
 }
 
-/// Writes `[scanned, skipped]` into the first two elements of a scan's `stats`
-/// out-parameter (fewer if it is shorter; an empty array ignores them).
+/// Writes `[scanned, skipped, filtered]` into the first elements of a scan's
+/// `stats` out-parameter (fewer if it is shorter; an empty array ignores them).
 fn write_stats(stats: &mut [u32], st: ScanStats) {
-    for (o, v) in stats.iter_mut().zip([st.scanned, st.skipped]) {
+    for (o, v) in stats.iter_mut().zip([st.scanned, st.skipped, st.filtered]) {
         *o = v as u32;
     }
+}
+
+/// Parses a filter's wire words (`filter.rs`; empty = no filter).
+fn filter_arg(words: &[u32]) -> Result<Option<AttrFilter>, JsValue> {
+    AttrFilter::from_words(words).map_err(js_err)
+}
+
+/// Validates a compiled attribute filter (the `u32` words the scans take) and
+/// returns its clause count (0 = no filter).
+#[wasm_bindgen]
+pub fn filter_check(filter: &[u32]) -> Result<u32, JsValue> {
+    Ok(filter_arg(filter)?.map_or(0, |f| f.clauses().len() as u32))
+}
+
+/// Applies a compiled attribute filter to attribute words: one byte per word,
+/// 1 where the word passes. An empty filter passes everything.
+#[wasm_bindgen]
+pub fn filter_matches(filter: &[u32], attrs: &[u32]) -> Result<Vec<u8>, JsValue> {
+    let f = filter_arg(filter)?;
+    Ok(attrs.iter().map(|&a| f.as_ref().is_none_or(|f| f.matches(a)) as u8).collect())
 }
 
 /// Scans one slab for unit query `q`; returns packed top-k hits
@@ -854,12 +875,15 @@ fn write_stats(stats: &mut [u32], st: ScanStats) {
 ///
 /// `tombstones` (`u32` LE ids, sorted unique as `tombstones_merge` writes them;
 /// empty = none) are skipped inside the scan, before top-k insertion, so the
-/// result holds the best `k` live entries. `stats` is an out-parameter
+/// result holds the best `k` live entries; `filter` (a compiled attribute
+/// filter's `u32` words, see `filter_check`; empty = none) drops entries whose
+/// `attrs` word fails it the same way. `stats` is an out-parameter
 /// (`Uint32Array`, copied back after the call): `stats[0]` = entries scanned,
-/// `stats[1]` = tombstoned entries skipped (only those that scored high enough
-/// to enter the top-k when reached). Pass `new Uint32Array(0)` to ignore them.
+/// `stats[1]` = tombstoned entries skipped, `stats[2]` = entries the filter
+/// dropped (both only among those that scored high enough to enter the top-k
+/// when reached). Pass `new Uint32Array(0)` to ignore them.
 #[wasm_bindgen]
-pub fn scan(slab_scan_bytes: &[u8], q: &[f32], k: u32, tombstones: &[u8], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
+pub fn scan(slab_scan_bytes: &[u8], q: &[f32], k: u32, tombstones: &[u8], filter: &[u32], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
     let view = SlabView::parse(slab_scan_bytes).map_err(js_err)?;
     if view.is_v3() {
         return Err(js_err("v3 (PQ) slab: scan it with scan_pq(prefix, PqTable, q, k, tombstones, stats), not scan"));
@@ -868,8 +892,9 @@ pub fn scan(slab_scan_bytes: &[u8], q: &[f32], k: u32, tombstones: &[u8], stats:
         return Err(js_err(format!("slab dim {} != query dim {}", view.dim, q.len())));
     }
     let t = tombstones_arg(tombstones)?;
+    let f = filter_arg(filter)?;
     let mut top = TopK::new(k as usize);
-    write_stats(stats, scan_slab(&view, q, &mut top, t.as_ref()));
+    write_stats(stats, scan_slab(&view, q, &mut top, t.as_ref(), f.as_ref()));
     Ok(pack_hits(&top.into_sorted()))
 }
 
@@ -1112,14 +1137,16 @@ impl PqTable {
 /// packed top-k hits in the `scan` wire format (`idx` = entry index, locating
 /// the int8 rerank record for `rerank`). `table` must be built from the same
 /// `q`. Errors on v1/v2 slabs and on a table whose `m` differs from the slab's.
-/// `tombstones` and `stats` as in `scan`: tombstoned ids are skipped before
-/// top-k insertion; `stats` receives `[scanned, skipped]`.
+/// `tombstones`, `filter` and `stats` as in `scan`: tombstoned and filtered-out
+/// entries are skipped before top-k insertion; `stats` receives
+/// `[scanned, skipped, filtered]`.
 #[wasm_bindgen]
-pub fn scan_pq(slab_scan_bytes: &[u8], table: &PqTable, q: &[f32], k: u32, tombstones: &[u8], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
+pub fn scan_pq(slab_scan_bytes: &[u8], table: &PqTable, q: &[f32], k: u32, tombstones: &[u8], filter: &[u32], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
     let view = SlabView::parse(slab_scan_bytes).map_err(js_err)?;
     let t = tombstones_arg(tombstones)?;
+    let f = filter_arg(filter)?;
     let mut top = TopK::new(k as usize);
-    write_stats(stats, scan_slab_pq(&view, &table.t, q, &mut top, t.as_ref()).map_err(js_err)?);
+    write_stats(stats, scan_slab_pq(&view, &table.t, q, &mut top, t.as_ref(), f.as_ref()).map_err(js_err)?);
     Ok(pack_hits(&top.into_sorted()))
 }
 
@@ -1267,15 +1294,17 @@ pub fn delta_info(delta_bytes: &[u8]) -> Result<Vec<u32>, JsValue> {
 /// (one dot per fine cell, unnormalized means). Returns the top `k` as packed
 /// hits in the `scan` wire format, `idx` = entry index in the segment. Scores
 /// are on the reranked (int8) scale, so they merge directly with `rerank`
-/// results; no second phase is needed. `tombstones` and `stats` as in `scan`:
-/// pass the ids to hide in this segment (for a segment added at rev `a`, the
-/// union of the sets with rev > `a`); `stats` receives `[scanned, skipped]`.
+/// results; no second phase is needed. `tombstones`, `filter` and `stats` as
+/// in `scan`: pass the ids to hide in this segment (for a segment added at rev
+/// `a`, the union of the sets with rev > `a`); `stats` receives
+/// `[scanned, skipped, filtered]`.
 #[wasm_bindgen]
-pub fn scan_delta(delta_bytes: &[u8], q: &[f32], qc: &[f32], k: u32, tombstones: &[u8], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
+pub fn scan_delta(delta_bytes: &[u8], q: &[f32], qc: &[f32], k: u32, tombstones: &[u8], filter: &[u32], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
     let v = DeltaView::parse(delta_bytes).map_err(js_err)?;
     let t = tombstones_arg(tombstones)?;
+    let f = filter_arg(filter)?;
     let mut top = TopK::new(k as usize);
-    write_stats(stats, scan_delta_core(&v, q, qc, &mut top, t.as_ref()).map_err(js_err)?);
+    write_stats(stats, scan_delta_core(&v, q, qc, &mut top, t.as_ref(), f.as_ref()).map_err(js_err)?);
     Ok(pack_hits(&top.into_sorted()))
 }
 
@@ -1611,13 +1640,13 @@ mod tests {
             assert_eq!((info[1], info[4], info[8]), (cnt, 3, if cnt > 0 { pq_m } else { 0 }));
             let prefix = &slab[..info[5] as usize];
             let mut st = [9u32; 2];
-            let hits = unpack_hits(&scan_pq(prefix, &table, &q, 5, &[], &mut st).unwrap());
+            let hits = unpack_hits(&scan_pq(prefix, &table, &q, 5, &[], &[], &mut st).unwrap());
             assert_eq!(hits.len(), (cnt as usize).min(5));
             assert_eq!(st, [cnt, 0]);
             // a tombstoned best hit does not take a slot: the next live entries fill the top 5
             if let Some(best) = hits.first() {
                 let tomb = tombstones_merge(&[], &[best.id]).unwrap();
-                let live = unpack_hits(&scan_pq(prefix, &table, &q, 5, &tomb, &mut st).unwrap());
+                let live = unpack_hits(&scan_pq(prefix, &table, &q, 5, &tomb, &[], &mut st).unwrap());
                 assert_eq!(live.len(), (cnt as usize - 1).min(5));
                 assert_eq!(&live[..hits.len() - 1], &hits[1..]);
                 assert_eq!(st[1], 1);
@@ -1752,24 +1781,24 @@ mod tests {
         let q = xs[(base + 40) * dim..(base + 41) * dim].to_vec();
         let qc = searcher.cell_dots(&q).unwrap();
         assert_eq!(searcher.route_from_dots(&qc, 3).unwrap(), searcher.route_flat(&q, 3).unwrap());
-        let hits = unpack_hits(&scan_delta(&delta, &q, &qc, 5, &[], &mut []).unwrap());
+        let hits = unpack_hits(&scan_delta(&delta, &q, &qc, 5, &[], &[], &mut []).unwrap());
         assert_eq!((hits[0].id, hits[0].idx), (base as u32 + 40, 40));
         assert!((hits[0].score - 1.0).abs() < 5e-3);
         // a tombstone removes it
         let tomb = tombstones_merge(&[], &[base as u32 + 40, 3]).unwrap();
         let tomb = tombstones_merge(&tomb, &[3, 1]).unwrap();
         assert_eq!(tomb.len(), 12);
-        let kept = unpack_hits(&filter_hits(&scan_delta(&delta, &q, &qc, 5, &[], &mut []).unwrap(), &tomb).unwrap());
+        let kept = unpack_hits(&filter_hits(&scan_delta(&delta, &q, &qc, 5, &[], &[], &mut []).unwrap(), &tomb).unwrap());
         assert_eq!(kept.len(), 4);
         assert!(kept.iter().all(|h| h.id != base as u32 + 40));
         // in the scan it does not take a slot: k = 1 returns the second-best entry, k = 5 still 5 hits
         let mut st = [0u32; 2];
-        let one = unpack_hits(&scan_delta(&delta, &q, &qc, 1, &tomb, &mut st).unwrap());
+        let one = unpack_hits(&scan_delta(&delta, &q, &qc, 1, &tomb, &[], &mut st).unwrap());
         assert_eq!((one, st), (vec![hits[1]], [60, 1]));
-        let five = unpack_hits(&scan_delta(&delta, &q, &qc, 5, &tomb, &mut st).unwrap());
+        let five = unpack_hits(&scan_delta(&delta, &q, &qc, 5, &tomb, &[], &mut st).unwrap());
         assert_eq!((five.len(), &five[..4]), (5, &hits[1..]));
         // merge is unchanged
-        let packed = scan_delta(&delta, &q, &qc, 5, &[], &mut []).unwrap();
+        let packed = scan_delta(&delta, &q, &qc, 5, &[], &[], &mut []).unwrap();
         assert_eq!(unpack_hits(&merge(&[packed.clone(), packed].concat(), 3)), hits[..3].to_vec());
 
         // compaction of every cell, formats 3 and 2

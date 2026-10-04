@@ -12,19 +12,21 @@
 import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, PrefixedBlobStore, R2BlobStore, type BlobStore, type BlobTrace, type CacheLike, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type QueryOptions, type QueryResult, type RevState } from "./query.js";
-import { compactSegments, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
+import { compactSegments, configureAttrs, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
+import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
+import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchOptions, type LexSearchResult } from "./lex.js";
 import { buildTombState, hasDense, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, resolveLexConfig, ThreadError, type CurrentPointer, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
-import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 
 export * from "./wire.js";
+export * from "./attrs.js";
 export * from "./store.js";
 export * from "./s3.js";
 export * from "./lex.js";
 export * from "./fusion.js";
 export type { Base, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, RevState } from "./query.js";
-export { Limiter, QUERY_INFLIGHT, executeQuery } from "./query.js";
-export type { CompactSegmentsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
+export { FILTER_WIDEN, Limiter, QUERY_INFLIGHT, executeQuery } from "./query.js";
+export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
 export { createLexicalGeneration } from "./write.js";
 
 /** A unified search: text, vector or both. */
@@ -45,6 +47,13 @@ export interface SearchRequest {
 	dense?: QueryOptions;
 	/** Resolve each hit through the `docs` store: `true` for the metadata, `"text"` for the stored text too. */
 	docs?: boolean | "text";
+	/**
+	 * Attribute filter on both lists: field conditions under the generation's schema (`{tenant: 5, lang: {$in:
+	 * ["en", "fr"]}}`; `{attrs: {$any: 1}}` on the raw word without one). The dense scan applies it before top-k
+	 * insertion (widening its probes up to `dense.maxNprobe`); the BM25 list is taken deeper and resolved through
+	 * the `docs` store (see `LexSearchOptions`).
+	 */
+	filter?: AttrFilterExpr;
 }
 
 export interface SearchHit {
@@ -268,6 +277,22 @@ export class ThreadIndex {
 	get segments(): SegmentRef[] {
 		return this.revState.segments;
 	}
+	/** The attribute schema (`manifest.attrs`), or null: the raw 32-bit word is then the one field, `attrs`. */
+	get attrSchema(): AttrSchema | null {
+		return this.revState.manifest.attrs ? validateSchema(this.revState.manifest.attrs) : null;
+	}
+	/** Packs field values into a document's attrs word under the schema (`{tenant: 5, lang: "en"}`). */
+	packAttrs(values: AttrValues): number {
+		return packAttrs(this.attrSchema, values);
+	}
+	/** The field values of a hit's `attrs` word under the schema. */
+	unpackAttrs(word: number): Record<string, number | string | boolean> {
+		return unpackAttrs(this.attrSchema, word);
+	}
+	/** Compiles a filter expression against the schema into the words `query({filter})` and `search({filter})` take. */
+	compileFilter(filter: AttrFilterExpr | null | undefined): Uint32Array {
+		return compileFilter(this.attrSchema, filter);
+	}
 
 	/**
 	 * Re-reads `idx/current.json` (or the generation's head) and switches to the new revision if it changed.
@@ -335,13 +360,15 @@ export class ThreadIndex {
 		const weights = { dense: req.weights?.dense ?? cfg?.weights.dense ?? 1, lexical: req.weights?.lexical ?? cfg?.weights.lexical ?? 1 };
 		const both = hasText && hasVector;
 		const depth = both ? Math.max(recallK, topK) : topK;
+		// The filter is compiled once and applied to both lists.
+		const filter = req.filter ? this.compileFilter(req.filter) : undefined;
 		let tDense = 0;
 		let tLex = 0;
 		const [dense, lexical] = await Promise.all([
 			hasVector
 				? (async () => {
 						const t = Date.now();
-						const r = await this.query(req.vector!, { ...req.dense, topK: depth });
+						const r = await this.query(req.vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
 						tDense = Date.now() - t;
 						return r;
 					})()
@@ -349,7 +376,7 @@ export class ThreadIndex {
 			hasText
 				? (async () => {
 						const t = Date.now();
-						const r = await this.lexicalSearch(req.text!, depth);
+						const r = await this.lexicalSearch(req.text!, depth, filter ? { filter } : {});
 						tLex = Date.now() - t;
 						return r;
 					})()
@@ -408,10 +435,10 @@ export class ThreadIndex {
 		};
 	}
 
-	/** BM25 top `k` for `text` over the revision's lexical segments (see `LexIndex.search`). */
-	async lexicalSearch(text: string, k: number): Promise<LexSearchResult> {
+	/** BM25 top `k` for `text` over the revision's lexical segments (see `LexIndex.search`); `opts.filter` takes compiled words. */
+	async lexicalSearch(text: string, k: number, opts: LexSearchOptions = {}): Promise<LexSearchResult> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
-		return this.thread.withRecovery("lexicalSearch", async () => (await this.lexIndex()).search(text, k));
+		return this.thread.withRecovery("lexicalSearch", async () => (await this.lexIndex()).search(text, k, opts));
 	}
 
 	/** The query's tokens under the index's tokenizer. */
@@ -433,6 +460,18 @@ export class ThreadIndex {
 	 */
 	async configureLexical(config: LexConfig): Promise<ConfigureLexicalResult> {
 		const r = await configureLexical(this.writer(), config);
+		await this.useRevision(r.gen, r.rev);
+		return r;
+	}
+
+	/**
+	 * @experimental Declares (or extends) the attribute schema: named fields packed into each document's 32-bit
+	 * attrs word, in declaration order (`{tenant: {bits: 12}, lang: {values: ["en", "fr"]}, public: "bool"}`), as a
+	 * manifest revision. Existing fields keep their layout (an enum may append values); documents written before
+	 * keep their words.
+	 */
+	async configureAttrs(spec: Record<string, AttrFieldSpec> | AttrSchema): Promise<ConfigureAttrsResult> {
+		const r = await configureAttrs(this.writer(), spec);
 		await this.useRevision(r.gen, r.rev);
 		return r;
 	}

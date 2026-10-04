@@ -7,6 +7,9 @@
  * manifest defaults (g3+: profile defaults, older generations: nprobe 1, rerank 32, pc 0). The
  * values the server actually used are printed from stats.params.
  * --rerank N: int8 re-scoring of the scan tier's top max(k, N) (format-2 generations); 0 = scan-tier scores only.
+ * --filter '{"attrs":{"$any":1}}' [--maxNprobe N]: an attribute filter (field conditions under manifest.attrs, or the
+ * raw `attrs` word without a schema) applied inside every scan; the Worker widens its probes past nprobe up to
+ * maxNprobe (default 4 x nprobe) until the rerank set is full. The summary adds the cells scanned per query.
  * --route flat|beam, --beam N: fine-cell routing (beam = only the cells of the centroid tree's best N groups; needs
  * manifest.tree); sent only when given (default: manifest.defaults.route, else flat; beam: manifest.tree.beam).
  * Interleaved routing comparison: --extras "route=flat|route=beam&beam=8|route=beam&beam=16".
@@ -51,7 +54,9 @@ const rerank = opt("rerank");
 const beam = opt("beam");
 const route = args.route ?? null;
 if (route !== null && !["flat", "beam"].includes(route)) throw new Error(`--route must be flat|beam, got ${route}`);
-const qs = [`k=${k}`, `cache=${cache}`, ...Object.entries({ nprobe, pc, rerank, route, beam }).filter(([, v]) => v !== null).map(([n, v]) => `${n}=${v}`)].join("&");
+const maxNprobe = opt("maxNprobe");
+const filter = args.filter ? encodeURIComponent(JSON.stringify(JSON.parse(args.filter))) : null;
+const qs = [`k=${k}`, `cache=${cache}`, ...Object.entries({ nprobe, pc, rerank, route, beam, maxNprobe, filter }).filter(([, v]) => v !== null).map(([n, v]) => `${n}=${v}`)].join("&");
 const show = (v) => (v === null ? "default" : v);
 const normExtra = (x) => (x && x !== "-" ? `&${x.replace(/^[?&]/, "")}` : "");
 const extra = normExtra(args.extra);
@@ -84,7 +89,7 @@ async function query(i) {
 	const data = await res.json();
 	const gt = truth(qIndex(i));
 	const hit = data.ids.filter((id) => gt.has(id)).length;
-	return { ms, cfg, recall: hit / gt.size, timing: data.timing, stats: data.stats, gen: data.gen, rev: data.rev };
+	return { ms, cfg, recall: hit / gt.size, timing: data.timing, stats: data.stats, gen: data.gen, rev: data.rev, cells: data.cells };
 }
 
 async function run(label) {
@@ -131,6 +136,9 @@ async function run(label) {
 		`  format ${fmts}: scanBytes ${(avg((r) => r.stats.scanBytes ?? r.stats.slabBytes) / 1024).toFixed(0)} KB  rerank T ${avg((r) => r.stats.rerank ?? 0)}  rerankReads ${avg((r) => r.stats.rerankReads ?? 0)}  rerankSlabs ${avg((r) => r.stats.rerankSlabs ?? 0)}  multipart ${avg((r) => r.stats.rerankMultipart ?? 0)}  rerankBytes ${(avg((r) => r.stats.rerankBytes ?? 0) / 1024).toFixed(1)} KB  rerankLocal ${avg((r) => r.stats.rerankLocal ?? 0)}`,
 	);
 	console.log(`  phases: phase1 ${avg((r) => r.timing.phase1 ?? 0)}ms (fetch ${avg((r) => r.timing.fetch)}ms)  phase2 ${avg((r) => r.timing.phase2 ?? 0)}ms`);
+	if (filter) {
+		console.log(`  filter ${args.filter}: cells scanned ${avg((r) => r.cells?.length ?? 0)} (maxNprobe ${show(maxNprobe)}, server ${avg((r) => r.stats.maxNprobe ?? 0)})  filterDropped ${avg((r) => r.stats.filterDropped ?? 0)}  candidates ${avg((r) => r.stats.candidates ?? 0)}`);
+	}
 	if (ok.some((r) => r.stats.deltas || r.stats.tombstones)) {
 		console.log(
 			`  update path: deltas ${avg((r) => r.stats.deltas ?? 0)}  deltaBytes ${(avg((r) => r.stats.deltaBytes ?? 0) / 1024).toFixed(0)} KB  deltaScanned ${avg((r) => r.stats.deltaScanned ?? 0)}  deltaHits ${avg((r) => r.stats.deltaHits ?? 0)} (dropped ${avg((r) => r.stats.deltaDropped ?? 0)}, in top-k ${avg((r) => r.stats.deltaTop ?? 0)})  tombstones ${avg((r) => r.stats.tombstones ?? 0)} in ${avg((r) => r.stats.tombSets ?? 0)} sets (slab hits dropped ${avg((r) => r.stats.tombDropped ?? 0)})  delta ms ${avg((r) => r.timing.delta ?? 0)}  wasmMem max ${Math.max(...ok.map((r) => r.stats.wasmMemMB ?? 0))} MB`,

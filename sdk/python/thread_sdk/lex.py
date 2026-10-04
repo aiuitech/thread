@@ -20,10 +20,11 @@ import time
 from array import array
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, TypeVar
+from typing import Any, Callable, Iterable, Sequence, TypeVar
 
 from . import _native
 from ._native import MissingRanges
+from .attrs import filter_matches
 from .store import BlobRange, BlobStore, BlobTrace
 from .wire import ResolvedLexConfig, TombState, ThreadError, parse_hits, tomb_for_segment, tomb_hides
 
@@ -193,11 +194,12 @@ class LexSearchResult:
 
 @dataclass
 class DocRecord:
-    """A resolved document: its metadata string and, when stored and requested, its text."""
+    """A resolved document: its metadata string, when stored and requested its text, and its attribute word."""
 
     id: int
     meta: str
     text: str | None = None
+    attrs: int = 0
 
 
 class LexIndex:
@@ -235,10 +237,41 @@ class LexIndex:
         futs = [self.io_pool.submit(fn, s) for s in segs]
         return [f.result() for f in futs]
 
-    def search(self, text: str, k: int, trace: BlobTrace | None = None) -> LexSearchResult:
+    def search(self, text: str, k: int, trace: BlobTrace | None = None, *, filter: Sequence[int] | None = None,
+               filter_depth: int | None = None, max_depth: int | None = None) -> LexSearchResult:
         """BM25 top `k` over every segment: tokenize, look the distinct tokens up in every lexical segment (one round
         each, concurrently), sum their df, score every segment with the corpus-wide statistics (one round each),
-        merge. Tombstoned ids never take a slot."""
+        merge. Tombstoned ids never take a slot. With a compiled attribute `filter`, the list is taken deeper
+        (`filter_depth`, default max(4 k, 32)), each candidate's attrs word is resolved through the `docs` store and
+        non-matching hits are dropped, deepening (x4) until `k` match, the lists are exhausted or `max_depth`
+        (default 1 << 16)."""
+        if not filter:
+            return self._search(text, k, trace)
+        t0 = time.perf_counter()
+        attrs_of: dict[int, int] = {}
+        depth = max(filter_depth if filter_depth is not None else max(4 * k, 32), k)
+        max_d = max(max_depth if max_depth is not None else 1 << 16, depth)
+        while True:
+            raw = self._search(text, depth, trace)
+            unknown = [h.id for h in raw.hits if h.id not in attrs_of]
+            if unknown:
+                found, io = self.docs(unknown, trace=trace)
+                raw.stats["io"] = {k_: raw.stats["io"][k_] + v for k_, v in io.as_dict().items()}
+                for i in unknown:
+                    attrs_of[i] = found[i].attrs if i in found else 0
+            hits = [h for h in raw.hits if filter_matches(filter, attrs_of[h.id])]
+            if len(hits) >= k or len(raw.hits) < depth or depth >= max_d:
+                raw.stats.update(depth=depth, filter_dropped=len(raw.hits) - len(hits),
+                                 ms=round((time.perf_counter() - t0) * 1000, 3))
+                return LexSearchResult(hits[:k], raw.tokens, raw.found, raw.stats)
+            depth = min(max_d, depth * 4)
+
+    def attrs(self, ids: Iterable[int], trace: BlobTrace | None = None) -> dict[int, int]:
+        """The attrs words of `ids` through the `docs` sections (newest live copy); ids without an entry are absent."""
+        found, _ = self.docs(ids, trace=trace)
+        return {i: d.attrs for i, d in found.items()}
+
+    def _search(self, text: str, k: int, trace: BlobTrace | None = None) -> LexSearchResult:
         t0 = time.perf_counter()
         io = LexIo()
         tokens = self.tokenize(text)
@@ -308,6 +341,6 @@ class LexIndex:
                 if g is None:
                     continue
                 resolved.add(wid)
-                out[wid] = DocRecord(wid, g[1], g[2] if text and g[2] is not None else None)
+                out[wid] = DocRecord(wid, g[1], g[2] if text and g[2] is not None else None, g[3])
             pending = [i for i in pending if i not in resolved]
         return out, io

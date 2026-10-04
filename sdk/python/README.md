@@ -13,7 +13,8 @@ store = S3BlobStore.r2(account_id, "vib-bench", access_key_id, secret_access_key
 with open_index(store) as index:
     hits = index.query(embedding, top_k=10).hits            # dense: [Hit(id, score, attrs, source), ...]
     r = index.search(text="deploy failed", vector=embedding, top_k=10, docs=True)
-    # hybrid: r.hits = [SearchHit(id, score, dense=Rank(rank, score), lexical=Rank(...), doc=DocRecord(id, meta)), ...]
+    # hybrid: r.hits = [SearchHit(id, score, dense=Rank(rank, score), lexical=Rank(...), doc=DocRecord(id, meta, text, attrs)), ...]
+    f = index.search(text="deploy failed", vector=embedding, top_k=10, filter={"tenant": 42, "lang": {"$in": ["en", "fr"]}})
 ```
 
 ## Install
@@ -111,13 +112,17 @@ Properties: `manifest` (the stored dict, camelCase keys), `gen`, `rev`, `dim`, `
 | `return_payload` | False | also return each hit's payload bytes |
 | `inflight` | 12 | reads in flight per query (remote stores) |
 | `speculate` | True | read the running top-T's rerank records while the last 6 slabs are still scanning (remote stores) |
+| `filter` | None | an attribute filter (see [Filtering](#filtering)): field conditions, or the compiled words |
+| `max_nprobe` | 4 x nprobe | with a filter: how many cells a selective filter may scan in all, in routing order, until `max(top_k, rerank)` candidates match (`nprobe` = no widening) |
 
 ```python
 @dataclass
 class QueryResult:
     hits: list[Hit]          # Hit(id, score, attrs, source: "slab" | "delta", payload: bytes | None)
-    params: dict             # {top_k, nprobe, rerank, pc, source: {nprobe, rerank, pc}} ("query" | "manifest" | "legacy")
-    stats: dict              # gen, rev, format, routing, cells, scanned, scan_bytes, slab_bytes,
+    params: dict             # {top_k, nprobe, rerank, pc, source: {nprobe, rerank, pc}} ("query" | "manifest" | "legacy");
+                             # with a filter also filter: True and the max_nprobe in effect
+    stats: dict              # gen, rev, format, routing, cells (scanned; beyond nprobe when a filter widened), filter_dropped,
+                             # candidates, scanned, scan_bytes, slab_bytes,
                              # rerank, rerank_candidates, rerank_slabs, rerank_reads, rerank_bytes, rerank_local,
                              # spec_records, spec_used, deltas, delta_bytes, delta_scanned, delta_hits, delta_dropped,
                              # delta_top, tombstones, tomb_sets, tomb_dropped,
@@ -137,16 +142,51 @@ concurrently at depth `recall_k` and are fused with Reciprocal Rank Fusion; a si
 | `recall_k` | `lex.defaults.recallK`, else max(top_k, 50) | depth of each list before fusion |
 | `rrf_k` | `lex.defaults.rrfK`, else 60 | RRF constant |
 | `weights` | `lex.defaults.weights`, else 1 / 1 | `{"dense": .., "lexical": ..}` list weights |
-| `dense` | - | `query` options of the dense list (`{"nprobe": 8, ...}`) |
+| `dense` | - | `query` options of the dense list (`{"nprobe": 8, "max_nprobe": 32, ...}`) |
 | `docs` | False | `True`: resolve each hit through the `docs` store; `"text"`: the stored text too |
+| `filter` | None | an attribute filter applied to both lists (see [Filtering](#filtering)) |
 
 `SearchResult(hits, mode, params, dense, lexical, stats)`: `mode` is `"dense"`, `"lexical"` or `"hybrid"`; each
 `SearchHit(id, score, dense, lexical, doc)` carries its rank and score in each list (`Rank(rank, score)`) and, with
-`docs`, its `DocRecord(id, meta, text)` (None when the id has no docs entry). `dense` / `lexical` hold the full
-list results (`QueryResult` / `LexSearchResult(hits, tokens, found, stats)`).
+`docs`, its `DocRecord(id, meta, text, attrs)` (None when the id has no docs entry). `dense` / `lexical` hold the
+full list results (`QueryResult` / `LexSearchResult(hits, tokens, found, stats)`).
 
-`index.lexical_search(text, k)` is the BM25 list alone, `index.tokenize(text)` the query's tokens,
+`index.lexical_search(text, k, filter=None)` is the BM25 list alone, `index.tokenize(text)` the query's tokens,
 `index.docs(ids, text=False)` the document store (`{id: DocRecord}`, newest live copy of each id).
+
+### Filtering
+
+Every document carries a 32-bit attribute word, stored with its vector (inside the scan prefix every query reads)
+and in its `docs` entry; a filter is a condition on that word, applied inside the scan before an entry can take a
+candidate slot. A schema names fields inside the word (design and knobs: [docs/filtering.md](../../docs/filtering.md)):
+
+```python
+index.configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr", "de"]}, public="bool", year={"bits": 7, "min": 1970})
+index.upsert(ids, vectors, texts=texts, metas=metas, attrs=[{"tenant": 42, "lang": "en", "public": True, "year": 2024}, {"tenant": 7}])
+r = index.query(embedding, top_k=10, filter={"tenant": 42, "lang": {"$in": ["en", "fr"]}, "year": {"$gte": 2020}})
+h = index.search(text="deploy failed", vector=embedding, filter={"public": True}, docs=True)
+index.unpack_attrs(r.hits[0].attrs)      # {"tenant": 42, "lang": "en", "public": True, "year": 2024}
+```
+
+| in a filter | fields | meaning |
+|---|---|---|
+| `field: value`, `{"$eq"}`, `{"$ne"}` | all | equal / not equal |
+| `{"$in": [...]}`, `{"$nin": [...]}` | all | in / not in a list |
+| `{"$lt", "$lte", "$gt", "$gte"}` | number | a range (combined into one test) |
+| `{"$any", "$all", "$none"}` (a bit mask) | number | some / every / no bit of the mask set |
+
+Conditions on different fields are ANDed; there is no `$or`. Field specs: `{"bits": n}` (an unsigned integer, with
+an optional `"min"`), `{"values": [...]}` (an enum) or `"bool"`; the fields are laid out in order and must fit 32
+bits. A later `configure_attrs` may add fields or enum values but never changes an existing field's layout. Without
+a schema the one field is `attrs`, the raw word (`filter={"attrs": {"$any": 1}}`); `attrs` in an upsert may always
+be given as raw ints. `index.compile_filter(expr)` returns the compiled words (an `array('I')`), the same words the
+TypeScript SDK compiles.
+
+What it costs: the dense scan reads nothing extra and tests the word only for candidates that would have entered
+the top-T. A selective filter makes the query scan more cells in routing order, in batches, until
+`max(top_k, rerank)` candidates match or `max_nprobe` cells were scanned (default 4 x nprobe): `stats["cells"]`
+lists what was scanned. The BM25 list is filtered after scoring: it is taken deeper (4 x k, then 4x more up to
+65 536) and each candidate's word is resolved through the `docs` store.
 
 ### `index.refresh() -> bool`
 
@@ -158,7 +198,8 @@ immutable, so everything else is cached per index; new data is visible within `r
 
 ```python
 index.configure_lexical(text=True, lengths="exact", bucket_terms=256)    # once: manifest.lex (a revision)
-r = index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["Title A", "Title B"], attrs=[5, 6])
+index.configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr"]})          # once: manifest.attrs (a revision)
+r = index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["Title A", "Title B"], attrs=[{"tenant": 5, "lang": "en"}, 6])
 # UpsertResult(gen, rev, seq, count, cells, distinct_cells, keys, bytes, conflicts, cas_conflicts, current_updated, ms)
 index.upsert([1002], texts=["text-only document"], metas=["C"])        # no vector: found by text alone
 index.delete([1000])                    # hides the vector, the text and the doc
@@ -205,7 +246,8 @@ threads without deadlock.
 `tests/test_interop.py` has the TypeScript SDK build and update an index on disk (deltas, lexical segments,
 replacements, deletes), checks that Python returns the same answers, then writes on top from Python (upserts,
 deletes, a segment compaction) and checks that the TypeScript SDK returns what Python returns. Ids, their order,
-attrs, payloads, docs, tokens, BM25 scores and fused scores agree exactly. Cosine scores agree to about 1e-7: the
+attrs, payloads, docs, tokens, BM25 scores, fused scores, compiled filters and the cells a filtered query scans
+agree exactly. Cosine scores agree to about 1e-7: the
 wasm build accumulates dot products in 16 SIMD lanes and the native build in 8 scalar partial sums (see
 `thread-core/src/math.rs`), so a score can differ in its last float32 ulp or two.
 

@@ -18,6 +18,8 @@
 //!   means for upserts, flat assignment and query routing
 //! - a query routes to `nprobe` fine cells, scans the slabs' scan prefixes with
 //!   the 4-bit codes, merges top-T, then reranks the winners with int8 records
+//! - attribute filters (`filter`): a predicate over each entry's 32-bit `attrs` word, applied
+//!   inside the scans before top-k insertion, like tombstones
 //! - incremental updates: new vectors go into small immutable delta segments
 //!   (`delta`, scanned with int8 records next to the probed slabs), deletes
 //!   are tombstones (`tomb`); compaction re-emits a slab's and the deltas'
@@ -47,6 +49,7 @@ pub mod delta;
 pub mod docs;
 pub mod error;
 pub mod excerpts;
+pub mod filter;
 pub mod fusion;
 pub mod lex;
 pub mod kmeans;

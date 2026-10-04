@@ -16,8 +16,10 @@ and a query always reads a consistent snapshot.
 
 - `POST /upsert` (JSON `{ids, vectors, attrs?, payloads?}` or a binary f32 body with `x-ids`/`?firstId=`, up to
   4096 vectors): one delta segment (`DeltaJob`: primary cell, found through the centroid tree when the manifest has
-  one, + 4-bit/int8/PQ codes against the cell mean) and a tombstone set for the ids (replace semantics: older
-  copies stop resolving), committed as rev + 1. Responds `{gen, rev, seq, cells, ms, bytes, conflicts}`.
+  one, + 4-bit/int8/PQ codes against the cell mean, each entry's 32-bit `attrs` word for filtering) and a tombstone
+  set for the ids (replace semantics: older copies stop resolving), committed as rev + 1. Responds
+  `{gen, rev, seq, cells, ms, bytes, conflicts}`. The SDKs' `upsert` also packs named fields into the word under
+  `manifest.attrs` ([filtering.md](filtering.md)).
 - `POST /delete {ids}`: one tombstone set, rev + 1.
 - Writers serialize on a create-only PUT of `manifest.{rev+1}.json` (R2 `onlyIf: {etagDoesNotMatch: "*"}`),
   retry on a lost race, and advance `current.json` with an etag compare-and-swap.

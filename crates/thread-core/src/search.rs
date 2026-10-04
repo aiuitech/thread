@@ -3,6 +3,7 @@
 //! Scanning a slab for a query, and reranking int8 records.
 
 use crate::error::{rd_f32, FormatError};
+use crate::filter::AttrFilter;
 use crate::math::{dot, dot_f32_i4, dot_f32_i8};
 use crate::pq::{adc, QueryTable};
 use crate::quant::score_sq8;
@@ -20,16 +21,26 @@ pub struct ScanStats {
     /// below it are never looked up, so this is not the number of tombstoned
     /// entries in the input.
     pub skipped: usize,
+    /// Entries that scored above the heap threshold but failed the attribute
+    /// filter (same caveat as `skipped`: only entries that would have entered).
+    pub filtered: usize,
 }
 
-/// Offers `(id, s, idx)` to `topk`, filtering on `skip` before insertion. The
-/// tombstone lookup runs only for a score that would enter the heap.
+/// Offers `(id, s, idx)` to `topk`, applying the attribute `filter` and the
+/// tombstone `skip` set before insertion. Both run only for a score that would
+/// enter the heap; the entry's `attrs` word is read only when there is a filter.
 #[inline(always)]
-fn offer(topk: &mut TopK, skip: Option<&Tombstones>, skipped: &mut usize, id: u32, s: f32, idx: u32) {
+fn offer(topk: &mut TopK, skip: Option<&Tombstones>, filter: Option<&AttrFilter>, st: &mut ScanStats, id: u32, attrs: impl FnOnce() -> u32, s: f32, idx: u32) {
     if s > topk.threshold() {
+        if let Some(f) = filter {
+            if !f.matches(attrs()) {
+                st.filtered += 1;
+                return;
+            }
+        }
         if let Some(t) = skip {
             if t.contains(id) {
-                *skipped += 1;
+                st.skipped += 1;
                 return;
             }
         }
@@ -38,42 +49,44 @@ fn offer(topk: &mut TopK, skip: Option<&Tombstones>, skipped: &mut usize, id: u3
 }
 
 /// Scores every entry in `slab` against unit query `q` and pushes
-/// `(id, score, entry index)` into `topk`, leaving out ids in `skip` (they do
-/// not take heap slots, so live entries ranked below them are kept).
+/// `(id, score, entry index)` into `topk`, leaving out ids in `skip` and
+/// entries whose `attrs` word fails `filter` (neither takes a heap slot, so
+/// live, matching entries ranked below them are kept).
 ///
 /// - v1 slabs: int8 residual score `q·c + scale * (q·code8)`.
 /// - v2 slabs: 4-bit scan tier `q·c + scale4 * (q·unpack(code4))`; works on a
 ///   `[0, scan_len)` prefix. Rerank the winners with [`rerank_records`].
 ///
 /// Panics on a v3 slab (its scan tier needs the PQ table: use [`scan_slab_pq`]).
-pub fn scan_slab(slab: &SlabView<'_>, q: &[f32], topk: &mut TopK, skip: Option<&Tombstones>) -> ScanStats {
+pub fn scan_slab(slab: &SlabView<'_>, q: &[f32], topk: &mut TopK, skip: Option<&Tombstones>, filter: Option<&AttrFilter>) -> ScanStats {
     assert_eq!(q.len(), slab.dim);
     assert!(!slab.is_v3(), "v3 slabs are scanned with scan_slab_pq");
     let centroid = slab.centroid();
     let qc = dot(q, &centroid);
-    let mut skipped = 0;
+    let mut st = ScanStats { scanned: slab.count, ..ScanStats::default() };
     if slab.is_v2() {
         let nb = slab.dim / 2;
         let codes = slab.codes4_section();
         for i in 0..slab.count {
             let s = qc + slab.scale4(i) * dot_f32_i4(q, &codes[i * nb..(i + 1) * nb]);
-            offer(topk, skip, &mut skipped, slab.id(i), s, i as u32);
+            offer(topk, skip, filter, &mut st, slab.id(i), || slab.attrs(i), s, i as u32);
         }
     } else {
         for i in 0..slab.count {
             let s = score_sq8(q, slab.code8(i), slab.scale8(i), qc);
-            offer(topk, skip, &mut skipped, slab.id(i), s, i as u32);
+            offer(topk, skip, filter, &mut st, slab.id(i), || slab.attrs(i), s, i as u32);
         }
     }
-    ScanStats { scanned: slab.count, skipped }
+    st
 }
 
 /// Scans a v3 slab (or its `[0, scan_len)` prefix) with asymmetric PQ
 /// distances: `q·c + sum_j table[j][code_j]`, pushing `(id, score, entry
-/// index)` into `topk` and leaving out ids in `skip`. `table` is
-/// [`QueryTable::new`] of the same unit query `q` and the index's codebook.
-/// Rerank the winners with [`rerank_records`] (v3 rerank records are v2's).
-pub fn scan_slab_pq(slab: &SlabView<'_>, table: &QueryTable, q: &[f32], topk: &mut TopK, skip: Option<&Tombstones>) -> Result<ScanStats, FormatError> {
+/// index)` into `topk` and leaving out ids in `skip` and entries failing
+/// `filter`. `table` is [`QueryTable::new`] of the same unit query `q` and the
+/// index's codebook. Rerank the winners with [`rerank_records`] (v3 rerank
+/// records are v2's).
+pub fn scan_slab_pq(slab: &SlabView<'_>, table: &QueryTable, q: &[f32], topk: &mut TopK, skip: Option<&Tombstones>, filter: Option<&AttrFilter>) -> Result<ScanStats, FormatError> {
     if !slab.is_v3() {
         return Err(FormatError::Inconsistent("scan_pq needs a v3 slab (use scan for v1/v2)"));
     }
@@ -90,34 +103,34 @@ pub fn scan_slab_pq(slab: &SlabView<'_>, table: &QueryTable, q: &[f32], topk: &m
     let qc = dot(q, &slab.centroid());
     let codes = slab.pq_section();
     let rows = &table.table[..];
-    let mut skipped = 0;
+    let mut st = ScanStats { scanned: slab.count, ..ScanStats::default() };
     for (i, code) in codes.chunks_exact(m).enumerate() {
         let s = qc + adc(rows, code);
-        offer(topk, skip, &mut skipped, slab.id(i), s, i as u32);
+        offer(topk, skip, filter, &mut st, slab.id(i), || slab.attrs(i), s, i as u32);
     }
-    Ok(ScanStats { scanned: slab.count, skipped })
+    Ok(st)
 }
 
 /// Scans a delta segment for unit query `q` with its int8 records:
 /// `qc[cell] + scale8 * (q·code8)`, where `qc[c] = q·mean[c]` for every cell
 /// (unnormalized means, e.g. `Router::cell_dots`). Pushes `(id, score, entry
-/// index)` into `topk`, leaving out ids in `skip`. Scores are on the same scale
-/// as reranked slab scores. Errors if an entry's cell is not covered by `qc` or
-/// the dims differ.
-pub fn scan_delta(delta: &crate::delta::DeltaView<'_>, q: &[f32], qc: &[f32], topk: &mut TopK, skip: Option<&Tombstones>) -> Result<ScanStats, FormatError> {
+/// index)` into `topk`, leaving out ids in `skip` and entries failing `filter`.
+/// Scores are on the same scale as reranked slab scores. Errors if an entry's
+/// cell is not covered by `qc` or the dims differ.
+pub fn scan_delta(delta: &crate::delta::DeltaView<'_>, q: &[f32], qc: &[f32], topk: &mut TopK, skip: Option<&Tombstones>, filter: Option<&AttrFilter>) -> Result<ScanStats, FormatError> {
     if q.len() != delta.dim {
         return Err(FormatError::Inconsistent("query dim != delta dim"));
     }
-    let mut skipped = 0;
+    let mut st = ScanStats { scanned: delta.count, ..ScanStats::default() };
     for i in 0..delta.count {
         let cell = delta.cell(i) as usize;
         let Some(&qcc) = qc.get(cell) else {
             return Err(FormatError::Inconsistent("delta entry cell >= qc length"));
         };
         let s = score_sq8(q, delta.code8(i), delta.scale8(i), qcc);
-        offer(topk, skip, &mut skipped, delta.id(i), s, i as u32);
+        offer(topk, skip, filter, &mut st, delta.id(i), || delta.attrs(i), s, i as u32);
     }
-    Ok(ScanStats { scanned: delta.count, skipped })
+    Ok(st)
 }
 
 /// Scores `n` consecutive rerank records (`[scale8 f32][code8 i8 * dim]`, as
@@ -204,7 +217,7 @@ mod tests {
         let q = xs[17].clone();
         let exact_ids = exact_top(&xs, &q, 5);
         let mut top = TopK::new(5);
-        assert_eq!(scan_slab(&view, &q, &mut top, None).scanned, 50);
+        assert_eq!(scan_slab(&view, &q, &mut top, None, None).scanned, 50);
         let got = top.into_sorted();
         assert_eq!(got[0].id, 17);
         assert!(got.iter().all(|h| h.idx == h.id));
@@ -228,7 +241,7 @@ mod tests {
             let exact_ids = exact_top(&xs, &q, 5);
             // 4-bit tier: top-T candidates
             let mut top = TopK::new(15);
-            assert_eq!(scan_slab(&view, &q, &mut top, None).scanned, 50);
+            assert_eq!(scan_slab(&view, &q, &mut top, None, None).scanned, 50);
             let cands = top.into_sorted();
             assert_eq!(cands[0].id as usize, qi);
             // rerank candidates with int8 records located via idx
@@ -300,7 +313,7 @@ mod tests {
         for qi in [0usize, 13, 39] {
             let q = xs[qi].clone();
             let mut top = TopK::new(40);
-            assert_eq!(scan_slab(&v1, &q, &mut top, None).scanned, 40);
+            assert_eq!(scan_slab(&v1, &q, &mut top, None, None).scanned, 40);
             let hits = top.into_sorted();
             let h = v2.header;
             let all = &s2[h.rerank_off..h.rerank_off + 40 * h.rerank_record_len];
@@ -375,7 +388,7 @@ mod tests {
             normalize(&mut q);
             let table = QueryTable::new(&q, &cb).unwrap();
             let mut top = TopK::new(t);
-            assert_eq!(scan_slab_pq(&prefix, &table, &q, &mut top, None).unwrap().scanned, n);
+            assert_eq!(scan_slab_pq(&prefix, &table, &q, &mut top, None, None).unwrap().scanned, n);
             let cands = top.into_sorted();
             assert_eq!(cands.len(), t);
             // scores equal q·(c + decoded residual)
@@ -411,11 +424,11 @@ mod tests {
         let table = QueryTable::new(&q, &cb).unwrap();
         let v2 = build_v2(&c, &xs[..10]);
         let v2v = SlabView::parse(&v2).unwrap();
-        assert!(scan_slab_pq(&v2v, &table, &q, &mut TopK::new(5), None).is_err());
+        assert!(scan_slab_pq(&v2v, &table, &q, &mut TopK::new(5), None, None).is_err());
         let other = Codebook::init_from_samples(&vec![0.5f32; 300 * dim], dim, 8, 1).unwrap();
         let t8 = QueryTable::new(&q, &other).unwrap();
-        assert!(scan_slab_pq(&prefix, &t8, &q, &mut TopK::new(5), None).is_err());
-        assert!(scan_slab_pq(&prefix, &table, &q[..dim - 2], &mut TopK::new(5), None).is_err());
+        assert!(scan_slab_pq(&prefix, &t8, &q, &mut TopK::new(5), None, None).is_err());
+        assert!(scan_slab_pq(&prefix, &table, &q[..dim - 2], &mut TopK::new(5), None, None).is_err());
     }
 
     #[test]
@@ -423,7 +436,7 @@ mod tests {
     fn scan_slab_rejects_v3() {
         let (_, xs, _, slab) = pq_fixture(16, 4, 300, 3);
         let v = SlabView::parse(&slab).unwrap();
-        scan_slab(&v, &xs[0], &mut TopK::new(3), None);
+        scan_slab(&v, &xs[0], &mut TopK::new(3), None, None);
     }
 
     #[test]
@@ -452,7 +465,7 @@ mod tests {
             normalize(&mut q);
             let qc = router.cell_dots(&q);
             let mut t = TopK::new(top);
-            assert_eq!(scan_delta(&v, &q, &qc, &mut t, None).unwrap(), ScanStats { scanned: n, skipped: 0 });
+            assert_eq!(scan_delta(&v, &q, &qc, &mut t, None, None).unwrap(), ScanStats { scanned: n, skipped: 0, filtered: 0 });
             let hits = t.into_sorted();
             let exact = exact_top(&xs, &q, top);
             // every hit's score is the cosine within int8 error
@@ -474,8 +487,8 @@ mod tests {
         }
         // a qc table that does not cover the cells is an error
         let q = xs[0].clone();
-        assert!(scan_delta(&v, &q, &router.cell_dots(&q)[..k - 1], &mut TopK::new(3), None).is_err());
-        assert!(scan_delta(&v, &q[..dim - 2], &router.cell_dots(&q), &mut TopK::new(3), None).is_err());
+        assert!(scan_delta(&v, &q, &router.cell_dots(&q)[..k - 1], &mut TopK::new(3), None, None).is_err());
+        assert!(scan_delta(&v, &q[..dim - 2], &router.cell_dots(&q), &mut TopK::new(3), None, None).is_err());
     }
 
     fn record_ids(recs: &[u8], dim: usize) -> Vec<u32> {
@@ -605,7 +618,7 @@ mod tests {
         let q = news[qi].clone();
         let table = QueryTable::new(&q, &cb).unwrap();
         let mut top = TopK::new(10);
-        scan_slab_pq(&mv, &table, &q, &mut top, None).unwrap();
+        scan_slab_pq(&mv, &table, &q, &mut top, None, None).unwrap();
         let hit = top.into_sorted().into_iter().find(|h| h.id == in_cell[5]).expect("new vector not in top 10");
         let s = rerank_records(&q, &c, mv.rerank_record(hit.idx as usize), 1).unwrap()[0];
         assert!((s - 1.0).abs() < 5e-3, "{s}");
@@ -642,7 +655,7 @@ mod tests {
     /// input of `n` entries.
     fn check_skip_before_heap(n: usize, run: &dyn Fn(&mut TopK, Option<&Tombstones>) -> ScanStats) {
         let mut all = TopK::new(n);
-        assert_eq!(run(&mut all, None), ScanStats { scanned: n, skipped: 0 });
+        assert_eq!(run(&mut all, None), ScanStats { scanned: n, skipped: 0, filtered: 0 });
         let full = all.into_sorted();
         assert_eq!(full.len(), n);
         assert!(full[0].score > full[1].score);
@@ -679,7 +692,7 @@ mod tests {
         let h = SlabHeader::parse(&v2).unwrap();
         let view = SlabView::parse(&v2[..h.scan_len]).unwrap();
         let q = xs[11].clone();
-        check_skip_before_heap(60, &|t, skip| scan_slab(&view, &q, t, skip));
+        check_skip_before_heap(60, &|t, skip| scan_slab(&view, &q, t, skip, None));
         // v1
         let mut b = SlabBuilderV1::new(dim, 0, &c);
         let mut code = vec![0i8; dim];
@@ -689,7 +702,7 @@ mod tests {
         }
         let v1 = b.finish();
         let view = SlabView::parse(&v1).unwrap();
-        check_skip_before_heap(60, &|t, skip| scan_slab(&view, &q, t, skip));
+        check_skip_before_heap(60, &|t, skip| scan_slab(&view, &q, t, skip, None));
     }
 
     #[test]
@@ -700,7 +713,7 @@ mod tests {
         let prefix = SlabView::parse(&slab[..h.scan_len]).unwrap();
         let q = xs[42].clone();
         let table = QueryTable::new(&q, &cb).unwrap();
-        check_skip_before_heap(n, &|t, skip| scan_slab_pq(&prefix, &table, &q, t, skip).unwrap());
+        check_skip_before_heap(n, &|t, skip| scan_slab_pq(&prefix, &table, &q, t, skip, None).unwrap());
     }
 
     #[test]
@@ -724,7 +737,97 @@ mod tests {
         let router = Router::new(dim, 1, k, &vec![1.0; dim], means);
         let q = xs[7].clone();
         let qc = router.cell_dots(&q);
-        check_skip_before_heap(n, &|t, skip| scan_delta(&v, &q, &qc, t, skip).unwrap());
+        check_skip_before_heap(n, &|t, skip| scan_delta(&v, &q, &qc, t, skip, None).unwrap());
+    }
+
+    /// Attribute filters are applied before heap insertion, like tombstones: with `k` = 1 and the
+    /// best entry failing the filter, the best matching entry is returned. `attrs_of(id)` is the
+    /// word each entry was written with.
+    fn check_filter_before_heap(n: usize, run: &dyn Fn(&mut TopK, Option<&AttrFilter>) -> ScanStats, attrs_of: &dyn Fn(u32) -> u32) {
+        use crate::filter::{Clause, Op};
+        let mut all = TopK::new(n);
+        assert_eq!(run(&mut all, None), ScanStats { scanned: n, skipped: 0, filtered: 0 });
+        let full = all.into_sorted();
+        assert_eq!(full.len(), n);
+        // pick the class the best entry is NOT in, so a post-filter of the top-1 would be empty
+        let want_class = (attrs_of(full[0].id) + 1) % 3;
+        let eq = AttrFilter::new(vec![Clause { mask: u32::MAX, op: Op::Eq, a: want_class, b: 0, values: vec![] }]);
+        let want: Vec<_> = full.iter().filter(|h| attrs_of(h.id) == want_class).copied().collect();
+        assert!(want.len() >= 5);
+        let mut t = TopK::new(1);
+        let st = run(&mut t, Some(&eq));
+        assert_eq!(st.scanned, n);
+        assert!(st.filtered >= 1);
+        assert_eq!(t.into_sorted(), vec![want[0]]);
+        let mut t = TopK::new(5);
+        run(&mut t, Some(&eq));
+        assert_eq!(t.into_sorted(), want[..5].to_vec());
+        // a set and a bit test; conjunction with a tombstone set
+        let in_set = AttrFilter::new(vec![Clause { mask: u32::MAX, op: Op::In, a: 0, b: 0, values: vec![want_class, (want_class + 1) % 3] }]);
+        let want2: Vec<_> = full.iter().filter(|h| attrs_of(h.id) != (want_class + 2) % 3).copied().collect();
+        let mut t = TopK::new(4);
+        run(&mut t, Some(&in_set));
+        assert_eq!(t.into_sorted(), want2[..4].to_vec());
+        // a filter nothing matches: every entry is tested (the heap never fills) and dropped
+        let mut t = TopK::new(3);
+        let st = run(&mut t, Some(&AttrFilter::nothing()));
+        assert_eq!((st.filtered, t.into_sorted().len()), (n, 0));
+    }
+
+    #[test]
+    fn scan_slab_filters_attrs_before_heap() {
+        let dim = 32;
+        let (c, xs) = cluster(dim, 60, 33);
+        let mut b = SlabBuilder::new(dim, 0, &c);
+        let (mut c4, mut c8, mut scratch) = (vec![0u8; dim / 2], vec![0i8; dim], vec![0f32; dim]);
+        for (i, x) in xs.iter().enumerate() {
+            let s4 = encode_residual_sq4(x, &c, &mut c4, &mut scratch);
+            let s8 = encode_residual_sq8(x, &c, &mut c8);
+            b.push(i as u32, &c4, s4, &c8, s8, &[], i as u32 % 3);
+        }
+        let v2 = b.finish();
+        let h = SlabHeader::parse(&v2).unwrap();
+        let view = SlabView::parse(&v2[..h.scan_len]).unwrap();
+        let q = xs[11].clone();
+        assert_eq!(view.attrs(4), 1);
+        check_filter_before_heap(60, &|t, f| scan_slab(&view, &q, t, None, f), &|id| id % 3);
+        // tombstones and the filter compose: the best matching entry tombstoned -> the next one
+        use crate::filter::{Clause, Op};
+        let mut all = TopK::new(60);
+        scan_slab(&view, &q, &mut all, None, None);
+        let full = all.into_sorted();
+        let eq = AttrFilter::new(vec![Clause { mask: u32::MAX, op: Op::Eq, a: 2, b: 0, values: vec![] }]);
+        let twos: Vec<_> = full.iter().filter(|h| h.id % 3 == 2).copied().collect();
+        let dead = Tombstones::from_ids(&[twos[0].id]);
+        let mut t = TopK::new(1);
+        let st = scan_slab(&view, &q, &mut t, Some(&dead), Some(&eq));
+        assert_eq!(t.into_sorted(), vec![twos[1]]);
+        assert_eq!(st.skipped, 1);
+    }
+
+    #[test]
+    fn scan_delta_filters_attrs_before_heap() {
+        use crate::delta::{DeltaEncoder, DeltaView};
+        use crate::route::Router;
+        let (dim, k, n) = (32, 4, 120);
+        let mut means = Vec::new();
+        let mut xs = Vec::new();
+        for c in 0..k {
+            let (m, cx) = cluster(dim, n / k, 300 + c as u64);
+            means.extend(m.iter().map(|v| v * 0.9));
+            xs.extend(cx);
+        }
+        let mut enc = DeltaEncoder::new(dim, k, means.clone(), 1).unwrap();
+        for (i, x) in xs.iter().enumerate() {
+            enc.add(x, 1000 + i as u32, i as u32 % 3, &[]);
+        }
+        let bytes = enc.finish();
+        let v = DeltaView::parse(&bytes).unwrap();
+        assert_eq!(v.attrs(5), 2);
+        let router = Router::new(dim, 1, k, &vec![1.0; dim], means);
+        let q = xs[7].clone();
+        let qc = router.cell_dots(&q);
+        check_filter_before_heap(n, &|t, f| scan_delta(&v, &q, &qc, t, None, f).unwrap(), &|id| (id - 1000) % 3);
     }
 
     #[test]

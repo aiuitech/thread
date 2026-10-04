@@ -12,6 +12,7 @@
  */
 import type { BlobRange, BlobStore, BlobTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
+import { filterMatches } from "./attrs.js";
 import { parseHits, tombForSegment, tombHides, ThreadError, type ResolvedLexConfig, type SegmentRef, type TombState } from "./wire.js";
 
 export interface Range {
@@ -225,6 +226,15 @@ export interface LexSearchOptions {
 	trace?: BlobTrace;
 	/** Also return the query's tokens and how many segments had each. */
 	explain?: boolean;
+	/**
+	 * A compiled attribute filter (`compileFilter`): the BM25 list is taken deeper than `k`, each candidate's
+	 * attrs word is resolved through the `docs` store and non-matching hits are dropped, deepening until `k` match
+	 * or the lists are exhausted (at most `maxDepth`).
+	 */
+	filter?: Uint32Array;
+	/** First depth of a filtered search (default `max(4 k, 32)`) and the deepest it goes (default 1 << 16). */
+	filterDepth?: number;
+	maxDepth?: number;
 }
 
 export interface LexSearchResult {
@@ -242,6 +252,9 @@ export interface LexSearchResult {
 		df: Record<string, number>;
 		io: LexIo;
 		ms: number;
+		/** With a filter: the list depth used and the candidates the filter dropped. */
+		depth?: number;
+		filterDropped?: number;
 	};
 }
 
@@ -249,6 +262,8 @@ export interface LexSearchResult {
 export interface DocRecord {
 	id: number;
 	meta: string;
+	/** The document's attribute word (0 when none was stored). */
+	attrs: number;
 	/** The text, when stored and requested. */
 	text?: string;
 }
@@ -298,6 +313,44 @@ export class LexIndex {
 	 * merge. Tombstoned ids never take a slot.
 	 */
 	async search(text: string, k: number, opts: LexSearchOptions = {}): Promise<LexSearchResult> {
+		if (!opts.filter?.length) return this.searchUnfiltered(text, k, opts);
+		// A filtered search: take the list deeper, resolve the candidates' attrs through `docs`, keep the matches.
+		const t0 = Date.now();
+		const filter = opts.filter;
+		const attrsOf = new Map<number, number>();
+		let depth = Math.max(opts.filterDepth ?? Math.max(4 * k, 32), k);
+		const maxDepth = Math.max(opts.maxDepth ?? 1 << 16, depth);
+		let dropped = 0;
+		for (;;) {
+			const raw = await this.searchUnfiltered(text, depth, opts);
+			const unknown = raw.hits.filter((h) => !attrsOf.has(h.id)).map((h) => h.id);
+			if (unknown.length) {
+				const found = await this.attrs(unknown, opts.trace, raw.stats.io);
+				for (const id of unknown) attrsOf.set(id, found.get(id) ?? 0);
+			}
+			const hits = raw.hits.filter((h) => filterMatches(filter, attrsOf.get(h.id)!));
+			dropped = raw.hits.length - hits.length;
+			if (hits.length >= k || raw.hits.length < depth || depth >= maxDepth) {
+				return { ...raw, hits: hits.slice(0, k), stats: { ...raw.stats, depth, filterDropped: dropped, ms: Date.now() - t0 } };
+			}
+			depth = Math.min(maxDepth, depth * 4);
+		}
+	}
+
+	/** The attrs words of `ids` through the `docs` sections (newest live copy); ids without an entry are absent. */
+	async attrs(ids: readonly number[], trace?: BlobTrace, io?: LexIo): Promise<Map<number, number>> {
+		const out = new Map<number, number>();
+		const r = await this.docs(ids, { trace });
+		if (io) {
+			io.rounds += r.io.rounds;
+			io.ranges += r.io.ranges;
+			io.bytes += r.io.bytes;
+		}
+		for (const [id, d] of r.docs) out.set(id, d.attrs);
+		return out;
+	}
+
+	private async searchUnfiltered(text: string, k: number, opts: LexSearchOptions = {}): Promise<LexSearchResult> {
 		const t0 = Date.now();
 		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
 		const tokens = this.tokenize(text);
@@ -346,12 +399,12 @@ export class LexIndex {
 			if (!seg.hasDocs) continue;
 			const want = pending.filter((id) => !tombHides(this.tomb, id, ref.addedRev));
 			if (!want.length) continue;
-			const got = (await seg.run(() => seg.reader.docs_get(Uint32Array.from(want), opts.text ?? false), io, opts.trace)) as ({ id: number; meta: string; text: string | null } | null)[];
+			const got = (await seg.run(() => seg.reader.docs_get(Uint32Array.from(want), opts.text ?? false), io, opts.trace)) as ({ id: number; meta: string; text: string | null; attrs: number } | null)[];
 			const resolved = new Set<number>();
 			got.forEach((g, j) => {
 				if (!g) return;
 				resolved.add(want[j]);
-				out.set(want[j], { id: want[j], meta: g.meta, ...(g.text !== null && opts.text ? { text: g.text } : {}) });
+				out.set(want[j], { id: want[j], meta: g.meta, attrs: g.attrs, ...(g.text !== null && opts.text ? { text: g.text } : {}) });
 			});
 			pending = pending.filter((id) => !resolved.has(id));
 		}

@@ -11,12 +11,13 @@
 //!   run.add_records(cell, first_idx, bytes, idxs)  # the records read (speculatively or for the plan)
 //!   run.finish(k)                                  # rerank, merge with the delta hits, the top k
 
-use crate::{value_err, Buf, Query};
+use crate::{filter_arg, value_err, Buf, Query};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 use thread_core::delta::DeltaView;
+use thread_core::filter::AttrFilter;
 use thread_core::search::{rerank_records, scan_delta, scan_slab, scan_slab_pq};
 use thread_core::slab::SlabView;
 use thread_core::tomb::Tombstones;
@@ -69,6 +70,8 @@ struct RunState {
     delta_bytes: u64,
     delta_scanned: u64,
     delta_dropped: u64,
+    /// Entries the attribute filter dropped (slabs and deltas).
+    filter_dropped: u64,
     merged: Vec<Hit>,
     /// Phase 2: per slab with winners, its winners `(id, idx)` by ascending idx.
     plan: Vec<(u32, Vec<(u32, u32)>)>,
@@ -104,6 +107,8 @@ pub struct QueryRun {
     t: usize,
     do_rerank: bool,
     return_payload: bool,
+    /// The attribute filter every scan applies (None = none).
+    filter: Option<AttrFilter>,
     st: Mutex<RunState>,
 }
 
@@ -116,16 +121,31 @@ impl QueryRun {
 #[pymethods]
 impl QueryRun {
     /// `t`: candidates kept per slab and overall (`max(k, rerank)` with a rerank, else `k`); `do_rerank`: phase 2
-    /// runs (formats 2/3); `return_payload`: keep the payloads of slabs read whole.
+    /// runs (formats 2/3); `return_payload`: keep the payloads of slabs read whole; `filter`: a compiled attribute
+    /// filter's wire words (None = none), applied inside every scan before top-k insertion.
     #[new]
-    fn new(query: Py<Query>, t: usize, do_rerank: bool, return_payload: bool) -> Self {
-        QueryRun {
+    #[pyo3(signature = (query, t, do_rerank, return_payload, filter = None))]
+    fn new(
+        query: Py<Query>,
+        t: usize,
+        do_rerank: bool,
+        return_payload: bool,
+        filter: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        Ok(QueryRun {
             query,
             t,
             do_rerank,
             return_payload,
+            filter: filter_arg(filter)?,
             st: Mutex::new(RunState::default()),
-        }
+        })
+    }
+
+    /// Distinct ids holding a scan-tier candidate slot so far (entries that passed the filter and the tombstones
+    /// and entered some slab's top-T): the host's cue to stop widening a filtered query's probes.
+    fn candidates(&self) -> usize {
+        self.lock().cand.len()
     }
 
     /// Scans one slab's scan prefix (`full`: the whole object, when the store read it whole) with the tombstones
@@ -151,16 +171,17 @@ impl QueryRun {
                 return Err(format!("slab {cell}: dim {} != query dim {dim}", view.dim));
             }
             let skip = tombs(tomb)?;
+            let filter = self.filter.as_ref();
             let mut top = TopK::new(t);
             let st = if view.is_v3() {
                 let table = q
                     .table
                     .as_ref()
                     .ok_or_else(|| format!("slab {cell} is v3 but the query has no PQ table"))?;
-                scan_slab_pq(&view, table, &q.q, &mut top, skip.as_ref())
+                scan_slab_pq(&view, table, &q.q, &mut top, skip.as_ref(), filter)
                     .map_err(|e| e.to_string())?
             } else {
-                scan_slab(&view, &q.q, &mut top, skip.as_ref())
+                scan_slab(&view, &q.q, &mut top, skip.as_ref(), filter)
             };
             let hits = top.into_sorted();
             let h = view.header;
@@ -205,6 +226,7 @@ impl QueryRun {
             s.slab_bytes += full.map_or(prefix.len(), <[u8]>::len) as u64;
             s.scan_bytes += prefix.len() as u64;
             s.tomb_dropped += st.skipped as u64;
+            s.filter_dropped += st.filtered as u64;
             s.scanned += h.count as u64;
             s.versions.insert(h.version);
             s.packed.extend_from_slice(&hits);
@@ -282,8 +304,8 @@ impl QueryRun {
             let v = DeltaView::parse(delta).map_err(|e| e.to_string())?;
             let skip = tombs(tomb)?;
             let mut top = TopK::new(t);
-            let st =
-                scan_delta(&v, &q.q, qc, &mut top, skip.as_ref()).map_err(|e| e.to_string())?;
+            let st = scan_delta(&v, &q.q, qc, &mut top, skip.as_ref(), self.filter.as_ref())
+                .map_err(|e| e.to_string())?;
             let hits: Vec<DeltaHit> = top
                 .into_sorted()
                 .into_iter()
@@ -298,6 +320,7 @@ impl QueryRun {
             s.delta_bytes += delta.len() as u64;
             s.delta_scanned += v.count as u64;
             s.delta_dropped += st.skipped as u64;
+            s.filter_dropped += st.filtered as u64;
             s.delta_hits.extend(hits);
             Ok::<_, String>(())
         })
@@ -529,6 +552,7 @@ impl QueryRun {
         d.set_item("delta_hits", s.delta_hits.len())?;
         d.set_item("delta_dropped", s.delta_dropped)?;
         d.set_item("tomb_dropped", s.tomb_dropped)?;
+        d.set_item("filter_dropped", s.filter_dropped)?;
         Ok(d)
     }
 }

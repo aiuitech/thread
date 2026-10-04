@@ -58,11 +58,15 @@ export interface Built {
 	dim: number;
 }
 
-/** Builds a generation like the Worker's assign + finalize + publish stages, with a slabs table unless `legacy`. */
-export async function buildGen(gen: string, format: 1 | 2 | 3, opts: { dim?: number; k2?: number; m?: number; n?: number; legacy?: boolean; store?: MemoryBlobStore } = {}): Promise<Built> {
+/**
+ * Builds a generation like the Worker's assign + finalize + publish stages, with a slabs table unless `legacy`.
+ * With `attrs` (a word per vector index), the slabs are built the way a compaction builds them, from a delta
+ * segment's records (one primary cell per vector, so `m` is 1), since the assign job writes no attrs.
+ */
+export async function buildGen(gen: string, format: 1 | 2 | 3, opts: { dim?: number; k2?: number; m?: number; n?: number; legacy?: boolean; store?: MemoryBlobStore; attrs?: (i: number) => number } = {}): Promise<Built> {
 	const dim = opts.dim ?? 16;
 	const k2 = opts.k2 ?? 8;
-	const m = opts.m ?? 2;
+	const m = opts.attrs ? 1 : (opts.m ?? 2);
 	const n = opts.n ?? 400;
 	const r = rng(42);
 	const fine = unitRows(k2, dim, r);
@@ -86,16 +90,29 @@ export async function buildGen(gen: string, format: 1 | 2 | 3, opts: { dim?: num
 		codebook = w.pq_init_codebook(w.residuals_for(vectors, fine, assign, dim), dim, pqM, 7);
 		job.set_codebook(codebook);
 	}
-	expect(job.add_batch(vectors, 0)).toBe(n);
-	const part = job.take_part(0);
-	job.free();
-	const dir = w.part_directory(part);
-	expect(dir[0]).toBe(k2);
+	let recordsOf: (cell: number) => Uint8Array;
+	if (opts.attrs) {
+		job.free();
+		const dj = new w.DeltaJob(dim, k2, fine, 1);
+		if (codebook) dj.set_codebook(codebook);
+		const ids = Uint32Array.from({ length: n }, (_, i) => i);
+		const attrs = Uint32Array.from({ length: n }, (_, i) => opts.attrs!(i));
+		expect(dj.add(vectors, ids, attrs).length).toBe(n);
+		const delta = dj.finish();
+		recordsOf = (cell) => w.delta_records_for_cell(delta, cell, new Uint8Array(0));
+	} else {
+		expect(job.add_batch(vectors, 0)).toBe(n);
+		const part = job.take_part(0);
+		job.free();
+		const dir = w.part_directory(part);
+		expect(dir[0]).toBe(k2);
+		recordsOf = (cell) => part.subarray(dir[3 + cell * 3], dir[3 + cell * 3] + dir[4 + cell * 3]);
+	}
 	const rows: SlabRow[] = [];
 	for (let cell = 0; cell < k2; cell++) {
-		const [count, off, len] = [dir[2 + cell * 3], dir[3 + cell * 3], dir[4 + cell * 3]];
+		const recs = recordsOf(cell);
 		const sj = new w.SlabJob(dim, cell, fine.subarray(cell * dim, (cell + 1) * dim), format);
-		if (len) expect(sj.add_records(part.subarray(off, off + len))).toBe(count);
+		if (recs.byteLength) expect(sj.add_records(recs)).toBeGreaterThan(0);
 		const bytes = sj.finish();
 		const info = w.slab_info(bytes);
 		expect(info[4]).toBe(format);
