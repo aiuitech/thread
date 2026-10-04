@@ -1,0 +1,215 @@
+/**
+ * `S3BlobStore`: the BlobStore interface over any S3-compatible endpoint (R2's S3 API, AWS S3, MinIO, ...)
+ * with plain `fetch` and AWS Signature V4 (WebCrypto HMAC-SHA256; no dependencies). Single-range GETs, HEAD,
+ * PUT and conditional PUT (`If-None-Match: *` for create-only, `If-Match` for compare-and-swap) and
+ * ListObjectsV2. S3 has no multi-range GET, so `getRanges` is not implemented: the SDK issues one request
+ * per rerank range (put a `CachedBlobStore` in front for multi-range reads from the edge cache).
+ */
+import type { BlobHead, BlobRange, BlobStore, GetOptions, PutOptions } from "./store.js";
+import { VibError } from "./wire.js";
+
+export interface S3BlobStoreOptions {
+	/** `https://<account>.r2.cloudflarestorage.com`, `https://s3.us-east-1.amazonaws.com`, `http://localhost:9000`, ... */
+	endpoint: string;
+	bucket: string;
+	/** Signing region: R2 uses `"auto"` (default). */
+	region?: string;
+	accessKeyId: string;
+	secretAccessKey: string;
+	/** STS/temporary credentials (R2 temporary access credentials). */
+	sessionToken?: string;
+	/** `https://endpoint/bucket/key` (default, works everywhere) vs `https://bucket.endpoint/key`. */
+	pathStyle?: boolean;
+	/** `fetch` to use (default: the global one). */
+	fetch?: typeof fetch;
+	/** Retries of a GET/HEAD after a network error or 5xx (default 1). */
+	retries?: number;
+	/** Clock override for tests (ms since epoch). */
+	now?: () => number;
+}
+
+const enc = new TextEncoder();
+const hex = (b: ArrayBuffer | Uint8Array): string => Array.from(b instanceof Uint8Array ? b : new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
+const sha256 = async (data: Uint8Array | string): Promise<string> => hex(await crypto.subtle.digest("SHA-256", typeof data === "string" ? enc.encode(data) : (data as Uint8Array<ArrayBuffer>)));
+async function hmac(key: Uint8Array | string, data: string): Promise<Uint8Array> {
+	const k = await crypto.subtle.importKey("raw", typeof key === "string" ? enc.encode(key) : (key as Uint8Array<ArrayBuffer>), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+	return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(data)));
+}
+/** RFC 3986 encoding (AWS style: `*` and `~` handling, `/` kept in paths). */
+export const awsEncode = (s: string, keepSlash: boolean): string =>
+	encodeURIComponent(s)
+		.replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())
+		.replace(/%2F/g, keepSlash ? "/" : "%2F")
+		.replace(/%7E/g, "~");
+
+export const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+export interface SigV4Input {
+	method: string;
+	/** Already-encoded canonical path (`/bucket/key` or `/key`). */
+	path: string;
+	/** Query parameters (unencoded). */
+	query?: Record<string, string>;
+	/** Extra headers to sign (lower-case names); `host`, `x-amz-date`, `x-amz-content-sha256` are added. */
+	headers: Record<string, string>;
+	payloadHash: string;
+	host: string;
+	region: string;
+	service?: string;
+	accessKeyId: string;
+	secretAccessKey: string;
+	sessionToken?: string;
+	/** `YYYYMMDDTHHMMSSZ`. */
+	amzDate: string;
+}
+
+export const amzDateOf = (ms: number): string => new Date(ms).toISOString().replace(/[:-]|\.\d{3}/g, "");
+
+/** Signs a request (AWS Signature Version 4, header auth). Returns the headers to send. */
+export async function signV4(i: SigV4Input): Promise<Record<string, string>> {
+	const service = i.service ?? "s3";
+	const date = i.amzDate.slice(0, 8);
+	const headers: Record<string, string> = { ...i.headers, host: i.host, "x-amz-date": i.amzDate, "x-amz-content-sha256": i.payloadHash };
+	if (i.sessionToken) headers["x-amz-security-token"] = i.sessionToken;
+	const names = Object.keys(headers).sort();
+	const canonicalHeaders = names.map((n) => `${n}:${headers[n].trim().replace(/\s+/g, " ")}\n`).join("");
+	const signed = names.join(";");
+	const query = Object.entries(i.query ?? {})
+		.map(([k, v]) => [awsEncode(k, false), awsEncode(v, false)] as const)
+		.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : 1))
+		.map(([k, v]) => `${k}=${v}`)
+		.join("&");
+	const canonical = [i.method, i.path, query, canonicalHeaders, signed, i.payloadHash].join("\n");
+	const scope = `${date}/${i.region}/${service}/aws4_request`;
+	const toSign = ["AWS4-HMAC-SHA256", i.amzDate, scope, await sha256(canonical)].join("\n");
+	const kDate = await hmac("AWS4" + i.secretAccessKey, date);
+	const kRegion = await hmac(kDate, i.region);
+	const kService = await hmac(kRegion, service);
+	const kSigning = await hmac(kService, "aws4_request");
+	const signature = hex(await hmac(kSigning, toSign));
+	const out = { ...headers };
+	delete out.host; // fetch sets it
+	out.authorization = `AWS4-HMAC-SHA256 Credential=${i.accessKeyId}/${scope}, SignedHeaders=${signed}, Signature=${signature}`;
+	return out;
+}
+
+const stripQuotes = (etag: string | null): string => (etag ?? "").replace(/^W\//, "").replace(/^"|"$/g, "");
+
+export class S3BlobStore implements BlobStore {
+	readonly endpoint: URL;
+	readonly bucket: string;
+	readonly region: string;
+	readonly pathStyle: boolean;
+	private readonly fetchFn: typeof fetch;
+	private readonly retries: number;
+	private readonly now: () => number;
+	constructor(private readonly opts: S3BlobStoreOptions) {
+		this.endpoint = new URL(opts.endpoint);
+		this.bucket = opts.bucket;
+		this.region = opts.region ?? "auto";
+		this.pathStyle = opts.pathStyle ?? true;
+		this.fetchFn = opts.fetch ?? ((input, init) => fetch(input, init));
+		this.retries = opts.retries ?? 1;
+		this.now = opts.now ?? Date.now;
+		if (!opts.accessKeyId || !opts.secretAccessKey) throw new VibError("S3BlobStore needs accessKeyId and secretAccessKey", 400);
+	}
+
+	/** Host and canonical path of an object (or of the bucket when `key` is empty). */
+	private target(key: string): { host: string; path: string } {
+		const host = this.pathStyle ? this.endpoint.host : `${this.bucket}.${this.endpoint.host}`;
+		const base = this.endpoint.pathname.replace(/\/$/, "");
+		const path = this.pathStyle ? `${base}/${awsEncode(this.bucket, false)}${key ? "/" + awsEncode(key, true) : ""}` : `${base}/${key ? awsEncode(key, true) : ""}`;
+		return { host, path: path || "/" };
+	}
+
+	private async send(method: string, key: string, headers: Record<string, string>, body?: Uint8Array, query?: Record<string, string>): Promise<Response> {
+		const { host, path } = this.target(key);
+		const payloadHash = body ? await sha256(body) : EMPTY_SHA256;
+		const signedHeaders = await signV4({ method, path, query, headers, payloadHash, host, region: this.region, accessKeyId: this.opts.accessKeyId, secretAccessKey: this.opts.secretAccessKey, sessionToken: this.opts.sessionToken, amzDate: amzDateOf(this.now()) });
+		const qs = query ? "?" + Object.entries(query).map(([k, v]) => `${awsEncode(k, false)}=${awsEncode(v, false)}`).join("&") : "";
+		const url = `${this.endpoint.protocol}//${host}${path}${qs}`;
+		let lastErr: unknown;
+		for (let attempt = 0; attempt <= (method === "PUT" ? 0 : this.retries); attempt++) {
+			try {
+				const r = await this.fetchFn(url, { method, headers: signedHeaders, body: body ? (body as Uint8Array<ArrayBuffer>) : undefined });
+				if (r.status >= 500 && attempt < this.retries && method !== "PUT") {
+					await r.body?.cancel();
+					lastErr = new VibError(`S3 ${method} ${key}: HTTP ${r.status}`, r.status);
+					continue;
+				}
+				return r;
+			} catch (e) {
+				lastErr = e;
+			}
+		}
+		throw lastErr instanceof Error ? lastErr : new VibError(`S3 ${method} ${key} failed: ${String(lastErr)}`);
+	}
+
+	private async fail(r: Response, what: string): Promise<never> {
+		const text = (await r.text().catch(() => "")).slice(0, 300);
+		throw new VibError(`S3 ${what}: HTTP ${r.status} ${text}`, r.status === 403 ? 403 : 502);
+	}
+
+	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+		const headers: Record<string, string> = range ? { range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : {};
+		const r = await this.send("GET", key, headers);
+		if (r.status === 404) {
+			await r.body?.cancel();
+			return null;
+		}
+		if (!r.ok) return this.fail(r, `GET ${key}`);
+		let b = new Uint8Array(await r.arrayBuffer());
+		if (opts?.trace) {
+			opts.trace.reads++;
+			opts.trace.bytes += b.byteLength;
+		}
+		if (range) {
+			if (r.status === 200) b = b.subarray(range.offset, range.offset + range.length); // Range ignored
+			if (b.byteLength !== range.length) throw new VibError(`${key} [${range.offset}, +${range.length}): got ${b.byteLength} bytes`);
+		}
+		return b;
+	}
+
+	async head(key: string): Promise<BlobHead | null> {
+		const r = await this.send("HEAD", key, {});
+		await r.body?.cancel();
+		if (r.status === 404) return null;
+		if (!r.ok) throw new VibError(`S3 HEAD ${key}: HTTP ${r.status}`, 502);
+		return { size: Number(r.headers.get("content-length") ?? 0), etag: stripQuotes(r.headers.get("etag")) };
+	}
+
+	/**
+	 * Conditional puts use `If-None-Match: *` (create-only) and `If-Match: "<etag>"`; a 412 (or 409) means the
+	 * condition failed. R2's S3 API and AWS S3 support both on PutObject; a store that ignores them cannot
+	 * serialize writers (use the R2 binding or a Durable Object for that).
+	 */
+	async put(key: string, data: Uint8Array | string, opts: PutOptions = {}): Promise<BlobHead | null> {
+		const body = typeof data === "string" ? enc.encode(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+		const headers: Record<string, string> = { "content-type": opts.contentType ?? "application/octet-stream", "content-length": String(body.byteLength) };
+		if (opts.ifAbsent) headers["if-none-match"] = "*";
+		if (opts.ifMatch !== undefined) headers["if-match"] = `"${stripQuotes(opts.ifMatch)}"`;
+		const r = await this.send("PUT", key, headers, body);
+		await r.body?.cancel();
+		if (r.status === 412 || r.status === 409) return null;
+		if (!r.ok) throw new VibError(`S3 PUT ${key}: HTTP ${r.status}`, 502);
+		return { size: body.byteLength, etag: stripQuotes(r.headers.get("etag")) };
+	}
+
+	async list(prefix: string): Promise<string[]> {
+		const out: string[] = [];
+		let token: string | undefined;
+		do {
+			const query: Record<string, string> = { "list-type": "2", prefix, "max-keys": "1000" };
+			if (token) query["continuation-token"] = token;
+			const r = await this.send("GET", "", {}, undefined, query);
+			if (!r.ok) return this.fail(r, `LIST ${prefix}`);
+			const xml = await r.text();
+			for (const m of xml.matchAll(/<Key>([^<]*)<\/Key>/g)) out.push(decodeXml(m[1]));
+			const next = xml.match(/<NextContinuationToken>([^<]*)<\/NextContinuationToken>/);
+			token = /<IsTruncated>true<\/IsTruncated>/.test(xml) && next ? decodeXml(next[1]) : undefined;
+		} while (token);
+		return out;
+	}
+}
+
+const decodeXml = (s: string): string => s.replace(/&(lt|gt|amp|quot|apos|#(\d+));/g, (_, n: string, d?: string) => (d ? String.fromCodePoint(Number(d)) : ({ lt: "<", gt: ">", amp: "&", quot: '"', apos: "'" } as Record<string, string>)[n]));

@@ -1,0 +1,12 @@
+[package]
+name = "vib-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vib"
+path = "src/main.rs"
+
+[dependencies]
+vib-core = { path = "../vib-core" }

@@ -1,0 +1,8 @@
+[package]
+name = "vib-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Blob-native IVF vector index: format, quantization, k-means and scan kernels. No I/O."
+
+[dependencies]

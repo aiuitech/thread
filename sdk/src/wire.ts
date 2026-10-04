@@ -1,0 +1,354 @@
+/**
+ * Wire formats shared with the vib Worker: packed hits, slab and delta-segment headers, the manifest
+ * (revisions, deltas, tombstone sets), the slabs table and the R2 key layout. Everything here is plain
+ * JS over `Uint8Array`s (no wasm), so headers can be parsed without copying a slab into wasm memory.
+ */
+
+export class VibError extends Error {
+	constructor(
+		message: string,
+		/** HTTP-like status: 400 bad input, 404 missing object, 409 write conflict, 500 corrupt index. */
+		public readonly status = 500,
+	) {
+		super(message);
+		this.name = "VibError";
+	}
+}
+
+// ---------- packed hits ----------
+
+/** One hit of `scan`/`scan_pq`/`scan_delta`/`merge`: `idx` is the entry index in its slab or delta segment. */
+export interface PackedHit {
+	id: number;
+	score: number;
+	idx: number;
+}
+
+/** Parses packed hits `[count u32][id u32, score f32, idx u32]*` (little-endian). */
+export function parseHits(packed: Uint8Array): PackedHit[] {
+	if (packed.byteLength < 4) return [];
+	const dv = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
+	const n = dv.getUint32(0, true);
+	if (packed.byteLength < 4 + n * 12) throw new VibError(`packed hits: ${n} hits need ${4 + n * 12} bytes, have ${packed.byteLength}`);
+	const out: PackedHit[] = new Array(n);
+	for (let i = 0; i < n; i++) {
+		const o = 4 + i * 12;
+		out[i] = { id: dv.getUint32(o, true), score: dv.getFloat32(o + 4, true), idx: dv.getUint32(o + 8, true) };
+	}
+	return out;
+}
+
+/** Number of hits in a packed hit buffer. */
+export const packedCount = (b: Uint8Array): number => (b.byteLength < 4 ? 0 : new DataView(b.buffer, b.byteOffset, 4).getUint32(0, true));
+
+export function concatBytes(parts: Uint8Array[]): Uint8Array {
+	const out = new Uint8Array(parts.reduce((a, b) => a + b.byteLength, 0));
+	let o = 0;
+	for (const p of parts) {
+		out.set(p, o);
+		o += p.byteLength;
+	}
+	return out;
+}
+
+// ---------- slab header (64 bytes, "VIBS") ----------
+
+export const SLAB_MAGIC = 0x53424956; // "VIBS" LE
+export const SLAB_ENTRY_BYTES = 16;
+
+export interface SlabHeader {
+	/** 1 = int8 only (read whole, no phase 2); 2 = 4-bit scan + int8 rerank; 3 = PQ scan + int8 rerank. */
+	version: number;
+	dim: number;
+	count: number;
+	cell: number;
+	centroidOff: number;
+	/** Entry table: `count` x 16 B `[id u32, payloadOff u32, payloadLen u32, attrs u32]`. */
+	entriesOff: number;
+	/** Bytes to range-read for a scan (`[0, scanLen)`); for v1 the payload offset (the slab is read whole anyway). */
+	scanLen: number;
+	/** v2/v3: rerank record `i` is `[rerankOff + i * recLen, +recLen)`; 0 for v1. */
+	rerankOff: number;
+	/** `4 + dim` for v2/v3, 0 for v1. */
+	recLen: number;
+	payloadOff: number;
+	payloadLen: number;
+	/** v3: PQ subspaces of the scan tier (0 otherwise). */
+	pqM: number;
+}
+
+export function parseSlabHeader(b: Uint8Array): SlabHeader {
+	if (b.byteLength < 64) throw new VibError(`slab header needs 64 bytes, have ${b.byteLength}`);
+	const dv = new DataView(b.buffer, b.byteOffset, 64);
+	if (dv.getUint32(0, true) !== SLAB_MAGIC) throw new VibError("bad slab magic");
+	const version = dv.getUint16(4, true);
+	const dim = dv.getUint32(8, true);
+	const count = dv.getUint32(12, true);
+	const cell = dv.getUint32(16, true);
+	const centroidOff = dv.getUint32(20, true);
+	const entriesOff = dv.getUint32(24, true);
+	if (version === 2 || version === 3) {
+		// v2 and v3 share every field read here (v3 stores pq_m at 32, where v2 has scales4_off).
+		return { version, dim, count, cell, centroidOff, entriesOff, rerankOff: dv.getUint32(36, true), payloadOff: dv.getUint32(40, true), payloadLen: dv.getUint32(44, true), scanLen: dv.getUint32(48, true), recLen: 4 + dim, pqM: version === 3 ? dv.getUint32(32, true) : 0 };
+	}
+	if (version === 1) {
+		const payloadOff = dv.getUint32(36, true);
+		return { version, dim, count, cell, centroidOff, entriesOff, rerankOff: 0, payloadOff, payloadLen: dv.getUint32(40, true), scanLen: payloadOff, recLen: 0, pqM: 0 };
+	}
+	throw new VibError(`unknown slab version ${version}`);
+}
+
+/** The cell mean stored in a slab prefix (copied out, so it outlives the prefix). */
+export function slabCentroid(b: Uint8Array, h: SlabHeader): Float32Array {
+	const end = h.centroidOff + h.dim * 4;
+	if (b.byteLength < end) throw new VibError(`slab prefix too short for the centroid (${b.byteLength} < ${end})`);
+	return new Float32Array(b.slice(h.centroidOff, end).buffer);
+}
+
+export interface SlabEntry {
+	id: number;
+	payloadOff: number;
+	payloadLen: number;
+	attrs: number;
+}
+
+/** Entry `i` of the slab entry table (inside the scan prefix). */
+export function slabEntry(b: Uint8Array, h: SlabHeader, i: number): SlabEntry {
+	const o = h.entriesOff + i * SLAB_ENTRY_BYTES;
+	if (i >= h.count || b.byteLength < o + SLAB_ENTRY_BYTES) throw new VibError(`slab entry ${i} out of range`);
+	const dv = new DataView(b.buffer, b.byteOffset + o, SLAB_ENTRY_BYTES);
+	return { id: dv.getUint32(0, true), payloadOff: dv.getUint32(4, true), payloadLen: dv.getUint32(8, true), attrs: dv.getUint32(12, true) };
+}
+
+// ---------- delta segment header (64 bytes, "VIBD") ----------
+
+export const DELTA_MAGIC = 0x44424956; // "VIBD" LE
+export const DELTA_ENTRY_BYTES = 24;
+
+export interface DeltaHeader {
+	version: number;
+	dim: number;
+	count: number;
+	pqM: number;
+	seq: number;
+	/** Entry table: `count` x 24 B `[id, cell, attrs, payloadOff, payloadLen, reserved]` (u32 each). */
+	entriesOff: number;
+	rerankOff: number;
+	payloadOff: number;
+	payloadLen: number;
+}
+
+export function parseDeltaHeader(b: Uint8Array): DeltaHeader {
+	if (b.byteLength < 64) throw new VibError(`delta header needs 64 bytes, have ${b.byteLength}`);
+	const dv = new DataView(b.buffer, b.byteOffset, 64);
+	if (dv.getUint32(0, true) !== DELTA_MAGIC) throw new VibError("bad delta magic");
+	const version = dv.getUint16(4, true);
+	if (version !== 1) throw new VibError(`unknown delta version ${version}`);
+	return { version, dim: dv.getUint32(8, true), count: dv.getUint32(12, true), pqM: dv.getUint32(16, true), seq: dv.getUint32(20, true), entriesOff: dv.getUint32(24, true), rerankOff: dv.getUint32(28, true), payloadOff: dv.getUint32(44, true), payloadLen: dv.getUint32(48, true) };
+}
+
+export interface DeltaEntry extends SlabEntry {
+	cell: number;
+}
+
+export function deltaEntry(b: Uint8Array, h: DeltaHeader, i: number): DeltaEntry {
+	const o = h.entriesOff + i * DELTA_ENTRY_BYTES;
+	if (i >= h.count || b.byteLength < o + DELTA_ENTRY_BYTES) throw new VibError(`delta entry ${i} out of range`);
+	const dv = new DataView(b.buffer, b.byteOffset + o, DELTA_ENTRY_BYTES);
+	return { id: dv.getUint32(0, true), cell: dv.getUint32(4, true), attrs: dv.getUint32(8, true), payloadOff: dv.getUint32(12, true), payloadLen: dv.getUint32(16, true) };
+}
+
+// ---------- manifest, slabs table, current pointer ----------
+
+/** Query defaults recorded in a manifest; an absent query parameter takes its value from here. */
+export interface QueryDefaults {
+	nprobe: number;
+	rerank: number;
+	pc: number;
+}
+
+/** Defaults of manifests without `defaults` (generations before g3). */
+export const LEGACY_DEFAULTS: QueryDefaults = { nprobe: 1, rerank: 32, pc: 0 };
+
+/**
+ * Row of a slabs table (array indexed by cell): `[scanLen, rerankOff, count, bytes, slabRev?]`. `slabRev`
+ * (absent = 0) names the slab object: 0 = `slab/{cell:05}`, r > 0 = `slab/{cell:05}.{r}` (written by a
+ * compaction that read manifest rev r - 1).
+ */
+export type SlabRow = [number, number, number, number] | [number, number, number, number, number];
+export const slabRevOf = (row: SlabRow | undefined): number => (row && row.length > 4 ? (row[4] as number) : 0);
+
+/** A delta segment listed in a manifest. */
+export interface DeltaRef {
+	seq: number;
+	key: string;
+	count: number;
+	bytes: number;
+	/** The manifest rev that first listed this segment: tombstone sets with rev > addedRev hide its entries. */
+	addedRev: number;
+	cells?: number;
+}
+
+/** A tombstone set: ids deleted (or replaced by an upsert) at manifest rev `rev`. */
+export interface TombRef {
+	rev: number;
+	key: string;
+	count: number;
+}
+
+/** Objects a revision reads. Manifests without `files` (rev 0) use the generation's fixed names. */
+export interface IndexFiles {
+	coarse: string;
+	fine: string;
+	pq: string | null;
+	slabs: string | null;
+}
+
+export interface Manifest {
+	gen: string;
+	k1: number;
+	k2: number;
+	dim: number;
+	m: number;
+	probeCoarse?: number;
+	vectors: number;
+	/** 3 = PQ scan + int8 rerank tiers; 2 = 4-bit scan + int8 rerank; absent/1 = int8-only slabs. */
+	format?: number;
+	profile?: string;
+	tiers?: string;
+	pq?: { m: number };
+	nNeigh?: number;
+	defaults?: QueryDefaults;
+	createdAt?: string;
+	notes?: unknown;
+	/** Revision; absent = 0 (`idx/{gen}/manifest.json`). */
+	rev?: number;
+	parentRev?: number;
+	updatedAt?: string;
+	change?: Record<string, unknown>;
+	files?: IndexFiles;
+	deltas?: DeltaRef[];
+	tombstones?: TombRef[];
+	/** Next delta sequence number. */
+	nextSeq?: number;
+}
+
+/** `idx/current.json`: the generation and revision queries use by default. */
+export interface CurrentPointer {
+	gen: string;
+	rev: number;
+}
+
+export const pad5 = (n: number): string => n.toString().padStart(5, "0");
+
+/** Object keys of the index layout, relative to the store prefix. */
+export const keys = {
+	current: (): string => "idx/current.json",
+	manifest: (gen: string, rev: number): string => (rev === 0 ? `idx/${gen}/manifest.json` : `idx/${gen}/manifest.${rev}.json`),
+	slabsTable: (gen: string, rev: number): string => (rev === 0 ? `idx/${gen}/slabs.json` : `idx/${gen}/slabs.${rev}.json`),
+	slab: (gen: string, cell: number, slabRev = 0): string => (slabRev === 0 ? `idx/${gen}/slab/${pad5(cell)}` : `idx/${gen}/slab/${pad5(cell)}.${slabRev}`),
+	tombstones: (gen: string, rev: number): string => `idx/${gen}/tombstones.${rev}.u32`,
+	delta: (gen: string, seq: number): string => `idx/${gen}/delta/${seq}.vibd`,
+};
+
+export function manifestFiles(m: Manifest): IndexFiles {
+	if (m.files) return m.files;
+	const g = m.gen;
+	return { coarse: `idx/${g}/coarse.f32`, fine: `idx/${g}/fine.f32`, pq: (m.format ?? 1) === 3 ? `idx/${g}/pq.bin` : null, slabs: `idx/${g}/slabs.json` };
+}
+
+const utf8 = new TextDecoder();
+export const decodeJson = <T>(b: Uint8Array): T => JSON.parse(utf8.decode(b)) as T;
+
+/** Parses `idx/current.json`; a pointer without `rev` (older publishes) means rev 0. */
+export function parseCurrent(b: Uint8Array): CurrentPointer {
+	const j = decodeJson<{ gen?: unknown; rev?: unknown }>(b);
+	if (typeof j.gen !== "string" || !j.gen) throw new VibError("current.json has no gen");
+	const rev = j.rev === undefined ? 0 : Number(j.rev);
+	if (!Number.isInteger(rev) || rev < 0) throw new VibError(`current.json has a bad rev ${String(j.rev)}`);
+	return { gen: j.gen, rev };
+}
+
+/** Parses a manifest and checks it is for `gen`; fills `rev` (absent in rev-0 manifests). */
+export function parseManifest(b: Uint8Array, gen: string, rev: number): Manifest {
+	const m = decodeJson<Manifest>(b);
+	if (m.gen !== gen) throw new VibError(`manifest for ${gen} rev ${rev} is for generation ${m.gen}`);
+	for (const f of ["k1", "k2", "dim", "vectors"] as const) if (!Number.isInteger(m[f])) throw new VibError(`manifest ${gen} rev ${rev}: missing ${f}`);
+	if ((m.rev ?? 0) !== rev) throw new VibError(`manifest ${gen} rev ${rev} says rev ${m.rev}`);
+	return { ...m, rev };
+}
+
+export function parseSlabsTable(b: Uint8Array, cells: number, key: string): SlabRow[] {
+	const t = decodeJson<unknown>(b);
+	if (!Array.isArray(t) || t.length !== cells) throw new VibError(`${key} has ${Array.isArray(t) ? t.length : "no"} rows, expected ${cells}`);
+	return t as SlabRow[];
+}
+
+// ---------- tombstones ----------
+
+/** Sorted unique union of id sets as a tombstone buffer (`u32` LE), the format `filter_hits` takes. */
+export function idUnion(sets: ArrayLike<number>[]): Uint8Array {
+	let n = 0;
+	for (const s of sets) n += s.length;
+	const all = new Uint32Array(n);
+	let o = 0;
+	for (const s of sets) {
+		all.set(s, o);
+		o += s.length;
+	}
+	all.sort();
+	let w = 0;
+	for (let i = 0; i < all.length; i++) if (i === 0 || all[i] !== all[i - 1]) all[w++] = all[i];
+	return new Uint8Array(all.buffer, 0, w * 4);
+}
+
+/** The tombstone sets of a revision, parsed once; `unions` caches the per-slabRev filter buffers. */
+export interface TombState {
+	sets: { rev: number; ids: Uint32Array }[];
+	/** Ids over all sets (with repeats). */
+	total: number;
+	/** id -> highest rev of a set containing it (the delta rule). */
+	maxRev: Map<number, number>;
+	unions: Map<number, Uint8Array>;
+	/** Union of the sets with rev > a (the filter for delta segments added at rev a), by a. */
+	deltaUnions: Map<number, Uint8Array>;
+}
+
+export function buildTombState(sets: { rev: number; ids: Uint32Array }[]): TombState {
+	const maxRev = new Map<number, number>();
+	let total = 0;
+	for (const s of sets) {
+		total += s.ids.length;
+		for (const id of s.ids) if ((maxRev.get(id) ?? -1) < s.rev) maxRev.set(id, s.rev);
+	}
+	return { sets, total, maxRev, unions: new Map(), deltaUnions: new Map() };
+}
+
+/**
+ * Filter buffer for hits of a slab with revision `slabRev`: the union of the sets with rev >= slabRev. A slab
+ * written by a compaction that read manifest rev R has slabRev R + 1 and already excludes the sets with
+ * rev <= R; rev-0 slabs are hidden by every set.
+ */
+export function tombFor(t: TombState, slabRev: number): Uint8Array {
+	let u = t.unions.get(slabRev);
+	if (!u) {
+		u = idUnion(t.sets.filter((s) => s.rev >= slabRev).map((s) => s.ids));
+		t.unions.set(slabRev, u);
+	}
+	return u;
+}
+
+/**
+ * Filter buffer for the entries of a delta segment added at manifest rev `addedRev`: the union of the sets with
+ * rev > addedRev (the upsert's own set has rev = addedRev and hides older copies, not the new one).
+ */
+export function tombForDelta(t: TombState, addedRev: number): Uint8Array {
+	let u = t.deltaUnions.get(addedRev);
+	if (!u) {
+		u = idUnion(t.sets.filter((s) => s.rev > addedRev).map((s) => s.ids));
+		t.deltaUnions.set(addedRev, u);
+	}
+	return u;
+}
+
+export const NO_TOMBSTONES: Uint8Array = new Uint8Array(0);

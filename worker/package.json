@@ -1,0 +1,19 @@
+{
+	"name": "worker",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "cf dev",
+		"build": "cf build",
+		"deploy": "cf deploy",
+		"typecheck": "cf workers types && tsc"
+	},
+	"devDependencies": {
+		"@cloudflare/vite-plugin": "beta",
+		"@cloudflare/workers-types": "^5.20261003.1",
+		"cf": "^1.0.0-beta.12",
+		"rolldown": "~1.2.11",
+		"typescript": "^7.0.2",
+		"vite": "^8.3.0"
+	}
+}

@@ -1,0 +1,13 @@
+/data/
+/.venv/
+/target/
+node_modules/
+/worker/pkg/
+/worker/dist/
+/worker/.cloudflare/
+/worker/.wrangler/
+*.log
+.dev.vars*
+.env*
+.wrangler
+.cloudflare
