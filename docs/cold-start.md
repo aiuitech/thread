@@ -373,14 +373,286 @@ The TS pack runs show a faster phase 2 (321 vs 393 ms at rtt25) with the same re
 a bug in the SDK's `Limiter` (below), which the pack path triggers. Compare pack and per-object TS phase-2 numbers
 only after that is fixed.
 
+## Store-level optimizations
+
+What the SDKs now do between a query and S3, both SDKs with the same option names (TS camelCase / Python
+snake_case). Every item was measured with the harness above (same pinned rev 179, same queries 0..19, n = 10 per
+scenario); the option matrix is `bench/cold/run_store.sh` (one run per config, proxy on its own port, configs set
+through `cold_bench` flags), the tables come from `node bench/cold/store_table.mjs`, and `TAG=store
+bench/cold/run_baseline.sh` repeats the baseline runs (proxy and pack, three profiles) with the new defaults.
+
+| # | option | default | what it does |
+|---|---|---|---|
+| 1 | `missPolicy` / `miss_policy` on `CachedBlobStore` and `open` | `whole` for the Workers Cache API, `range+warm` for `MemoryCache` / `DiskCache` | what a slab-prefix cache miss reads: the whole slab, exactly the range, or the range now and the whole slab into the cache in the background (2 at a time, 1 while the query's own reads are in flight, deduplicated, bounded queue, `waitUntil`) |
+| 1 | Node's default cache | `MemoryCache` (256 MB) in front of a remote store outside Workers | before: none, so every Node query was cold |
+| 2 | `inflight` (store hint, query option) | 32 for `S3BlobStore` in Node / Python, 6 for S3 inside a Worker, 12 for the Cache API and other stores | reads in flight per query; the TS `Limiter` is now exact (it oversubscribed, see below) |
+| 2 | `coalesceBytes` / `coalesce_bytes` | 128 KB for `S3BlobStore`, 4 KB elsewhere | a slab's wanted rerank records are read as runs of up to this many bytes |
+| 2 | `spanBytes` / `span_bytes` | off | one range from a slab's first to last wanted record when the span is at most this |
+| 3 | SigV4 signing-key cache | on | the derived key per (date, region, service), imported once as an HMAC `CryptoKey` (TS) |
+| 4 | `warmup` (open option; `S3BlobStore({ warmup })` at construction) | `inflight` connections for remote stores outside Workers | opens connections while `open` loads the index; TS sends one-byte GETs (a HEAD's connection is not reused by Node's `fetch`) and no longer cancels small bodies (which closed the socket); Python's `S3BlobStore` now has one bounded keep-alive pool shared by all threads instead of a connection per thread |
+| 4 | `chunkBytes` / `chunk_bytes` on `S3BlobStore` | 8 MiB, 4 at a time | a whole-object GET above this becomes parallel range GETs (the 25 MB routing table) |
+| 5 | `DiskCache` (`thread-sdk/node`, Python) | - | whole objects on disk in the bucket layout (shared by both SDKs, LRU by mtime, size-bounded); a `FileBlobStore`, so `copyObjects(s3, disk, snapshotKeys(rev))` pre-warms it |
+| 6 | `coldPolicy` / `cold_policy` | off | `{nprobe, rerank, threshold}` for queries whose probed slabs are mostly (> 50%) not cached |
+| 7 | prefetch on refresh, `warm(keys?)` | on (`prefetchBytes` 64 MB) | a new revision's manifest, slabs table, tombstones, base files (if changed) and deltas are loaded before the switch, the rest of `snapshotKeys(new) - snapshotKeys(old)` warmed afterwards; the periodic `current.json` check runs in the background |
+
+How to read the tables: `process-cold` includes the open (e2e = spawn to hits); `slab-cold` is a new query in the
+same process; `warm` repeats the `slab-cold` query right away, so under `range+warm` it usually runs while the
+background warms of the previous query are still in flight (`default-drain` waits for them first: that is the warm
+cost once the cache has filled). Requests and SDK MB are the query's own foreground reads; proxy MB is everything
+the proxy sent during the scenario, background warms included. `legacy` is the new code configured like the old
+defaults (TS: no cache, inflight 12, coalesce 4 KB, no warm-up, no chunking; Python: `MemoryCache` with `whole`
+misses, inflight 12; Python's connection pool is shared in every config).
+
+### The new defaults against the baseline
+
+`TAG=store WARM=0 R2S3=0 bench/cold/run_baseline.sh` (both SDKs with no options, proxy and pack, three profiles),
+medians, baseline -> now (`node bench/cold/store_table.mjs --tag store`):
+
+| profile | store | sdk | process-cold e2e | process-cold query | slab-cold query | warm query | slab-cold requests | slab-cold proxy MB | process-cold proxy conns | recall@10 |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| rtt25 | proxy | ts | 1925 -> 1190 | 576 -> 155 | 564 -> 141 | 536 -> 136 | 177 -> 87 | 6.2 -> 11.2 | 12 -> 33 | 91.5 -> 91.5% |
+| rtt25 | proxy | py | 1813 -> 1188 | 476 -> 139 | 307 -> 151 | 13 -> 148 | 34 -> 86 | 47.3 -> 11.9 | 33 -> 32 | 91.5 -> 91.5% |
+| rtt25 | pack | ts | 2012 -> 1019 | 508 -> 141 | 482 -> 132 | 471 -> 143 | 178 -> 88 | 6.2 -> 11.8 | 17 -> 34 | 91.5 -> 91.5% |
+| rtt25 | pack | py | 1892 -> 914 | 471 -> 149 | 306 -> 147 | 12 -> 151 | 34 -> 87 | 47.3 -> 11.2 | 33 -> 32 | 91.5 -> 91.5% |
+| rtt25link500 | proxy | ts | 1955 -> 1251 | 603 -> 222 | 564 -> 220 | 548 -> 219 | 179 -> 86 | 6.2 -> 10.5 | 12 -> 33 | 91.5 -> 91.5% |
+| rtt25link500 | proxy | py | 2215 -> 1286 | 891 -> 230 | 829 -> 243 | 11 -> 240 | 34 -> 88 | 47.3 -> 11.4 | 33 -> 32 | 91.5 -> 91.5% |
+| rtt25link500 | pack | ts | 2033 -> 1190 | 522 -> 225 | 456 -> 216 | 470 -> 227 | 179 -> 85 | 6.2 -> 10.5 | 17 -> 34 | 91.5 -> 91.5% |
+| rtt25link500 | pack | py | 2302 -> 1102 | 886 -> 230 | 855 -> 244 | 9 -> 239 | 34 -> 91 | 47.3 -> 11.7 | 33 -> 32 | 91.5 -> 91.5% |
+| rtt60 | proxy | ts | 3786 -> 2234 | 1141 -> 277 | 1091 -> 280 | 1122 -> 254 | 178 -> 87 | 6.2 -> 11.2 | 12 -> 33 | 91.5 -> 91.5% |
+| rtt60 | proxy | py | 3605 -> 2300 | 1010 -> 310 | 612 -> 308 | 5 -> 312 | 34 -> 89 | 47.3 -> 10.9 | 33 -> 32 | 91.5 -> 91.5% |
+| rtt60 | pack | ts | 4011 -> 1942 | 1005 -> 261 | 957 -> 274 | 978 -> 257 | 179 -> 88 | 6.2 -> 10.8 | 17 -> 34 | 91.5 -> 91.5% |
+| rtt60 | pack | py | 3863 -> 1773 | 1031 -> 305 | 635 -> 305 | 5 -> 309 | 34 -> 85 | 47.3 -> 11.3 | 33 -> 32 | 91.5 -> 91.5% |
+
+Against the real R2 S3 endpoint (option matrix runs `legacy` -> `default`, one run each, R2 is +-12% between runs):
+TS process-cold e2e 2142 -> 1445 ms, slab-cold query 1198 -> 440 ms (phase 2 869 -> 220 ms, 142 -> 48 requests);
+Python e2e 1622 -> 1385 ms, slab-cold 610 -> 465 ms (47.8 -> 9.1 MB per query).
+
+- **TypeScript**: cold queries are 2.6-4x faster (phase 2 was ~140 single-record GETs at 12 in flight; now ~35 runs
+  of up to 128 KB at 32 in flight), and repeat queries are cached at all now (Node had no cache). The open is
+  ~320 ms shorter at rtt25 (1285 -> 961 ms; `open.base` 1137 -> 794 ms: the 25 MB routing table as parallel range
+  GETs).
+- **Python**: cold queries 2-3.4x faster, 4-5x less transfer (the prefixes and records instead of whole slabs, which
+  matters most on a shared link: 829 -> 243 ms slab-cold at `rtt25link500`). The price: a query repeated right
+  after a cold one is no longer ~10 ms but ~140-310 ms until the background warms land (`warm` column); once they
+  have (`default-drain` below), warm queries are 10-14 ms again. `miss_policy="whole"` restores the old trade.
+- **Packs** gain the most at open (2012 -> 1019 ms TS, 1892 -> 914 ms Python e2e at rtt25; TS `open.base` 1141 ->
+  422 ms): the routing table is one 25 MB range of the pack, now read as 4 parallel ranges in one round (a per-object whole GET needs a first chunk to
+  learn the size, then the rest: two rounds).
+- New connections per cold process: TS 12 -> 33 (inflight 32: warmed during the open, then reused by the query);
+  Python 33 -> 32, from one shared pool.
+
+### Option by option
+
+1. **Miss policy.** On per-response bandwidth (`rtt25`) a whole-slab miss looks affordable at 32 in flight
+   (slab-cold 222 ms TS / 171 ms Python with `whole-i32` vs 141 / 146 ms with `range+warm`), but on a shared link it
+   is not: at `rtt25link500` `whole` costs 855 ms per slab-cold query (48 MB through 500 Mbps) against 226 / 234 ms
+   for the prefix-and-records reads, and 351 vs 273 ms (TS) at `rtt60`. `range` and `range+warm` cost the same in
+   the query (the warm traffic is background: proxy MB 11 vs 9); what `range+warm` adds is that a later query hits:
+   `default-drain`'s warm query is 14 ms TS / 10 ms Python, where `range` stays at ~145 ms. The price is the query
+   right after a cold one: until the background warms land (34 slabs at 2 at a time take ~1-2 s through the proxy)
+   a repeat is still mostly cold (`warm` column of `default`), where Python's old `whole` default answered it in
+   13 ms.
+2. **In flight and coalescing.** These two are what moved the query. `inflight` 12 -> 32 cut the slab-cold query
+   from 289 to 141 ms (TS) and 286 to 146 ms (Python) at `rtt25`; 6 (the Worker-direct-to-S3 default) would roughly
+   double it again (v1 run: 910 ms TS). Coalescing a slab's records into runs of up to 4 KB / 32 KB / 128 KB /
+   512 KB takes phase 2 from 148 to 71 / 35 / 18 requests (TS, slab-cold, `rtt25`) and the query from 261 to 196 /
+   141 / 139 ms, for 6.2 / 6.8 / 9.1 / 12.4 MB per query. On the shared link 512 KB is already worse than 128 KB
+   (277 vs 226 ms TS, 293 vs 234 ms Python): the extra bytes cost more than the saved round trips, so 128 KB is the
+   default for `S3BlobStore`. At `rtt60`, 4 KB vs 128 KB is 472 vs 273 ms (TS) and 486 vs 305 ms (Python).
+   `spanBytes` 1 MB (one range per winner slab when its records lie within 1 MB) is no better than 128 KB runs
+   (142 vs 141 ms TS, 168 vs 146 ms Python) and reads more; it stays off.
+3. **SigV4 key cache.** `signV4` per request: 135 us -> 24 us in Node (median of 32 runs; 115-238 -> 21-44), Python
+   `sign_v4` 9 -> 5 us. Not visible in query latency (the signing overlapped the waits before too).
+4. **Connections.** With `inflight` 32 a cold query needs 32 connections. Warming them during `open` saves 44 ms of
+   process-cold query in TS (192 -> 148 ms) and 37 ms in Python (183 -> 146 ms) at `rtt25`; creating the store with
+   `warmup` before `Thread.init` (`early-warmup`) also takes Node's lazy `fetch`/`Response` load out of `wasmInit`
+   (13.0 -> 0.5 ms) and saves another ~35 ms of e2e (1209 -> 1175 ms). Two bugs made the first version of the TS
+   warm-up useless (65 instead of 33 new connections per process): `S3BlobStore` cancelled small response bodies
+   (HEAD, 404, PUT), which makes Node's `fetch` close the socket, and undici does not reuse a connection after a
+   HEAD answer with a Content-Length; small bodies are now read to the end and the warm-up sends one-byte GETs.
+   Python's store now keeps one bounded pool shared by all threads (32 connections per cold process, all reused by
+   the query), instead of one connection per I/O thread. Splitting whole-object GETs above 8 MiB into 4 parallel
+   ranges (`chunkBytes`) cuts the routing-table read from 1088 to 799 ms (TS) and 1458 -> 1172 ms of Python e2e at
+   `rtt25`, and 2821 -> 2229 ms TS e2e at `rtt60`: it is the largest single open-time win here. Node's `fetch` is
+   HTTP/1.1 (undici; HTTP/2 only with an `Agent` using `allowH2`); against R2, `nodeFetch({ allowH2: true })` was not
+   faster for 32 parallel range GETs (hot rounds ~180 ms vs ~140 ms on HTTP/1.1), and a 60 s keep-alive
+   (`nodeFetch({ keepAliveTimeout: 60000 })`) made a query after 6 s idle ~175 ms instead of ~260 ms (undici's 4 s
+   default had closed the connections).
+5. **Disk cache.** A restarted process over a filled `DiskCache` (`disk-restart`; the cache filled by
+   `disk-fill`'s process, which drained its warms) answers process-cold in 472 ms e2e TS / 396 ms Python (79 / 36 ms
+   query, 0 requests) instead of ~1200 ms. `DiskCache` hits are file range reads, so its slabs are not "whole" in
+   memory and phase 2 reads records from disk (17 / 6 ms).
+6. **Cold-path policy.** `coldPolicy {nprobe: 20, rerank: 100}` on the cold queries: recall@10 91.5% -> 86.5%
+   (over the 20 cold queries), slab-cold 141 -> 128 ms (TS) / 146 -> 131 ms (Python) at `rtt25`, 226 -> 176 /
+   234 -> 192 ms on the shared link, 273 -> 244 / 305 -> 241 ms at `rtt60`. It only applies while most probed
+   slabs miss the cache, so warm queries keep full recall. Off by default: 5 points of recall for 10-25% of a cold
+   query.
+7. **Prefetch on refresh.** A revision switch (rev 179 -> 180 in a proxy overlay: new manifest, a new 121 KB slabs
+   table, a tombstone set) used to stall the query that noticed it: `await refresh()` + query took 117 ms (TS) /
+   137 ms (Python) median at `rtt25`. Now that query answers from the current revision in 19 ms / 12 ms while the
+   switch completes 126 / 118 ms later in the background, and the next query (on the new revision) takes 12 / 16 ms
+   (`node bench/cold/refresh_bench.mjs --sdk ts|py`, n = 10).
+
+**Packs.** With a `PackedBlobStore`, every read (whole-object warms included) is a range of the pack: a cache in
+front sees the objects' own keys, and `whole` / `range+warm` fetch the object's range of the pack, never the pack
+(tested in both SDKs). Coalescing phase-1 prefix reads of different slabs would need them adjacent in the pack: in
+key order only 3.1% of probed cells have a probed neighbour (0.53 adjacent pairs per query over queries 0..29),
+and the prefixes of neighbouring cells are ~1 MB apart (the first slab's rerank tier lies between them), so
+merging them would read 1 MB to save one request. Not worth it with the current entry order.
+
+**Limiter.** The TS `Limiter` is exact now (a released slot is handed to the next waiter): the hammering test
+reproduced the old oversubscription (7 in flight under a limit of 3); Python's limiter took its slot under a lock
+and was already exact. With the fix, the pack and per-object paths issue the same requests at the same
+concurrency.
+
+**What did not change.** The open is still dominated by the routing table (25 MB, now ~800 ms at `rtt25` instead of
+~1.1 s) and its serial chain (current -> manifest -> slabs); `warmup` connections start with the open, so
+`open.current` pays ~20 ms more while 32 handshakes run beside it (starting them after `current.json` would avoid
+that; not done). A per-object whole GET learns the object's size from its first 8 MiB range and fetches the rest
+after it (two rounds); a pack range or a size hint from the manifest (`fine.f32` is `k1 * k2 * dim * 4` bytes) would
+allow one round, as the pack's 422 ms `open.base` shows (not done). `range+warm` makes the query right after a cold query slower than Python's old whole-slab default
+(137 vs 13 ms) for the ~1-2 s the background warms take; `missPolicy: "whole"` brings it back where bandwidth is
+plentiful.
+
+### The option matrix
+
+`bench/cold/run_store.sh` (n = 10 per scenario, one run per config). `slab-cold req` and `MB SDK` are the
+query's own reads (speculative reads that land during phase 1 count there); `MB proxy` includes background warms.
+`r2s3` has no proxy counters.
+
+#### rtt25, TypeScript (Node)
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 1925 | 576 | 564 / 592 | 135 / 415 | 34 / 143 | 6.2 / 6.2 | 536.4 | 91.5% |
+| legacy | 1895 | 528 | 507 / 540 | 120 / 389 | 34 / 142 | 6.2 / 6.2 | 509.4 | 91.5% |
+| default | 1209 | 148 | 141 / 164 | 99 / 38 | 60 / 35 | 9.1 / 11.2 | 141.9 | 91.5% |
+| default-drain | 1164 | 136 | 147 / 161 | 95 / 42 | 60 / 41 | 9.2 / 11.6 | 14.3 | 91.5% |
+| whole-i32 | 1281 | 241 | 222 / 266 | 218 / 1 | 34 / 0 | 47.8 / 47.3 | 16.0 | 91.5% |
+| range-i32 | 1188 | 149 | 142 / 165 | 95 / 43 | 56 / 38 | 9.2 / 9.2 | 145.5 | 91.5% |
+| inflight12 | 1287 | 265 | 289 / 326 | 132 / 154 | 34 / 52 | 8.9 / 13.5 | 274.3 | 91.5% |
+| coalesce4k | 1275 | 235 | 261 / 311 | 100 / 156 | 63 / 148 | 6.2 / 10.8 | 238.0 | 91.5% |
+| coalesce32k | 1235 | 187 | 196 / 212 | 95 / 84 | 63 / 71 | 6.8 / 10.0 | 180.3 | 91.5% |
+| coalesce512k | 1186 | 143 | 139 / 168 | 96 / 38 | 45 / 18 | 12.4 / 14.3 | 149.5 | 91.5% |
+| span1m | 1184 | 138 | 142 / 172 | 100 / 42 | 56 / 18 | 11.6 / 13.8 | 158.0 | 91.5% |
+| chunk0 | 1478 | 134 | 141 / 159 | 97 / 40 | 62 / 35 | 9.0 / 11.2 | 136.9 | 91.5% |
+| warmup0 | 1267 | 192 | 152 / 178 | 104 / 40 | 60 / 35 | 9.3 / 12.7 | 146.3 | 91.5% |
+| early-warmup | 1175 | 141 | 141 / 171 | 102 / 37 | 62 / 34 | 9.2 / 11.0 | 133.9 | 91.5% |
+| cold-np20-rr100 | 1153 | 123 | 128 / 135 | 52 / 73 | 20 / 44 | 5.7 / 7.6 | 128.1 | 86.5% |
+| disk-fill | 1195 | 137 | 138 / 179 | 96 / 38 | 60 / 32 | 9.2 / 11.2 | 30.5 | 91.5% |
+| disk-restart | 472 | 79 | 70 / 88 | 50 / 17 | 0 / 0 | 8.9 / 0.0 | 18.8 | 91.5% |
+
+#### rtt25, Python
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 1813 | 476 | 307 / 361 | 301 / 2 | 34 / 0 | 47.8 / 47.3 | 13.0 | 91.5% |
+| legacy | 1699 | 368 | 288 / 332 | 282 / 2 | 34 / 0 | 47.8 / 47.3 | 11.6 | 91.5% |
+| default | 1172 | 146 | 146 / 161 | 113 / 30 | 83 / 4 | 8.9 / 11.4 | 137.1 | 91.5% |
+| default-drain | 1170 | 130 | 152 / 158 | 115 / 31 | 83 / 3 | 9.0 / 10.9 | 9.5 | 91.5% |
+| whole-i32 | 1220 | 170 | 171 / 201 | 166 / 1 | 34 / 0 | 47.8 / 47.3 | 11.9 | 91.5% |
+| range-i32 | 1178 | 136 | 146 / 166 | 113 / 29 | 84 / 3 | 9.4 / 9.4 | 146.0 | 91.5% |
+| inflight12 | 1311 | 271 | 286 / 316 | 251 / 31 | 84 / 4 | 8.9 / 13.7 | 294.2 | 91.5% |
+| coalesce4k | 1256 | 223 | 224 / 248 | 183 / 30 | 176 / 4 | 6.2 / 9.6 | 226.4 | 91.5% |
+| coalesce32k | 1200 | 167 | 165 / 199 | 138 / 28 | 124 / 2 | 6.8 / 9.9 | 177.4 | 91.5% |
+| coalesce512k | 1192 | 145 | 141 / 150 | 99 / 39 | 59 / 3 | 12.2 / 14.4 | 134.4 | 91.5% |
+| span1m | 1196 | 149 | 168 / 193 | 120 / 34 | 68 / 4 | 11.4 / 14.3 | 174.2 | 91.5% |
+| chunk0 | 1458 | 149 | 145 / 169 | 116 / 32 | 83 / 6 | 8.9 / 10.8 | 145.9 | 91.5% |
+| warmup0 | 1226 | 183 | 135 / 145 | 103 / 30 | 85 / 7 | 9.5 / 12.5 | 130.4 | 91.5% |
+| cold-np20-rr100 | 1173 | 126 | 131 / 138 | 95 / 32 | 54 / 8 | 5.5 / 7.9 | 120.8 | 86.5% |
+| disk-fill | 1246 | 158 | 148 / 178 | 120 / 29 | 83 / 3 | 8.9 / 11.1 | 23.8 | 91.5% |
+| disk-restart | 396 | 36 | 39 / 52 | 29 / 6 | 0 / 0 | 9.0 / 0.0 | 20.0 | 91.5% |
+
+#### rtt25link500, TypeScript (Node)
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 1955 | 603 | 564 / 601 | 157 / 404 | 34 / 145 | 6.2 / 6.2 | 547.9 | 91.5% |
+| legacy | 1923 | 560 | 555 / 575 | 155 / 385 | 34 / 145 | 6.2 / 6.2 | 536.4 | 91.5% |
+| default | 1273 | 228 | 226 / 267 | 141 / 83 | 34 / 51 | 8.9 / 10.5 | 220.7 | 91.5% |
+| default-drain | 1262 | 233 | 227 / 261 | 143 / 80 | 34 / 52 | 8.9 / 10.6 | 14.4 | 91.5% |
+| whole-i32 | 1930 | 898 | 855 / 1086 | 852 / 1 | 34 / 0 | 47.8 / 47.3 | 12.6 | 91.5% |
+| range-i32 | 1252 | 218 | 218 / 260 | 131 / 83 | 34 / 51 | 8.9 / 8.9 | 216.7 | 91.5% |
+| coalesce4k | 1371 | 336 | 310 / 375 | 139 / 170 | 34 / 145 | 6.2 / 9.7 | 332.9 | 91.5% |
+| coalesce512k | 1288 | 266 | 277 / 319 | 139 / 127 | 34 / 28 | 12.2 / 13.5 | 272.5 | 91.5% |
+| chunk0 | 1561 | 230 | 228 / 263 | 141 / 84 | 34 / 51 | 8.9 / 10.7 | 225.4 | 91.5% |
+| cold-np20-rr100 | 1207 | 167 | 176 / 197 | 99 / 71 | 20 / 39 | 5.4 / 7.5 | 164.1 | 86.5% |
+
+#### rtt25link500, Python
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 2215 | 891 | 829 / 1039 | 823 / 2 | 34 / 0 | 47.8 / 47.3 | 11.1 | 91.5% |
+| legacy | 2238 | 917 | 831 / 1085 | 826 / 2 | 34 / 0 | 47.8 / 47.3 | 12.4 | 91.5% |
+| default | 1260 | 229 | 234 / 277 | 200 / 31 | 82 / 4 | 9.0 / 11.4 | 232.8 | 91.5% |
+| default-drain | 1286 | 244 | 236 / 286 | 202 / 31 | 82 / 5 | 8.9 / 11.4 | 12.1 | 91.5% |
+| whole-i32 | 1933 | 889 | 854 / 1072 | 848 / 2 | 34 / 0 | 47.8 / 47.3 | 11.3 | 91.5% |
+| range-i32 | 1255 | 212 | 223 / 267 | 189 / 32 | 82 / 8 | 9.0 / 9.0 | 223.6 | 91.5% |
+| coalesce4k | 1357 | 307 | 320 / 339 | 272 / 33 | 176 / 9 | 6.2 / 9.5 | 305.3 | 91.5% |
+| coalesce512k | 1303 | 288 | 293 / 349 | 258 / 29 | 58 / 3 | 12.2 / 15.1 | 304.1 | 91.5% |
+| chunk0 | 1540 | 234 | 239 / 282 | 203 / 31 | 83 / 4 | 9.0 / 11.1 | 237.3 | 91.5% |
+| cold-np20-rr100 | 1216 | 185 | 192 / 207 | 148 / 37 | 55 / 8 | 6.1 / 8.4 | 180.1 | 86.5% |
+
+#### rtt60, TypeScript (Node)
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 3786 | 1141 | 1091 / 1175 | 261 / 835 | 34 / 144 | 6.2 / 6.2 | 1121.5 | 91.5% |
+| legacy | 3773 | 1115 | 1089 / 1146 | 259 / 829 | 34 / 145 | 6.2 / 6.2 | 1068.8 | 91.5% |
+| default | 2229 | 287 | 273 / 295 | 200 / 66 | 63 / 22 | 9.0 / 10.9 | 259.3 | 91.5% |
+| whole-i32 | 2312 | 354 | 351 / 410 | 347 / 1 | 34 / 0 | 47.8 / 47.3 | 12.6 | 91.5% |
+| coalesce4k | 2443 | 503 | 472 / 605 | 204 / 267 | 63 / 116 | 6.2 / 10.1 | 500.3 | 91.5% |
+| chunk0 | 2821 | 262 | 278 / 327 | 205 / 71 | 63 / 25 | 8.9 / 11.1 | 260.3 | 91.5% |
+| cold-np20-rr100 | 2208 | 241 | 244 / 287 | 94 / 146 | 20 / 46 | 5.7 / 7.4 | 243.2 | 86.5% |
+
+#### rtt60, Python
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 3605 | 1010 | 612 / 782 | 610 / 0 | 34 / 0 | 47.8 / 47.3 | 5.2 | 91.5% |
+| legacy | 3361 | 734 | 582 / 775 | 575 / 2 | 34 / 0 | 47.8 / 47.3 | 12.4 | 91.5% |
+| default | 2307 | 302 | 305 / 324 | 233 / 65 | 82 / 3 | 8.9 / 11.5 | 301.1 | 91.5% |
+| whole-i32 | 2359 | 343 | 345 / 436 | 338 / 2 | 34 / 0 | 47.8 / 47.3 | 12.8 | 91.5% |
+| coalesce4k | 2478 | 483 | 486 / 547 | 414 / 65 | 174 / 5 | 6.2 / 9.4 | 482.1 | 91.5% |
+| chunk0 | 2864 | 295 | 302 / 340 | 234 / 65 | 83 / 3 | 8.9 / 11.1 | 302.6 | 91.5% |
+| cold-np20-rr100 | 2255 | 260 | 241 / 297 | 163 / 71 | 50 / 10 | 5.8 / 7.7 | 243.5 | 86.5% |
+
+#### r2s3, TypeScript (Node)
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 2319 | 1305 | 1293 / 1358 | 302 / 960 | 34 / 144 | 6.2 / - | 1175.5 | 91.5% |
+| legacy | 2142 | 1276 | 1198 / 1431 | 297 / 869 | 34 / 142 | 6.2 / - | 1177.4 | 91.5% |
+| default | 1445 | 503 | 440 / 704 | 221 / 220 | 41 / 48 | 9.1 / - | 431.0 | 91.5% |
+| whole-i32 | 1747 | 719 | 686 / 823 | 681 / 1 | 34 / 0 | 47.8 / - | 14.8 | 91.5% |
+| coalesce4k | 1603 | 560 | 562 / 709 | 170 / 387 | 34 / 148 | 6.2 / - | 641.7 | 91.5% |
+| chunk0 | 1265 | 376 | 362 / 433 | 174 / 181 | 34 / 50 | 9.0 / - | 400.6 | 91.5% |
+| cold-np20-rr100 | 1335 | 312 | 376 / 469 | 159 / 174 | 22 / 34 | 5.7 / - | 359.4 | 86.5% |
+| disk-fill | 1359 | 420 | 384 / 550 | 240 / 164 | 56 / 24 | 8.9 / - | 21.9 | 91.5% |
+| disk-restart | 440 | 50 | 34 / 73 | 23 / 4 | 0 / 0 | 8.9 / - | 13.5 | 91.5% |
+
+#### r2s3, Python
+
+| config | process-cold e2e | process-cold query | slab-cold query med / p90 | slab-cold phase1 / phase2 ms | slab-cold req phase1 / phase2 | slab-cold MB SDK / proxy | warm query | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline (docs) | 1609 | 678 | 599 / 705 | 592 / 2 | 34 / 0 | 47.8 / - | 12.3 | 91.5% |
+| legacy | 1622 | 687 | 610 / 893 | 604 / 2 | 34 / 0 | 47.8 / - | 8.7 | 91.5% |
+| default | 1385 | 474 | 465 / 736 | 349 / 112 | 82 / 8 | 9.1 / - | 445.6 | 91.5% |
+| whole-i32 | 1867 | 678 | 658 / 769 | 651 / 2 | 34 / 0 | 47.8 / - | 11.6 | 91.5% |
+| coalesce4k | 1721 | 626 | 660 / 968 | 534 / 150 | 178 / 38 | 6.3 / - | 668.5 | 91.5% |
+| chunk0 | 1647 | 556 | 531 / 600 | 360 / 140 | 85 / 8 | 9.3 / - | 552.5 | 91.5% |
+| cold-np20-rr100 | 1864 | 388 | 407 / 592 | 297 / 117 | 52 / 12 | 6.3 / - | 435.8 | 86.5% |
+| disk-fill | 1820 | 553 | 504 / 653 | 366 / 123 | 86 / 6 | 9.2 / - | 16.9 | 91.5% |
+| disk-restart | 305 | 27 | 25 / 37 | 19 / 3 | 0 / 0 | 8.9 / - | 15.4 | 91.5% |
+
 ## Surprises and caveats
 
 - **`Limiter` oversubscribes (TS SDK bug).** `Limiter.run` increments `active` only after a woken waiter resumes,
   so when a slot is released and a new caller arrives in the same tick, both get in. With a slot taken and released
   without I/O, which `fetchRecords` does on a `PackedBlobStore` over S3 (`getRanges` answers null at once, then the
   single-range reads follow), a standalone reproduction reaches 24 reads in flight under a limit of 12; through the
-  proxy the pack path averaged 13.5 in flight vs 10.9 for per-object keys. Not fixed here (it changes query
-  behaviour under the baseline); the harness will show the effect of the fix.
+  proxy the pack path averaged 13.5 in flight vs 10.9 for per-object keys. Fixed in "Store-level
+  optimizations" above (a released slot is handed to the next waiter).
 - **Node's lazy `fetch` globals cost 13-18 ms** in a cold process, paid by whatever touches `Response`/`fetch`
   first. wasm-bindgen's init does `typeof Response`, so it lands in `wasmInit`. The bench takes care not to touch
   them earlier (an early `fetch` to the proxy had moved that cost out of the measurement; the TS runs were redone).
