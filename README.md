@@ -16,7 +16,8 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
 
 - **Your index is just files.** A bucket prefix holds everything: centroids, slabs, text segments, a manifest.
   Copy it, version it, sync it to a laptop, serve it from a CDN. Nothing is ever rewritten in place, so every
-  object caches forever and every query reads a consistent snapshot.
+  object caches forever and every query reads a consistent snapshot. Or pack one revision into a single file and
+  query that file anywhere, in place: `open_index("idx.threadpack")`.
 - **It runs where you already are.** The same index is read by a Worker (wasm, inside a 128 MB isolate), by Node,
   and by Python (a native extension). The TypeScript and Python SDKs share one wire format and give identical
   answers, down to the id order.
@@ -76,8 +77,9 @@ with open_index(store) as index:
     index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["A", "B"])
 ```
 
-Python reads the same bucket the Worker serves from, or a local directory holding a copy of it, with an optional
-disk cache. See [sdk/python/README.md](sdk/python/README.md).
+Python reads the same bucket the Worker serves from, a local directory holding a copy of it, or a pack
+(`open_index("/data/idx.threadpack")`), with an optional disk cache. See [sdk/python/README.md](sdk/python/README.md)
+and [docs/portability.md](docs/portability.md) for moving an index between all of these.
 
 ### Building an index
 

@@ -1,7 +1,9 @@
 // The TypeScript half of tests/test_interop.py, over the built SDK (sdk/ts/dist) and a directory store:
 //   node ts_side.mjs build <dir>   builds a format-3 generation with deltas, lexical segments and tombstones written
 //                                  by the TS SDK, and records queries and their TS results in <dir>/ts-results.json
-//   node ts_side.mjs run <dir>     answers the requests in <dir>/requests.json (written by Python) and prints them
+//   node ts_side.mjs run <dir> [store]   answers the requests in <dir>/requests.json (written by Python) against the
+//                                  index at <store> (a directory or a pack file; default <dir>) and prints them
+//   node ts_side.mjs pack <dir> <file>    packs the current revision of the index in <dir> into <file>
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,67 +11,10 @@ import { fileURLToPath } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dist = path.join(here, "../../../ts/dist");
 const { Thread, keys } = await import(path.join(dist, "index.js"));
+const { FileBlobStore, packIndexToFile, storeAt } = await import(path.join(dist, "node.js"));
 const wasmModule = new WebAssembly.Module(fs.readFileSync(path.join(dist, "wasm/thread_bg.wasm")));
 const thread = await Thread.init({ wasmModule });
 const w = thread.wasm;
-
-/** A BlobStore over a directory, the layout Python's FileBlobStore reads. */
-class DirStore {
-	constructor(root) {
-		this.root = root;
-	}
-	p(key) {
-		return path.join(this.root, ...key.split("/"));
-	}
-	etag(st) {
-		return `${st.ino.toString(16)}-${st.mtimeNs?.toString(16) ?? st.mtimeMs}-${st.size.toString(16)}`;
-	}
-	async get(key, range) {
-		let b;
-		try {
-			b = fs.readFileSync(this.p(key));
-		} catch {
-			return null;
-		}
-		const u = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-		return range ? u.slice(range.offset, range.offset + range.length) : u;
-	}
-	async getRanges(key, ranges) {
-		const b = await this.get(key);
-		return b ? ranges.map((r) => b.slice(r.offset, r.offset + r.length)) : null;
-	}
-	async head(key) {
-		try {
-			const st = fs.statSync(this.p(key), { bigint: true });
-			return { size: Number(st.size), etag: this.etag(st) };
-		} catch {
-			return null;
-		}
-	}
-	async put(key, data, opts = {}) {
-		const file = this.p(key);
-		const cur = await this.head(key);
-		if (opts.ifAbsent && cur) return null;
-		if (opts.ifMatch !== undefined && cur?.etag !== opts.ifMatch) return null;
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		const tmp = path.join(path.dirname(file), `.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`);
-		fs.writeFileSync(tmp, typeof data === "string" ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength));
-		fs.renameSync(tmp, file);
-		return this.head(key);
-	}
-	async list(prefix) {
-		const out = [];
-		const walk = (dir, rel) => {
-			for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-				const k = rel + e.name;
-				if (e.isDirectory()) walk(path.join(dir, e.name), k + "/");
-				else if (k.startsWith(prefix) && !e.name.startsWith(".")) out.push(k);
-			}
-		};
-		walk(this.root, "");
-		return out.sort();
-	}
-}
 
 function rng(seed) {
 	let s = seed >>> 0;
@@ -171,8 +116,8 @@ async function answer(index, req) {
 	throw new Error(`unknown request ${req.kind}`);
 }
 
-const [cmd, dir] = process.argv.slice(2);
-const store = new DirStore(dir);
+const [cmd, dir, extra] = process.argv.slice(2);
+const store = new FileBlobStore(dir);
 if (cmd === "build") {
 	const vectors = await buildGen(store, "gi");
 	const index = await thread.open({ store, cache: false });
@@ -199,9 +144,12 @@ if (cmd === "build") {
 	index.close();
 } else if (cmd === "run") {
 	const { requests } = JSON.parse(fs.readFileSync(path.join(dir, "requests.json"), "utf8"));
-	const index = await thread.open({ store, cache: false });
+	const index = await thread.open({ store: extra ? await storeAt(extra) : store, cache: false });
 	const results = [];
 	for (const req of requests) results.push(await answer(index, req));
 	process.stdout.write(JSON.stringify({ gen: index.gen, rev: index.rev, results }));
 	index.close();
-} else throw new Error(`usage: ts_side.mjs build|run <dir>`);
+} else if (cmd === "pack") {
+	const r = await packIndexToFile(store, extra);
+	process.stdout.write(JSON.stringify(r));
+} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | pack <dir> <file>`);

@@ -47,7 +47,7 @@ build).
 ## Pointing at the index
 
 ```python
-from thread_sdk import DiskCache, FileBlobStore, MemoryBlobStore, MemoryCache, S3BlobStore, open_index
+from thread_sdk import DiskCache, FileBlobStore, MemoryBlobStore, MemoryCache, PackedBlobStore, S3BlobStore, open_index
 
 # 1. Any S3-compatible endpoint: R2's S3 API, AWS S3, MinIO, ...
 store = S3BlobStore("https://<account>.r2.cloudflarestorage.com", "vib-bench", key_id, secret)  # region "auto"
@@ -56,8 +56,13 @@ store = S3BlobStore("https://s3.us-east-1.amazonaws.com", "bucket", key_id, secr
 
 # 2. A local directory holding the bucket's layout (a synced copy, or a local index you write to)
 store = FileBlobStore("/data/vib-bench")
+index = open_index("/data/vib-bench")                        # a path does the same
 
-# 3. Memory, or your own BlobStore subclass
+# 3. One file: a pack of one revision (see "Snapshots and packs"), on disk or as an object in a bucket
+index = open_index("/data/vib-bench-g4-rev12.threadpack")
+store = PackedBlobStore(S3BlobStore(...), "packs/g4-rev12.threadpack")
+
+# 4. Memory, or your own BlobStore subclass
 store = MemoryBlobStore()
 
 index = open_index(store)                                    # remote stores get a 256 MB MemoryCache by default
@@ -78,6 +83,9 @@ directory shared by every process that uses it and reads only the requested rang
 ## API
 
 ### `open_index(store, **options) -> ThreadIndex`
+
+`store` is a `BlobStore`, or a path: a directory holding the layout (`FileBlobStore`) or a pack file
+(`PackedBlobStore`); `store_at(path)` is the function behind that.
 
 | option | default | meaning |
 |---|---|---|
@@ -193,6 +201,32 @@ class BlobStore:
 thread-safe. `remote = True` sends reads through the thread pool (in parallel, `inflight` per query, with
 speculative phase-2 reads); local stores are read on the calling thread.
 
+Stores: `S3BlobStore`, `FileBlobStore(root)` (atomic puts, create-only via hard link, CAS under an advisory lock),
+`MemoryBlobStore`, `PrefixedBlobStore(inner, prefix)`, `PackedBlobStore(inner, key)` (the objects of a pack under
+their original keys, each read as a range of the pack; read-only; `PackedBlobStore.from_bytes(data)` for a pack in
+memory) and `CachedBlobStore(inner, cache)`. Put a cache in front of a pack, not behind it (`open_index` does).
+
+### Snapshots and packs
+
+```python
+from thread_sdk import copy_objects, pack_index, pack_to_bytes, snapshot_keys, store_at
+
+keys = snapshot_keys(index.revision)                 # every object the open revision reads, sorted
+copy_objects(src, dst)                               # everything src lists -> dst (any two stores): (copied, bytes, skipped)
+copy_objects(src, dst, ["idx/current.json", *keys])  # one consistent revision
+copy_objects(src, dst, skip_existing=True, workers=16)
+
+r = pack_index(src, "idx.threadpack", gen="g4", rev=12)   # PackResult(gen, rev, count, bytes, keys); atomic rename
+pack_index(src, sys.stdout.buffer)                        # any binary file object: streams, never seeks back
+data, r = pack_to_bytes(src)                              # the same pack in memory (small indexes)
+index = open_index("idx.threadpack")                      # queried in place; store_at(path) gives the store alone
+```
+
+`pack_index` writes `idx/current.json` (pointing at the packed revision) and then `snapshot_keys` in key order, so
+the two SDKs produce identical files for the same revision (the interop test checks). A pack is read-only:
+`copy_objects(pack, dst)` into a directory or a bucket to write on top of it. Format and rationale:
+[docs/portability.md](../../docs/portability.md).
+
 ## Threads, asyncio
 
 A `ThreadIndex` is safe to share between threads: queries, searches and writes may run concurrently. The calls
@@ -204,14 +238,16 @@ threads without deadlock.
 
 `tests/test_interop.py` has the TypeScript SDK build and update an index on disk (deltas, lexical segments,
 replacements, deletes), checks that Python returns the same answers, then writes on top from Python (upserts,
-deletes, a segment compaction) and checks that the TypeScript SDK returns what Python returns. Ids, their order,
+deletes, a segment compaction) and checks that the TypeScript SDK returns what Python returns; finally both SDKs
+pack that revision and the files must be byte-identical, each SDK answering from the other's pack. Ids, their order,
 attrs, payloads, docs, tokens, BM25 scores and fused scores agree exactly. Cosine scores agree to about 1e-7: the
 wasm build accumulates dot products in 16 SIMD lanes and the native build in 8 scalar partial sums (see
 `thread-core/src/math.rs`), so a score can differ in its last float32 ulp or two.
 
 Differences from the TypeScript API: snake_case names and keyword options; results are dataclasses (stats stay
 dicts with snake_case keys); `docs()` returns a dict; there is no wasm instance to reset (`Thread.init`,
-`withRecovery`); the Cache API is replaced by `MemoryCache` / `DiskCache`, and `FileBlobStore` is added.
+`withRecovery`); the Cache API is replaced by `MemoryCache` / `DiskCache`; `FileBlobStore` and `store_at` live in the
+package itself rather than a `thread-sdk/node` entry.
 
 ## Performance
 
@@ -232,12 +268,13 @@ keeps `inflight` reads per query in flight and scans each slab as it arrives.
 
 ```sh
 cd sdk/python && . .venv/bin/activate
-maturin develop --uv && pytest            # end to end against memory/file/S3 (local server) stores
+maturin develop --uv && pytest            # end to end against memory/file/pack/S3 (local server) stores
 (cd ../ts && npm run build)               # test_interop.py needs node and sdk/ts/dist, else it is skipped
 mypy thread_sdk
 ```
 
 Layout: `crates/thread-py` (the PyO3 bindings: dense kernels and the per-query `QueryRun` in `lib.rs`/`run.rs`, the
-lexical reader and builders in `lex.rs`), `thread_sdk/` (`index.py` the `ThreadIndex`, `query.py` the dense query
-I/O, `lex.py` the segment reader loop and BM25 across segments, `write.py` the commit protocol, `store.py` /
-`s3.py` the stores and caches, `wire.py` the manifest and object formats, `_native.pyi` the extension's types).
+lexical reader and builders in `lex.rs`), `thread_sdk/` (`index.py` the `ThreadIndex`, `revision.py` resolving and loading a
+revision and `snapshot_keys`, `query.py` the dense query I/O, `lex.py` the segment reader loop and BM25 across
+segments, `write.py` the commit protocol, `store.py` / `s3.py` the stores and caches, `pack.py` packs and
+`copy_objects`, `wire.py` the manifest and object formats, `_native.pyi` the extension's types).

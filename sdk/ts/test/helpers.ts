@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect } from "vitest";
-import { MemoryBlobStore, Thread, keys, type Manifest, type SlabRow } from "../src/index.js";
+import { MemoryBlobStore, Thread, keys, type CacheLike, type Manifest, type SlabRow } from "../src/index.js";
 
 // Node has a constructible WebAssembly.Module (the workers-types declaration is abstract, hence the cast).
 const wasmBytes = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "../src/wasm/thread_bg.wasm"));
@@ -112,3 +112,47 @@ export async function buildGen(gen: string, format: 1 | 2 | 3, opts: { dim?: num
 	return { store, vectors, dim };
 }
 
+/** A Cache API stand-in that honours single and multi-range requests like Cloudflare's cache does. */
+export class FakeCache implements CacheLike {
+	objects = new Map<string, Uint8Array>();
+	matches = 0;
+	puts = 0;
+	/** 0 = honour Range (206), 1 = ignore Range (200 full body). */
+	ignoreRange = false;
+	async match(req: Request): Promise<Response | undefined> {
+		this.matches++;
+		const body = this.objects.get(req.url);
+		if (!body) return undefined;
+		const range = req.headers.get("range");
+		if (!range || this.ignoreRange) return new Response(body.slice(), { status: 200, headers: { "content-length": String(body.byteLength) } });
+		const ranges = range
+			.replace(/^bytes=/, "")
+			.split(",")
+			.map((r) => r.trim().split("-").map(Number) as [number, number]);
+		if (ranges.length === 1) {
+			const [a, b] = ranges[0];
+			return new Response(body.slice(a, b + 1), { status: 206, headers: { "content-range": `bytes ${a}-${b}/${body.byteLength}` } });
+		}
+		const boundary = "fakeboundary42";
+		const enc = new TextEncoder();
+		const parts: Uint8Array[] = [];
+		for (const [a, b] of ranges) {
+			parts.push(enc.encode(`--${boundary}\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes ${a}-${b}/${body.byteLength}\r\n\r\n`));
+			parts.push(body.slice(a, b + 1));
+			parts.push(enc.encode("\r\n"));
+		}
+		parts.push(enc.encode(`--${boundary}--\r\n`));
+		const total = parts.reduce((x, p) => x + p.byteLength, 0);
+		const out = new Uint8Array(total);
+		let o = 0;
+		for (const p of parts) {
+			out.set(p, o);
+			o += p.byteLength;
+		}
+		return new Response(out, { status: 206, headers: { "content-type": `multipart/byteranges; boundary=${boundary}` } });
+	}
+	async put(req: Request, res: Response): Promise<void> {
+		this.puts++;
+		this.objects.set(req.url, new Uint8Array(await res.arrayBuffer()));
+	}
+}

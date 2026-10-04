@@ -78,7 +78,15 @@ const index = await thread.open({
 	}),
 });
 
-// 3. Your own BlobStore (the "local profile": a disk, a KV, a test fixture) - see "BlobStore" below
+// 3. In Node: a directory holding the layout, or a single pack file (see "BlobStore" and docs/portability.md)
+import { storeAt } from "thread-sdk/node";
+const index = await thread.open({ store: await storeAt("/data/idx") });
+const index = await thread.open({ store: await storeAt("/data/idx-g4-rev12.threadpack") });
+
+// 4. A pack kept in a bucket, read by range requests, from a Worker or anywhere
+const index = await thread.open({ store: await PackedBlobStore.open(new R2BlobStore(env.BUCKET), "packs/g4.threadpack") });
+
+// 5. Your own BlobStore (a KV, a test fixture) - see "BlobStore" below
 const index = await thread.open({ store: new MemoryBlobStore() });
 ```
 
@@ -251,9 +259,36 @@ interface BlobStore {
   the local winners' rerank records, so phase 2 costs nothing for that slab.
 - `MemoryBlobStore()`: a Map, with etags and conditions (tests, tiny local indexes).
 - `PrefixedBlobStore(inner, prefix)`: what `open({ prefix })` wraps.
+- `PackedBlobStore.open(inner, key)`: the objects of a pack (one file holding a whole snapshot) under their
+  original keys, each read as a range of the pack. Read-only. `PackedBlobStore.fromBytes(bytes)` for a pack in
+  memory. Put a cache in front of it, not behind it (`open` does).
+- From `thread-sdk/node` (Node only): `FileBlobStore(root)`, an index in a directory (the layout Python's
+  `FileBlobStore` reads and writes; atomic puts, create-only via hard link, CAS under a lock directory);
+  `storeAt(path)`, a `FileBlobStore` for a directory or a `PackedBlobStore` for a pack file;
+  `packIndexToFile(store, file, { gen?, rev? })`.
 
 A store may return views into a larger buffer (the whole object on a miss); the SDK detects that for slab
 prefixes and uses the rest of the object instead of re-reading it.
+
+### Snapshots and packs
+
+```ts
+import { copyObjects, packIndex, packToBytes, snapshotKeys, MemorySink } from "thread-sdk";
+import { FileBlobStore, packIndexToFile, storeAt } from "thread-sdk/node";
+
+const keys = snapshotKeys(index.revision);                       // every object the open revision reads, sorted
+await copyObjects(src, dst);                                      // everything src lists -> dst (any two stores)
+await copyObjects(src, dst, ["idx/current.json", ...keys]);       // one consistent revision
+await copyObjects(src, dst, undefined, { skipExisting: true, concurrency: 16 });
+
+const r = await packIndexToFile(src, "idx.threadpack", { gen: "g4", rev: 12 });   // { gen, rev, count, bytes, keys }
+const { bytes } = await packToBytes(src);                         // the same pack in memory (small indexes)
+await packIndex(src, sink);                                       // any PackSink: { write(bytes) }
+```
+
+`packIndex` writes `idx/current.json` (pointing at the packed revision) and then `snapshotKeys` in key order, so
+the two SDKs produce identical files for the same revision. A pack is read-only: `copyObjects(pack, dst)` into a
+directory or a bucket to write on top of it. Format and rationale: [docs/portability.md](../../docs/portability.md).
 
 ## Memory and limits
 
@@ -313,7 +348,7 @@ prefixes and uses the rest of the object instead of re-reading it.
 ```sh
 npm install
 npm run sync-wasm      # copy crates/thread-wasm/pkg/{thread.js,thread.d.ts,thread_bg.wasm,...} into src/wasm
-npm test               # vitest: wire formats, stores, SigV4, end-to-end with the wasm in Node
+npm test               # vitest: wire formats, stores, packs, the Node file store, SigV4, end-to-end with the wasm in Node
 npm run build          # dist/ (tsc + wasm assets)
 cd examples/basic && npm install && cf deploy --secrets-file .env.secrets
 node scripts/verify.mjs --n 50 --nprobe 34 --rerank 150    # compare the example with the main Worker
