@@ -181,8 +181,9 @@ class ThreadIndex:
             warm = (WarmPrefixStore(store), got)
             store = warm[0]
         timeline: dict[str, Any] = {}
-        g, r = resolve_target(store, gen, rev, timeline)
-        state = load_rev_state(store, g, r, timeline)
+        inline: dict[str, Any] = {}
+        g, r = resolve_target(store, gen, rev, timeline, inline)
+        state = load_rev_state(store, g, r, timeline, inline.get("manifest"))
         ix = cls(store, state, gen=gen, pinned=gen is not None and rev is not None, refresh_interval=refresh_interval,
                  delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
                  job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)))
@@ -305,11 +306,12 @@ class ThreadIndex:
         if self._pinned:
             return False
         with self._refresh_lock:
-            g, r = resolve_target(self.store, self._gen_opt, None)
+            inline: dict[str, Any] = {}
+            g, r = resolve_target(self.store, self._gen_opt, None, None, inline)
             self._last_check = time.monotonic()
             if g == self._rev.gen and r == self._rev.rev:
                 return False
-            self.use_revision(g, r)
+            self.use_revision(g, r, inline.get("manifest"))
             return True
 
     def _maybe_refresh(self) -> None:
@@ -319,9 +321,10 @@ class ThreadIndex:
             except Exception as e:  # noqa: BLE001 - a failed refresh keeps the current revision
                 log.error("thread_sdk: refresh failed: %s", e)
 
-    def use_revision(self, gen: str, rev: int) -> None:
-        """Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists."""
-        nxt = load_rev_state(self.store, gen, rev)
+    def use_revision(self, gen: str, rev: int, manifest: dict[str, Any] | None = None) -> None:
+        """Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. `manifest`: its
+        manifest when already known (an inline copy in `idx/current.json`), saving the GET."""
+        nxt = load_rev_state(self.store, gen, rev, None, manifest)
         with self._lock:
             self._rev = nxt
             if self.warm is not None:

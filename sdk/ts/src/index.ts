@@ -283,7 +283,7 @@ export class ThreadIndex {
 		}
 		const tl: RevTimeline = {};
 		const target = await resolveTarget(store, opts.gen, opts.rev, tl);
-		const rev = await loadRevState(store, target.gen, target.rev, tl);
+		const rev = await loadRevState(store, target.gen, target.rev, tl, target.manifest);
 		const ix = new ThreadIndex(thread, store, rev, opts);
 		if (warm) ix.startWarm(warm.layer, warm.got, opts.warmPack!, t0);
 		const loaded: { stat?: BaseStat } = {};
@@ -347,7 +347,7 @@ export class ThreadIndex {
 			const t = await resolveTarget(this.store, this.opts.gen, undefined);
 			this.lastCheck = Date.now();
 			if (t.gen === this.revState.gen && t.rev === this.revState.rev) return false;
-			await this.useRevision(t.gen, t.rev);
+			await this.useRevision(t.gen, t.rev, t.manifest);
 			return true;
 		})();
 		this.refreshing = p;
@@ -380,9 +380,12 @@ export class ThreadIndex {
 		this.opts.waitUntil?.(this.warmReady);
 	}
 
-	/** Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. */
-	async useRevision(gen: string, rev: number): Promise<void> {
-		const next = await loadRevState(this.store, gen, rev);
+	/**
+	 * Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. `manifest`: its
+	 * manifest when already known (an inline copy in `idx/current.json`), saving the GET.
+	 */
+	async useRevision(gen: string, rev: number, manifest?: Manifest): Promise<void> {
+		const next = await loadRevState(this.store, gen, rev, undefined, manifest);
 		this.revState = next;
 		if (this.warm) {
 			const current = revisionSlabKeys(next);

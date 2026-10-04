@@ -37,6 +37,10 @@ __all__ = [
     "keys",
     "manifest_files",
     "parse_current",
+    "parse_current_full",
+    "current_body",
+    "check_manifest",
+    "INLINE_MANIFEST_MAX",
     "parse_manifest",
     "parse_slabs_table",
     "has_dense",
@@ -326,8 +330,24 @@ def decode_json(b: BytesLike) -> Any:
     return json.loads(bytes(b).decode("utf-8"))
 
 
-def parse_current(b: BytesLike) -> tuple[str, int]:
-    """Parses `idx/current.json` into `(gen, rev)`; a pointer without `rev` (older publishes) means rev 0."""
+#: Largest manifest (serialized, UTF-8 bytes) the writers copy into `idx/current.json`; the pointer is re-read every
+#: 30 s.
+INLINE_MANIFEST_MAX = 16 * 1024
+
+
+def current_body(gen: str, rev: int, manifest: dict[str, Any] | None = None) -> str:
+    """The body of `idx/current.json` for (gen, rev): with an inline copy of `manifest` when it is small enough (an open
+    then skips the manifest GET). The TypeScript SDK's `currentBody` writes the same bytes."""
+    if manifest is not None:
+        m = dumps(manifest)
+        if len(m.encode("utf-8")) <= INLINE_MANIFEST_MAX:
+            return f'{{"gen":{dumps(gen)},"rev":{rev},"manifest":{m}}}'
+    return dumps({"gen": gen, "rev": rev})
+
+
+def parse_current_full(b: BytesLike) -> tuple[str, int, dict[str, Any] | None]:
+    """`parse_current` plus the inline manifest copy when `current.json` carries one for (gen, rev) that checks out
+    (else None: the reader fetches the manifest)."""
     j = decode_json(b)
     gen = j.get("gen") if isinstance(j, dict) else None
     if not isinstance(gen, str) or not gen:
@@ -335,7 +355,20 @@ def parse_current(b: BytesLike) -> tuple[str, int]:
     rev = j.get("rev", 0)
     if not _is_int(rev) or rev < 0:
         raise ThreadError(f"current.json has a bad rev {rev!r}")
-    return gen, int(rev)
+    m = j.get("manifest")
+    inline = None
+    if isinstance(m, dict):
+        try:
+            inline = check_manifest(m, gen, int(rev))
+        except ThreadError:
+            inline = None
+    return gen, int(rev), inline
+
+
+def parse_current(b: BytesLike) -> tuple[str, int]:
+    """Parses `idx/current.json` into `(gen, rev)`; a pointer without `rev` (older publishes) means rev 0."""
+    gen, rev, _ = parse_current_full(b)
+    return gen, rev
 
 
 def has_dense(m: dict[str, Any]) -> bool:
@@ -345,7 +378,11 @@ def has_dense(m: dict[str, Any]) -> bool:
 
 def parse_manifest(b: BytesLike, gen: str, rev: int) -> dict[str, Any]:
     """Parses a manifest and checks it is for `gen`; fills `rev` (absent in rev-0 manifests)."""
-    m = decode_json(b)
+    return check_manifest(decode_json(b), gen, rev)
+
+
+def check_manifest(m: Any, gen: str, rev: int) -> dict[str, Any]:
+    """Checks a parsed manifest is for (gen, rev); fills `rev` (absent in rev-0 manifests)."""
     if not isinstance(m, dict) or m.get("gen") != gen:
         raise ThreadError(f"manifest for {gen} rev {rev} is for generation {m.get('gen') if isinstance(m, dict) else None}")
     for f in ("k1", "k2", "dim", "vectors"):

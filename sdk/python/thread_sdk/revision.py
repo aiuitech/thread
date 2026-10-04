@@ -18,7 +18,7 @@ from .wire import (
     keys,
     manifest_files,
     manifest_rev_of_key,
-    parse_current,
+    parse_current_full,
     parse_manifest,
     parse_slabs_table,
     slab_rev_of,
@@ -69,10 +69,11 @@ def head_revision(store: BlobStore, gen: str, trace: BlobTrace | None = None) ->
 
 
 def resolve_target(store: BlobStore, gen: str | None = None, rev: int | None = None,
-                   timeline: dict[str, Any] | None = None) -> tuple[str, int]:
+                   timeline: dict[str, Any] | None = None, inline: dict[str, Any] | None = None) -> tuple[str, int]:
     """The (gen, rev) to read: both given; `gen` alone at its head (current.json's rev when it names that
     generation, else the newest manifest in the store); else `idx/current.json` (rev absent = 0). With `timeline`,
-    records the step as `timeline["current"]` (see `load_rev_state`)."""
+    records the step as `timeline["current"]` (see `load_rev_state`). With `inline` (a dict), sets
+    `inline["manifest"]` to the manifest of the returned (gen, rev) when `current.json` carries a copy of it."""
     with _timed(timeline, "current") as trace:
         if gen is not None and rev is not None:
             return gen, rev
@@ -81,21 +82,27 @@ def resolve_target(store: BlobStore, gen: str | None = None, rev: int | None = N
             if gen is None:
                 raise ThreadError("no published index (idx/current.json missing)", 404)
             return gen, head_revision(store, gen, trace)
-        cgen, crev = parse_current(cur)
+        cgen, crev, manifest = parse_current_full(cur)
         if gen is None or gen == cgen:
-            return cgen, rev if rev is not None else crev
+            r = rev if rev is not None else crev
+            if inline is not None and manifest is not None and r == crev:
+                inline["manifest"] = manifest
+            return cgen, r
         return gen, head_revision(store, gen, trace)
 
 
-def load_rev_state(store: BlobStore, gen: str, rev: int, timeline: dict[str, Any] | None = None) -> RevState:
+def load_rev_state(store: BlobStore, gen: str, rev: int, timeline: dict[str, Any] | None = None,
+                   manifest: dict[str, Any] | None = None) -> RevState:
     """Loads a revision: manifest, slabs table, tombstone sets. With `timeline`, records the wall time and store work
     of each step (`phase_stat`) as `timeline["manifest"]` and `timeline["slabs"]` (the slabs table and the tombstone
-    sets)."""
+    sets). `manifest`: the manifest when `idx/current.json` carried it (see `resolve_target`'s `inline`); used instead
+    of a GET when it is for (gen, rev)."""
     with _timed(timeline, "manifest") as trace:
-        mb = store.get(keys.manifest(gen, rev), trace=trace)
-        if mb is None:
-            raise ThreadError(f"no manifest {keys.manifest(gen, rev)}", 404)
-        manifest = parse_manifest(mb, gen, rev)
+        if manifest is None or manifest.get("gen") != gen or manifest.get("rev", 0) != rev:
+            mb = store.get(keys.manifest(gen, rev), trace=trace)
+            if mb is None:
+                raise ThreadError(f"no manifest {keys.manifest(gen, rev)}", 404)
+            manifest = parse_manifest(mb, gen, rev)
     files = manifest_files(manifest)
     fmt = manifest.get("format") or 1
     cells = manifest["k1"] * manifest["k2"]

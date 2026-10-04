@@ -22,6 +22,7 @@ from . import _native
 from .store import BlobStore, unique_suffix
 from .wire import (
     ThreadError,
+    current_body,
     build_tomb_state,
     dumps,
     has_dense,
@@ -154,13 +155,14 @@ def _read_current(store: BlobStore) -> tuple[tuple[str, int], str] | None:
     return parse_current(b), h.etag
 
 
-def _advance_current(store: BlobStore, gen: str, rev: int) -> tuple[bool, int]:
+def _advance_current(store: BlobStore, gen: str, rev: int, manifest: dict[str, Any] | None = None) -> tuple[bool, int]:
     """Moves idx/current.json forward to (gen, rev) with a CAS loop; leaves it alone if it names another generation
-    or a newer rev. Returns (updated, conflicts)."""
+    or a newer rev. Returns (updated, conflicts). The pointer carries a copy of `manifest` (when small), so an open
+    skips one GET."""
     conflicts = 0
+    body = current_body(gen, rev, manifest)
     for _ in range(10):
         r = _read_current(store)
-        body = dumps({"gen": gen, "rev": rev})
         if r is None:
             if _put_if_absent(store, keys.current(), body, "application/json"):
                 return True, conflicts
@@ -223,7 +225,7 @@ def _commit_rev(ctx: WriterContext, make: Callable[[int, dict[str, Any], dict[st
         body = dumps(manifest)
         key = keys.manifest(gen, rev)
         if _put_if_absent(store, key, body, "application/json"):
-            updated, cas = _advance_current(store, gen, rev)
+            updated, cas = _advance_current(store, gen, rev, manifest)
             return _Commit(rev, manifest, key, len(body.encode("utf-8")), conflicts, cas, updated)
         conflicts += 1
         use_list = True
@@ -618,7 +620,7 @@ def create_lexical_generation(store: BlobStore, gen: str, lex: dict[str, Any] | 
         raise ThreadError(f"generation {gen} already exists", 409)
     if set_current:
         cur = _read_current(store)
-        body = dumps({"gen": gen, "rev": 0})
+        body = current_body(gen, 0, manifest)
         if cur is None:
             _put_if_absent(store, keys.current(), body, "application/json")
         else:

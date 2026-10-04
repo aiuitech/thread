@@ -94,7 +94,10 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 		expect(a.rev).toBe(1);
 		expect(a.manifest.deltas?.length).toBe(1);
 		expect(a.manifest.tombstones?.length).toBe(1);
-		expect(JSON.parse(new TextDecoder().decode((await b.store.get(keys.current()))!))).toEqual({ gen: "gu", rev: 1 });
+		// the pointer carries a copy of the manifest it names
+		const cur = JSON.parse(new TextDecoder().decode((await b.store.get(keys.current()))!));
+		expect(cur).toMatchObject({ gen: "gu", rev: 1 });
+		expect(cur.manifest).toEqual(JSON.parse(new TextDecoder().decode((await b.store.get(keys.manifest("gu", 1)))!)));
 		const q1 = await a.query(fresh.subarray(0, 16), { topK: 3, returnPayload: true });
 		expect(q1.hits[0]).toMatchObject({ id: 1000, source: "delta", attrs: 5 });
 		expect(new TextDecoder().decode(q1.hits[0].payload)).toBe("p-1000");

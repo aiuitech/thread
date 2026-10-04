@@ -10,7 +10,7 @@ import { asF32 } from "./index.js";
 import { safeFree } from "./query.js";
 import type { BlobStore } from "./store.js";
 import type * as W from "./wasm/thread.js";
-import { buildTombState, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
+import { buildTombState, currentBody, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
 
 export interface UpsertInput {
 	ids: ArrayLike<number>;
@@ -146,11 +146,12 @@ async function readCurrent(store: BlobStore): Promise<{ cur: CurrentPointer; eta
 }
 
 /** Moves idx/current.json forward to (gen, rev) with a CAS loop; leaves it alone if it names another generation or a newer rev. */
-async function advanceCurrent(store: BlobStore, gen: string, rev: number): Promise<{ updated: boolean; conflicts: number }> {
+async function advanceCurrent(store: BlobStore, gen: string, rev: number, manifest?: Manifest): Promise<{ updated: boolean; conflicts: number }> {
 	let conflicts = 0;
+	// The pointer carries a copy of the manifest it names (when small), so an open skips one GET.
+	const body = currentBody(gen, rev, manifest);
 	for (let attempt = 0; attempt < 10; attempt++) {
 		const r = await readCurrent(store);
-		const body = JSON.stringify({ gen, rev });
 		if (!r) {
 			if (await putIfAbsent(store, keys.current(), body, "application/json")) return { updated: true, conflicts };
 		} else {
@@ -208,7 +209,7 @@ async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifes
 		const body = JSON.stringify(manifest);
 		const key = keys.manifest(gen, rev);
 		if (await putIfAbsent(store, key, body, "application/json")) {
-			const c = await advanceCurrent(store, gen, rev);
+			const c = await advanceCurrent(store, gen, rev, manifest);
 			return { rev, manifest, manifestKey: key, manifestBytes: body.length, conflicts, casConflicts: c.conflicts, currentUpdated: c.updated };
 		}
 		conflicts++;
@@ -538,7 +539,7 @@ export async function createLexicalGeneration(opts: CreateLexicalOptions): Promi
 	if (!(await putIfAbsent(store, keys.manifest(gen, 0), JSON.stringify(manifest), "application/json"))) throw new ThreadError(`generation ${gen} already exists`, 409);
 	if (opts.setCurrent !== false) {
 		const cur = await readCurrent(store);
-		const body = JSON.stringify({ gen, rev: 0 });
+		const body = currentBody(gen, 0, manifest);
 		if (!cur) await putIfAbsent(store, keys.current(), body, "application/json");
 		else await writable(store).put(keys.current(), body, { ifMatch: cur.etag, contentType: "application/json" });
 	}
