@@ -22,7 +22,7 @@ classifiers = [
 test = ["pytest>=8"]
 
 [tool.maturin]
-manifest-path = "../crates/thread-py/Cargo.toml"
+manifest-path = "../../crates/thread-py/Cargo.toml"
 module-name = "thread_sdk._native"
 python-source = "."
 python-packages = ["thread_sdk"]

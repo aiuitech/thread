@@ -1,6 +1,6 @@
 # thread-sdk
 
-Query and update a [thread](../README.md) blob-native search index from a Cloudflare Worker: dense vectors (the
+Query and update a [thread](../../README.md) blob-native search index from a Cloudflare Worker: dense vectors (the
 IVF slabs), BM25 text (lexical segments), or both fused by rank, with one document store for the hits. The index
 lives as immutable objects in R2 (or any S3-compatible store); the SDK streams the probed slabs and the queried
 posting lists through the Rust/wasm kernels, like a Vectorize binding but with the index in your own bucket,
@@ -160,7 +160,7 @@ with `rerank: 0` they are scan-tier (4-bit or PQ) estimates.
 
 ### `index.search(request): Promise<SearchResult>`
 
-Text, vector or both (see [docs/lexical.md](../docs/lexical.md)). A text needs `manifest.lex` (`configureLexical`),
+Text, vector or both (see [docs/lexical.md](../../docs/lexical.md)). A text needs `manifest.lex` (`configureLexical`),
 a vector a dense generation.
 
 | field | default | meaning |
@@ -218,7 +218,7 @@ await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   /
 `bucketTerms`, `docs`, `text`, `bucketDocs`, `defaults: {rrfK, recallK, weights}`; see docs/lexical.md for what
 each one trades.
 
-Implemented against [docs/update-path.md](../docs/update-path.md): an upsert encodes one delta segment
+Implemented against [docs/update-path.md](../../docs/update-path.md): an upsert encodes one delta segment
 (`DeltaJob`: primary cell + residual codes, PQ codes with the generation's codebook) and, unless
 `replace: false`, a tombstone set of its ids (`tombstones_merge`), then commits manifest `rev + 1` with a
 create-only put (`manifest.{rev+1}.json`, the writer lock; a lost race rebuilds on the new head and reuses the

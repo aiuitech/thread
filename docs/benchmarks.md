@@ -89,4 +89,4 @@ is g1 with flat routing. g2's spread reflects Worker-side improvements made whil
 SDK: `thread-sdk` returns identical top-10 to the Worker (300/300 via the R2 binding, 50/50 via the S3-compatible store against R2's S3 endpoint); cold S3-store query 457 ms with 15 signed origin reads, warm 93 ms.
 
 Sources: `data/bench-*.txt`, `data/diagnosis-g1.md`, `data/quant-experiment.md`,
-`sdk/VERIFICATION.md`.
+`sdk/ts/VERIFICATION.md`.

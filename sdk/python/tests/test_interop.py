@@ -1,4 +1,4 @@
-"""Cross-implementation check against the TypeScript SDK (needs `node` and a built `sdk/dist`, else skipped):
+"""Cross-implementation check against the TypeScript SDK (needs `node` and a built `sdk/ts/dist`, else skipped):
 
 1. the TS SDK builds a generation on disk and writes to it (deltas, lexical segments, replacements, deletes); Python
    opens the same directory and must return the TS results for every recorded query;
@@ -25,10 +25,10 @@ from helpers import rng, unit_rows
 
 HERE = Path(__file__).parent
 SCRIPT = HERE / "interop" / "ts_side.mjs"
-DIST = HERE.parent.parent / "sdk" / "dist" / "index.js"
+DIST = HERE.parent.parent / "ts" / "dist" / "index.js"
 
 pytestmark = pytest.mark.skipif(shutil.which("node") is None or not DIST.exists(),
-                                reason="needs node and a built sdk/dist (cd sdk && npm run build)")
+                                reason="needs node and a built sdk/ts/dist (cd sdk/ts && npm run build)")
 
 
 def node(cmd: str, d: Path) -> str:

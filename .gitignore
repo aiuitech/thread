@@ -1,8 +1,8 @@
 /data/
 /.venv/
-/python/.venv/
-/python/thread_sdk/*.so
-/python/thread_sdk/*.pyd
+/sdk/python/.venv/
+/sdk/python/thread_sdk/*.so
+/sdk/python/thread_sdk/*.pyd
 .pytest_cache/
 .mypy_cache/
 target/
@@ -11,7 +11,7 @@ node_modules/
 dist/
 build/
 build-bundle/
-/sdk/src/wasm/
+/sdk/ts/src/wasm/
 .cloudflare/
 .wrangler/
 .cache/

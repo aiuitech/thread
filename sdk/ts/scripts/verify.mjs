@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Verifies the deployed SDK example against the reference Worker and the dataset ground truth.
- *   node sdk/scripts/verify.mjs [--n 50] [--nprobe 34] [--rerank 150] [--k 10] [--store r2|s3] [--example URL] [--main URL]
+ *   node sdk/ts/scripts/verify.mjs [--n 50] [--nprobe 34] [--rerank 150] [--k 10] [--store r2|s3] [--example URL] [--main URL]
  * For each of the first n queries of data/prep/queries.f32 it POSTs the vector to the example's /search (JSON) and
  * to the main Worker's /query (octet-stream) with the same nprobe/rerank, then compares the top-k id sets, the
  * recall@k of each against data/prep/groundtruth.u32 and the client latencies. Tokens: worker/.env.secrets
@@ -10,7 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../..");
+const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../..");
 const args = Object.fromEntries(process.argv.slice(2).map((a, i, all) => (a.startsWith("--") ? [a.slice(2), all[i + 1] && !all[i + 1].startsWith("--") ? all[i + 1] : "true"] : null)).filter(Boolean));
 const N = Number(args.n ?? 50);
 const k = Number(args.k ?? 10);

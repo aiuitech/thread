@@ -4,7 +4,7 @@ thread searches by vector (the IVF index of `README.md`) and by text (BM25), ove
 lists. This document is the design of the text side and of the document store: what the objects hold, how a query
 reads them from blob storage, how updates and compaction work, and which knobs trade index size for query speed.
 The code is `crates/thread-core/src/{source,container,tokenize,lex,docs,segment,fusion,excerpts,rerank}.rs`, the
-bindings `crates/thread-wasm/src/lex.rs`, the host side `sdk/src/{lex,fusion,write,index}.ts`, and the native CLI
+bindings `crates/thread-wasm/src/lex.rs`, the host side `sdk/ts/src/{lex,fusion,write,index}.ts`, and the native CLI
 `crates/thread-cli/src/lex_cli.rs`.
 
 It is a port and reshaping of Wiper's `thread` engine (`../wiper/rust/thread`), which held BM25 postings, a
@@ -142,7 +142,7 @@ in one or two more. Transient bytes are evicted from the wasm reader once they e
 the resident parts are a few KB per segment (20k documents: 2.5 KB terms directory + 2.5 KB docs directory).
 
 The dense query and the lexical query run concurrently at depth `recallK`; the two id lists are fused with
-Reciprocal Rank Fusion (`score = Σ weight / (rrfK + rank)`, float64, ties by id; `fusion.rs` and `sdk/src/fusion.ts`
+Reciprocal Rank Fusion (`score = Σ weight / (rrfK + rank)`, float64, ties by id; `fusion.rs` and `sdk/ts/src/fusion.ts`
 compute identical sums) and the top k is resolved through `docs` when asked. Each hit reports its rank and score in
 each list it appeared in.
 

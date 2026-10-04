@@ -6,7 +6,7 @@
 #       target/wasm32-unknown-unknown/release/thread_wasm.wasm
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
-src="${1:-$here/../worker/pkg}"
+src="${1:-$here/../../worker/pkg}"
 dst="$here/src/wasm"
 mkdir -p "$dst"
 for f in thread.js thread.d.ts thread_bg.wasm thread_bg.wasm.d.ts; do

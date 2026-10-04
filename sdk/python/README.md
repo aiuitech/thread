@@ -1,9 +1,9 @@
 # thread-sdk (Python)
 
-Query and update a [thread](../README.md) blob-native search index from Python: dense vectors (the IVF slabs),
+Query and update a [thread](../../README.md) blob-native search index from Python: dense vectors (the IVF slabs),
 BM25 text (lexical segments), or both fused by rank, with one document store for the hits. The index lives as
 immutable objects in R2, any S3-compatible store or a local directory. It is the same index and wire format the
-Worker and the [TypeScript SDK](../sdk/README.md) read and write, and the numeric kernels are the same Rust code
+Worker and the [TypeScript SDK](../ts/README.md) read and write, and the numeric kernels are the same Rust code
 (`crates/thread-core`), compiled as a native extension.
 
 ```python
@@ -25,10 +25,10 @@ pip install thread-sdk            # once published: one abi3 wheel per platform,
 No runtime dependencies (the S3 client and SigV4 signing use the standard library). From a checkout:
 
 ```sh
-cd python
+cd sdk/python
 uv venv .venv && . .venv/bin/activate && uv pip install maturin pytest
 maturin develop --uv              # builds crates/thread-py into thread_sdk/_native (profile `python`)
-maturin build                     # a wheel in ../target/wheels
+maturin build                     # a wheel in ../../target/wheels
 ```
 
 The extension is built with the workspace's `python` cargo profile: `release` with `panic = "unwind"`, so a Rust
@@ -128,7 +128,7 @@ class QueryResult:
 
 ### `index.search(text=None, vector=None, **options) -> SearchResult`
 
-Text, vector or both (see [docs/lexical.md](../docs/lexical.md)): the dense list and the BM25 list run
+Text, vector or both (see [docs/lexical.md](../../docs/lexical.md)): the dense list and the BM25 list run
 concurrently at depth `recall_k` and are fused with Reciprocal Rank Fusion; a single list is returned as is.
 
 | option | default | meaning |
@@ -231,9 +231,9 @@ keeps `inflight` reads per query in flight and scans each slab as it arrives.
 ## Development
 
 ```sh
-cd python && . .venv/bin/activate
+cd sdk/python && . .venv/bin/activate
 maturin develop --uv && pytest            # end to end against memory/file/S3 (local server) stores
-(cd ../sdk && npm run build)              # test_interop.py needs node and sdk/dist, else it is skipped
+(cd ../ts && npm run build)               # test_interop.py needs node and sdk/ts/dist, else it is skipped
 mypy thread_sdk
 ```
 

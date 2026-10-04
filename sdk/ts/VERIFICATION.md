@@ -7,8 +7,8 @@ compaction). Queries: the first n vectors of `data/prep/queries.f32`; ground tru
 
 ## SDK example (R2 binding) vs the reference Worker
 
-Example Worker `vib-sdk-example` (`sdk/examples/basic`, `POST /search`, JSON body, store `r2`) against the
-main Worker `vib-bench` (`POST /query?nprobe=34&rerank=150`, octet-stream body). `node sdk/scripts/verify.mjs`
+Example Worker `vib-sdk-example` (`sdk/ts/examples/basic`, `POST /search`, JSON body, store `r2`) against the
+main Worker `vib-bench` (`POST /query?nprobe=34&rerank=150`, octet-stream body). `node sdk/ts/scripts/verify.mjs`
 sends each query to both, after one warm-up pass so both have the slabs in their edge cache; latencies are
 client-observed from a laptop, sequential, one request to each Worker at a time.
 
@@ -32,10 +32,10 @@ client-observed from a laptop, sequential, one request to each Worker at a time.
 Commands:
 
 ```sh
-cd sdk && npm test && npm run build
+cd sdk/ts && npm test && npm run build
 cd examples/basic && npm install && cf deploy --secrets-file .env.secrets
-node sdk/scripts/verify.mjs --n 50 --nprobe 34 --rerank 150
-node sdk/scripts/verify.mjs --n 300 --nprobe 34 --rerank 150
+node sdk/ts/scripts/verify.mjs --n 50 --nprobe 34 --rerank 150
+node sdk/ts/scripts/verify.mjs --n 300 --nprobe 34 --rerank 150
 ```
 
 ## S3 path (`S3BlobStore`)
@@ -61,8 +61,8 @@ What was verified instead:
 
 To run the S3 verification once a token exists: put `S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com`,
 `S3_BUCKET=vib-bench`, `S3_ACCESS_KEY_ID=...`, `S3_SECRET_ACCESS_KEY=...` into
-`sdk/examples/basic/.env.secrets`, redeploy (`cf deploy --secrets-file .env.secrets`), then
-`node sdk/scripts/verify.mjs --n 50 --store s3` and compare with the `--store r2` run above. Expected
+`sdk/ts/examples/basic/.env.secrets`, redeploy (`cf deploy --secrets-file .env.secrets`), then
+`node sdk/ts/scripts/verify.mjs --n 50 --store s3` and compare with the `--store r2` run above. Expected
 differences: the same ids (the store does not affect scoring); cold queries slower (TLS + SigV4 + 34 single
 GETs instead of binding reads); warm queries identical (everything is served by the Cache API in both cases).
 Conditional PUT behaviour of R2's S3 API (`If-Match` on PutObject) is documented by Cloudflare but was not
@@ -92,7 +92,7 @@ exercised here; until it is, use the R2 binding for writers.
 Credentials: a dedicated R2 API token (object read/write on `vib-bench`) supplied by the owner in
 `examples/basic/.env.secrets`; `S3_ENDPOINT=https://<account-id>.r2.cloudflarestorage.com`, region `auto`.
 
-- `node sdk/scripts/verify.mjs --n 50 --store s3 --nprobe 34 --rerank 150` (g4 rev 103): 50/50 identical
+- `node sdk/ts/scripts/verify.mjs --n 50 --store s3 --nprobe 34 --rerank 150` (g4 rev 103): 50/50 identical
   top-10 vs the main Worker, recall@10 93.40% = main, client p50 74 ms (warm pass; all reads served from the
   per-store edge cache, which the warm pass filled through the S3 store).
 - Cold query through the S3 store (fresh query vector, empty per-store cache): HTTP 200, 15 origin reads

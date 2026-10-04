@@ -1,4 +1,4 @@
-// The TypeScript half of tests/test_interop.py, over the built SDK (sdk/dist) and a directory store:
+// The TypeScript half of tests/test_interop.py, over the built SDK (sdk/ts/dist) and a directory store:
 //   node ts_side.mjs build <dir>   builds a format-3 generation with deltas, lexical segments and tombstones written
 //                                  by the TS SDK, and records queries and their TS results in <dir>/ts-results.json
 //   node ts_side.mjs run <dir>     answers the requests in <dir>/requests.json (written by Python) and prints them
@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const dist = path.join(here, "../../../sdk/dist");
+const dist = path.join(here, "../../../ts/dist");
 const { Thread, keys } = await import(path.join(dist, "index.js"));
 const wasmModule = new WebAssembly.Module(fs.readFileSync(path.join(dist, "wasm/thread_bg.wasm")));
 const thread = await Thread.init({ wasmModule });
