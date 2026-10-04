@@ -4,8 +4,11 @@
  * PUT and conditional PUT (`If-None-Match: *` for create-only, `If-Match` for compare-and-swap) and
  * ListObjectsV2. S3 has no multi-range GET, so `getRanges` is not implemented: the SDK issues one request
  * per rerank range (put a `CachedBlobStore` in front for multi-range reads from the edge cache).
+ *
+ * Signing costs one SHA-256 and one HMAC per request: the derived signing key of each (date, region, service) is
+ * imported once as an HMAC `CryptoKey` and reused (`SigningKeyCache`).
  */
-import type { BlobHead, BlobRange, BlobStore, GetOptions, PutOptions } from "./store.js";
+import { inWorkers, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PutOptions } from "./store.js";
 import { ThreadError } from "./wire.js";
 
 export interface S3BlobStoreOptions {
@@ -26,14 +29,64 @@ export interface S3BlobStoreOptions {
 	retries?: number;
 	/** Clock override for tests (ms since epoch). */
 	now?: () => number;
+	/**
+	 * Reads in flight per query (a query's `inflight` default): 32 in Node and other runtimes without a connection
+	 * cap, 6 inside a Worker (the Workers limit of simultaneous open connections per request).
+	 */
+	inflight?: number;
+	/** Phase-2 range merging defaults for queries (`QueryOptions.coalesceBytes` / `spanBytes`). */
+	coalesceBytes?: number;
+	spanBytes?: number;
 }
 
+/** Reads in flight per query against S3 directly: no connection cap outside Workers, 6 inside. */
+export const S3_INFLIGHT = 32;
+export const S3_INFLIGHT_WORKERS = 6;
+
 const enc = new TextEncoder();
-const hex = (b: ArrayBuffer | Uint8Array): string => Array.from(b instanceof Uint8Array ? b : new Uint8Array(b), (x) => x.toString(16).padStart(2, "0")).join("");
+const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
+const hex = (b: ArrayBuffer | Uint8Array): string => {
+	const u = b instanceof Uint8Array ? b : new Uint8Array(b);
+	let s = "";
+	for (let i = 0; i < u.length; i++) s += HEX[u[i]];
+	return s;
+};
 const sha256 = async (data: Uint8Array | string): Promise<string> => hex(await crypto.subtle.digest("SHA-256", typeof data === "string" ? enc.encode(data) : (data as Uint8Array<ArrayBuffer>)));
-async function hmac(key: Uint8Array | string, data: string): Promise<Uint8Array> {
-	const k = await crypto.subtle.importKey("raw", typeof key === "string" ? enc.encode(key) : (key as Uint8Array<ArrayBuffer>), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+const importHmac = (key: Uint8Array | string): Promise<CryptoKey> => crypto.subtle.importKey("raw", typeof key === "string" ? enc.encode(key) : (key as Uint8Array<ArrayBuffer>), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+async function hmac(key: Uint8Array | string | CryptoKey, data: string): Promise<Uint8Array> {
+	const k = typeof key === "string" || key instanceof Uint8Array ? await importHmac(key) : key;
 	return new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode(data)));
+}
+
+/** Derives the SigV4 signing key `kSigning` for (date, region, service) from a secret (4 HMACs). */
+export async function deriveSigningKey(secretAccessKey: string, date: string, region: string, service: string): Promise<Uint8Array> {
+	const kDate = await hmac("AWS4" + secretAccessKey, date);
+	const kRegion = await hmac(kDate, region);
+	const kService = await hmac(kRegion, service);
+	return hmac(kService, "aws4_request");
+}
+
+/**
+ * Derived signing keys of one secret by (date, region, service), imported once as HMAC `CryptoKey`s: a request then
+ * costs one HMAC instead of five HMACs and five key imports. Holds the last few scopes (the date rolls daily).
+ */
+export class SigningKeyCache {
+	private readonly keys = new Map<string, Promise<CryptoKey>>();
+	/** Key derivations performed (tests, benchmarks). */
+	derived = 0;
+	constructor(private readonly secretAccessKey: string) {}
+	get(date: string, region: string, service: string): Promise<CryptoKey> {
+		const scope = `${date}/${region}/${service}`;
+		let k = this.keys.get(scope);
+		if (!k) {
+			this.derived++;
+			k = deriveSigningKey(this.secretAccessKey, date, region, service).then(importHmac);
+			k.catch(() => this.keys.get(scope) === k && this.keys.delete(scope));
+			if (this.keys.size >= 4) this.keys.delete(this.keys.keys().next().value!);
+			this.keys.set(scope, k);
+		}
+		return k;
+	}
 }
 /** RFC 3986 encoding (AWS style: `*` and `~` handling, `/` kept in paths). */
 export const awsEncode = (s: string, keepSlash: boolean): string =>
@@ -65,8 +118,11 @@ export interface SigV4Input {
 
 export const amzDateOf = (ms: number): string => new Date(ms).toISOString().replace(/[:-]|\.\d{3}/g, "");
 
-/** Signs a request (AWS Signature Version 4, header auth). Returns the headers to send. */
-export async function signV4(i: SigV4Input): Promise<Record<string, string>> {
+/**
+ * Signs a request (AWS Signature Version 4, header auth). Returns the headers to send. With `keys` (a cache for
+ * `i.secretAccessKey`) the derived signing key is reused across requests.
+ */
+export async function signV4(i: SigV4Input, keys?: SigningKeyCache): Promise<Record<string, string>> {
 	const service = i.service ?? "s3";
 	const date = i.amzDate.slice(0, 8);
 	const headers: Record<string, string> = { ...i.headers, host: i.host, "x-amz-date": i.amzDate, "x-amz-content-sha256": i.payloadHash };
@@ -82,10 +138,7 @@ export async function signV4(i: SigV4Input): Promise<Record<string, string>> {
 	const canonical = [i.method, i.path, query, canonicalHeaders, signed, i.payloadHash].join("\n");
 	const scope = `${date}/${i.region}/${service}/aws4_request`;
 	const toSign = ["AWS4-HMAC-SHA256", i.amzDate, scope, await sha256(canonical)].join("\n");
-	const kDate = await hmac("AWS4" + i.secretAccessKey, date);
-	const kRegion = await hmac(kDate, i.region);
-	const kService = await hmac(kRegion, service);
-	const kSigning = await hmac(kService, "aws4_request");
+	const kSigning = keys ? await keys.get(date, i.region, service) : await deriveSigningKey(i.secretAccessKey, date, i.region, service);
 	const signature = hex(await hmac(kSigning, toSign));
 	const out = { ...headers };
 	delete out.host; // fetch sets it
@@ -100,10 +153,19 @@ export class S3BlobStore implements BlobStore {
 	readonly bucket: string;
 	readonly region: string;
 	readonly pathStyle: boolean;
+	readonly remote = true;
+	readonly inflight: number;
+	readonly coalesceBytes: number | undefined;
+	readonly spanBytes: number | undefined;
+	readonly signingKeys: SigningKeyCache;
 	private readonly fetchFn: typeof fetch;
 	private readonly retries: number;
 	private readonly now: () => number;
 	constructor(private readonly opts: S3BlobStoreOptions) {
+		this.inflight = opts.inflight ?? (inWorkers() ? S3_INFLIGHT_WORKERS : S3_INFLIGHT);
+		this.coalesceBytes = opts.coalesceBytes;
+		this.spanBytes = opts.spanBytes;
+		this.signingKeys = new SigningKeyCache(opts.secretAccessKey);
 		this.endpoint = new URL(opts.endpoint);
 		this.bucket = opts.bucket;
 		this.region = opts.region ?? "auto";
@@ -125,7 +187,7 @@ export class S3BlobStore implements BlobStore {
 	private async send(method: string, key: string, headers: Record<string, string>, body?: Uint8Array, query?: Record<string, string>): Promise<Response> {
 		const { host, path } = this.target(key);
 		const payloadHash = body ? await sha256(body) : EMPTY_SHA256;
-		const signedHeaders = await signV4({ method, path, query, headers, payloadHash, host, region: this.region, accessKeyId: this.opts.accessKeyId, secretAccessKey: this.opts.secretAccessKey, sessionToken: this.opts.sessionToken, amzDate: amzDateOf(this.now()) });
+		const signedHeaders = await signV4({ method, path, query, headers, payloadHash, host, region: this.region, accessKeyId: this.opts.accessKeyId, secretAccessKey: this.opts.secretAccessKey, sessionToken: this.opts.sessionToken, amzDate: amzDateOf(this.now()) }, this.signingKeys);
 		const qs = query ? "?" + Object.entries(query).map(([k, v]) => `${awsEncode(k, false)}=${awsEncode(v, false)}`).join("&") : "";
 		const url = `${this.endpoint.protocol}//${host}${path}${qs}`;
 		let lastErr: unknown;
@@ -168,6 +230,16 @@ export class S3BlobStore implements BlobStore {
 			if (b.byteLength !== range.length) throw new ThreadError(`${key} [${range.offset}, +${range.length}): got ${b.byteLength} bytes`);
 		}
 		return b;
+	}
+
+	/**
+	 * Opens up to `n` connections ahead of the first query: `n` concurrent HEADs of `key` (default
+	 * `idx/current.json`; a 404 is fine), so the TLS handshakes are not on the query's critical path. Errors are
+	 * swallowed. Idle connections are kept by the HTTP client for its keep-alive timeout (undici: 4 s by default;
+	 * see `nodeFetch` in `thread-sdk/node` for a longer one).
+	 */
+	async warmup(n: number, key = "idx/current.json"): Promise<void> {
+		await Promise.all(Array.from({ length: Math.max(0, n) }, () => this.head(key).catch(() => null)));
 	}
 
 	async head(key: string): Promise<BlobHead | null> {
