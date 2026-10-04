@@ -14,11 +14,11 @@ from . import _native
 from .attrs import AttrFilterExpr, AttrSchema, compile_filter, pack_attrs, unpack_attrs, validate_schema
 from .fusion import DEFAULT_RRF_K, rrf
 from .lex import DocRecord, LexIndex, LexIo, LexSearchResult, LexSegment
-from .query import QUERY_INFLIGHT, Base, QueryContext, QueryResult, RevState, execute_query
+from .query import Base, QueryContext, QueryResult, RevState, execute_query
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
 from .pack import PackedBlobStore, store_at
-from .revision import get_required, head_revision, load_rev_state, resolve_target
-from .wire import LEGACY_DEFAULTS, BytesLike, ResolvedLexConfig, ThreadError, has_dense, resolve_lex_config
+from .revision import get_required, head_revision, load_rev_state, resolve_target, snapshot_keys
+from .wire import LEGACY_DEFAULTS, BytesLike, ResolvedLexConfig, ThreadError, has_dense, keys, resolve_lex_config, slab_rev_of
 from .write import (
     CompactSegmentsResult,
     ConfigureAttrsResult,
@@ -39,6 +39,9 @@ __all__ = ["ThreadIndex", "open_index", "SearchHit", "SearchResult", "Rank", "re
 _ = (resolve_target, load_rev_state, head_revision)  # re-exported from here for compatibility
 
 log = logging.getLogger("thread_sdk")
+
+#: Bytes a revision switch prefetches by default (`prefetch_bytes`).
+DEFAULT_PREFETCH_BYTES = 64 * 1024 * 1024
 
 
 @dataclass
@@ -110,7 +113,8 @@ class ThreadIndex:
     between threads; `query`, `search` and the write methods may run concurrently."""
 
     def __init__(self, store: BlobStore, rev: RevState, *, gen: str | None, pinned: bool, refresh_interval: float,
-                 delta_cache_bytes: int, lex_transient_bytes: int, io_workers: int, job_workers: int) -> None:
+                 delta_cache_bytes: int, lex_transient_bytes: int, io_workers: int, job_workers: int,
+                 cold_policy: dict[str, Any] | None = None, prefetch_bytes: int = DEFAULT_PREFETCH_BYTES) -> None:
         self.store = store
         self._rev = rev
         self._gen_opt = gen
@@ -123,11 +127,16 @@ class ThreadIndex:
         self._lock = threading.RLock()
         #: (base key, future of the Base) of the routing table queries use.
         self._base: tuple[str, Future] | None = None
+        #: The base a revision switch in progress loaded for the new revision.
+        self._pre_base: tuple[str, Future] | None = None
         self._delta_cache: dict[str, Future] = {}
         self._seg_cache: dict[str, Future] = {}
         self._lex: tuple[str, int, Future] | None = None
         self._last_check = time.monotonic()
         self._refresh_lock = threading.Lock()
+        self._refreshing = False
+        self._cold_policy = cold_policy
+        self._prefetch_bytes = prefetch_bytes
         self._closed = False
         #: Where `open` spent its time and reads: `{total, current, manifest, slabs, base}` (see `open_index`).
         self.open_stats: dict[str, Any] = {}
@@ -146,6 +155,11 @@ class ThreadIndex:
         lex_transient_bytes: int = 8 * 1024 * 1024,
         io_workers: int = 32,
         job_workers: int | None = None,
+        miss_policy: str | None = None,
+        warm_concurrency: int = 2,
+        warmup: bool | int | None = None,
+        cold_policy: dict[str, Any] | None = None,
+        prefetch_bytes: int = DEFAULT_PREFETCH_BYTES,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
@@ -158,16 +172,26 @@ class ThreadIndex:
         elif cache is True:
             cache = MemoryCache()
         if cache:
-            store = CachedBlobStore(store, cache)  # type: ignore[arg-type]
+            store = CachedBlobStore(store, cache, miss_policy=miss_policy,  # type: ignore[arg-type]
+                                    warm_concurrency=warm_concurrency)
         t0 = time.perf_counter()
         timeline: dict[str, Any] = {}
-        g, r = resolve_target(store, gen, rev, timeline)
-        state = load_rev_state(store, g, r, timeline)
-        ix = cls(store, state, gen=gen, pinned=gen is not None and rev is not None, refresh_interval=refresh_interval,
-                 delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
-                 job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)))
+        ix = cls(store, None, gen=gen, pinned=gen is not None and rev is not None,  # type: ignore[arg-type]
+                 refresh_interval=refresh_interval, delta_cache_bytes=delta_cache_bytes,
+                 lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
+                 job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), cold_policy=cold_policy,
+                 prefetch_bytes=prefetch_bytes)
         loaded: dict[str, Any] = {}
         try:
+            # Connection warm-up: HEADs on the I/O pool's threads (each keeps its own connection), overlapping the
+            # open's own sequential reads (current.json, manifest, base files).
+            n = (store.inflight or 12) if warmup is None or warmup is True else int(warmup or 0)
+            if warmup is None and not store.remote:
+                n = 0
+            if n > 0:
+                store.warmup(n, ix._io)
+            g, r = resolve_target(store, gen, rev, timeline)
+            state = ix._rev = load_rev_state(store, g, r, timeline)
             if has_dense(state.manifest):
                 ix._acquire_base(state, loaded)
         except BaseException:
@@ -259,8 +283,9 @@ class ThreadIndex:
             raise ThreadError("index is closed", 400)
 
     def refresh(self) -> bool:
-        """Re-reads `idx/current.json` (or the generation's head) and switches to the new revision if it changed.
-        Returns True when it did. A pinned index (`gen` and `rev` given) never changes."""
+        """Re-reads `idx/current.json` (or the generation's head) and switches to the new revision if it changed
+        (after loading what its first query would wait for, see `use_revision`). Returns True when it did. A pinned
+        index (`gen` and `rev` given) never changes."""
         self._check_open()
         if self._pinned:
             return False
@@ -273,15 +298,43 @@ class ThreadIndex:
             return True
 
     def _maybe_refresh(self) -> None:
-        if self._refresh_interval > 0 and not self._pinned and time.monotonic() - self._last_check > self._refresh_interval:
+        """Starts a background refresh when `refresh_interval` has elapsed (queries never wait for it)."""
+        if self._refresh_interval <= 0 or self._pinned or time.monotonic() - self._last_check <= self._refresh_interval:
+            return
+        with self._lock:
+            if self._refreshing:
+                return
+            self._refreshing = True
+            self._last_check = time.monotonic()
+
+        def run() -> None:
             try:
                 self.refresh()
             except Exception as e:  # noqa: BLE001 - a failed refresh keeps the current revision
                 log.error("thread_sdk: refresh failed: %s", e)
+            finally:
+                with self._lock:
+                    self._refreshing = False
+
+        try:
+            self._jobs.submit(run)
+        except RuntimeError:  # closed
+            with self._lock:
+                self._refreshing = False
 
     def use_revision(self, gen: str, rev: int) -> None:
-        """Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists."""
+        """Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. Before switching
+        it loads what the first query on the new revision would otherwise wait for: the manifest, slabs table and
+        tombstones, the base files when they changed (routing table, PQ codebook) and the new delta segments; then it
+        warms the rest of the difference (`warm`) in the background."""
+        prev = self._rev
         nxt = load_rev_state(self.store, gen, rev)
+        if has_dense(nxt.manifest):
+            self._acquire_base(nxt, install=False)
+        if sum(d.get("bytes", 0) for d in nxt.deltas) <= self._delta_budget:
+            futs = [self._get_delta(d, BlobTrace(), nxt) for d in nxt.deltas]
+            for f in futs:
+                f.exception()
         with self._lock:
             self._rev = nxt
             listed = {d["key"] for d in nxt.deltas}
@@ -293,17 +346,106 @@ class ThreadIndex:
             self._lex = None
             if self._base is not None and self._base[0] != nxt.base_key:
                 self._base = None
+            pre = self._pre_base
+            if pre is not None and pre[0] == nxt.base_key and self._base is None:
+                self._base = pre
+            self._pre_base = None
+        before = set(snapshot_keys(prev))
+        fresh = [k for k in snapshot_keys(nxt) if k not in before]
+        if fresh and self._prefetch_bytes > 0:
+            def bg() -> None:
+                try:
+                    self.warm(fresh)
+                except Exception as e:  # noqa: BLE001 - prefetching is best effort
+                    log.error("thread_sdk: prefetch failed: %s", e)
 
-    def _acquire_base(self, rev: RevState, loaded: dict[str, Any] | None = None) -> Base:
+            try:
+                self._jobs.submit(bg)
+            except RuntimeError:
+                pass
+
+    def warm(self, keys_: Sequence[str] | None = None, *, budget: int | None = None,
+             workers: int = 4) -> dict[str, int]:
+        """Reads `keys_` (default: every object of the current revision, `snapshot_keys(index.revision)`) through the
+        store so its cache holds them: slabs as a `fill` read of their scan prefix (the cache's miss policy decides
+        whether the whole slab is cached now or in the background), every other object whole. Keys already cached are
+        skipped; slab prefixes and delta / lexical segments stop at `budget` bytes (default `prefetch_bytes`, 64 MB).
+        A store without a cache in front (a local directory) is not read. A revision switch runs this on the keys the
+        new revision adds. Returns `{objects, bytes, skipped}`."""
+        rev = self._rev
+        out = {"objects": 0, "bytes": 0, "skipped": 0}
+        if not self.store.remote and not isinstance(self.store, CachedBlobStore):
+            return out
+        left = [self._prefetch_bytes if budget is None else budget]
+        # A slab costs its scan prefix, or the whole slab when a miss reads it whole (the "whole" policy).
+        whole = isinstance(self.store, CachedBlobStore) and self.store.miss_policy == "whole"
+        prefix_of: dict[str, int] = {}
+        cost_of: dict[str, int] = {}
+        if rev.slabs is not None:
+            for cell, row in enumerate(rev.slabs):
+                if row:
+                    k = keys.slab(rev.gen, cell, slab_rev_of(row))
+                    prefix_of[k] = row[0]
+                    cost_of[k] = row[3] if whole else row[0]
+        budgeted = {d["key"] for d in rev.deltas} | {s["key"] for s in rev.segments}
+        todo = list(keys_ if keys_ is not None else snapshot_keys(rev))
+        lock = threading.Lock()
+        trace = BlobTrace()
+
+        def worker() -> None:
+            from .store import BlobRange
+            while True:
+                with lock:
+                    if not todo:
+                        return
+                    k = todo.pop(0)
+                if self.store.contains(k):
+                    with lock:
+                        out["skipped"] += 1
+                    continue
+                scan_len = prefix_of.get(k)
+                is_budgeted = scan_len is not None or k in budgeted
+                with lock:
+                    if is_budgeted and left[0] <= 0:
+                        out["skipped"] += 1
+                        continue
+                if scan_len is not None:
+                    b = self.store.get(k, BlobRange(0, scan_len), trace=trace, fill=True)
+                else:
+                    b = self.store.get(k, trace=trace)
+                if b is None:
+                    continue
+                with lock:
+                    out["objects"] += 1
+                    out["bytes"] += len(b)
+                    if is_budgeted:
+                        left[0] -= cost_of[k] if scan_len is not None else len(b)
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, workers))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return out
+
+    def _acquire_base(self, rev: RevState, loaded: dict[str, Any] | None = None, install: bool = True) -> Base:
         """The routing table of `rev`'s base files, loaded once (concurrent callers share the load); `loaded["stat"]`
-        is set when this call did the load."""
+        is set when this call did the load. With `install=False` (a revision switch preparing its base) a new base is
+        kept aside until the switch."""
         with self._lock:
             slot = self._base
+            pre = self._pre_base
             if slot is not None and slot[0] == rev.base_key:
                 fut, owner = slot[1], False
+            elif pre is not None and pre[0] == rev.base_key:
+                fut, owner = pre[1], False
             else:
                 fut, owner = Future(), True
-                slot = self._base = (rev.base_key, fut)
+                slot = (rev.base_key, fut)
+                if install:
+                    self._base = slot
+                else:
+                    self._pre_base = slot
         if not owner:
             return fut.result()
         try:
@@ -312,12 +454,14 @@ class ThreadIndex:
             with self._lock:
                 if self._base is slot:
                     self._base = None
+                if self._pre_base is slot:
+                    self._pre_base = None
             fut.set_exception(e)
             raise
         fut.set_result(base)
         return base
 
-    def _get_delta(self, ref: dict[str, Any], trace: BlobTrace) -> Future:
+    def _get_delta(self, ref: dict[str, Any], trace: BlobTrace, rev: RevState | None = None) -> Future:
         key = ref["key"]
         with self._lock:
             hit = self._delta_cache.get(key)
@@ -331,7 +475,7 @@ class ThreadIndex:
             return b
 
         fut = self._io.submit(read)
-        if sum(d.get("bytes", 0) for d in self._rev.deltas) <= self._delta_budget:
+        if sum(d.get("bytes", 0) for d in (rev or self._rev).deltas) <= self._delta_budget:
             with self._lock:
                 self._delta_cache.setdefault(key, fut)
 
@@ -355,10 +499,13 @@ class ThreadIndex:
         rerank: int | None = None,
         pc: int | None = None,
         return_payload: bool = False,
-        inflight: int = QUERY_INFLIGHT,
+        inflight: int | None = None,
         speculate: bool = True,
         filter: Any = None,
         max_nprobe: int | None = None,
+        coalesce_bytes: int | None = None,
+        span_bytes: int | None = None,
+        cold_policy: dict[str, Any] | Literal[False] | None = None,
     ) -> QueryResult:
         """Nearest neighbours of `vector` (any norm; normalized): a list of floats, an `array('f')`, a numpy array or
         raw f32 bytes of `dim` values. `nprobe` slabs are scanned, the best `rerank` scan-tier candidates re-scored
@@ -366,7 +513,10 @@ class ThreadIndex:
         the manifest defaults. `filter`: an attribute filter (field conditions under the schema, e.g. `{"tenant": 5,
         "lang": {"$in": ["en", "fr"]}}`, or compiled words) applied inside every scan before top-k insertion; with
         one, probing widens past `nprobe` in routing order until `max(top_k, rerank)` candidates match or
-        `max_nprobe` cells were scanned (default 4 x nprobe)."""
+        `max_nprobe` cells were scanned (default 4 x nprobe). `inflight` (default: the store's, 32 against S3, else
+        12), `coalesce_bytes` / `span_bytes` (phase-2 range merging) and `cold_policy` (`{"nprobe", "rerank",
+        "threshold"}`, applied when more than `threshold` of the probed slabs are not cached; `False` disables an
+        index-wide one) tune the I/O."""
         self._check_open()
         if not self.has_dense:
             raise ThreadError("this generation has no dense index (lexical only): use search(text=...)", 400)
@@ -374,12 +524,13 @@ class ThreadIndex:
         rev = self._rev
         loaded: dict[str, Any] = {}
         base = self._acquire_base(rev, loaded)
-        ctx = QueryContext(self.store, rev, base, self._io, self._get_delta)
+        ctx = QueryContext(self.store, rev, base, self._io, self._get_delta, self._cold_policy)
         words = filter if filter is None or not isinstance(filter, Mapping) else compile_filter(
             validate_schema(rev.manifest["attrs"]) if rev.manifest.get("attrs") else None, filter)
         r = execute_query(ctx, vector, top_k=top_k, nprobe=nprobe, rerank=rerank, pc=pc,
                           return_payload=return_payload, inflight=inflight, speculate=speculate, filter=words,
-                          max_nprobe=max_nprobe)
+                          max_nprobe=max_nprobe, coalesce_bytes=coalesce_bytes, span_bytes=span_bytes,
+                          cold_policy=cold_policy)
         if "stat" in loaded:  # this query (re)loaded the routing table (a switch to another generation)
             r.stats["timeline"]["base"] = loaded["stat"]
         return r
@@ -630,6 +781,8 @@ class ThreadIndex:
         self._closed = True
         self._io.shutdown(wait=False, cancel_futures=True)
         self._jobs.shutdown(wait=False, cancel_futures=True)
+        if isinstance(self.store, CachedBlobStore):
+            self.store.close()
         with self._lock:
             self._base = None
             self._delta_cache.clear()
@@ -658,6 +811,11 @@ def open_index(
     lex_transient_bytes: int = 8 * 1024 * 1024,
     io_workers: int = 32,
     job_workers: int | None = None,
+    miss_policy: str | None = None,
+    warm_concurrency: int = 2,
+    warmup: bool | int | None = None,
+    cold_policy: dict[str, Any] | None = None,
+    prefetch_bytes: int = DEFAULT_PREFETCH_BYTES,
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -671,8 +829,17 @@ def open_index(
     - `delta_cache_bytes`: delta segments kept in memory across queries;
     - `lex_transient_bytes`: transient lexical bytes (buckets, posting lists, texts) each segment reader may hold;
     - `io_workers`: threads for reads (shared by concurrent queries; each query keeps at most `inflight` in flight);
-    - `job_workers`: threads for `query_many` and the lexical half of a hybrid search.
+    - `job_workers`: threads for `query_many` and the lexical half of a hybrid search;
+    - `miss_policy`: what a slab-prefix cache miss reads: "whole", "range" or "range+warm" (default: the cache's,
+      "range+warm" for `MemoryCache` / `DiskCache`); `warm_concurrency`: background whole-object fetches at once;
+    - `warmup`: open connections to a remote store while opening (True = the store's `inflight`, an int = that many,
+      False = none; default on for remote stores);
+    - `cold_policy`: `{"nprobe", "rerank", "threshold"}` applied to queries whose probed slabs are mostly not cached
+      (off by default);
+    - `prefetch_bytes`: slab prefixes / delta and lexical segments a revision switch prefetches into the cache.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
-                            io_workers=io_workers, job_workers=job_workers)
+                            io_workers=io_workers, job_workers=job_workers, miss_policy=miss_policy,
+                            warm_concurrency=warm_concurrency, warmup=warmup, cold_policy=cold_policy,
+                            prefetch_bytes=prefetch_bytes)

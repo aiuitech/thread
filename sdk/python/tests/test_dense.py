@@ -220,22 +220,28 @@ def test_concurrent_queries_and_writes():
     index.close()
 
 
+@pytest.mark.parametrize("policy", ["whole", "range+warm"])
 @pytest.mark.parametrize("kind", ["memory", "disk"])
-def test_cache_in_front(tmp_path, kind):
-    """A cache serves the second query; a fill read keeps the local rerank records (no phase-2 reads)."""
+def test_cache_in_front(tmp_path, kind, policy):
+    """A cache serves the second query; a "whole" fill read keeps the local rerank records (no phase-2 reads)."""
     b = build_gen("gk", 3)
     cache = MemoryCache() if kind == "memory" else DiskCache(tmp_path / "cache")
-    with open_index(b.store, cache=cache) as ix:
+    with open_index(b.store, cache=cache, miss_policy=policy) as ix:
         q = row(b.vectors, 9, 16)
         r1 = ix.query(q, nprobe=8)
         assert r1.stats["io"]["misses"] > 0
+        assert ix.store.drain(5)
         r2 = ix.query(q, nprobe=8)
         assert [h.id for h in r2.hits] == [h.id for h in r1.hits]
         assert [h.score for h in r2.hits] == [h.score for h in r1.hits]
         assert r2.stats["io"]["misses"] == 0 and r2.stats["io"]["reads"] == 0
-        if kind == "memory":
+        if kind == "memory" and policy == "whole":
             assert r1.stats["rerank_local"] == r1.stats["rerank_candidates"]
             assert r1.stats["rerank_reads"] == 0
+        if policy == "range+warm":
+            assert r1.stats["whole_slabs"] == 0 and r1.stats["rerank_local"] == 0
+            assert r1.stats["io"]["warms"] == 8
+            assert r2.stats["whole_slabs"] == (8 if kind == "memory" else 0)
     with open_index(b.store, cache=False) as plain:
         r3 = plain.query(q, nprobe=8)
         assert [(h.id, h.score) for h in r3.hits] == [(h.id, h.score) for h in r1.hits]
@@ -293,7 +299,8 @@ def test_parallel_path_matches_inline(ranges, cache):
         w.upsert([9000 + i for i in range(6)], fresh, payloads=[f"x{i}" for i in range(6)], attrs=list(range(6)))
         w.delete([1, 2, 3])
     remote = RemoteLike(b.store, ranges)
-    with open_index(b.store, cache=False) as inline, open_index(remote, cache=MemoryCache() if cache else False) as par:
+    with open_index(b.store, cache=False) as inline, \
+            open_index(remote, cache=MemoryCache() if cache else False, miss_policy="whole") as par:
         qs = [row(b.vectors, i, 16) for i in range(0, 60, 3)] + [row(fresh, i, 16) for i in range(6)]
         opts = dict(top_k=10, nprobe=8, rerank=40, return_payload=True)
         want = [[(h.id, h.score, h.attrs, h.source, h.payload) for h in inline.query(q, **opts).hits] for q in qs]

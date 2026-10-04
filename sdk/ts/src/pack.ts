@@ -108,6 +108,10 @@ export function parsePackDirectory(b: Uint8Array, dirOff: number, count: number)
  * on a miss, which is why `fill` is never forwarded.
  */
 export class PackedBlobStore implements BlobStore {
+	readonly remote: boolean;
+	readonly inflight: number | undefined;
+	readonly coalesceBytes: number | undefined;
+	readonly spanBytes: number | undefined;
 	private constructor(
 		public readonly inner: BlobStore,
 		public readonly key: string,
@@ -119,7 +123,16 @@ export class PackedBlobStore implements BlobStore {
 		 * fit in the tail, the directory read. `thread.open` reports it as `openStats.pack`.
 		 */
 		public readonly openStats: PhaseStat,
-	) {}
+	) {
+		this.remote = inner.remote ?? false;
+		this.inflight = inner.inflight;
+		this.coalesceBytes = inner.coalesceBytes;
+		this.spanBytes = inner.spanBytes;
+	}
+
+	warmup(n: number): Promise<void> {
+		return this.inner.warmup?.(n) ?? Promise.resolve();
+	}
 
 	/** Reads the footer and directory of the pack at `key` in `inner`. */
 	static async open(inner: BlobStore, key: string): Promise<PackedBlobStore> {

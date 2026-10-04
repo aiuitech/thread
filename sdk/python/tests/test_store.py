@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.server
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import pytest
@@ -80,7 +81,7 @@ def test_cached_store(tmp_path, kind):
     inner.put("idx/g/slab/00001", body)
     inner.put("idx/current.json", '{"gen":"g"}')
     cache = MemoryCache() if kind == "memory" else DiskCache(tmp_path / "c", max_bytes=12000)
-    s = CachedBlobStore(inner, cache)
+    s = CachedBlobStore(inner, cache, miss_policy="whole")
     t = BlobTrace()
     # a range miss without fill goes to the origin and caches nothing
     assert bytes(s.get("idx/g/slab/00001", BlobRange(10, 20), trace=t)) == body[10:30]
@@ -122,7 +123,7 @@ def test_concurrent_fills_share_one_read():
 
     inner = Slow()
     inner.objects["idx/x"] = (data(1000), "e")
-    s = CachedBlobStore(inner, MemoryCache())
+    s = CachedBlobStore(inner, MemoryCache(), miss_policy="whole")
     out = []
     ts = [threading.Thread(target=lambda: out.append(bytes(s.get("idx/x", BlobRange(0, 10), fill=True))))
           for _ in range(8)]
@@ -246,11 +247,15 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
 def s3_server():
     FakeS3.objects = {}
     FakeS3.calls = []
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeS3)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeS3, bind_and_activate=False)
+    srv.request_queue_size = 128  # open_index warms up to 32 connections at once
+    srv.server_bind()
+    srv.server_activate()
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
+    srv.server_close()  # connections still queued are refused, not left waiting
 
 
 def test_s3_store(s3_server):
@@ -295,6 +300,8 @@ def test_index_over_s3(s3_server):
         want = [(h.id, h.score) for h in ref.query(q, nprobe=8).hits]
         r1 = ix.query(q, nprobe=8)
         assert [(h.id, h.score) for h in r1.hits] == want
+        assert r1.stats["io"]["warms"] == 8  # "range+warm": the probed slabs are fetched whole in the background
+        assert ix.store.drain(5)
         r2 = ix.query(q, nprobe=8)
         assert r2.stats["io"]["reads"] == 0  # served by the memory cache
         ix.upsert([777], q)
@@ -304,3 +311,38 @@ def test_index_over_s3(s3_server):
         r = nocache.query(q, nprobe=8, rerank=40)
         assert r.stats["rerank_reads"] > 0  # single-range reads in parallel, no multi-range on S3
         assert {h.id for h in r.hits[:2]} == {21, 777}
+
+
+def test_s3_connection_pool_is_shared_and_bounded(s3_server):
+    """Connections are pooled across threads: at most `max_connections` open, warmed ones reused by any thread."""
+    s = S3BlobStore(s3_server, "bucket", "AK", "SK", max_connections=4)
+    s.put("idx/x", b"0123456789" * 100)
+    opened = s.stats["opened"]  # the put used a fresh connection
+    for f in s.warmup(4):
+        f.result()
+    assert s.stats["opened"] - opened <= 4
+    with ThreadPoolExecutor(16) as ex:
+        got = list(ex.map(lambda i: bytes(s.get("idx/x", BlobRange(i, 10))), range(200)))
+    assert got == [(b"0123456789" * 100)[i:i + 10] for i in range(200)]
+    assert s._open <= 4 and s.stats["opened"] - opened <= 4
+
+
+def test_s3_whole_gets_are_chunked(s3_server):
+    s = S3BlobStore(s3_server, "bucket", "AK", "SK", chunk_bytes=100, chunk_concurrency=2)
+    body = bytes((i * 3) & 0xFF for i in range(350))
+    s.put("idx/g4/fine.f32", body)
+    n0 = len(FakeS3.calls)
+    t = BlobTrace()
+    assert s.get("idx/g4/fine.f32", trace=t) == body
+    assert sorted(c[2]["range"] for c in FakeS3.calls[n0:]) == ["bytes=0-99", "bytes=100-199", "bytes=200-299",
+                                                                 "bytes=300-349"]
+    assert (t.reads, t.bytes) == (4, 350)
+    n1 = len(FakeS3.calls)
+    assert s.get("idx/g4/fine.f32", BlobRange(20, 300)) == body[20:320]  # more than 2 chunks: split too
+    assert sorted(c[2]["range"] for c in FakeS3.calls[n1:]) == ["bytes=120-219", "bytes=20-119", "bytes=220-319"]
+    assert s.get("idx/g4/fine.f32", BlobRange(20, 150)) == body[20:170]
+    s.put("idx/small", b"abc")
+    assert s.get("idx/small") == b"abc"
+    s.put("idx/empty", b"")
+    assert s.get("idx/empty") == b""
+    assert s.get("idx/none") is None

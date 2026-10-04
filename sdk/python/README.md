@@ -76,10 +76,38 @@ The layout under the store is the one thread's build pipeline writes (`idx/curre
 `tombstones.{rev}.u32`, `coarse.f32`, `fine.f32`, `pq.bin`).
 
 A cache plays the part the Workers Cache API plays for the TypeScript SDK: objects under `idx/` are immutable, so
-whole objects are cached and ranges are served from them (`current.json` is never cached). A phase-1 miss reads the
-whole slab once (concurrent misses of the same object share one read) and keeps the local winners' rerank records,
-so phase 2 costs nothing for that slab. `MemoryCache` is an LRU in process memory; `DiskCache` keeps files in a
-directory shared by every process that uses it and reads only the requested ranges.
+whole objects are cached and ranges are served from them (`current.json` is never cached). `MemoryCache` is an LRU
+in process memory; `DiskCache` keeps files in a directory shared by every process that uses it and reads only the
+requested ranges. What a cache miss reads is the **miss policy** (`miss_policy`):
+
+| `miss_policy` | a slab-prefix miss reads | phase 2 for that slab | right for |
+|---|---|---|---|
+| `"range+warm"` (default) | the prefix now (~200 KB on g4); the whole slab into the cache in the background | one range read per record run | an in-process cache: the first query does not wait for the whole slabs (~57 MB on g4), later queries hit |
+| `"whole"` | the whole slab once (concurrent misses share one read), cached | free: the winners' records are in memory | a cache many processes share |
+| `"range"` | exactly the prefix, nothing cached | one range read per record run | no caching |
+
+Background warms run on a small pool of their own (`warm_concurrency`, default 2, only 1 while the query's own
+reads are in flight; at most 1024 queued; deduplicated); `index.store.drain()` waits for them,
+`index.store.warm_stats` counts them. Before this, a cold query read every probed slab whole. Reads without `fill`
+(rerank records, postings) never fetch whole objects, and a `PackedBlobStore` turns every read, warms included,
+into a range of the pack.
+
+**Disk cache.** `DiskCache(dir, max_bytes=4 << 30)` keeps whole objects as files in the bucket layout
+(`{dir}/idx/g4/slab/00123`), the layout the TypeScript SDK's `DiskCache` uses (they can share a directory),
+evicting least recently used objects beyond `max_bytes` (order in memory, and in the files' mtimes across
+restarts). A restart is then not a cold start. A `DiskCache` is also a `FileBlobStore`, so warming a laptop from a
+bucket is a copy: `copy_objects(s3, disk, snapshot_keys(index.revision))`.
+
+**Connections.** `S3BlobStore` uses `http.client` with a pool of keep-alive connections shared by every thread (at
+most `max_connections`, default `inflight` = 32; a thread takes an idle connection or opens one, and waits when all
+are busy; a connection the server closed is reopened and the request retried), so there is no third-party HTTP
+client and no extra dependency. Before, each I/O thread kept its own connection, so a cold process opened one per
+thread (33). `open_index` warms `inflight` of them with HEADs of `idx/current.json` while it loads the index
+(`warmup`), so the first query does not pay the TLS handshakes. Signing costs one HMAC per request: the derived SigV4 key is cached per (date, region, service)
+(`SigningKeyCache`; ~5 us instead of ~9 us per request). `S3BlobStore(..., inflight=32, coalesce_bytes=128 << 10,
+chunk_bytes=8 << 20, chunk_concurrency=4, max_connections=inflight, warmup=0)`: rerank records are read as runs of
+up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whole-object GET larger than
+`chunk_bytes` becomes parallel range GETs (one S3 stream is bandwidth-bound; the routing table is 25 MB on g4).
 
 ## API
 
@@ -97,7 +125,12 @@ directory shared by every process that uses it and reads only the requested rang
 | `delta_cache_bytes` | 40 MB | delta segments kept in memory across queries |
 | `lex_transient_bytes` | 8 MB | transient lexical bytes (buckets, posting lists, texts) each segment reader may hold |
 | `io_workers` | 32 | threads for reads, shared by concurrent queries |
-| `job_workers` | 4-16 (CPUs) | threads for `query_many` and the lexical half of a hybrid search |
+| `job_workers` | 4-16 (CPUs) | threads for `query_many`, the lexical half of a hybrid search and background refreshes |
+| `miss_policy` | the cache's: `"range+warm"` for `MemoryCache` / `DiskCache` | what a slab-prefix cache miss reads (see "Pointing at the index") |
+| `warm_concurrency` | 2 | `"range+warm"`: background whole-slab fetches at once |
+| `warmup` | on for remote stores | open connections while opening: `True` = the store's `inflight` (32 for S3), an int, `False` |
+| `cold_policy` | None | `{"nprobe", "rerank", "threshold"}` for queries whose probed slabs are mostly not cached (see `query`) |
+| `prefetch_bytes` | 64 MB | slab prefixes / delta and lexical segments a revision switch prefetches into the cache |
 
 `gen` without `rev` reads the generation's head (the current rev when `current.json` names that generation, else
 the newest `manifest.*.json` in the store). `ThreadIndex` is a context manager; `close()` releases its threads.
@@ -125,10 +158,13 @@ Properties: `manifest` (the stored dict, camelCase keys), `gen`, `rev`, `dim`, `
 | `rerank` | manifest default | scan-tier candidates re-scored with the int8 tier (`T = max(top_k, rerank)`); 0 = scan-tier scores only |
 | `pc` | manifest default | coarse groups to probe (two-level indexes); 0 = flat routing over all cells |
 | `return_payload` | False | also return each hit's payload bytes |
-| `inflight` | 12 | reads in flight per query (remote stores) |
+| `inflight` | the store's: 32 for `S3BlobStore`, else 12 | reads in flight per query (remote stores) |
 | `speculate` | True | read the running top-T's rerank records while the last 6 slabs are still scanning (remote stores) |
 | `filter` | None | an attribute filter (see [Filtering](#filtering)): field conditions, or the compiled words |
 | `max_nprobe` | 4 x nprobe | with a filter: how many cells a selective filter may scan in all, in routing order, until `max(top_k, rerank)` candidates match (`nprobe` = no widening) |
+| `coalesce_bytes` | the store's: 128 KB for `S3BlobStore`, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while it stays within this many bytes |
+| `span_bytes` | the store's, else 0 (off) | phase 2: read a slab's records as ONE range from the first to the last wanted one when that span is at most this |
+| `cold_policy` | `open_index(cold_policy=)` | `{"nprobe", "rerank", "threshold"}`: when more than `threshold` (default 0.5) of the probed slabs are not cached, scan only the best `nprobe` and rerank `rerank` (each capped at the query's value); `False` disables it |
 
 ```python
 @dataclass
@@ -143,6 +179,8 @@ class QueryResult:
                              # delta_top, tombstones, tomb_sets, tomb_dropped,
                              # io: {reads, hits, misses, r206, r200, bytes}, timing: {total, route, phase1, phase2, payload} (ms),
                              # timeline: {route, phase1, phase2, payload, base?} (phase stats, below)
+                             # whole_slabs (slabs whose whole object was in memory), inflight, coalesce_bytes,
+                             # span_bytes, cold: {misses, probed, applied} (with a cold policy); io also has warms
 ```
 
 `stats["timeline"]` splits the query into phases, each a phase stat `{ms, reads, hits, misses, r206, r200, bytes}`:
@@ -211,9 +249,17 @@ lists what was scanned. The BM25 list is filtered after scoring: it is taken dee
 
 ### `index.refresh() -> bool`
 
-Re-reads `current.json` (or the generation's head) and switches to the new revision if it changed. Revisions are
-immutable, so everything else is cached per index; new data is visible within `refresh_interval`, at once after
-`refresh()`, or at once on the handle that wrote it.
+Re-reads `current.json` (or the generation's head) and switches to the new revision if it changed. Before switching
+it loads the new revision's manifest, slabs table and tombstones, its routing table when the base files changed and
+its new delta segments; then it warms the rest of what the revision adds (`snapshot_keys(new)` minus
+`snapshot_keys(old)`, slabs as scan prefixes) in the background within `prefetch_bytes`. The periodic check
+(`refresh_interval`) runs in the background on the job pool: the query that notices a new revision answers from the
+current one instead of waiting for the switch (~130 ms on g4 through a 25 ms-RTT S3). New data is visible within
+`refresh_interval` (plus the load), at once after `refresh()`, or at once on the handle that wrote it.
+
+`index.warm(keys=None, budget=None)` reads `keys` (default: every object of the current revision) through the
+store's cache: slabs as a `fill` read of their scan prefix, the rest whole, skipping cached keys, slab prefixes and
+segments within `budget`. Returns `{objects, bytes, skipped}`.
 
 ### Write path
 

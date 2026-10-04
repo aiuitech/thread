@@ -10,12 +10,12 @@
  *   const { hits } = await index.query(vector, { topK: 10 });        // dense only
  */
 import init, * as W from "./wasm/thread.js";
-import { CachedBlobStore, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobStore, type BlobTrace, type CacheLike, type PhaseStat, type R2BucketLike } from "./store.js";
-import { executeQuery, safeFree, type Base, type BaseStat, type QueryOptions, type QueryResult, type RevState } from "./query.js";
+import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
+import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { compactSegments, configureAttrs, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
-import { hasDense, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
-import { asF32, getRequired, loadRevState, resolveTarget, type RevTimeline } from "./revision.js";
+import { hasDense, keys, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
+import { asF32, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchOptions, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 import { PackedBlobStore } from "./pack.js";
@@ -27,9 +27,9 @@ export * from "./s3.js";
 export * from "./lex.js";
 export * from "./fusion.js";
 export * from "./pack.js";
-export type { Base, BaseStat, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
+export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
-export { FILTER_WIDEN, Limiter, QUERY_INFLIGHT, executeQuery } from "./query.js";
+export { FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, slabResident } from "./query.js";
 export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
 export { createLexicalGeneration } from "./write.js";
 
@@ -124,14 +124,36 @@ export interface OpenOptions {
 	gen?: string;
 	/** Read this manifest revision (default: current.json's rev, or the generation's head). With `gen`, pins the index. */
 	rev?: number;
-	/** Cache API in front of the store (default `caches.default` when available); `false` disables it. */
-	cache?: CacheLike | false;
+	/**
+	 * A cache in front of the store: the Workers Cache API (`caches.default` by default when available), or an
+	 * in-process `BlobCache` (`MemoryCache`, `DiskCache` from `thread-sdk/node`). Outside Workers a remote store
+	 * (S3) gets a 256 MB `MemoryCache` by default. `false` disables caching.
+	 */
+	cache?: CacheLike | BlobCache | false;
 	/** Synthetic origin of the cache keys (default `https://vib-sdk.cache/`). */
 	cacheOrigin?: string;
+	/** What a slab-prefix cache miss reads (see `MissPolicy`): default `"whole"` for the Cache API, `"range+warm"` for an in-process cache. */
+	missPolicy?: MissPolicy;
+	/** `"range+warm"`: background whole-object fetches at once (default 2). */
+	warmConcurrency?: number;
 	/** `ctx.waitUntil`, so background cache fills outlive the response. */
 	waitUntil?: (p: Promise<unknown>) => void;
-	/** How often a query re-reads `current.json` to pick up new revisions (ms; default 30 000; 0 = only `refresh()`). */
+	/**
+	 * Opens connections to a remote store while `open` loads the index, so the first query does not pay the TLS
+	 * handshakes: `true` = as many as the store's `inflight` (32 against S3 from Node), a number = that many, `false`
+	 * = none. Default on for remote stores that support it (`S3BlobStore`) outside Workers.
+	 */
+	warmup?: boolean | number;
+	/** Cold-path policy applied to every query (see `ColdPolicy`); off by default. */
+	coldPolicy?: ColdPolicy;
+	/**
+	 * How often a query checks `current.json` for a new revision (ms; default 30 000; 0 = only `refresh()`). The check
+	 * runs in the background: the query that triggers it reads the current revision, and the switch happens once the
+	 * new revision's manifest, slabs table, tombstones, new delta segments and (if they changed) base files are loaded.
+	 */
 	refreshInterval?: number;
+	/** Bytes of slab prefixes / delta and lexical segments a revision switch prefetches into the cache (default 64 MB; 0 = none). */
+	prefetchBytes?: number;
 	/** Delta segments kept in memory across queries (bytes; default 40 MB). */
 	deltaCacheBytes?: number;
 	/** Transient lexical bytes (buckets, posting lists, texts) each segment reader may hold (default 8 MB). */
@@ -207,6 +229,9 @@ export class Thread {
 	}
 }
 
+/** Bytes a revision switch prefetches by default (`OpenOptions.prefetchBytes`). */
+export const DEFAULT_PREFETCH_BYTES = 64 * 1024 * 1024;
+
 interface BaseSlot extends Base {
 	users: number;
 	dropped: boolean;
@@ -224,6 +249,7 @@ export class ThreadIndex {
 	private readonly refreshInterval: number;
 	private lastCheck = 0;
 	private refreshing: Promise<boolean> | null = null;
+	private refreshStarted = 0;
 	private closed = false;
 	private readonly deltaCache = new Map<string, Promise<Uint8Array>>();
 	private readonly deltaBudget: number;
@@ -262,9 +288,18 @@ export class ThreadIndex {
 		let store: BlobStore | undefined = opts.store ?? (opts.bucket ? new R2BlobStore(opts.bucket) : undefined);
 		if (!store) throw new ThreadError("open: pass a `bucket` (R2 binding) or a `store`", 400);
 		if (opts.prefix) store = new PrefixedBlobStore(store, opts.prefix);
-		const cache = opts.cache === false ? null : (opts.cache ?? ((globalThis as { caches?: { default?: CacheLike } }).caches?.default ?? null));
-		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil });
+		let cache: CacheLike | BlobCache | null = opts.cache === false ? null : (opts.cache ?? ((globalThis as { caches?: { default?: CacheLike } }).caches?.default ?? null));
+		// Outside Workers there is no Cache API: a remote store gets an in-process cache, like the Python SDK.
+		if (!cache && opts.cache === undefined && store.remote && !inWorkers()) cache = new MemoryCache();
+		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
 		const t0 = nowMs();
+		// Connection warm-up overlaps the open's own sequential reads (current.json, manifest, base files).
+		const warm = opts.warmup ?? (store.remote && !inWorkers());
+		const n = typeof warm === "number" ? warm : warm ? (store.inflight ?? 12) : 0;
+		if (n > 0 && store.warmup) {
+			const p = store.warmup(n).catch(() => {});
+			opts.waitUntil?.(p);
+		}
 		const tl: RevTimeline = {};
 		const target = await resolveTarget(store, opts.gen, opts.rev, tl);
 		const rev = await loadRevState(store, target.gen, target.rev, tl);
@@ -341,7 +376,9 @@ export class ThreadIndex {
 	refresh(): Promise<boolean> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		if (this.pinned) return Promise.resolve(false);
-		if (this.refreshing) return this.refreshing;
+		// A refresh started by a request that ended may never settle (Workers): start over after a minute.
+		if (this.refreshing && Date.now() - this.refreshStarted < 60_000) return this.refreshing;
+		this.refreshStarted = Date.now();
 		const p = (async () => {
 			const t = await resolveTarget(this.store, this.opts.gen, undefined);
 			this.lastCheck = Date.now();
@@ -356,9 +393,39 @@ export class ThreadIndex {
 		return p;
 	}
 
-	/** Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. */
+	/** Starts a background refresh when `refreshInterval` has elapsed (queries never wait for it). */
+	private maybeRefresh(): void {
+		if (this.refreshInterval <= 0 || this.pinned || Date.now() - this.lastCheck <= this.refreshInterval) return;
+		this.lastCheck = Date.now();
+		const p = this.refresh().catch((e: unknown) => console.error(`thread-sdk: refresh failed: ${e instanceof Error ? e.message : String(e)}`));
+		this.opts.waitUntil?.(p);
+	}
+
+	/**
+	 * Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. Before switching it
+	 * loads what the first query on the new revision would otherwise wait for: the manifest, slabs table and
+	 * tombstones, the base files when they changed (routing table, PQ codebook) and the new delta segments; then it
+	 * warms the rest of the difference (`warm`) in the background.
+	 */
 	async useRevision(gen: string, rev: number): Promise<void> {
+		const prev = this.revState;
 		const next = await loadRevState(this.store, gen, rev);
+		const epoch = this.thread.epoch;
+		let pre: BaseSlot | null = null;
+		const haveBase = (this.base && this.base.key === next.baseKey && !this.base.dropped) || (this.basePromise && !this.base && prev.baseKey === next.baseKey);
+		if (hasDense(next.manifest) && !haveBase) {
+			const b = await loadBase(this.store, next, epoch);
+			pre = { ...b, users: 0, dropped: false };
+		}
+		const total = next.deltas.reduce((a, d) => a + d.bytes, 0);
+		if (total <= this.deltaBudget) await Promise.all(next.deltas.filter((d) => !this.deltaCache.has(d.key)).map((d) => this.getDelta(d, newTrace(), next).catch(() => {})));
+		if (this.closed) {
+			if (pre && pre.epoch === this.thread.epoch) {
+				safeFree(pre.searcher);
+				if (pre.pq) safeFree(pre.pq);
+			}
+			return;
+		}
 		this.revState = next;
 		const listed = new Set(next.deltas.map((d) => d.key));
 		for (const k of this.deltaCache.keys()) if (!listed.has(k)) this.deltaCache.delete(k);
@@ -374,6 +441,66 @@ export class ThreadIndex {
 		}
 		this.lexLoading = null;
 		if (this.base && this.base.key !== next.baseKey) this.dropBase();
+		if (pre) {
+			if (pre.epoch !== this.thread.epoch) pre.dropped = true; // a reset happened while loading: rebuilt on demand
+			else if (this.base && this.base.key === pre.key && !this.base.dropped) {
+				safeFree(pre.searcher); // loaded concurrently by a query
+				if (pre.pq) safeFree(pre.pq);
+			} else {
+				this.dropBase();
+				this.base = pre;
+				this.basePromise = Promise.resolve(pre);
+			}
+		}
+		const before = new Set(snapshotKeys(prev));
+		const fresh = snapshotKeys(next).filter((k) => !before.has(k));
+		if (fresh.length && (this.opts.prefetchBytes ?? DEFAULT_PREFETCH_BYTES) > 0) {
+			const p = this.warm(fresh).catch((e: unknown) => console.error(`thread-sdk: prefetch failed: ${e instanceof Error ? e.message : String(e)}`));
+			this.opts.waitUntil?.(p);
+		}
+	}
+
+	/**
+	 * Reads `keys` (default: every object of the current revision, `snapshotKeys(index.revision)`) through the
+	 * store so its cache holds them: slabs as a `fill` read of their scan prefix (the cache's miss policy decides
+	 * whether the whole slab is cached now or in the background), every other object whole. Keys already cached are
+	 * skipped; slab prefixes and delta / lexical segments stop at `budget` bytes (default `prefetchBytes`, 64 MB).
+	 * A store without a cache in front (a local directory) is not read. A revision switch runs this on the keys the
+	 * new revision adds. Returns what was read.
+	 */
+	async warm(want?: readonly string[], opts: { budget?: number; concurrency?: number } = {}): Promise<{ objects: number; bytes: number; skipped: number }> {
+		const rev = this.revState;
+		const out = { objects: 0, bytes: 0, skipped: 0 };
+		if (!this.store.remote && !(this.store instanceof CachedBlobStore)) return out;
+		let budget = opts.budget ?? this.opts.prefetchBytes ?? DEFAULT_PREFETCH_BYTES;
+		// A slab costs its scan prefix, or the whole slab when a miss reads it whole (the "whole" policy).
+		const whole = this.store instanceof CachedBlobStore && this.store.missPolicy === "whole";
+		const slabPrefix = new Map<string, [number, number]>();
+		if (rev.slabs) rev.slabs.forEach((row, cell) => row && slabPrefix.set(keys.slab(rev.gen, cell, slabRevOf(row)), [row[0], whole ? row[3] : row[0]]));
+		const budgeted = new Set([...rev.deltas.map((d) => d.key), ...rev.segments.map((s) => s.key)]);
+		const todo = [...(want ?? snapshotKeys(rev))];
+		const trace = newTrace();
+		const worker = async () => {
+			for (let k = todo.shift(); k !== undefined; k = todo.shift()) {
+				if (this.store.contains?.(k)) {
+					out.skipped++;
+					continue;
+				}
+				const [scanLen, cost] = slabPrefix.get(k) ?? [undefined, undefined];
+				const isBudgeted = scanLen !== undefined || budgeted.has(k);
+				if (isBudgeted && budget <= 0) {
+					out.skipped++;
+					continue;
+				}
+				const b = scanLen !== undefined ? await this.store.get(k, { offset: 0, length: scanLen }, { trace, fill: true }) : await this.store.get(k, undefined, { trace });
+				if (!b) continue;
+				out.objects++;
+				out.bytes += b.byteLength;
+				if (isBudgeted) budget -= cost ?? b.byteLength;
+			}
+		};
+		await Promise.all(Array.from({ length: Math.max(1, opts.concurrency ?? 4) }, worker));
+		return out;
 	}
 
 	// ---- unified search ----
@@ -391,7 +518,7 @@ export class ThreadIndex {
 		const hasText = typeof req.text === "string" && req.text.trim().length > 0;
 		const hasVector = req.vector !== undefined;
 		if (!hasText && !hasVector) throw new ThreadError("search needs a text, a vector or both", 400);
-		if (this.refreshInterval > 0 && !this.pinned && Date.now() - this.lastCheck > this.refreshInterval) await this.refresh().catch((e: unknown) => console.error(`thread-sdk: refresh failed: ${e instanceof Error ? e.message : String(e)}`));
+		this.maybeRefresh();
 		const cfg = this.lexConfig;
 		if (hasText && !cfg) throw new ThreadError("this generation has no lexical index (index.configureLexical first)", 400);
 		if (hasVector && !this.hasDense) throw new ThreadError("this generation has no dense index", 400);
@@ -569,7 +696,7 @@ export class ThreadIndex {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		if (!this.hasDense) throw new ThreadError("this generation has no dense index (lexical only): use search({text})", 400);
 		const q = vector instanceof Float32Array ? vector : Float32Array.from(vector);
-		if (this.refreshInterval > 0 && !this.pinned && Date.now() - this.lastCheck > this.refreshInterval) await this.refresh().catch((e: unknown) => console.error(`thread-sdk: refresh failed: ${e instanceof Error ? e.message : String(e)}`));
+		this.maybeRefresh();
 		return this.thread.withRecovery("query", async (attempt) => {
 			const loaded: { stat?: BaseStat } = {};
 			const base = await this.acquireBase(loaded);
@@ -585,6 +712,7 @@ export class ThreadIndex {
 						wasmResets: this.thread.resets,
 						wasmMemBytes: () => this.thread.memoryBytes(),
 						getDelta: (ref, trace) => this.getDelta(ref, trace),
+						coldPolicy: this.opts.coldPolicy,
 					},
 					q,
 					opts,
@@ -642,14 +770,14 @@ export class ThreadIndex {
 		return { thread: this.thread, w: W, store: this.store, gen: this.revState.gen, borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.thread.epoch ? this.base.pq : null) };
 	}
 
-	private async getDelta(ref: DeltaRef, trace: BlobTrace): Promise<Uint8Array> {
+	private async getDelta(ref: DeltaRef, trace: BlobTrace, rev: RevState = this.revState): Promise<Uint8Array> {
 		const hit = this.deltaCache.get(ref.key);
 		if (hit) return hit;
 		const p = this.store.get(ref.key, undefined, { trace }).then((b) => {
 			if (!b) throw new ThreadError(`missing delta segment ${ref.key}`, 404);
 			return b;
 		});
-		const total = this.revState.deltas.reduce((a, d) => a + d.bytes, 0);
+		const total = rev.deltas.reduce((a, d) => a + d.bytes, 0);
 		if (total <= this.deltaBudget) {
 			this.deltaCache.set(ref.key, p);
 			p.catch(() => this.deltaCache.get(ref.key) === p && this.deltaCache.delete(ref.key));
