@@ -1,12 +1,14 @@
 /**
  * Node-only stores and helpers (`import ... from "thread-sdk/node"`): an index in a local directory
  * (`FileBlobStore`, the layout Python's `FileBlobStore` reads and writes), opening a directory or a pack file from
- * a path (`storeAt`), and writing a pack to a file (`packIndexToFile`).
+ * a path (`storeAt`), writing a pack to a file (`packIndexToFile`), a size-bounded disk cache of index objects in
+ * the same directory layout (`DiskCache`, shared with Python's `DiskCache`), and a `fetch` with a longer keep-alive
+ * (`nodeFetch`).
  */
-import { promises as fs } from "node:fs";
+import { promises as fs, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { isPackHeader, PACK_HEADER_BYTES, packIndex, PackedBlobStore, type PackIndexOptions, type PackIndexResult, type PackSink } from "./pack.js";
-import type { BlobHead, BlobRange, BlobStore, GetOptions, PutOptions } from "./store.js";
+import type { BlobCache, BlobHead, BlobRange, BlobStore, GetOptions, MissPolicy, PutOptions } from "./store.js";
 import { ThreadError } from "./wire.js";
 
 const LOCK_DIR = ".thread-lock.d";
@@ -258,4 +260,172 @@ export async function packIndexToFile(store: BlobStore, file: string, opts: Pack
 		await fs.unlink(tmp).catch(() => {});
 		throw e;
 	}
+}
+
+// ---------- disk cache ----------
+
+export interface DiskCacheOptions {
+	/** Bytes kept on disk (default 4 GB); least recently used objects are deleted beyond it. */
+	maxBytes?: number;
+	/** The miss policy a `CachedBlobStore` over this cache uses by default (default `"range+warm"`). */
+	missPolicy?: MissPolicy;
+}
+
+/** A hit refreshes the file's mtime at most this often, so the LRU order survives a restart. */
+const TOUCH_EVERY_MS = 60_000;
+
+/**
+ * Whole immutable index objects on disk, for `thread.open({ store: s3, cache: new DiskCache(dir) })` in Node: a
+ * process restart is then not a cold start. The directory has the bucket layout (`{dir}/idx/{gen}/slab/00123`), the
+ * same one Python's `DiskCache` writes, so the two SDKs can share a cache directory, and a cache is also a valid
+ * directory store (`FileBlobStore`): `copyObjects(s3, diskCache, snapshotKeys(rev))` pre-warms it with one
+ * revision, and `new FileBlobStore(dir)` (pinned with `gen`/`rev`: a cache holds no `current.json`) reads it.
+ *
+ * Size-bounded: objects are evicted least recently used first (the order is kept in memory and, coarsely, in the
+ * files' mtimes, which the startup scan sorts by). Several processes may share a directory; each bounds what it
+ * wrote and sees, and a file another process evicted reads as a miss. Ranges are read from the file, never the
+ * whole object.
+ */
+export class DiskCache extends FileBlobStore implements BlobCache {
+	readonly maxBytes: number;
+	readonly defaultMissPolicy: MissPolicy;
+	/** Bytes this process accounts for (files found at startup plus its own puts, minus evictions). */
+	held = 0;
+	/** Key -> size and last touch (ms), least recently used first. */
+	private readonly lru = new Map<string, { size: number; touched: number }>();
+
+	constructor(root: string, opts: DiskCacheOptions = {}) {
+		super(root);
+		this.maxBytes = opts.maxBytes ?? 4 * 1024 ** 3;
+		this.defaultMissPolicy = opts.missPolicy ?? "range+warm";
+		const found: { key: string; size: number; mtime: number }[] = [];
+		const walk = (dir: string, rel: string) => {
+			let ents: import("node:fs").Dirent[];
+			try {
+				ents = readdirSync(dir, { withFileTypes: true });
+			} catch (e) {
+				if (errno(e) === "ENOENT") return;
+				throw e;
+			}
+			for (const e of ents) {
+				if (e.name.startsWith(".tmp-") || e.name === LOCK_DIR || e.name === ".thread-lock") continue;
+				const full = path.join(dir, e.name);
+				if (e.isDirectory()) walk(full, rel + e.name + "/");
+				else if (e.isFile()) {
+					try {
+						const st = statSync(full);
+						found.push({ key: rel + e.name, size: st.size, mtime: st.mtimeMs });
+					} catch {
+						/* evicted by another process meanwhile */
+					}
+				}
+			}
+		};
+		walk(this.root, "");
+		found.sort((a, b) => a.mtime - b.mtime);
+		for (const f of found) {
+			this.lru.set(f.key, { size: f.size, touched: f.mtime });
+			this.held += f.size;
+		}
+	}
+
+	has(key: string): boolean {
+		return this.lru.has(key);
+	}
+
+	private touch(key: string, size: number): void {
+		const e = this.lru.get(key);
+		const now = Date.now();
+		if (!e) {
+			this.lru.set(key, { size, touched: now });
+			this.held += size;
+			this.evict();
+			return;
+		}
+		this.lru.delete(key);
+		this.lru.set(key, e);
+		if (now - e.touched > TOUCH_EVERY_MS) {
+			e.touched = now;
+			const t = new Date(now);
+			fs.utimes(this.path(key), t, t).catch(() => {});
+		}
+	}
+
+	private forget(key: string): void {
+		const e = this.lru.get(key);
+		if (!e) return;
+		this.lru.delete(key);
+		this.held -= e.size;
+	}
+
+	private evict(): void {
+		for (const [k, e] of this.lru) {
+			if (this.held <= this.maxBytes || this.lru.size <= 1) break;
+			this.lru.delete(k);
+			this.held -= e.size;
+			fs.unlink(this.path(k)).catch(() => {});
+		}
+	}
+
+	override async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+		let b: Uint8Array | null;
+		try {
+			b = await super.get(key, range, opts);
+		} catch (e) {
+			if (errno(e) === "ENOENT") b = null;
+			else throw e;
+		}
+		if (!b) this.forget(key);
+		else if (!range) this.touch(key, b.byteLength);
+		else if (this.lru.has(key)) this.touch(key, 0);
+		return b;
+	}
+
+	override async getRanges(key: string, ranges: BlobRange[], opts?: GetOptions): Promise<Uint8Array[] | null> {
+		const got = await super.getRanges(key, ranges, opts);
+		if (!got) this.forget(key);
+		else if (this.lru.has(key)) this.touch(key, 0);
+		return got;
+	}
+
+	override async put(key: string, data: Uint8Array | string, opts: PutOptions = {}): Promise<BlobHead | null> {
+		const size = typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
+		if (size > this.maxBytes) return null;
+		const h = await super.put(key, data, opts);
+		if (h) {
+			this.forget(key);
+			this.lru.set(key, { size: h.size, touched: Date.now() });
+			this.held += h.size;
+			this.evict();
+		}
+		return h;
+	}
+}
+
+// ---------- fetch with a longer keep-alive ----------
+
+export interface NodeFetchOptions {
+	/** Idle time before a pooled connection is closed (ms; undici's default is 4 000). */
+	keepAliveTimeout?: number;
+	/** Negotiate HTTP/2 over TLS when the server offers it (undici's default: HTTP/1.1 only). */
+	allowH2?: boolean;
+	/** Most connections per origin (default unlimited). */
+	connections?: number;
+}
+
+/**
+ * A `fetch` for `S3BlobStore({ fetch })` whose connection pool keeps idle connections longer (and optionally speaks
+ * HTTP/2). Node's global `fetch` is undici with HTTP/1.1, one connection per request in flight, kept alive for 4 s
+ * when idle; queries more than 4 s apart then pay a TLS handshake per connection again. Node does not export
+ * undici's `Agent`, so this builds one from the class of the global dispatcher; when that is not possible it
+ * returns the global `fetch` unchanged.
+ */
+export async function nodeFetch(opts: NodeFetchOptions = {}): Promise<typeof fetch> {
+	const sym = Symbol.for("undici.globalDispatcher.1");
+	const g = globalThis as Record<symbol, unknown>;
+	if (!g[sym]) await fetch("data:,").catch(() => {});
+	const Agent = (g[sym] as { constructor?: new (o: object) => unknown } | undefined)?.constructor;
+	if (!Agent) return fetch;
+	const dispatcher = new Agent({ keepAliveTimeout: opts.keepAliveTimeout ?? 60_000, keepAliveMaxTimeout: Math.max(opts.keepAliveTimeout ?? 60_000, 600_000), allowH2: opts.allowH2 ?? false, ...(opts.connections ? { connections: opts.connections } : {}) });
+	return ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, dispatcher } as RequestInit)) as typeof fetch;
 }
