@@ -15,9 +15,9 @@ from .fusion import DEFAULT_RRF_K, rrf
 from .index import Rank, SearchHit, SearchResult, ThreadIndex, head_revision, load_rev_state, open_index, resolve_target
 from .lex import DocRecord, LexHit, LexIndex, LexSearchResult, LexSegment
 from .pack import PackedBlobStore, PackResult, PackWriter, copy_objects, pack_index, pack_to_bytes, store_at
-from .query import QUERY_INFLIGHT, Hit, QueryResult, RevState
+from .query import MULTI_COALESCE, QUERY_INFLIGHT, Hit, QueryResult, RevState, coalesce_runs
 from .revision import snapshot_keys
-from .s3 import S3BlobStore, sign_v4
+from .s3 import S3_INFLIGHT, S3BlobStore, SigningKeyCache, sign_v4
 from .store import (
     BlobCache,
     BlobHead,
@@ -28,6 +28,7 @@ from .store import (
     DiskCache,
     FileBlobStore,
     MemoryBlobStore,
+    MISS_POLICIES,
     MemoryCache,
     PrefixedBlobStore,
 )
@@ -92,6 +93,11 @@ __all__ = [
     "rrf",
     "DEFAULT_RRF_K",
     "sign_v4",
+    "SigningKeyCache",
+    "S3_INFLIGHT",
+    "MULTI_COALESCE",
+    "MISS_POLICIES",
+    "coalesce_runs",
     "resolve_target",
     "load_rev_state",
     "head_revision",

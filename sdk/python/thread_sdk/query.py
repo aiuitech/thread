@@ -1,9 +1,9 @@
 """The dense query path, the same algorithm as the reference Worker and the TypeScript SDK:
 
 1. route (flat over the cell means by default), build the PQ table (format 3);
-2. phase 1: read the scan prefix of each probed slab (a cache miss reads the whole object and keeps the local
-   winners' int8 records), scan it as it arrives with the tombstones applied inside the scan; scan every delta
-   segment (int8 scores, no phase 2);
+2. phase 1: read the scan prefix of each probed slab (a cache miss under the "whole" miss policy reads the whole
+   object and keeps the local winners' int8 records; "range" / "range+warm" read just the prefix), scan it as it
+   arrives with the tombstones applied inside the scan; scan every delta segment (int8 scores, no phase 2);
 3. phase 2: re-score the global top-T with the int8 rerank records, read with one multi-range request per slab
    (speculatively, once only a few slabs are left to scan);
 4. top-k over reranked slab hits and delta hits, one copy per id.
@@ -28,7 +28,8 @@ from . import _native
 from .store import BlobRange, BlobStore, BlobTrace, Bytes
 from .wire import LEGACY_DEFAULTS, TombState, ThreadError, keys, slab_rev_of, tomb_for, tomb_for_delta
 
-__all__ = ["Hit", "QueryResult", "RevState", "Base", "QUERY_INFLIGHT", "execute_query"]
+__all__ = ["Hit", "QueryResult", "RevState", "Base", "QUERY_INFLIGHT", "MULTI_COALESCE", "execute_query",
+           "coalesce_runs", "slab_resident"]
 
 QUERY_INFLIGHT = 12
 #: Rerank winners of one slab whose records lie within this span share one range (adjacent records).
@@ -94,6 +95,8 @@ class QueryContext:
     io: Executor
     #: A delta segment (whole), shared between concurrent queries.
     get_delta: Callable[[dict[str, Any], BlobTrace], Future]
+    #: The index-wide cold-path policy (`open_index(cold_policy=...)`).
+    cold_policy: dict[str, Any] | None = None
 
 
 class Limiter:
@@ -134,15 +137,29 @@ class _Run:
     members: list[int] = field(default_factory=list)
 
 
-def _coalesce_runs(idxs: list[int], rec_len: int) -> list[_Run]:
+def coalesce_runs(idxs: list[int], rec_len: int, coalesce_bytes: int = MULTI_COALESCE, span_bytes: int = 0) -> list[_Run]:
+    """Groups the ascending record indexes of one slab into runs read as one range each: the whole span when it is at
+    most `span_bytes`, else greedily while a run's span stays within `coalesce_bytes`."""
+    if not idxs:
+        return []
+    if len(idxs) > 1 and (idxs[-1] - idxs[0] + 1) * rec_len <= span_bytes:
+        return [_Run(idxs[0], idxs[-1], list(idxs))]
     runs: list[_Run] = []
     for i in idxs:
-        if runs and (i - runs[-1].a + 1) * rec_len <= MULTI_COALESCE:
+        if runs and (i - runs[-1].a + 1) * rec_len <= coalesce_bytes:
             runs[-1].b = i
             runs[-1].members.append(i)
         else:
             runs.append(_Run(i, i, [i]))
     return runs
+
+
+def slab_resident(store: BlobStore, rev: RevState, cell: int) -> bool:
+    """Whether probed `cell`'s slab can be read without an origin request (see the cold-path policy): the store's
+    `contains`, else True for a local store and False for a remote one."""
+    key = keys.slab(rev.gen, cell, slab_rev_of(rev.slabs[cell]) if rev.slabs is not None and cell < len(rev.slabs) and rev.slabs[cell] else 0)
+    r = store.contains(key)
+    return (not store.remote) if r is None else r
 
 
 def _int_param(name: str, v: Any, lo: int) -> int:
@@ -172,8 +189,11 @@ def execute_query(
     rerank: int | None = None,
     pc: int | None = None,
     return_payload: bool = False,
-    inflight: int = QUERY_INFLIGHT,
+    inflight: int | None = None,
     speculate: bool = True,
+    coalesce_bytes: int | None = None,
+    span_bytes: int | None = None,
+    cold_policy: dict[str, Any] | Literal[False] | None = None,
 ) -> QueryResult:
     store, rev, base, io = ctx.store, ctx.rev, ctx.base, ctx.io
     manifest, gen, fmt, tomb, deltas = rev.manifest, rev.gen, rev.format, rev.tomb, rev.deltas
@@ -189,12 +209,13 @@ def execute_query(
     rerank_v = _int_param("rerank", rerank if rerank is not None else defaults["rerank"], 0)
     params = {"top_k": k, "nprobe": nprobe_v, "rerank": rerank_v, "pc": pc_v,
               "source": {"nprobe": src(nprobe), "rerank": src(rerank), "pc": src(pc)}}
-    # Format 1 slabs have no rerank tier: phase 2 is skipped whatever rerank says.
-    do_rerank = fmt >= 2 and rev.slabs is not None and rerank_v > 0
-    T = max(k, rerank_v) if do_rerank else k
+    inflight_v = inflight if inflight is not None else store.inflight or QUERY_INFLIGHT
+    coalesce_v = coalesce_bytes if coalesce_bytes is not None else store.coalesce_bytes or MULTI_COALESCE
+    span_v = span_bytes if span_bytes is not None else store.span_bytes or 0
+    cold_v = None if cold_policy is False else (cold_policy or ctx.cold_policy)
     flat = pc_v == 0 or pc_v >= manifest["k1"]
     parallel = store.remote
-    lim = Limiter(inflight)
+    lim = Limiter(inflight_v)
     trace = BlobTrace()
     # Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
     delta_reads = [ctx.get_delta(d, trace) for d in deltas]
@@ -203,12 +224,30 @@ def execute_query(
     except ValueError as e:
         raise ThreadError(str(e), 400) from e
     cells = base.searcher.route(query, 0 if flat else pc_v, nprobe_v)
+    # Cold-path policy: fewer probes / a smaller rerank when most probed slabs would come from the origin. Cells are in
+    # routing order (best first), so the cold probe set is the best `cold_policy["nprobe"]` of them.
+    cold = None
+    if cold_v and cells:
+        probed = len(cells)
+        misses = sum(0 if slab_resident(store, rev, c) else 1 for c in cells)
+        applied = misses / probed > cold_v.get("threshold", 0.5)
+        if applied:
+            if cold_v.get("nprobe") is not None:
+                nprobe_v = max(1, min(nprobe_v, int(cold_v["nprobe"])))
+            if cold_v.get("rerank") is not None:
+                rerank_v = max(0, min(rerank_v, int(cold_v["rerank"])))
+            cells = cells[:nprobe_v]
+            params["nprobe"], params["rerank"] = nprobe_v, rerank_v
+        cold = {"misses": misses, "probed": probed, "applied": applied}
+    # Format 1 slabs have no rerank tier: phase 2 is skipped whatever rerank says.
+    do_rerank = fmt >= 2 and rev.slabs is not None and rerank_v > 0
+    T = max(k, rerank_v) if do_rerank else k
     t_route = time.perf_counter()
 
     run = _native.QueryRun(query, T, do_rerank, return_payload)
     slab_keys: dict[int, str] = {}
     lock = threading.Lock()
-    st = {"rerank_reads": 0, "rerank_bytes": 0}
+    st = {"rerank_reads": 0, "rerank_bytes": 0, "whole_slabs": 0}
     spec_futs: list[Future] = []
     spec_fired = False
 
@@ -240,7 +279,7 @@ def execute_query(
     def records(cell: int, rerank_off: int, rec_len: int, idxs: list[int], low: bool) -> list[Future]:
         """Reads records `idxs` of one slab: inline for a local store; on the pool as one task trying a multi-range
         request, or, for a store without them, one task per run (in parallel)."""
-        runs = _coalesce_runs(idxs, rec_len)
+        runs = coalesce_runs(idxs, rec_len, coalesce_v, span_v)
         multi = store.supports_ranges and len(runs) > 1
         if not parallel:
             read_records(cell, rerank_off, rec_len, runs, low, multi)
@@ -275,6 +314,9 @@ def execute_query(
     def slab_task(cell: int) -> None:
         nonlocal spec_fired
         prefix, full, slab_rev = read_slab(cell)
+        if full is not None and full is not prefix:
+            with lock:
+                st["whole_slabs"] += 1
         # Tombstones are applied inside the scan (before top-k insertion): ids deleted or replaced at a rev >= this
         # slab's revision (every set for rev-0 slabs).
         rerankable, done = run.add_slab(cell, prefix, full, tomb_for(tomb, slab_rev) if tomb else None)
@@ -352,6 +394,11 @@ def execute_query(
             "tombstones": tomb.total if tomb else 0,
             "tomb_sets": len(tomb.sets) if tomb else 0,
             "tomb_dropped": rs["tomb_dropped"],
+            "whole_slabs": st["whole_slabs"],
+            "inflight": inflight_v,
+            "coalesce_bytes": coalesce_v,
+            "span_bytes": span_v,
+            **({"cold": cold} if cold is not None else {}),
             "io": trace.as_dict(),
             "timing": {"total": ms(t_start, t_end), "route": ms(t_start, t_route), "phase1": ms(t_route, t_phase1),
                        "phase2": ms(t_phase1, t_phase2), "payload": ms(t_phase2, t_end)},
