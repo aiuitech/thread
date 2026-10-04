@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/thread-core", "crates/thread-wasm", "crates/thread-cli"]
+members = ["crates/thread-core", "crates/thread-wasm", "crates/thread-cli", "crates/thread-py"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,3 +13,9 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+# The Python extension (crates/thread-py, built by maturin with `--profile python`): a panic must
+# unwind into a Python exception instead of aborting the interpreter.
+[profile.python]
+inherits = "release"
+panic = "unwind"

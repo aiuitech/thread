@@ -29,7 +29,9 @@ Everything numeric is in Rust (`crates/thread-core`), exposed to JS through
 wasm-bindgen (`crates/thread-wasm`). The Worker (`worker/`) is an I/O shell that
 streams R2 objects through the wasm kernels so no stage holds more than a few
 tens of MB; the SDK (`sdk/`) is the same query path as a library, plus the lexical
-side, the write path and the fused `search`.
+side, the write path and the fused `search`. The Python SDK (`python/`, `thread-sdk` on
+PyPI) is the same library for Python, over a PyO3 extension of `thread-core`
+(`crates/thread-py`).
 
 Text lives in **segments** next to the slabs: immutable `THREADIX` containers holding
 BM25 postings (a bucketed term table carrying each term's `df` and posting range, lists
@@ -332,8 +334,13 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
                       lexical (`src/lex.rs`): LexTokenizer, SegmentJob, SegmentReader (paged), merge_segments, rrf_fuse,
                       best_doc_ranks, rerank_fuse, Lines, Excerpter
 - `crates/thread-cli`    native CLI: `seg build|inspect|search|merge`, `tokenize`, slab/scan benchmarks
+- `crates/thread-py`     PyO3 extension (`thread_sdk._native`): Searcher, PqCodebook, the per-query `QueryRun`
+                      (scan, merge, rerank), DeltaJob, tombstones, AssignJob/SlabJob, LexTokenizer, SegmentJob,
+                      SegmentReader (paged), merge_segments
 - `sdk/`              `thread-sdk`: the query path as a library (R2/S3/memory stores, Cache API), the lexical index,
                       `search` (dense, lexical, hybrid), the write path (upsert with texts, delete, segment compaction)
+- `python/`           `thread-sdk` for Python: the same library (S3/R2, directory and memory stores, memory/disk
+                      caches), wire-compatible with `sdk/` (see `python/README.md`)
 - `worker/`           `cf`-managed Worker: build-stage endpoints, `/query`, `/upsert`, `/delete`, compaction (manual and
                       automatic), cell splits, `/index/status`, rollback, gc (`src/index.ts`); `src/main.ts` runs build
                       stages and writes in build slots (Worker Loader); see `worker/README.md`
@@ -509,7 +516,9 @@ target/release/thread seg search --text "deploy failed" --k 10 --with-docs seg.t
 Checks before a commit: `cargo test --workspace`, `cargo check -p thread-core -p thread-wasm --target
 wasm32-unknown-unknown`, `cargo fmt --all --check` (the dense-side files predate rustfmt and carry
 `#![cfg_attr(rustfmt, rustfmt::skip)]`, so the formatter touches only the lexical modules and new code),
-`cargo clippy --all-targets`, and `cd sdk && npm run typecheck && npm test`.
+`cargo clippy --all-targets`, `cd sdk && npm run typecheck && npm test`, and
+`cd python && maturin develop --uv && pytest && mypy thread_sdk` (the Python tests include a cross-check against
+the built TypeScript SDK in `sdk/dist`).
 
 ### Build flags (`bench/driver.mjs`)
 

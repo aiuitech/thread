@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "thread-sdk"
+version = "0.1.0"
+description = "Query and update a thread blob-native search index (dense vectors, BM25 text, or both fused) in R2, S3 or on disk"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["vector-search", "bm25", "hybrid-search", "r2", "s3", "ann"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.maturin]
+manifest-path = "../crates/thread-py/Cargo.toml"
+module-name = "thread_sdk._native"
+python-source = "."
+python-packages = ["thread_sdk"]
+profile = "python"
+include = [{ path = "thread_sdk/py.typed", format = ["sdist", "wheel"] }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,5 +1,10 @@
 /data/
 /.venv/
+/python/.venv/
+/python/thread_sdk/*.so
+/python/thread_sdk/*.pyd
+.pytest_cache/
+.mypy_cache/
 /target/
 node_modules/
 /worker/pkg/
