@@ -247,7 +247,27 @@ export class S3BlobStore implements BlobStore {
 	}
 
 	get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
-		return !range && this.chunkBytes > 0 ? this.getChunked(key, opts) : this.getOne(key, range, opts);
+		if (this.chunkBytes > 0 && !range) return this.getChunked(key, opts);
+		if (this.chunkBytes > 0 && range && range.length > 2 * this.chunkBytes) return this.getRangeChunked(key, range, opts);
+		return this.getOne(key, range, opts);
+	}
+
+	/** A large range (a 25 MB routing table inside a pack) as parallel range GETs of `chunkBytes`. */
+	private async getRangeChunked(key: string, range: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+		const c = this.chunkBytes;
+		const out = new Uint8Array(range.length);
+		const todo: number[] = [];
+		for (let off = 0; off < range.length; off += c) todo.push(off);
+		let missing = false;
+		const worker = async () => {
+			for (let off = todo.shift(); off !== undefined && !missing; off = todo.shift()) {
+				const b = await this.getOne(key, { offset: range.offset + off, length: Math.min(c, range.length - off) }, opts);
+				if (!b) missing = true;
+				else out.set(b, off);
+			}
+		};
+		await Promise.all(Array.from({ length: Math.min(this.chunkConcurrency, todo.length) }, worker));
+		return missing ? null : out;
 	}
 
 	/** One GET (of `range`, else of the whole object). */

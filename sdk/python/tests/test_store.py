@@ -337,6 +337,10 @@ def test_s3_whole_gets_are_chunked(s3_server):
     assert sorted(c[2]["range"] for c in FakeS3.calls[n0:]) == ["bytes=0-99", "bytes=100-199", "bytes=200-299",
                                                                  "bytes=300-349"]
     assert (t.reads, t.bytes) == (4, 350)
+    n1 = len(FakeS3.calls)
+    assert s.get("idx/g4/fine.f32", BlobRange(20, 300)) == body[20:320]  # more than 2 chunks: split too
+    assert sorted(c[2]["range"] for c in FakeS3.calls[n1:]) == ["bytes=120-219", "bytes=20-119", "bytes=220-319"]
+    assert s.get("idx/g4/fine.f32", BlobRange(20, 150)) == body[20:170]
     s.put("idx/small", b"abc")
     assert s.get("idx/small") == b"abc"
     s.put("idx/empty", b"")

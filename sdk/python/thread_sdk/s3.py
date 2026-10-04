@@ -298,7 +298,32 @@ class S3BlobStore(BlobStore):
     def get(self, key, range=None, *, trace=None, fill=False):
         if range is None and self.chunk_bytes > 0:
             return self._get_chunked(key, trace)
+        if range is not None and self.chunk_bytes > 0 and range.length > 2 * self.chunk_bytes:
+            return self._get_range_chunked(key, range, trace)
         return self._get_one(key, range, trace)
+
+    def _get_range_chunked(self, key: str, rng: BlobRange, trace: BlobTrace | None) -> bytes | None:
+        """A large range (a 25 MB routing table inside a pack) as parallel range GETs of `chunk_bytes`."""
+        c = self.chunk_bytes
+        out = bytearray(rng.length)
+        missing = []
+
+        def one(off: int) -> None:
+            b = self._get_one(key, BlobRange(rng.offset + off, min(c, rng.length - off)), trace)
+            if b is None:
+                missing.append(off)
+            else:
+                out[off : off + len(b)] = b
+
+        for f in [self._pool_for_chunks().submit(one, off) for off in builtins.range(0, rng.length, c)]:
+            f.result()
+        return None if missing else bytes(out)
+
+    def _pool_for_chunks(self) -> ThreadPoolExecutor:
+        with self._chunk_lock:
+            if self._chunk_pool is None:
+                self._chunk_pool = ThreadPoolExecutor(max_workers=self.chunk_concurrency, thread_name_prefix="thread-s3")
+            return self._chunk_pool
 
     def _get_chunked(self, key: str, trace: BlobTrace | None) -> bytes | None:
         """A whole object as parallel range GETs: the first `chunk_bytes` (whose Content-Range gives the size), then
@@ -332,10 +357,7 @@ class S3BlobStore(BlobStore):
                 raise ThreadError(f"{key} disappeared while being read", 404)
             out[off : off + len(b)] = b
 
-        with self._chunk_lock:
-            if self._chunk_pool is None:
-                self._chunk_pool = ThreadPoolExecutor(max_workers=self.chunk_concurrency, thread_name_prefix="thread-s3")
-        for f in [self._chunk_pool.submit(one, off) for off in offs]:
+        for f in [self._pool_for_chunks().submit(one, off) for off in offs]:
             f.result()
         return bytes(out)
 

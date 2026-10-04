@@ -96,6 +96,10 @@ describe("S3BlobStore", () => {
 		const gets = calls.slice(n0).map((c) => c.headers.range);
 		expect(gets.sort()).toEqual(["bytes=0-99", "bytes=100-199", "bytes=200-299", "bytes=300-349"]);
 		expect(trace).toMatchObject({ reads: 4, bytes: 350 });
+		const n1 = calls.length;
+		expect(await chunked.get("idx/g4/fine.f32", { offset: 20, length: 300 })).toEqual(data.slice(20, 320)); // > 2 chunks: split too
+		expect(calls.slice(n1).map((c) => c.headers.range).sort()).toEqual(["bytes=120-219", "bytes=20-119", "bytes=220-319"]);
+		expect(await chunked.get("idx/g4/fine.f32", { offset: 20, length: 150 })).toEqual(data.slice(20, 170)); // one GET
 		await chunked.put("idx/small", new Uint8Array([1, 2, 3]));
 		expect(await chunked.get("idx/small")).toEqual(new Uint8Array([1, 2, 3]));
 		expect(await chunked.get("idx/none")).toBeNull();

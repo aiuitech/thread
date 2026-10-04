@@ -40,7 +40,7 @@ function row(name, recs) {
 	];
 }
 
-for (const profile of profiles)
+if (!args.tag) for (const profile of profiles)
 	for (const sdk of sdks) {
 		const rows = [];
 		const base = load(path.join(root, "data/cold", profile === "r2s3" ? `baseline-${sdk}-r2s3.jsonl` : `baseline-${sdk}-proxy-${profile}.jsonl`));
@@ -56,3 +56,27 @@ for (const profile of profiles)
 		console.log(`|${header.map((_, i) => (i ? "---:" : "---")).join("|")}|`);
 		for (const r of rows) console.log(`| ${r.join(" | ")} |`);
 	}
+
+// --tag TAG: the run_baseline.sh runs of TAG against the baseline, side by side (median, scenario by scenario).
+if (args.tag) {
+	const pair = (a, b, d = 0) => `${f(a, d)} -> ${f(b, d)}`;
+	const header = ["profile", "store", "sdk", "process-cold e2e", "process-cold query", "slab-cold query", "warm query", "slab-cold requests", "slab-cold proxy MB", "process-cold proxy conns", "recall@10"];
+	console.log(`\n#### baseline -> ${args.tag} (run_baseline.sh, medians)\n`);
+	console.log(`| ${header.join(" | ")} |`);
+	console.log(`|${header.map((_, i) => (i > 2 ? "---:" : "---")).join("|")}|`);
+	for (const profile of ["rtt25", "rtt25link500", "rtt60", "r2s3"])
+		for (const store of profile === "r2s3" ? ["r2s3"] : ["proxy", "pack"])
+			for (const sdk of sdks) {
+				const name = (tag) => path.join(root, "data/cold", profile === "r2s3" ? `${tag}-${sdk}-r2s3.jsonl` : `${tag}-${sdk}-${store}-${profile}.jsonl`);
+				const a = load(name("baseline"));
+				const b = load(name(args.tag));
+				if (!a || !b) continue;
+				const m = (recs, s, g) => median(recs.filter((r) => r.scenario === s).map(g).filter((v) => v !== null && v !== undefined));
+				const rc = (recs) => {
+					const c = recs.filter((r) => r.scenario !== "warm");
+					return (100 * c.reduce((x, r) => x + r.recall, 0)) / c.length;
+				};
+				const g = (s, fn, d) => pair(m(a, s, fn), m(b, s, fn), d);
+				console.log(`| ${[profile, store, sdk, g("process-cold", (r) => r.ms.e2e), g("process-cold", (r) => r.ms.query), g("slab-cold", (r) => r.ms.query), g("warm", (r) => r.ms.query), g("slab-cold", (r) => r.reqs.query), g("slab-cold", (r) => (r.proxy ? r.proxy.bytes / MB : null), 1), g("process-cold", (r) => r.proxy?.newConnections), pair(rc(a), rc(b), 1) + "%"].join(" | ")} |`);
+			}
+}
