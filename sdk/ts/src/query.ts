@@ -11,6 +11,7 @@
 import type { BlobRange, BlobStore, BlobTrace, PhaseStat } from "./store.js";
 import { newTrace, nowMs, phaseStat, roundMs, snapTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
+import type { ColdRouting, ColdStat } from "./cold.js";
 import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SegmentRef, type SlabRow, type TombState, type IndexFiles, type RoutingElem } from "./wire.js";
 
 export interface QueryOptions {
@@ -28,6 +29,11 @@ export interface QueryOptions {
 	inflight?: number;
 	/** Speculative rerank reads of the running top-T while the last slabs are still scanning (default true). */
 	speculate?: boolean;
+	/**
+	 * Cold routing only (`open({coldRouting: "tree"})`, before the full routing table has loaded): groups of the
+	 * centroid tree whose cells are ranked (default `open`'s `coldBeam`).
+	 */
+	beam?: number;
 }
 
 export interface Hit {
@@ -84,9 +90,12 @@ export interface QueryStats {
 	gen: string;
 	rev: number;
 	format: number;
-	routing: "flat" | "tree";
-	/** The routing table the probed cells were ranked with (`open({routing})`). */
+	/** `cold`: ranked over the tree's best groups while the full routing table loads (`coldRouting: "tree"`). */
+	routing: "flat" | "tree" | "cold";
+	/** The routing table the probed cells were ranked with (`open({routing})`; the grouped table's for `cold`). */
 	routingTable: RoutingElem;
+	/** Cold routing: the beam and the group / delta-cell means this query had to read. */
+	cold?: ColdStat;
 	/** Probed cells, in routing order. */
 	cells: number[];
 	/** Entries scanned (slabs) and bytes of scan prefixes / of slab objects transferred. */
@@ -150,7 +159,10 @@ export interface RevState {
 /** Routing table and PQ codebook of a generation, in wasm memory. */
 export interface Base {
 	key: string;
-	searcher: W.Searcher;
+	/** The full routing table (null for a cold base, which routes with `cold`). */
+	searcher: W.Searcher | null;
+	/** Cold routing: the centroid tree plus the groups' means loaded so far. */
+	cold?: ColdRouting | null;
 	pq: W.PqCodebook | null;
 	/** The routing table the searcher was built from (f32 = `files.fine`). */
 	routing: RoutingElem;
@@ -262,8 +274,23 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const deltaReads = deltas.map((d) => ctx.getDelta(d, trace));
 
 	// One q·mean per cell: flat routing ranks them, and scan_delta scores every delta entry against its cell.
-	const cellDots = flat || deltas.length ? base.searcher.cell_dots(q) : null;
-	const cells = Array.from(flat ? base.searcher.route_from_dots(cellDots!, nprobe) : base.searcher.route(q, pc, nprobe));
+	const cold = base.cold ?? null;
+	let cellDots: Float32Array | null = null;
+	let cells: number[];
+	let coldStat: ColdStat | null = null;
+	if (cold) {
+		// Cold routing: the tree's best groups (their means read now unless an earlier query loaded them), then
+		// the members of those groups ranked as the full table would rank them.
+		const beam = o.beam ?? cold.beam;
+		if (!Number.isInteger(beam) || beam < 1) throw new ThreadError("beam must be an integer >= 1", 400);
+		coldStat = cold.newStat(beam);
+		await cold.ensureGroups(q, beam, trace, coldStat);
+		cells = Array.from(cold.router.route_beam(q, beam, nprobe));
+	} else {
+		const searcher = base.searcher!;
+		cellDots = flat || deltas.length ? searcher.cell_dots(q) : null;
+		cells = Array.from(flat ? searcher.route_from_dots(cellDots!, nprobe) : searcher.route(q, pc, nprobe));
+	}
 	// Format 3: one asymmetric-distance table (m x 256 f32) per query, shared by every probed slab.
 	const table = base.pq ? w.PqTable.from_codebook(q, base.pq) : null;
 	const tRoute = nowMs();
@@ -427,7 +454,9 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			deltaScanned += hdr.count;
 			// A delta entry is hidden by the sets newer than the rev that added its segment (applied inside the scan).
 			const scanStats = new Uint32Array(2);
-			const hits = w.scan_delta(bytes, q, cellDots!, T, tomb ? tombForDelta(tomb, d.addedRev) : NO_TOMBSTONES, scanStats);
+			// Cold routing: q·mean for just the cells this segment holds entries in (their rows read if needed).
+			const qc = cold ? await cold.deltaDots(d.key, bytes, q, trace, coldStat!) : cellDots!;
+			const hits = w.scan_delta(bytes, q, qc, T, tomb ? tombForDelta(tomb, d.addedRev) : NO_TOMBSTONES, scanStats);
 			deltaDropped += scanStats[1];
 			for (const h of parseHits(hits)) {
 				const e = deltaEntry(bytes, hdr, h.idx);
@@ -522,8 +551,9 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			gen,
 			rev: rev.rev,
 			format,
-			routing: flat ? "flat" : "tree",
+			routing: cold ? "cold" : flat ? "flat" : "tree",
 			routingTable: base.routing,
+			...(cold ? { cold: cold.finishStat(coldStat!) } : {}),
 			cells,
 			scanned,
 			scanBytes,

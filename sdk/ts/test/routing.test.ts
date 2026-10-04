@@ -1,20 +1,28 @@
 /** Compact routing tables (fine.f16 / fine.i8): building them, opening with `routing`, fallbacks, snapshots. */
 import { describe, expect, it } from "vitest";
-import { asF32, buildRoutingObjects, chooseRouting, keys, manifestFiles, snapshotKeys, loadRevState, type Manifest, type MemoryBlobStore } from "../src/index.js";
-import { buildGen, rng, thread, unitRows, w } from "./helpers.js";
+import { asF32, buildRoutingObjects, chooseRouting, groupedTableOf, keys, manifestFiles, snapshotKeys, loadRevState, type BlobStore, type Manifest, type MemoryBlobStore, type RoutingElem } from "../src/index.js";
+import { bruteForce, buildGen, rng, thread, unitRows, w } from "./helpers.js";
 
 /** Adds a revision naming `fine.f16` / `fine.i8` made from the generation's means (what publish-rev writes). */
-export async function addRoutingRev(store: MemoryBlobStore, gen: string, opts: { tables?: ("f16" | "i8")[]; staleFine?: boolean } = {}): Promise<{ rev: number; manifest: Manifest }> {
+export async function addRoutingRev(store: MemoryBlobStore, gen: string, opts: { tables?: ("f16" | "i8")[]; staleFine?: boolean; tree?: { groups: number; elem?: RoutingElem; beam?: number } } = {}): Promise<{ rev: number; manifest: Manifest }> {
 	const cur = JSON.parse(new TextDecoder().decode((await store.get(keys.current()))!)) as { gen: string; rev?: number };
 	const head = cur.rev ?? 0;
 	const m = JSON.parse(new TextDecoder().decode((await store.get(keys.manifest(gen, head)))!)) as Manifest;
 	const files = manifestFiles(m);
 	const fine = asF32((await store.get(files.fine))!, files.fine);
-	const built = buildRoutingObjects(w, { fineKey: files.fine, fine, dim: m.dim, tables: opts.tables });
-	for (const [k, b] of built.objects) await store.put(k, b);
 	const rev = head + 1;
+	let tree = m.tree;
+	let grouped: Parameters<typeof buildRoutingObjects>[1]["grouped"];
+	if (opts.tree) {
+		const bytes = w.build_centroid_tree(fine, m.dim, opts.tree.groups, 5, 7);
+		tree = { key: `idx/${gen}/tree.${rev}.bin`, groups: opts.tree.groups, beam: opts.tree.beam ?? 2 };
+		await store.put(tree.key, bytes);
+		grouped = { gen, rev, treeKey: tree.key, tree: bytes, elem: opts.tree.elem };
+	}
+	const built = buildRoutingObjects(w, { fineKey: files.fine, fine, dim: m.dim, tables: opts.tables, grouped });
+	for (const [k, b] of built.objects) await store.put(k, b);
 	const routing = opts.staleFine ? { ...built.routing, fine: `idx/${gen}/fine.0.f32` } : built.routing;
-	const manifest: Manifest = { ...m, rev, parentRev: head, files, routing };
+	const manifest: Manifest = { ...m, rev, parentRev: head, files, routing, ...(tree ? { tree } : {}) };
 	await store.put(keys.manifest(gen, rev), JSON.stringify(manifest));
 	await store.put(keys.current(), JSON.stringify({ gen, rev }));
 	return { rev, manifest };
@@ -87,6 +95,131 @@ describe("compact routing tables", () => {
 		expect(chooseRouting(stale.manifest, stale.files, "f16")).toEqual({ elem: "f32", key: "idx/gs/fine.f32" });
 		const ix = await thread.open({ store: b.store, cache: false, routing: "f16" });
 		expect((await ix.query(queries(1, b.dim, 2)[0])).stats.routingTable).toBe("f32");
+		ix.close();
+	});
+});
+
+/** A store whose reads of `key` wait until `release()` (to hold the full routing table back). */
+function gated(inner: BlobStore, key: string): { store: BlobStore; release: () => void; reads: string[] } {
+	let release!: () => void;
+	const gate = new Promise<void>((r) => (release = r));
+	const reads: string[] = [];
+	const store: BlobStore = {
+		get: async (k, range, o) => {
+			reads.push(range ? `${k}@${range.offset}+${range.length}` : k);
+			if (k === key) await gate;
+			return inner.get(k, range, o);
+		},
+		getRanges: inner.getRanges ? async (k, ranges, o) => (reads.push(`${k}#${ranges.length}`), inner.getRanges!(k, ranges, o)) : undefined,
+		head: (k) => inner.head(k),
+		list: inner.list ? (p) => inner.list!(p) : undefined,
+		put: inner.put ? (k, d, o) => inner.put!(k, d, o) : undefined,
+	};
+	return { store, release, reads };
+}
+
+describe("cold routing (coldRouting: tree)", () => {
+	it("grouped table: layout from the tree, partial routing equals full beam / flat routing", async () => {
+		const b = await buildGen("gt", 3, { k2: 48, n: 1500 });
+		const { manifest } = await addRoutingRev(b.store, "gt", { tree: { groups: 6, elem: "f32" } });
+		const g = groupedTableOf(manifest, manifestFiles(manifest))!;
+		expect(g.key).toBe("idx/gt/fine.grouped.1.f32");
+		expect(g.rows).toBe(48);
+		const bytes = (await b.store.get(g.key))!;
+		expect(Array.from(w.grouped_table_info(bytes))).toEqual([0, b.dim, 48, 6, 48, g.dataOff, 4 * b.dim, bytes.byteLength]);
+		const tree = (await b.store.get(manifest.tree!.key))!;
+		const full = await thread.open({ store: b.store, cache: false });
+		const gate = gated(b.store, "idx/gt/fine.f32");
+		const cold = await thread.open({ store: gate.store, cache: false, coldRouting: "tree", coldBeam: 6 });
+		expect(cold.routingState).toBe("cold");
+		expect(gate.reads).toContain(manifest.tree!.key);
+		for (const q of queries(20, b.dim, 4)) {
+			const a = await full.query(q, { nprobe: 5 });
+			const c = await cold.query(q, { nprobe: 5 });
+			// beam = every group: the exact flat ranking over the (f32) means, so the same probes and hits
+			expect(c.stats.routing).toBe("cold");
+			expect(c.stats.cells).toEqual(a.stats.cells);
+			expect(c.hits).toEqual(a.hits);
+		}
+		// the searcher a ColdRouter matches: Searcher.route_beam over the full table with the same tree
+		const s = new w.Searcher(b.dim, 1, 48, new Float32Array(b.dim).fill(0.25), asF32((await b.store.get("idx/gt/fine.f32"))!, "fine"));
+		s.set_tree(tree);
+		const q = queries(1, b.dim, 8)[0];
+		const qn = w.normalize_vector(q);
+		const r = await cold.query(q, { nprobe: 4, beam: 2 });
+		expect(r.stats.cells).toEqual(Array.from(s.route_beam(qn, 2, 4)));
+		s.free();
+		gate.release();
+		await cold.whenFullRouting();
+		expect(cold.routingState).toBe("full");
+		const after = await cold.query(q, { nprobe: 4 });
+		expect(after.stats.routing).toBe("flat");
+		expect(after.stats.cold).toBeUndefined();
+		full.close();
+		cold.close();
+	});
+
+	it("reads only the beam's groups, once; later queries reuse them; i8 rows route almost like f32", async () => {
+		const b = await buildGen("gb", 3, { k2: 64, n: 2000 });
+		await addRoutingRev(b.store, "gb", { tree: { groups: 8 } }); // i8 rows
+		const gate = gated(b.store, "idx/gb/fine.f32");
+		const cold = await thread.open({ store: gate.store, cache: false, coldRouting: "tree", coldBeam: 2 });
+		const full = await thread.open({ store: b.store, cache: false });
+		const q = queries(1, b.dim, 21)[0];
+		const first = await cold.query(q, { nprobe: 4 });
+		expect(first.stats.routingTable).toBe("i8");
+		expect(first.stats.cold!.beam).toBe(2);
+		expect(first.stats.cold!.groups).toBeGreaterThanOrEqual(1);
+		expect(first.stats.cold!.groups).toBeLessThanOrEqual(2);
+		expect(first.stats.cold!.reads).toBe(1); // one (multi-)range request for the groups
+		expect(first.stats.cold!.bytes).toBe(first.stats.cold!.loadedCells * (4 + b.dim));
+		const again = await cold.query(q, { nprobe: 4 });
+		expect(again.stats.cold!.groups).toBe(0);
+		expect(again.stats.cold!.bytes).toBe(0);
+		expect(again.stats.cells).toEqual(first.stats.cells);
+		// recall of cold routing at a wide beam stays close to the full table's on this tiny index
+		let hitsCold = 0;
+		let hitsFull = 0;
+		for (const qq of queries(30, b.dim, 22)) {
+			const truth = bruteForce(b.vectors, b.dim, qq, 5);
+			hitsCold += (await cold.query(qq, { nprobe: 8, topK: 5, beam: 4 })).hits.filter((h) => truth.includes(h.id)).length;
+			hitsFull += (await full.query(qq, { nprobe: 8, topK: 5 })).hits.filter((h) => truth.includes(h.id)).length;
+		}
+		expect(hitsCold).toBeGreaterThanOrEqual(hitsFull * 0.9);
+		gate.release();
+		full.close();
+		cold.close();
+	});
+
+	it("delta segments get exact q·mean for their cells (rows read on demand); falls back without a grouped table", async () => {
+		const b = await buildGen("gd", 3, { k2: 32, n: 800 });
+		await addRoutingRev(b.store, "gd", { tree: { groups: 8, elem: "f32" } });
+		const writer = await thread.open({ store: b.store, cache: false });
+		const fresh = unitRows(40, b.dim, rng(77));
+		await writer.upsert({ ids: Array.from({ length: 40 }, (_, i) => 100000 + i), vectors: fresh });
+		writer.close();
+		const gate = gated(b.store, "idx/gd/fine.f32");
+		const cold = await thread.open({ store: gate.store, cache: false, coldRouting: "tree", coldBeam: 1 });
+		expect(cold.revision.deltas.length).toBe(1);
+		expect(groupedTableOf(cold.manifest, cold.revision.files)).not.toBeNull(); // inherited by the upsert's revision
+		const full = await thread.open({ store: b.store, cache: false });
+		for (let i = 0; i < 5; i++) {
+			const q = fresh.subarray(i * b.dim, (i + 1) * b.dim);
+			const c = await cold.query(q, { topK: 3 });
+			const f = await full.query(q, { topK: 3 });
+			expect(c.hits[0]).toEqual({ id: 100000 + i, score: c.hits[0].score, attrs: 0, source: "delta" });
+			const fd = f.hits.find((h) => h.id === 100000 + i)!;
+			expect(c.hits[0].score).toBe(fd.score); // same delta score as with the full table
+			if (i === 0) expect(c.stats.cold!.cells).toBeGreaterThan(0);
+		}
+		gate.release();
+		cold.close();
+		full.close();
+		// no grouped table: coldRouting is ignored
+		const plain = await buildGen("gp", 3, { k2: 8 });
+		const ix = await thread.open({ store: plain.store, cache: false, coldRouting: "tree" });
+		expect(ix.routingState).toBe("full");
+		expect((await ix.query(queries(1, plain.dim, 3)[0])).stats.routing).toBe("flat");
 		ix.close();
 	});
 });

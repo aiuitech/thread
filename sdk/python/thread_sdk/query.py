@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 from . import _native
+from .cold import ColdRouting, new_cold_stat
 from .store import BlobRange, BlobStore, BlobTrace, Bytes, phase_stat
 from .wire import LEGACY_DEFAULTS, TombState, ThreadError, keys, slab_rev_of, tomb_for, tomb_for_delta
 
@@ -82,10 +83,13 @@ class Base:
     """Routing table and PQ codebook of a generation, in native memory."""
 
     key: str
-    searcher: _native.Searcher
+    #: The full routing table (None for a cold base, which routes with `cold`).
+    searcher: _native.Searcher | None
     pq: _native.PqCodebook | None
-    #: The routing table the searcher was built from ("f32" = `files.fine`).
+    #: The routing table the searcher was built from ("f32" = `files.fine`; the grouped table's for a cold base).
     routing: str = "f32"
+    #: Cold routing (`cold_routing="tree"`): the centroid tree plus the groups' means loaded so far.
+    cold: ColdRouting | None = None
 
 
 @dataclass
@@ -176,6 +180,7 @@ def execute_query(
     return_payload: bool = False,
     inflight: int = QUERY_INFLIGHT,
     speculate: bool = True,
+    beam: int | None = None,
 ) -> QueryResult:
     store, rev, base, io = ctx.store, ctx.rev, ctx.base, ctx.io
     manifest, gen, fmt, tomb, deltas = rev.manifest, rev.gen, rev.format, rev.tomb, rev.deltas
@@ -201,11 +206,27 @@ def execute_query(
     tr_start = trace.as_dict()
     # Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
     delta_reads = [ctx.get_delta(d, trace) for d in deltas]
+    cold = base.cold
+    cold_stat: dict[str, int] | None = None
     try:
-        query = base.searcher.query(q_raw, dots=flat or bool(deltas), codebook=base.pq)
+        if cold is not None:
+            # Cold routing: the tree's best groups (their means read now unless an earlier query loaded them), then
+            # the members of those groups ranked as the full table would rank them. Delta segments get q·mean for
+            # the cells they hold entries in (those rows read too).
+            beam_v = _int_param("beam", beam if beam is not None else cold.beam, 1)
+            cold_stat = new_cold_stat(beam_v)
+            q0 = cold.router.query(q_raw)
+            cold.ensure_groups(q0, beam_v, trace, cold_stat)
+            dot_cells = sorted({c for d, f in zip(deltas, delta_reads) for c in cold.cells_of(d["key"], f.result())})
+            cold.ensure_cells(dot_cells, trace, cold_stat)
+            query = cold.router.query(q_raw, dot_cells=dot_cells or None, codebook=base.pq)
+            cells = cold.router.route_beam(query, beam_v, nprobe_v)
+        else:
+            assert base.searcher is not None
+            query = base.searcher.query(q_raw, dots=flat or bool(deltas), codebook=base.pq)
+            cells = base.searcher.route(query, 0 if flat else pc_v, nprobe_v)
     except ValueError as e:
         raise ThreadError(str(e), 400) from e
-    cells = base.searcher.route(query, 0 if flat else pc_v, nprobe_v)
     t_route = time.perf_counter()
     tr_route = trace.as_dict()
 
@@ -337,8 +358,9 @@ def execute_query(
             "gen": gen,
             "rev": rev.rev,
             "format": fmt,
-            "routing": "flat" if flat else "tree",
+            "routing": "cold" if cold is not None else "flat" if flat else "tree",
             "routing_table": base.routing,
+            **({"cold": cold.finish_stat(cold_stat)} if cold is not None and cold_stat is not None else {}),
             "cells": cells,
             "scanned": rs["scanned"],
             "scan_bytes": rs["scan_bytes"],

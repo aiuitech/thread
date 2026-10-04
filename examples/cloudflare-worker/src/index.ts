@@ -48,7 +48,7 @@ import wasmModule from "../../../crates/thread-wasm/pkg/thread_bg.wasm";
 import init, * as thread from "../../../crates/thread-wasm/pkg/thread.js";
 // Pure-TS builders shared with the SDK (no wasm import of their own: they take this module's bindings).
 import { buildRoutingObjects } from "../../../sdk/ts/src/routing.ts";
-import type { RoutingTables } from "../../../sdk/ts/src/wire.ts";
+import type { RoutingElem, RoutingTables } from "../../../sdk/ts/src/wire.ts";
 
 interface Env {
 	BUCKET: R2Bucket;
@@ -1012,31 +1012,39 @@ interface TreeReq {
 
 /**
  * `routing` option of publish / publish-rev: compact copies of the fine means (`fine.f16`, `fine.i8`) that readers can
- * route with instead of `fine.f32` (manifest.routing; SDK `open({routing})`).
+ * route with instead of `fine.f32`, and the means in centroid-tree group order (`fine.grouped.{rev}.{elem}`) for cold
+ * routing (manifest.routing; SDK `open({routing, coldRouting})`).
  */
 interface RoutingReq {
 	/** Tables to write (default both). */
 	tables?: ("f16" | "i8")[];
+	/** Element type of the tree-grouped table, written when the revision has a centroid tree (default "i8"); false = none. */
+	grouped?: RoutingElem | false;
 }
 
 function checkRoutingReq(r: RoutingReq): Required<RoutingReq> {
 	const tables = r.tables ?? ["f16", "i8"];
 	if (!Array.isArray(tables) || tables.some((t) => t !== "f16" && t !== "i8") || new Set(tables).size !== tables.length) throw new HttpError(400, 'routing.tables must be a list of distinct "f16" / "i8"');
-	return { tables };
+	const grouped = r.grouped ?? "i8";
+	if (grouped !== false && grouped !== "f32" && grouped !== "f16" && grouped !== "i8") throw new HttpError(400, 'routing.grouped must be "f32", "f16", "i8" or false');
+	return { tables, grouped };
 }
 
-/** Builds the compact routing tables of `fineKey`'s means and writes them (create-only, unique keys). */
-async function writeRoutingTables(env: Env, fineKey: string, fine: Float32Array, dim: number, req: RoutingReq, unique: boolean): Promise<RoutingTables> {
+/**
+ * Builds the routing objects of `fineKey`'s means (the compact tables, and the tree-grouped table when `tree` is given)
+ * and writes them (`unique`: create-only with a unique key, for revisions; else plain puts, for publish).
+ */
+async function writeRouting(env: Env, gen: string, rev: number, fineKey: string, fine: Float32Array, dim: number, req: RoutingReq, unique: boolean, tree: { key: string; bytes: Uint8Array } | null): Promise<RoutingTables> {
 	await ensureWasm();
-	const { tables } = checkRoutingReq(req);
-	const built = buildRoutingObjects(thread, { fineKey, fine, dim, tables });
+	const { tables, grouped } = checkRoutingReq(req);
+	const built = buildRoutingObjects(thread, { fineKey, fine, dim, tables, grouped: tree && grouped ? { gen, rev, treeKey: tree.key, tree: tree.bytes, elem: grouped } : undefined });
+	const put = async (key: string) => {
+		const bytes = built.objects.find(([k]) => k === key)![1];
+		return unique ? await putUnique(env, key, bytes) : (await putBytes(env.BUCKET, key, bytes), key);
+	};
 	const routing: RoutingTables = { fine: fineKey };
-	for (const elem of tables) {
-		const ref = built.routing[elem]!;
-		const bytes = built.objects.find(([k]) => k === ref.key)![1];
-		const key = unique ? await putUnique(env, ref.key, bytes) : (await putBytes(env.BUCKET, ref.key, bytes), ref.key);
-		routing[elem] = { key, bytes: bytes.byteLength };
-	}
+	for (const elem of tables) routing[elem] = { ...built.routing[elem]!, key: await put(built.routing[elem]!.key) };
+	if (built.routing.grouped) routing.grouped = { ...built.routing.grouped, key: await put(built.routing.grouped.key) };
 	return routing;
 }
 
@@ -1044,7 +1052,7 @@ async function writeRoutingTables(env: Env, fineKey: string, fine: Float32Array,
 const routingReqOf = (r: RoutingTables | undefined): RoutingReq | null => {
 	if (!r) return null;
 	const tables = (["f16", "i8"] as const).filter((e) => r[e]);
-	return tables.length ? { tables } : null;
+	return tables.length || r.grouped ? { tables, grouped: r.grouped?.elem ?? false } : null;
 };
 
 /** Defaults of manifests without `defaults` (generations before g3). */
@@ -1219,13 +1227,15 @@ async function stagePublish(env: Env, body: PublishReq) {
 		codebook ? putBytes(env.BUCKET, `idx/${gen}/pq.bin`, codebook) : Promise.resolve(),
 	]);
 	let tree: TreeRef | undefined;
+	let treeBytes: Uint8Array | null = null;
 	if (treeReq) {
 		const notes = body.notes as { cfg?: { sampleGroups?: number } } | undefined;
 		const t = await buildTree(env, gen, body, coarseKey, fineKey, treeReq, notes?.cfg?.sampleGroups);
 		tree = { key: treeKey(gen, 0), ...t.ref };
+		treeBytes = t.bytes;
 		await putBytes(env.BUCKET, tree.key, t.bytes);
 	}
-	const routing = routingReq === false ? undefined : await writeRoutingTables(env, `idx/${gen}/fine.f32`, new Float32Array(fine), body.dim, routingReq ?? {}, false);
+	const routing = routingReq === false ? undefined : await writeRouting(env, gen, 0, `idx/${gen}/fine.f32`, new Float32Array(fine), body.dim, routingReq ?? {}, false, tree && treeBytes ? { key: tree.key, bytes: treeBytes } : null);
 	// Rev 0 of the generation (manifest.json / slabs.json / slab/{cell:05}); later revisions are manifest.{rev}.json.
 	const manifest = { gen, ...rest, format, tiers, ...(format === 3 ? { pq: { m: pqM } } : {}), ...(tree ? { tree } : {}), ...(routing ? { routing } : {}), rev: 0, createdAt: new Date().toISOString() };
 	await putBytes(env.BUCKET, manifestKey(gen, 0), JSON.stringify(manifest));
@@ -3069,15 +3079,9 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 	// The tree is built once (outside the commit loop) over the head's fine means; a retry only re-checks the files.
 	let built: { fine: string; bytes: Uint8Array; ref: Omit<TreeRef, "key"> } | null = null;
 	let treeWritten: TreeRef | null = null;
-	let routingWritten: RoutingTables | null = null;
+	let routingWritten: { for: string; routing: RoutingTables } | null = null;
 	const c = await commitRev(env, gen, async ({ rev, manifest }) => {
 		const files = manifestFiles(manifest);
-		let routing: RoutingTables | undefined = manifest.routing;
-		if (body.routing === null) routing = undefined;
-		else if (body.routing) {
-			if (!routingWritten || routingWritten.fine !== files.fine) routingWritten = await writeRoutingTables(env, files.fine, await getF32(env.BUCKET, files.fine), manifest.dim, body.routing, true);
-			routing = routingWritten;
-		}
 		let tree: TreeRef | undefined = manifest.tree;
 		if (body.tree === null) tree = undefined;
 		else if (body.tree) {
@@ -3094,6 +3098,22 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 		if (!tree && defaults.route === "beam" && body.defaults?.route === undefined) delete defaults.route;
 		if (!tree && body.defaults?.beam === undefined) delete defaults.beam;
 		checkDefaults(defaults, tree);
+		// Routing objects: written on request; otherwise a head's grouped table that follows another tree is rebuilt for
+		// the new one (or dropped without a tree), and tables made from other means are dropped.
+		let routing: RoutingTables | undefined = manifest.routing?.fine === files.fine ? manifest.routing : undefined;
+		const treeArg = async () => (tree ? { key: tree.key, bytes: built && treeWritten?.key === tree.key ? built.bytes : new Uint8Array(await getBuffer(env.BUCKET, tree.key)) } : null);
+		const memo = async (req: RoutingReq): Promise<RoutingTables> => {
+			const id = `${files.fine}|${tree?.key ?? "-"}|${JSON.stringify(req)}`;
+			if (!routingWritten || routingWritten.for !== id) routingWritten = { for: id, routing: await writeRouting(env, gen, rev + 1, files.fine, await getF32(env.BUCKET, files.fine), manifest.dim, req, true, await treeArg()) };
+			return routingWritten.routing;
+		};
+		if (body.routing === null) routing = undefined;
+		else if (body.routing) routing = await memo(body.routing);
+		else if (routing?.grouped && routing.grouped.tree !== tree?.key) {
+			const { grouped, ...rest } = routing;
+			const rebuilt = tree ? (await memo({ tables: [], grouped: grouped.elem })).grouped : undefined;
+			routing = rebuilt ? { ...rest, grouped: rebuilt } : rest;
+		}
 		const next: Manifest = { ...inherit(manifest), defaults, ...(body.profile ? { profile: body.profile } : {}) };
 		if (tree) next.tree = tree;
 		else delete next.tree;
@@ -3103,7 +3123,7 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 		if (compaction) next.compaction = compaction;
 		else delete next.compaction;
 		const treeChange = body.tree === undefined ? {} : { tree: tree ? { key: tree.key, groups: tree.groups, beam: tree.beam } : null };
-		const routingChange = body.routing === undefined ? {} : { routing: routing ? { f16: routing.f16?.key ?? null, i8: routing.i8?.key ?? null } : null };
+		const routingChange = body.routing === undefined ? {} : { routing: routing ? { f16: routing.f16?.key ?? null, i8: routing.i8?.key ?? null, grouped: routing.grouped?.key ?? null } : null };
 		const compactionChange = body.compaction === undefined ? {} : { compaction: { from: manifest.compaction ?? null, to: compaction ?? null } };
 		return { ...next, change: { op: "publish-rev", defaults: { from: prev, to: defaults }, ...treeChange, ...routingChange, ...compactionChange } };
 	});
@@ -3836,6 +3856,7 @@ async function splitRouting(env: Env, gen: string, rev: number, m: Manifest, fil
 	});
 	const fine = await putUnique(env, `idx/${gen}/fine.${rev}.f32`, means);
 	let tree: TreeRef | undefined;
+	let treeBytes: Uint8Array | null = null;
 	if (m.tree) {
 		const t = m.tree;
 		// The recall check costs ~1.3e10 multiply-adds per call at 2000 rows (exact top 3 over all k cells): measure
@@ -3843,10 +3864,11 @@ async function splitRouting(env: Env, gen: string, rev: number, m: Manifest, fil
 		const req: TreeReq = { groups: Math.min(t.groups, kk), iters: t.iters ?? 10, seed: t.seed ?? 7, beam: t.beam, sampleRows: measureTree ? 125 : 0 };
 		const built = await buildTree(env, gen, { dim, k1: 1, k2: kk }, files.coarse, fine, req, undefined, means);
 		tree = { key: await putUnique(env, treeKey(gen, rev), built.bytes), ...built.ref };
+		treeBytes = built.bytes;
 	}
-	// The head's compact routing tables describe the old means: write the same tables for the new ones.
-	const rr = routingReqOf(m.routing);
-	const routing = rr ? await writeRoutingTables(env, fine, means, dim, rr, true) : undefined;
+	// The head's routing objects describe the old means (and tree): write the same ones for the new means.
+	const rr = routingReqOf(m.routing?.fine === files.fine ? m.routing : undefined);
+	const routing = rr ? await writeRouting(env, gen, rev, fine, means, dim, rr, true, tree && treeBytes ? { key: tree.key, bytes: treeBytes } : null) : undefined;
 	return { fine, k: kk, tree, routing, fineBytes: means.byteLength };
 }
 

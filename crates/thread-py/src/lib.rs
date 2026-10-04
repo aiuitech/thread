@@ -458,6 +458,26 @@ fn routing_table_decode<'py>(
     Ok(f32_bytes(py, &v))
 }
 
+/// Builds a centroid tree ("VIBC") over `k = len(means) / dim` cell means: spherical k-means of the
+/// means into `groups` groups, deterministic for `seed` (the Worker's `build_centroid_tree`).
+#[pyfunction]
+fn build_centroid_tree<'py>(
+    py: Python<'py>,
+    means: &Bound<'_, PyAny>,
+    dim: usize,
+    groups: usize,
+    iters: usize,
+    seed: u64,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let means = f32_vec(means)?;
+    let k = check_batch(means.len(), dim)?;
+    if k == 0 {
+        return Err(value_err("means is empty"));
+    }
+    let out = py.detach(|| CentroidTree::build(&means, dim, k, groups, iters, seed).to_bytes());
+    Ok(PyBytes::new(py, &out))
+}
+
 /// The means (`k * dim`) in the group order of a centroid tree built over them ("VIBG").
 #[pyfunction]
 fn grouped_table_encode<'py>(
@@ -1200,6 +1220,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(routing_table_encode, m)?)?;
     m.add_function(wrap_pyfunction!(routing_table_decode, m)?)?;
     m.add_function(wrap_pyfunction!(grouped_table_encode, m)?)?;
+    m.add_function(wrap_pyfunction!(build_centroid_tree, m)?)?;
     m.add_function(wrap_pyfunction!(grouped_table_info, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     lex::register(m)

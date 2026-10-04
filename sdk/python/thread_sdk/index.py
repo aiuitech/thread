@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Literal, Sequence
 
 from . import _native
+from .cold import ColdRouting
 from .fusion import DEFAULT_RRF_K, rrf
 from .lex import DocRecord, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import QUERY_INFLIGHT, Base, QueryContext, QueryResult, RevState, execute_query
@@ -23,6 +24,7 @@ from .wire import (
     ResolvedLexConfig,
     ThreadError,
     choose_routing,
+    grouped_table_of,
     has_dense,
     resolve_lex_config,
     routing_row_bytes,
@@ -120,13 +122,56 @@ def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, loaded: d
     return Base(rev.base_key, searcher, pq, elem)
 
 
+def _cold_key(rev: RevState) -> str:
+    g = grouped_table_of(rev.manifest, rev.files)
+    return f"{rev.base_key}|{g['key'] if g else '-'}"
+
+
+def load_cold_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, beam: int | None = None,
+                   loaded: dict[str, Any] | None = None) -> Base:
+    """Loads a cold base (`cold_routing="tree"`): the centroid tree and the PQ codebook, plus an empty cold router over
+    the tree-grouped table that queries fill group by group. `beam` defaults to `manifest.defaults.beam`, else 16."""
+    m, files = rev.manifest, rev.files
+    g = grouped_table_of(m, files)
+    if g is None:
+        raise ThreadError(f"{rev.gen} rev {rev.rev} has no tree-grouped routing table for its tree")
+    b = beam if beam is not None else (m.get("defaults") or {}).get("beam") or 16
+    if isinstance(b, bool) or not isinstance(b, int) or b < 1:
+        raise ThreadError("cold_beam must be an integer >= 1", 400)
+    t0 = time.perf_counter()
+    trace = BlobTrace()
+    ft = io.submit(get_required, store, g["tree"], trace)
+    fp = io.submit(get_required, store, files["pq"], trace) if files.get("pq") else None
+    t, p = ft.result(), fp.result() if fp else None
+    t1 = time.perf_counter()
+    if rev.format == 3 and p is None:
+        raise ThreadError(f"format 3 generation {rev.gen} has no PQ codebook")
+    pq = None
+    if p is not None:
+        pq = _native.PqCodebook(p)
+        if pq.dim != m["dim"] or (m.get("pq") and pq.m != m["pq"]["m"]):
+            raise ThreadError(f"{files['pq']} is dim {pq.dim} m {pq.m}, manifest dim {m['dim']} pq {m.get('pq')}")
+    router = _native.ColdRouter(t, g["elem"])
+    k = m["k1"] * m["k2"]
+    if router.k != k or router.dim != m["dim"] or router.groups != g["groups"] or router.row_bytes != g["rowBytes"]:
+        raise ThreadError(f"{g['tree']} (k {router.k}, dim {router.dim}, {router.groups} groups) does not match "
+                          f"{g['key']} / the manifest (k {k}, dim {m['dim']}, {g['groups']} groups)")
+    cold = ColdRouting(store, router, g, b)
+    t2 = time.perf_counter()
+    if loaded is not None:
+        loaded["stat"] = {**phase_stat((t2 - t0) * 1000, trace), "fetch": round((t1 - t0) * 1000, 3),
+                          "build": round((t2 - t1) * 1000, 3),
+                          "files": {"coarse": 0, "fine": len(t), "pq": len(p) if p is not None else 0}}
+    return Base(_cold_key(rev), None, pq, g["elem"], cold)
+
+
 class ThreadIndex:
     """An opened index: one (gen, rev) snapshot plus the generation's routing table in native memory. Safe to share
     between threads; `query`, `search` and the write methods may run concurrently."""
 
     def __init__(self, store: BlobStore, rev: RevState, *, gen: str | None, pinned: bool, refresh_interval: float,
                  delta_cache_bytes: int, lex_transient_bytes: int, io_workers: int, job_workers: int,
-                 routing: str = "f32") -> None:
+                 routing: str = "f32", cold_routing: str = "off", cold_beam: int | None = None) -> None:
         self.store = store
         self._rev = rev
         self._gen_opt = gen
@@ -135,6 +180,13 @@ class ThreadIndex:
         self._delta_budget = delta_cache_bytes
         self._lex_transient = lex_transient_bytes
         self._routing = routing
+        if cold_routing not in ("tree", "off"):
+            raise ThreadError(f'cold_routing must be "tree" or "off" (got {cold_routing!r})', 400)
+        self._cold_routing = cold_routing
+        self._cold_beam = cold_beam
+        #: (cold key, future of the cold Base) while queries route cold.
+        self._cold: tuple[str, Future] | None = None
+        self._bg_load: threading.Thread | None = None
         self._io = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="thread-io")
         self._jobs = ThreadPoolExecutor(max_workers=job_workers, thread_name_prefix="thread-job")
         self._lock = threading.RLock()
@@ -164,6 +216,8 @@ class ThreadIndex:
         io_workers: int = 32,
         job_workers: int | None = None,
         routing: str = "f32",
+        cold_routing: str = "off",
+        cold_beam: int | None = None,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
@@ -183,11 +237,17 @@ class ThreadIndex:
         state = load_rev_state(store, g, r, timeline)
         ix = cls(store, state, gen=gen, pinned=gen is not None and rev is not None, refresh_interval=refresh_interval,
                  delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
-                 job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), routing=routing)
+                 job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), routing=routing,
+                 cold_routing=cold_routing, cold_beam=cold_beam)
         loaded: dict[str, Any] = {}
         try:
             if has_dense(state.manifest):
-                ix._acquire_base(state, loaded)
+                if ix._cold_wanted(state):
+                    # Cold routing: wait for the tree and the codebook only; the full table loads in the background.
+                    ix._acquire_cold(state, loaded)
+                    ix._load_full_in_background()
+                else:
+                    ix._acquire_base(state, loaded)
         except BaseException:
             ix.close()
             raise
@@ -293,6 +353,8 @@ class ThreadIndex:
             self._lex = None
             if self._base is not None and self._base[0] != nxt.base_key:
                 self._base = None
+            if self._cold is not None and self._cold[0] != _cold_key(nxt):
+                self._cold = None
 
     def _acquire_base(self, rev: RevState, loaded: dict[str, Any] | None = None) -> Base:
         """The routing table of `rev`'s base files, loaded once (concurrent callers share the load); `loaded["stat"]`
@@ -316,6 +378,85 @@ class ThreadIndex:
             raise
         fut.set_result(base)
         return base
+
+    # ---- cold routing ----
+
+    def _cold_wanted(self, rev: RevState) -> bool:
+        """Whether queries of `rev` may route cold (the option is on and the revision has a usable grouped table)."""
+        return self._cold_routing == "tree" and has_dense(rev.manifest) and grouped_table_of(rev.manifest,
+                                                                                           rev.files) is not None
+
+    def _full_ready(self, rev: RevState) -> bool:
+        with self._lock:
+            slot = self._base
+        return slot is not None and slot[0] == rev.base_key and slot[1].done() and slot[1].exception() is None
+
+    def _acquire_query_base(self, rev: RevState, loaded: dict[str, Any]) -> Base:
+        """The base a query uses: the full routing table once it is loaded; before that, with cold routing, the cold
+        base (and the full table keeps loading in the background)."""
+        if self._full_ready(rev) or not self._cold_wanted(rev):
+            return self._acquire_base(rev, loaded)
+        self._load_full_in_background()
+        return self._acquire_cold(rev, loaded)
+
+    def _load_full_in_background(self) -> None:
+        """Starts loading the full routing table on a background thread (once per revision's base)."""
+        with self._lock:
+            if self._bg_load is not None and self._bg_load.is_alive():
+                return
+            rev = self._rev
+            if self._base is not None and self._base[0] == rev.base_key:
+                return
+
+            def run() -> None:
+                try:
+                    self._acquire_base(rev)
+                    with self._lock:
+                        self._cold = None  # the full table takes over from cold routing
+                except BaseException as e:  # noqa: BLE001 - cold routing continues
+                    if not self._closed:
+                        log.error("thread_sdk: loading the routing table failed (cold routing continues): %s", e)
+
+            self._bg_load = threading.Thread(target=run, name="thread-routing-load", daemon=True)
+            self._bg_load.start()
+
+    def _acquire_cold(self, rev: RevState, loaded: dict[str, Any] | None = None) -> Base:
+        key = _cold_key(rev)
+        with self._lock:
+            slot = self._cold
+            if slot is not None and slot[0] == key:
+                fut, owner = slot[1], False
+            else:
+                fut, owner = Future(), True
+                slot = self._cold = (key, fut)
+        if not owner:
+            return fut.result()
+        try:
+            base = load_cold_base(self.store, rev, self._io, self._cold_beam, loaded)
+        except BaseException as e:
+            with self._lock:
+                if self._cold is slot:
+                    self._cold = None
+            fut.set_exception(e)
+            raise
+        fut.set_result(base)
+        return base
+
+    @property
+    def routing_state(self) -> str:
+        """"full" once the routing table is loaded, "cold" while queries route cold, "none" before either."""
+        if self._full_ready(self._rev):
+            return "full"
+        with self._lock:
+            c = self._cold
+        return "cold" if c is not None and c[1].done() and c[1].exception() is None else "none"
+
+    def when_full_routing(self) -> None:
+        """Waits until the full routing table is loaded (starting the load if needed)."""
+        if self.has_dense:
+            self._acquire_base(self._rev)
+            with self._lock:
+                self._cold = None
 
     def _get_delta(self, ref: dict[str, Any], trace: BlobTrace) -> Future:
         key = ref["key"]
@@ -357,21 +498,23 @@ class ThreadIndex:
         return_payload: bool = False,
         inflight: int = QUERY_INFLIGHT,
         speculate: bool = True,
+        beam: int | None = None,
     ) -> QueryResult:
         """Nearest neighbours of `vector` (any norm; normalized): a list of floats, an `array('f')`, a numpy array or
         raw f32 bytes of `dim` values. `nprobe` slabs are scanned, the best `rerank` scan-tier candidates re-scored
         with the int8 tier (0 = scan-tier scores only), `pc` coarse groups probed (0 = flat routing); absent ones take
-        the manifest defaults."""
+        the manifest defaults. `beam`: groups ranked by a cold-routed query (`cold_routing="tree"`, before the full
+        routing table has loaded; default `cold_beam`)."""
         self._check_open()
         if not self.has_dense:
             raise ThreadError("this generation has no dense index (lexical only): use search(text=...)", 400)
         self._maybe_refresh()
         rev = self._rev
         loaded: dict[str, Any] = {}
-        base = self._acquire_base(rev, loaded)
+        base = self._acquire_query_base(rev, loaded)
         ctx = QueryContext(self.store, rev, base, self._io, self._get_delta)
         r = execute_query(ctx, vector, top_k=top_k, nprobe=nprobe, rerank=rerank, pc=pc,
-                          return_payload=return_payload, inflight=inflight, speculate=speculate)
+                          return_payload=return_payload, inflight=inflight, speculate=speculate, beam=beam)
         if "stat" in loaded:  # this query (re)loaded the routing table (a switch to another generation)
             r.stats["timeline"]["base"] = loaded["stat"]
         return r
@@ -605,6 +748,7 @@ class ThreadIndex:
         self._jobs.shutdown(wait=False, cancel_futures=True)
         with self._lock:
             self._base = None
+            self._cold = None
             self._delta_cache.clear()
             self._seg_cache.clear()
             self._lex = None
@@ -632,6 +776,8 @@ def open_index(
     io_workers: int = 32,
     job_workers: int | None = None,
     routing: str = "f32",
+    cold_routing: str = "off",
+    cold_beam: int | None = None,
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -648,8 +794,13 @@ def open_index(
     - `job_workers`: threads for `query_many` and the lexical half of a hybrid search;
     - `routing`: the routing table to load: "f32" (default, `fine.f32`), "f16" / "i8" (the compact copies, half and a
       quarter of the bytes, decoded to f32 on load) or "auto" (the smallest the revision has); a revision without the
-      table falls back to f32. It only picks which cells to probe: slabs are scored with their own f32 means.
+      table falls back to f32. It only picks which cells to probe: slabs are scored with their own f32 means;
+    - `cold_routing`: "tree" makes a cold open wait only for the centroid tree and the PQ codebook; until the full
+      routing table has loaded (in the background), queries rank the cells of the tree's best `cold_beam` groups,
+      range-reading just those groups' means from the tree-grouped table (needs `manifest.routing.grouped`; else the
+      open loads the full table as usual). `cold_beam` defaults to `manifest.defaults.beam`, else 16.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
-                            io_workers=io_workers, job_workers=job_workers, routing=routing)
+                            io_workers=io_workers, job_workers=job_workers, routing=routing,
+                            cold_routing=cold_routing, cold_beam=cold_beam)
