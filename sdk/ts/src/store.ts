@@ -42,6 +42,27 @@ export const newTrace = (): BlobTrace => ({ reads: 0, hits: 0, misses: 0, r206: 
 /** Whether this runs inside the Cloudflare Workers runtime (6 simultaneous open connections per request). */
 export const inWorkers = (): boolean => (globalThis as { navigator?: { userAgent?: string } }).navigator?.userAgent === "Cloudflare-Workers";
 
+/**
+ * One step of a cold-start timeline (`index.openStats`, `stats.timeline`): its wall time and the store work done
+ * during it (the `BlobTrace` counters: origin reads, cache hits/misses, bytes). Python's SDK uses the same names.
+ */
+export interface PhaseStat extends BlobTrace {
+	/** Wall time in ms. */
+	ms: number;
+}
+
+/** Wall-clock ms (sub-ms where the runtime allows; in Workers it only advances across I/O, like `Date.now`). */
+export const nowMs = (): number => (typeof performance !== "undefined" ? performance.now() : Date.now());
+export const roundMs = (ms: number): number => Math.round(ms * 1000) / 1000;
+
+/** A copy of a trace's counters (to diff later with `phaseStat`). */
+export const snapTrace = (t: BlobTrace): BlobTrace => ({ reads: t.reads, hits: t.hits, misses: t.misses, r206: t.r206, r200: t.r200, bytes: t.bytes });
+
+/** The phase between two snapshots of a trace (`before` defaults to an empty trace). */
+export function phaseStat(ms: number, after: BlobTrace, before: BlobTrace = newTrace()): PhaseStat {
+	return { ms: roundMs(ms), reads: after.reads - before.reads, hits: after.hits - before.hits, misses: after.misses - before.misses, r206: after.r206 - before.r206, r200: after.r200 - before.r200, bytes: after.bytes - before.bytes };
+}
+
 export interface GetOptions {
 	trace?: BlobTrace;
 	/**

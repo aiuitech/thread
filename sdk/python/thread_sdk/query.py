@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 from . import _native
-from .store import BlobRange, BlobStore, BlobTrace, Bytes
+from .store import BlobRange, BlobStore, BlobTrace, Bytes, phase_stat
 from .wire import LEGACY_DEFAULTS, TombState, ThreadError, keys, slab_rev_of, tomb_for, tomb_for_delta
 
 __all__ = ["Hit", "QueryResult", "RevState", "Base", "QUERY_INFLIGHT", "MULTI_COALESCE", "execute_query",
@@ -217,6 +217,7 @@ def execute_query(
     parallel = store.remote
     lim = Limiter(inflight_v)
     trace = BlobTrace()
+    tr_start = trace.as_dict()
     # Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
     delta_reads = [ctx.get_delta(d, trace) for d in deltas]
     try:
@@ -243,6 +244,7 @@ def execute_query(
     do_rerank = fmt >= 2 and rev.slabs is not None and rerank_v > 0
     T = max(k, rerank_v) if do_rerank else k
     t_route = time.perf_counter()
+    tr_route = trace.as_dict()
 
     run = _native.QueryRun(query, T, do_rerank, return_payload)
     slab_keys: dict[int, str] = {}
@@ -351,6 +353,7 @@ def execute_query(
             slab_task(c)
         scan_deltas()
     t_phase1 = time.perf_counter()
+    tr_phase1 = trace.as_dict()
 
     # Phase 2: the global top-T's records that are neither local nor read speculatively, one request per slab.
     futs = []
@@ -360,9 +363,11 @@ def execute_query(
     raw, payload_reads = run.finish(k)
     hits = [Hit(i, s, a, src_, p) for i, s, a, src_, p in raw]
     t_phase2 = time.perf_counter()
+    tr_phase2 = trace.as_dict()
     if payload_reads:
         _fetch_payloads(hits, payload_reads, slab_keys, store, io if parallel else None, read, trace)
     t_end = time.perf_counter()
+    tr_end = trace.as_dict()
     rs = run.stats()
     ms = lambda a, b: round((b - a) * 1000, 3)  # noqa: E731
     return QueryResult(
@@ -402,6 +407,11 @@ def execute_query(
             "io": trace.as_dict(),
             "timing": {"total": ms(t_start, t_end), "route": ms(t_start, t_route), "phase1": ms(t_route, t_phase1),
                        "phase2": ms(t_phase1, t_phase2), "payload": ms(t_phase2, t_end)},
+            # Per-phase wall time and the store work that completed during it (trace snapshots at the boundaries).
+            "timeline": {"route": phase_stat((t_route - t_start) * 1000, tr_route, tr_start),
+                         "phase1": phase_stat((t_phase1 - t_route) * 1000, tr_phase1, tr_route),
+                         "phase2": phase_stat((t_phase2 - t_phase1) * 1000, tr_phase2, tr_phase1),
+                         "payload": phase_stat((t_end - t_phase2) * 1000, tr_end, tr_phase2)},
         },
     )
 

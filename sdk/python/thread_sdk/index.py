@@ -14,8 +14,8 @@ from . import _native
 from .fusion import DEFAULT_RRF_K, rrf
 from .lex import DocRecord, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import Base, QueryContext, QueryResult, RevState, execute_query
-from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore
-from .pack import store_at
+from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
+from .pack import PackedBlobStore, store_at
 from .revision import get_required, head_revision, load_rev_state, resolve_target, snapshot_keys
 from .wire import LEGACY_DEFAULTS, BytesLike, ResolvedLexConfig, ThreadError, has_dense, keys, resolve_lex_config, slab_rev_of
 from .write import (
@@ -74,13 +74,18 @@ class SearchResult:
     stats: dict[str, Any]
 
 
-def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor) -> Base:
-    """Loads the routing table (and PQ codebook) of a revision's generation into native memory."""
+def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, loaded: dict[str, Any] | None = None) -> Base:
+    """Loads the routing table (and PQ codebook) of a revision's generation into native memory. With `loaded`, records
+    the load as `loaded["stat"]`: `phase_stat` fields plus `fetch` (ms reading the files, concurrently), `build` (ms
+    building the native objects) and `files` (`{coarse, fine, pq}` bytes)."""
     m, files = rev.manifest, rev.files
-    fc = io.submit(get_required, store, files["coarse"])
-    ff = io.submit(get_required, store, files["fine"])
-    fp = io.submit(get_required, store, files["pq"]) if files.get("pq") else None
+    t0 = time.perf_counter()
+    trace = BlobTrace()
+    fc = io.submit(get_required, store, files["coarse"], trace)
+    ff = io.submit(get_required, store, files["fine"], trace)
+    fp = io.submit(get_required, store, files["pq"], trace) if files.get("pq") else None
     c, f, p = fc.result(), ff.result(), fp.result() if fp else None
+    t1 = time.perf_counter()
     if rev.format == 3 and p is None:
         raise ThreadError(f"format 3 generation {rev.gen} has no PQ codebook")
     pq = None
@@ -92,6 +97,11 @@ def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor) -> Base:
         if len(b) != n * m["dim"] * 4:
             raise ThreadError(f"{files[name]} is {len(b)} bytes, expected {n} x {m['dim']} f32")
     searcher = _native.Searcher(m["dim"], m["k1"], m["k2"], c, f)
+    t2 = time.perf_counter()
+    if loaded is not None:
+        loaded["stat"] = {**phase_stat((t2 - t0) * 1000, trace), "fetch": round((t1 - t0) * 1000, 3),
+                          "build": round((t2 - t1) * 1000, 3),
+                          "files": {"coarse": len(c), "fine": len(f), "pq": len(p) if p is not None else 0}}
     return Base(rev.base_key, searcher, pq)
 
 
@@ -125,6 +135,8 @@ class ThreadIndex:
         self._cold_policy = cold_policy
         self._prefetch_bytes = prefetch_bytes
         self._closed = False
+        #: Where `open` spent its time and reads: `{total, current, manifest, slabs, base}` (see `open_index`).
+        self.open_stats: dict[str, Any] = {}
 
     @classmethod
     def open(
@@ -149,6 +161,7 @@ class ThreadIndex:
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
             store = store_at(store)
+        pack = store.open_stats if isinstance(store, PackedBlobStore) else None
         if prefix:
             store = PrefixedBlobStore(store, prefix)
         if cache is None:
@@ -158,11 +171,14 @@ class ThreadIndex:
         if cache:
             store = CachedBlobStore(store, cache, miss_policy=miss_policy,  # type: ignore[arg-type]
                                     warm_concurrency=warm_concurrency)
+        t0 = time.perf_counter()
+        timeline: dict[str, Any] = {}
         ix = cls(store, None, gen=gen, pinned=gen is not None and rev is not None,  # type: ignore[arg-type]
                  refresh_interval=refresh_interval, delta_cache_bytes=delta_cache_bytes,
                  lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
                  job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), cold_policy=cold_policy,
                  prefetch_bytes=prefetch_bytes)
+        loaded: dict[str, Any] = {}
         try:
             # Connection warm-up: HEADs on the I/O pool's threads (each keeps its own connection), overlapping the
             # open's own sequential reads (current.json, manifest, base files).
@@ -171,13 +187,19 @@ class ThreadIndex:
                 n = 0
             if n > 0:
                 store.warmup(n, ix._io)
-            g, r = resolve_target(store, gen, rev)
-            state = ix._rev = load_rev_state(store, g, r)
+            g, r = resolve_target(store, gen, rev, timeline)
+            state = ix._rev = load_rev_state(store, g, r, timeline)
             if has_dense(state.manifest):
-                ix._acquire_base(state)
+                ix._acquire_base(state, loaded)
         except BaseException:
             ix.close()
             raise
+        none = phase_stat(0, BlobTrace())
+        ix.open_stats = {"total": round((time.perf_counter() - t0) * 1000, 3),
+                         **{k: timeline.get(k, none) for k in ("current", "manifest", "slabs")},
+                         "base": loaded.get("stat")}
+        if pack is not None:
+            ix.open_stats["pack"] = pack
         return ix
 
     # ---- properties ----
@@ -380,9 +402,10 @@ class ThreadIndex:
             t.join()
         return out
 
-    def _acquire_base(self, rev: RevState, install: bool = True) -> Base:
-        """The routing table of `rev`'s base files, loaded once (concurrent callers share the load). With
-        `install=False` (a revision switch preparing its base) a new base is kept aside until the switch."""
+    def _acquire_base(self, rev: RevState, loaded: dict[str, Any] | None = None, install: bool = True) -> Base:
+        """The routing table of `rev`'s base files, loaded once (concurrent callers share the load); `loaded["stat"]`
+        is set when this call did the load. With `install=False` (a revision switch preparing its base) a new base is
+        kept aside until the switch."""
         with self._lock:
             slot = self._base
             pre = self._pre_base
@@ -400,7 +423,7 @@ class ThreadIndex:
         if not owner:
             return fut.result()
         try:
-            base = load_base(self.store, rev, self._io)
+            base = load_base(self.store, rev, self._io, loaded)
         except BaseException as e:
             with self._lock:
                 if self._base is slot:
@@ -467,11 +490,15 @@ class ThreadIndex:
             raise ThreadError("this generation has no dense index (lexical only): use search(text=...)", 400)
         self._maybe_refresh()
         rev = self._rev
-        base = self._acquire_base(rev)
+        loaded: dict[str, Any] = {}
+        base = self._acquire_base(rev, loaded)
         ctx = QueryContext(self.store, rev, base, self._io, self._get_delta, self._cold_policy)
-        return execute_query(ctx, vector, top_k=top_k, nprobe=nprobe, rerank=rerank, pc=pc,
-                             return_payload=return_payload, inflight=inflight, speculate=speculate,
-                             coalesce_bytes=coalesce_bytes, span_bytes=span_bytes, cold_policy=cold_policy)
+        r = execute_query(ctx, vector, top_k=top_k, nprobe=nprobe, rerank=rerank, pc=pc,
+                          return_payload=return_payload, inflight=inflight, speculate=speculate,
+                          coalesce_bytes=coalesce_bytes, span_bytes=span_bytes, cold_policy=cold_policy)
+        if "stat" in loaded:  # this query (re)loaded the routing table (a switch to another generation)
+            r.stats["timeline"]["base"] = loaded["stat"]
+        return r
 
     def query_many(self, vectors: Iterable[Any], **opts: Any) -> list[QueryResult]:
         """Several queries against the same snapshot and routing table, concurrently."""

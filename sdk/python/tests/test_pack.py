@@ -268,3 +268,16 @@ def test_packs_on_disk_and_open_index_from_a_path(tmp_path):
         store_at(tmp_path / "plain.bin")
     with pytest.raises(ThreadError, match="no such file"):
         open_index(tmp_path / "nothing")
+
+
+def test_pack_open_stats_show_up_in_open_index():
+    b = build_gen("go", 3, n=200)
+    pack, _ = pack_to_bytes(b.store)
+    ps = PackedBlobStore.from_bytes(pack)
+    st = ps.open_stats
+    # head (counted as a read of 0 bytes) + one tail read: a small directory fits in the tail
+    assert st["reads"] == 2 and st["bytes"] == min(len(pack), 64 * 1024)
+    idx = open_index(ps, cache=False)
+    assert idx.open_stats["pack"] == st
+    assert idx.open_stats["current"]["reads"] == 1  # the pack's own idx/current.json, a range of the pack
+    idx.close()

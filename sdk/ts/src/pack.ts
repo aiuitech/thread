@@ -16,7 +16,7 @@
  * The footer comes last so a pack streams out without seeking back; a reader does one `head` and one or two range
  * reads to open it.
  */
-import { newTrace, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PutOptions, MemoryBlobStore } from "./store.js";
+import { newTrace, nowMs, phaseStat, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PhaseStat, type PutOptions, MemoryBlobStore } from "./store.js";
 import { loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
 import { concatBytes, decodeJson, ThreadError } from "./wire.js";
 
@@ -118,6 +118,11 @@ export class PackedBlobStore implements BlobStore {
 		/** Size and etag of the pack object. */
 		public readonly pack: BlobHead,
 		public readonly directory: PackDirectory,
+		/**
+		 * What `open` did: the `head` (counted as a read of 0 bytes), the tail read and, when the directory does not
+		 * fit in the tail, the directory read. `thread.open` reports it as `openStats.pack`.
+		 */
+		public readonly openStats: PhaseStat,
 	) {
 		this.remote = inner.remote ?? false;
 		this.inflight = inner.inflight;
@@ -131,11 +136,14 @@ export class PackedBlobStore implements BlobStore {
 
 	/** Reads the footer and directory of the pack at `key` in `inner`. */
 	static async open(inner: BlobStore, key: string): Promise<PackedBlobStore> {
+		const t0 = nowMs();
+		const trace = newTrace();
 		const h = await inner.head(key);
+		trace.reads++;
 		if (!h) throw new ThreadError(`no pack at ${key}`, 404);
 		if (h.size < PACK_HEADER_BYTES + PACK_FOOTER_BYTES) throw new ThreadError(`${key} is too small to be a pack (${h.size} bytes)`);
 		const tailLen = Math.min(h.size, PACK_TAIL_READ);
-		const tail = await inner.get(key, { offset: h.size - tailLen, length: tailLen });
+		const tail = await inner.get(key, { offset: h.size - tailLen, length: tailLen }, { trace });
 		if (!tail) throw new ThreadError(`no pack at ${key}`, 404);
 		const { dirOff, dirLen, count } = parsePackFooter(tail.subarray(tail.byteLength - PACK_FOOTER_BYTES));
 		if (dirOff < PACK_HEADER_BYTES || dirOff + dirLen > h.size - PACK_FOOTER_BYTES) throw new ThreadError(`${key}: directory [${dirOff}, +${dirLen}) is outside the pack`);
@@ -143,11 +151,12 @@ export class PackedBlobStore implements BlobStore {
 		let dir: Uint8Array;
 		if (dirOff >= tailStart) dir = tail.subarray(dirOff - tailStart, dirOff - tailStart + dirLen);
 		else {
-			const d = await inner.get(key, { offset: dirOff, length: dirLen });
+			const d = await inner.get(key, { offset: dirOff, length: dirLen }, { trace });
 			if (!d) throw new ThreadError(`no pack at ${key}`, 404);
 			dir = d;
 		}
-		return new PackedBlobStore(inner, key, h, parsePackDirectory(dir, dirOff, count));
+		const directory = parsePackDirectory(dir, dirOff, count);
+		return new PackedBlobStore(inner, key, h, directory, phaseStat(nowMs() - t0, trace));
 	}
 
 	/** A pack held in memory (tests, small indexes shipped inside a bundle). */

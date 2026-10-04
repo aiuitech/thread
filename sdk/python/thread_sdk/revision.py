@@ -4,10 +4,12 @@ native code here, so the pack writer and other tools can use it without an index
 
 from __future__ import annotations
 
-from typing import Any
+import time
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 from .query import RevState
-from .store import BlobStore
+from .store import BlobStore, BlobTrace, phase_stat
 from .wire import (
     BytesLike,
     ThreadError,
@@ -26,21 +28,38 @@ from .wire import (
 __all__ = ["head_revision", "resolve_target", "load_rev_state", "snapshot_keys"]
 
 
-def get_required(store: BlobStore, key: str | None) -> BytesLike:
+@contextmanager
+def _timed(timeline: dict[str, Any] | None, name: str) -> Iterator[BlobTrace | None]:
+    """Records the wall time and store work of the block as `timeline[name]` (when a timeline is given)."""
+    if timeline is None:
+        yield None
+        return
+    t0 = time.perf_counter()
+    trace = BlobTrace()
+    try:
+        yield trace
+    finally:
+        timeline[name] = phase_stat((time.perf_counter() - t0) * 1000, trace)
+
+
+def get_required(store: BlobStore, key: str | None, trace: BlobTrace | None = None) -> BytesLike:
     assert key is not None
-    b = store.get(key)
+    b = store.get(key, trace=trace)
     if b is None:
         raise ThreadError(f"missing object {key}", 404)
     return b
 
 
-def head_revision(store: BlobStore, gen: str) -> int:
+def head_revision(store: BlobStore, gen: str, trace: BlobTrace | None = None) -> int:
     """The newest manifest revision of `gen` present in the store (needs `list`), else 0 (legacy `manifest.json`)."""
     if not store.supports_list:
         return 0
     prefix = f"idx/{gen}/manifest."
     head = -1
-    for key in store.list(prefix):
+    listed = store.list(prefix)
+    if trace is not None:
+        trace.add(reads=1)  # a listing (its size is not accounted)
+    for key in listed:
         r = manifest_rev_of_key(key[len(prefix):])
         if r is not None:
             head = max(head, r)
@@ -49,41 +68,49 @@ def head_revision(store: BlobStore, gen: str) -> int:
     return head
 
 
-def resolve_target(store: BlobStore, gen: str | None = None, rev: int | None = None) -> tuple[str, int]:
+def resolve_target(store: BlobStore, gen: str | None = None, rev: int | None = None,
+                   timeline: dict[str, Any] | None = None) -> tuple[str, int]:
     """The (gen, rev) to read: both given; `gen` alone at its head (current.json's rev when it names that
-    generation, else the newest manifest in the store); else `idx/current.json` (rev absent = 0)."""
-    if gen is not None and rev is not None:
-        return gen, rev
-    cur = store.get(keys.current())
-    if cur is None:
-        if gen is None:
-            raise ThreadError("no published index (idx/current.json missing)", 404)
-        return gen, head_revision(store, gen)
-    cgen, crev = parse_current(cur)
-    if gen is None or gen == cgen:
-        return cgen, rev if rev is not None else crev
-    return gen, head_revision(store, gen)
+    generation, else the newest manifest in the store); else `idx/current.json` (rev absent = 0). With `timeline`,
+    records the step as `timeline["current"]` (see `load_rev_state`)."""
+    with _timed(timeline, "current") as trace:
+        if gen is not None and rev is not None:
+            return gen, rev
+        cur = store.get(keys.current(), trace=trace)
+        if cur is None:
+            if gen is None:
+                raise ThreadError("no published index (idx/current.json missing)", 404)
+            return gen, head_revision(store, gen, trace)
+        cgen, crev = parse_current(cur)
+        if gen is None or gen == cgen:
+            return cgen, rev if rev is not None else crev
+        return gen, head_revision(store, gen, trace)
 
 
-def load_rev_state(store: BlobStore, gen: str, rev: int) -> RevState:
-    """Loads a revision: manifest, slabs table, tombstone sets."""
-    mb = store.get(keys.manifest(gen, rev))
-    if mb is None:
-        raise ThreadError(f"no manifest {keys.manifest(gen, rev)}", 404)
-    manifest = parse_manifest(mb, gen, rev)
+def load_rev_state(store: BlobStore, gen: str, rev: int, timeline: dict[str, Any] | None = None) -> RevState:
+    """Loads a revision: manifest, slabs table, tombstone sets. With `timeline`, records the wall time and store work
+    of each step (`phase_stat`) as `timeline["manifest"]` and `timeline["slabs"]` (the slabs table and the tombstone
+    sets)."""
+    with _timed(timeline, "manifest") as trace:
+        mb = store.get(keys.manifest(gen, rev), trace=trace)
+        if mb is None:
+            raise ThreadError(f"no manifest {keys.manifest(gen, rev)}", 404)
+        manifest = parse_manifest(mb, gen, rev)
     files = manifest_files(manifest)
     fmt = manifest.get("format") or 1
     cells = manifest["k1"] * manifest["k2"]
     slabs = None
     slabs_key = files.get("slabs")
-    if slabs_key and has_dense(manifest):
-        b = store.get(slabs_key)
-        if b is not None:
-            slabs = parse_slabs_table(b, cells, slabs_key)
-        elif fmt >= 2 or manifest.get("files"):
-            # v1 generations may predate slabs tables: their slabs are read whole.
-            raise ThreadError(f"missing {files['slabs']}", 404)
-    sets = [(t["rev"], u32_array(get_required(store, t["key"]), t["key"])) for t in manifest.get("tombstones") or []]
+    with _timed(timeline, "slabs") as trace:
+        if slabs_key and has_dense(manifest):
+            b = store.get(slabs_key, trace=trace)
+            if b is not None:
+                slabs = parse_slabs_table(b, cells, slabs_key)
+            elif fmt >= 2 or manifest.get("files"):
+                # v1 generations may predate slabs tables: their slabs are read whole.
+                raise ThreadError(f"missing {files['slabs']}", 404)
+        sets = [(t["rev"], u32_array(get_required(store, t["key"], trace), t["key"]))
+                for t in manifest.get("tombstones") or []]
     if fmt >= 2 and slabs is None and has_dense(manifest):
         raise ThreadError(f"{files['slabs']} missing for format {fmt}")
     return RevState(gen=gen, rev=rev, manifest=manifest, files=files, format=fmt, slabs=slabs,

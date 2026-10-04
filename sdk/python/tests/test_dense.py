@@ -312,3 +312,47 @@ def test_parallel_path_matches_inline(ranges, cache):
             assert any(r.stats["spec_used"] > 0 for r in got)
         else:  # fill reads keep every winner's record in memory: no phase-2 reads
             assert all(r.stats["rerank_local"] == r.stats["rerank_candidates"] for r in got[len(qs):])
+
+
+def test_cold_start_timeline_open_stats_and_query_timeline():
+    b = build_gen("gt", 3)
+    index = open_index(b.store, cache=False)
+    os_ = index.open_stats
+    assert "wasm_init" not in os_ and "wasmInit" not in os_
+    assert os_["current"]["reads"] == 1 and os_["current"]["bytes"] == len(b.store.objects[keys.current()][0])
+    assert os_["manifest"]["reads"] == 1
+    assert os_["manifest"]["bytes"] == len(b.store.objects[keys.manifest("gt", 0)][0])
+    assert os_["slabs"]["reads"] == 1  # slabs table, no tombstone sets yet
+    base = os_["base"]
+    assert base["reads"] == 3  # coarse, fine, pq
+    assert base["files"]["pq"] > 0
+    assert base["bytes"] == base["files"]["coarse"] + base["files"]["fine"] + base["files"]["pq"]
+    assert base["fetch"] + base["build"] <= base["ms"] + 0.01
+    assert set(base) >= {"ms", "reads", "hits", "misses", "r206", "r200", "bytes", "fetch", "build", "files"}
+    assert os_["total"] >= os_["current"]["ms"] + os_["manifest"]["ms"] + os_["slabs"]["ms"] + base["ms"] - 0.01
+    assert "pack" not in os_
+
+    res = index.query(row(b.vectors, 0, 16), nprobe=4)
+    tl = res.stats["timeline"]
+    assert set(tl) == {"route", "phase1", "phase2", "payload"}
+    assert tl["route"]["reads"] == 0
+    assert tl["phase1"]["reads"] >= 4  # one scan-prefix read per probed slab
+    for f in ("reads", "bytes"):
+        assert sum(tl[p][f] for p in tl) == res.stats["io"][f]
+    assert tl["phase1"]["ms"] == res.stats["timing"]["phase1"]
+
+    index.delete([5])
+    again = open_index(b.store, cache=False)
+    assert again.open_stats["slabs"]["reads"] == 2  # + the tombstone set
+    index.close()
+    again.close()
+
+    # Behind a cache: a cold open misses and fills, a second open over the same cache only re-reads current.json.
+    cache = MemoryCache()
+    c1 = open_index(b.store, cache=cache)
+    assert c1.open_stats["base"]["misses"] == 3 and c1.open_stats["base"]["reads"] == 3
+    c2 = open_index(b.store, cache=cache)
+    assert c2.open_stats["current"]["reads"] == 1  # current.json is never cached
+    assert (c2.open_stats["base"]["reads"], c2.open_stats["base"]["misses"], c2.open_stats["base"]["hits"]) == (0, 0, 3)
+    c1.close()
+    c2.close()

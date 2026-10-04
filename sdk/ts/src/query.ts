@@ -9,8 +9,8 @@
  *     per slab (speculatively once only a few slabs are left to scan),
  *  4. top-k over reranked slab hits and delta hits, one copy per id.
  */
-import type { BlobRange, BlobStore, BlobTrace } from "./store.js";
-import { newTrace } from "./store.js";
+import type { BlobRange, BlobStore, BlobTrace, PhaseStat } from "./store.js";
+import { newTrace, nowMs, phaseStat, roundMs, snapTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
 import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SegmentRef, type SlabRow, type TombState, type IndexFiles } from "./wire.js";
 
@@ -80,6 +80,34 @@ export interface QueryParams {
 	source: { nprobe: ParamSource; rerank: ParamSource; pc: ParamSource };
 }
 
+/** Loading a generation's routing table and PQ codebook (`openStats.base`, `timeline.base`). */
+export interface BaseStat extends PhaseStat {
+	/** ms reading `coarse.f32`, `fine.f32` and `pq.bin` (concurrently). */
+	fetch: number;
+	/** ms building the wasm `Searcher` and `PqCodebook` from them. */
+	build: number;
+	/** Bytes of each file. */
+	files: { coarse: number; fine: number; pq: number };
+}
+
+/**
+ * Where a query spent its time and reads: each phase's wall time (ms) and the store work that completed during it
+ * (snapshots of the query's trace at the phase boundaries, so a speculative read issued in phase 1 that lands in
+ * phase 2 counts in phase 2). Python's `stats["timeline"]` has the same fields.
+ */
+export interface QueryTimeline {
+	/** Normalize, route over the cell means, build the PQ table (CPU; delta reads may start here). */
+	route: PhaseStat;
+	/** Scan-prefix reads and scans of the probed slabs (plus delta segments and speculative rerank reads). */
+	phase1: PhaseStat;
+	/** Rerank record reads and the rerank itself. */
+	phase2: PhaseStat;
+	/** Payload reads (`returnPayload`) and the final top-k. */
+	payload: PhaseStat;
+	/** Present when this query (re)loaded the routing table (after a wasm reset or a switch of generation). */
+	base?: BaseStat;
+}
+
 export interface QueryStats {
 	gen: string;
 	rev: number;
@@ -125,7 +153,10 @@ export interface QueryStats {
 	attempt: number;
 	wasmResets: number;
 	wasmMemMB: number;
+	/** ms (sub-ms where the runtime's clock allows; CPU-only phases read ~0 in Workers). */
 	timing: { total: number; route: number; phase1: number; phase2: number; payload: number };
+	/** Per-phase wall time and store work (see `QueryTimeline`). */
+	timeline: QueryTimeline;
 }
 
 export interface QueryResult {
@@ -245,7 +276,7 @@ interface SlabInfo {
 export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: QueryOptions, attempt: number): Promise<QueryResult> {
 	const { w, store, rev, base } = ctx;
 	const { manifest, gen, format, tomb, deltas } = rev;
-	const tStart = Date.now();
+	const tStart = nowMs();
 	if (qRaw.length !== manifest.dim) throw new ThreadError(`query dim ${qRaw.length} != index dim ${manifest.dim}`, 400);
 	const k = o.topK ?? 10;
 	if (!Number.isInteger(k) || k < 1) throw new ThreadError("topK must be an integer >= 1", 400);
@@ -266,6 +297,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const flat = pc === 0 || pc >= manifest.k1;
 	const lim = new Limiter(inflight);
 	const trace = newTrace();
+	const trStart = snapTrace(trace);
 	const epoch = ctx.epoch();
 	// Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
 	const deltaReads = deltas.map((d) => ctx.getDelta(d, trace));
@@ -294,7 +326,8 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const T = doRerank ? Math.max(k, rerankParam) : k;
 	// Format 3: one asymmetric-distance table (m x 256 f32) per query, shared by every probed slab.
 	const table = base.pq ? w.PqTable.from_codebook(q, base.pq) : null;
-	const tRoute = Date.now();
+	const tRoute = nowMs();
+	const trRoute = snapTrace(trace);
 
 	const packed: Uint8Array[] = [];
 	/** Best scan-tier copy per id (the rule thread.merge applies), remembering where it lives. */
@@ -462,12 +495,14 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	let slabResults: { id: number; score: number }[];
 	let rerankSlabs = 0;
 	let tPhase1: number;
+	let trPhase1: BlobTrace;
 	try {
 		await Promise.all([slabPhase, deltaPhase]);
 		const all = concatBytes(packed);
 		packed.length = 0;
 		merged = all.byteLength === 0 ? [] : parseHits(w.merge(all, T));
-		tPhase1 = Date.now();
+		tPhase1 = nowMs();
+		trPhase1 = snapTrace(trace);
 
 		// Phase 2: re-score the global top-T with the int8 tier, one multi-range read per slab with winners.
 		if (doRerank && (versions.has(2) || versions.has(3))) {
@@ -515,7 +550,8 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	} finally {
 		if (table && epoch === ctx.epoch()) safeFree(table);
 	}
-	const tPhase2 = Date.now();
+	const tPhase2 = nowMs();
+	const trPhase2 = snapTrace(trace);
 
 	// Final top k over slab and delta hits, one copy per id (the best score).
 	const best = new Map<number, Hit & { cand?: Cand }>();
@@ -533,7 +569,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const top = [...best.values()].sort((a, b) => b.score - a.score).slice(0, k);
 	if (o.returnPayload) await fetchPayloads(top, slabInfo, store, lim, trace);
 	const hits: Hit[] = top.map(({ cand: _c, ...h }) => h);
-	const tEnd = Date.now();
+	const tEnd = nowMs();
 	return {
 		hits,
 		params,
@@ -573,7 +609,8 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			attempt,
 			wasmResets: ctx.wasmResets,
 			wasmMemMB: Math.round(ctx.wasmMemBytes() / 1048576),
-			timing: { total: tEnd - tStart, route: tRoute - tStart, phase1: tPhase1 - tRoute, phase2: tPhase2 - tPhase1, payload: tEnd - tPhase2 },
+			timing: { total: roundMs(tEnd - tStart), route: roundMs(tRoute - tStart), phase1: roundMs(tPhase1 - tRoute), phase2: roundMs(tPhase2 - tPhase1), payload: roundMs(tEnd - tPhase2) },
+			timeline: { route: phaseStat(tRoute - tStart, trRoute, trStart), phase1: phaseStat(tPhase1 - tRoute, trPhase1, trRoute), phase2: phaseStat(tPhase2 - tPhase1, trPhase2, trPhase1), payload: phaseStat(tEnd - tPhase2, trace, trPhase2) },
 		},
 	};
 }

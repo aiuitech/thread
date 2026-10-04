@@ -10,13 +10,14 @@
  *   const { hits } = await index.query(vector, { topK: 10 });        // dense only
  */
 import init, * as W from "./wasm/thread.js";
-import { CachedBlobStore, inWorkers, MemoryCache, newTrace, PrefixedBlobStore, R2BlobStore, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type R2BucketLike } from "./store.js";
-import { executeQuery, safeFree, type Base, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
+import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
+import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { compactSegments, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { hasDense, keys, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
-import { asF32, getRequired, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
+import { asF32, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
+import { PackedBlobStore } from "./pack.js";
 
 export * from "./wire.js";
 export * from "./store.js";
@@ -24,7 +25,8 @@ export * from "./s3.js";
 export * from "./lex.js";
 export * from "./fusion.js";
 export * from "./pack.js";
-export type { Base, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, RevState } from "./query.js";
+export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
+export type { RevTimeline } from "./revision.js";
 export { Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, slabResident } from "./query.js";
 export type { CompactSegmentsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
 export { createLexicalGeneration } from "./write.js";
@@ -72,6 +74,30 @@ export interface SearchResult {
 }
 /** The raw wasm-bindgen bindings (advanced use: build jobs, slab tools). */
 export type WasmBindings = typeof W;
+
+/**
+ * The cold-start timeline of `thread.open` (`index.openStats`): each step's wall time (ms) and store work (origin
+ * reads, cache hits/misses, bytes). Python's `index.open_stats` has the same fields, without `wasmInit`.
+ */
+export interface OpenStats {
+	/** Wall time of `open` (ms): current + manifest + slabs + base, plus parsing. */
+	total: number;
+	/** How long `Thread.init` took (wasm instantiation + panic hook; once per isolate, not part of `total`). */
+	wasmInit: number;
+	/** `idx/current.json` (or listing the generation's manifests); zero work for a pinned (gen, rev). */
+	current: PhaseStat;
+	/** The manifest revision. */
+	manifest: PhaseStat;
+	/** The slabs table and the tombstone sets (read concurrently). */
+	slabs: PhaseStat;
+	/** The routing table and PQ codebook (`coarse.f32`, `fine.f32`, `pq.bin`) read and loaded into wasm; null without a dense index. */
+	base: BaseStat | null;
+	/**
+	 * When the store is a `PackedBlobStore`: its own open (head, tail and directory reads, `PackedBlobStore.openStats`).
+	 * It happened before `open` (when the pack store was created), so it is not part of `total`.
+	 */
+	pack?: PhaseStat;
+}
 
 export interface ThreadInitOptions {
 	/** The compiled `thread_bg.wasm` (`import wasmModule from "thread-sdk/wasm"` with the Cloudflare Vite plugin or Wrangler). */
@@ -130,15 +156,19 @@ export class Thread {
 	/** Bumped on every reset; wasm objects created under an older epoch are invalid and must not be freed. */
 	epoch = 0;
 	resets = 0;
+	/** How long `Thread.init` took (ms): wasm instantiation and the panic hook. */
+	initMs = 0;
 	private raw: W.InitOutput | null = null;
 	private readonly resetListeners = new Set<() => void>();
 	private constructor(readonly module: WebAssembly.Module) {}
 
 	static async init(opts: ThreadInitOptions): Promise<Thread> {
+		const t0 = nowMs();
 		const v = new Thread(opts.wasmModule);
 		// wasm-bindgen keeps one instance per module scope: a second init() with another module is a no-op.
 		v.raw = await init({ module_or_path: opts.wasmModule });
 		W.init_panic_hook();
+		v.initMs = roundMs(nowMs() - t0);
 		return v;
 	}
 
@@ -201,6 +231,8 @@ interface BaseSlot extends Base {
 /** An opened index: one (gen, rev) snapshot plus the generation's routing table in wasm memory. */
 export class ThreadIndex {
 	readonly store: BlobStore;
+	/** Where `open` spent its time and reads (see `OpenStats`). */
+	openStats!: OpenStats;
 	private revState: RevState;
 	private base: BaseSlot | null = null;
 	private basePromise: Promise<BaseSlot> | null = null;
@@ -251,6 +283,7 @@ export class ThreadIndex {
 		// Outside Workers there is no Cache API: a remote store gets an in-process cache, like the Python SDK.
 		if (!cache && opts.cache === undefined && store.remote && !inWorkers()) cache = new MemoryCache();
 		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
+		const t0 = nowMs();
 		// Connection warm-up overlaps the open's own sequential reads (current.json, manifest, base files).
 		const warm = opts.warmup ?? (store.remote && !inWorkers());
 		const n = typeof warm === "number" ? warm : warm ? (store.inflight ?? 12) : 0;
@@ -258,10 +291,15 @@ export class ThreadIndex {
 			const p = store.warmup(n).catch(() => {});
 			opts.waitUntil?.(p);
 		}
-		const target = await resolveTarget(store, opts.gen, opts.rev);
-		const rev = await loadRevState(store, target.gen, target.rev);
+		const tl: RevTimeline = {};
+		const target = await resolveTarget(store, opts.gen, opts.rev, tl);
+		const rev = await loadRevState(store, target.gen, target.rev, tl);
 		const ix = new ThreadIndex(thread, store, rev, opts);
-		if (hasDense(rev.manifest)) await ix.acquireBase().then((s) => ix.releaseBase(s));
+		const loaded: { stat?: BaseStat } = {};
+		if (hasDense(rev.manifest)) await ix.acquireBase(loaded).then((s) => ix.releaseBase(s));
+		const none = phaseStat(0, newTrace());
+		ix.openStats = { total: roundMs(nowMs() - t0), wasmInit: thread.initMs, current: tl.current ?? none, manifest: tl.manifest ?? none, slabs: tl.slabs ?? none, base: loaded.stat ?? null };
+		if (opts.store instanceof PackedBlobStore) ix.openStats.pack = opts.store.openStats;
 		return ix;
 	}
 
@@ -619,10 +657,11 @@ export class ThreadIndex {
 		const q = vector instanceof Float32Array ? vector : Float32Array.from(vector);
 		this.maybeRefresh();
 		return this.thread.withRecovery("query", async (attempt) => {
-			const base = await this.acquireBase();
+			const loaded: { stat?: BaseStat } = {};
+			const base = await this.acquireBase(loaded);
 			try {
 				const rev = this.revState;
-				return await executeQuery(
+				const r = await executeQuery(
 					{
 						w: W,
 						store: this.store,
@@ -638,6 +677,9 @@ export class ThreadIndex {
 					opts,
 					attempt,
 				);
+				// This query (re)loaded the routing table (after a reset or a switch to another generation).
+				if (loaded.stat) r.stats.timeline.base = loaded.stat;
+				return r;
 			} finally {
 				this.releaseBase(base);
 			}
@@ -702,14 +744,15 @@ export class ThreadIndex {
 		return p;
 	}
 
-	private acquireBase(): Promise<BaseSlot> {
+	/** The routing table of the current revision; `loaded.stat` is set when this call started the load. */
+	private acquireBase(loaded?: { stat?: BaseStat }): Promise<BaseSlot> {
 		if (this.base && this.base.epoch === this.thread.epoch && !this.base.dropped) {
 			this.base.users++;
 			return Promise.resolve(this.base);
 		}
 		if (!this.basePromise) {
 			const rev = this.revState;
-			const p = loadBase(this.store, rev, this.thread.epoch).then((b) => {
+			const p = loadBase(this.store, rev, this.thread.epoch, loaded).then((b) => {
 				const slot: BaseSlot = { ...b, users: 0, dropped: false };
 				if (this.basePromise === p && !this.closed) this.base = slot;
 				else slot.dropped = true; // superseded while loading
@@ -749,10 +792,16 @@ export class ThreadIndex {
 
 export { asF32, headRevision, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
 
-/** Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. */
-export async function loadBase(store: BlobStore, rev: RevState, epoch: number): Promise<Base> {
+/**
+ * Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. With `loaded`, records
+ * the load's wall time, reads and bytes in `loaded.stat` (`fetch`: reading the files, `build`: the wasm objects).
+ */
+export async function loadBase(store: BlobStore, rev: RevState, epoch: number, loaded?: { stat?: BaseStat }): Promise<Base> {
 	const { manifest, files } = rev;
-	const [c, f, p] = await Promise.all([getRequired(store, files.coarse), getRequired(store, files.fine), files.pq ? getRequired(store, files.pq) : Promise.resolve(null)]);
+	const t0 = nowMs();
+	const trace = newTrace();
+	const [c, f, p] = await Promise.all([getRequired(store, files.coarse, trace), getRequired(store, files.fine, trace), files.pq ? getRequired(store, files.pq, trace) : Promise.resolve(null)]);
+	const t1 = nowMs();
 	if (rev.format === 3 && !p) throw new ThreadError(`format 3 generation ${rev.gen} has no PQ codebook`);
 	let pq: W.PqCodebook | null = null;
 	if (p) {
@@ -765,6 +814,8 @@ export async function loadBase(store: BlobStore, rev: RevState, epoch: number): 
 	}
 	try {
 		const searcher = new W.Searcher(manifest.dim, manifest.k1, manifest.k2, asF32(c, files.coarse), asF32(f, files.fine));
+		const t2 = nowMs();
+		if (loaded) loaded.stat = { ...phaseStat(t2 - t0, trace), fetch: roundMs(t1 - t0), build: roundMs(t2 - t1), files: { coarse: c.byteLength, fine: f.byteLength, pq: p?.byteLength ?? 0 } };
 		return { key: rev.baseKey, searcher, pq, epoch };
 	} catch (e) {
 		if (pq) safeFree(pq);
