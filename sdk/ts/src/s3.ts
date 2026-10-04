@@ -37,6 +37,12 @@ export interface S3BlobStoreOptions {
 	/** Phase-2 range merging defaults for queries (`QueryOptions.coalesceBytes` / `spanBytes`). */
 	coalesceBytes?: number;
 	spanBytes?: number;
+	/**
+	 * Open this many connections right away (`warmup(n)`), e.g. while the wasm compiles: create the store before
+	 * `Thread.init`. In Node the first `fetch` also loads the lazy `fetch`/`Response` globals (13-18 ms) here
+	 * instead of inside `Thread.init`. `open` then skips its own warm-up. Default 0.
+	 */
+	warmup?: number;
 }
 
 /** Reads in flight per query against S3 directly: no connection cap outside Workers, 6 inside. */
@@ -174,7 +180,10 @@ export class S3BlobStore implements BlobStore {
 		this.retries = opts.retries ?? 1;
 		this.now = opts.now ?? Date.now;
 		if (!opts.accessKeyId || !opts.secretAccessKey) throw new ThreadError("S3BlobStore needs accessKeyId and secretAccessKey", 400);
+		if (opts.warmup) void this.warmup(opts.warmup);
 	}
+
+	private warming: { n: number; at: number; p: Promise<void> } | null = null;
 
 	/** Host and canonical path of an object (or of the bucket when `key` is empty). */
 	private target(key: string): { host: string; path: string } {
@@ -238,8 +247,12 @@ export class S3BlobStore implements BlobStore {
 	 * swallowed. Idle connections are kept by the HTTP client for its keep-alive timeout (undici: 4 s by default;
 	 * see `nodeFetch` in `thread-sdk/node` for a longer one).
 	 */
-	async warmup(n: number, key = "idx/current.json"): Promise<void> {
-		await Promise.all(Array.from({ length: Math.max(0, n) }, () => this.head(key).catch(() => null)));
+	warmup(n: number, key = "idx/current.json"): Promise<void> {
+		// A warm-up of at least n connections started in the last 3 s (e.g. at construction) covers this one.
+		if (this.warming && this.warming.n >= n && Date.now() - this.warming.at < 3000) return this.warming.p;
+		const p = Promise.all(Array.from({ length: Math.max(0, n) }, () => this.head(key).catch(() => null))).then(() => {});
+		this.warming = { n, at: Date.now(), p };
+		return p;
 	}
 
 	async head(key: string): Promise<BlobHead | null> {

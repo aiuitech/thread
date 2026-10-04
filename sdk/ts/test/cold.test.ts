@@ -296,6 +296,13 @@ describe("SigV4 signing-key cache", () => {
 		expect(seen.length).toBe(7);
 		expect(s3.signingKeys.derived).toBe(1);
 	});
+	it("warmup at construction; a later warm-up of no more connections reuses it", async () => {
+		let heads = 0;
+		const s3 = new S3BlobStore({ endpoint: "https://x.example", bucket: "b", accessKeyId: "a", secretAccessKey: "s", warmup: 4, fetch: async (_u, init) => (init?.method === "HEAD" && heads++, new Response(null, { status: 404 })) });
+		await s3.warmup(4);
+		await s3.warmup(2);
+		expect(heads).toBe(4);
+	});
 });
 
 describe("connection warm-up", () => {

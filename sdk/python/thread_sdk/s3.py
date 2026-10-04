@@ -164,6 +164,7 @@ class S3BlobStore(BlobStore):
         coalesce_bytes: int | None = None,
         span_bytes: int | None = None,
         max_connections: int | None = None,
+        warmup: int = 0,
     ) -> None:
         if not access_key_id or not secret_access_key:
             raise ThreadError("S3BlobStore needs access_key_id and secret_access_key", 400)
@@ -189,6 +190,8 @@ class S3BlobStore(BlobStore):
         self._pool_cond = threading.Condition()
         #: Connections opened over the store's life (tests, benchmarks).
         self.stats = {"opened": 0}
+        if warmup > 0:  # open connections right away (background threads); they join the shared pool
+            self.warmup(warmup)
         self.signing_keys = SigningKeyCache(secret_access_key)
         if inflight is not None:
             self.inflight = inflight
