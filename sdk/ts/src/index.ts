@@ -13,7 +13,7 @@ import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobStore, type BlobTrace, type CacheLike, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { compactSegments, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
-import { chooseRouting, groupedTableOf, hasDense, keys, parseManifest, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
+import { chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseManifest, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
 import { asF32, baseKeysOf, getRequired, loadRevState, resolveTarget, type RevTimeline } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
@@ -812,10 +812,26 @@ async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, r
 	const done = (source: OpenStats["prefetch"]["source"], key: string | null) => ({ ...phaseStat(nowMs() - t0, trace), source, key });
 	if (opts.basePack === false) return done("none", null);
 	const cold = opts.coldRouting === "tree";
+	const routing = opts.routing ?? "f32";
 	const mkey = keys.manifest(gen, rev);
-	if (!(opts.store instanceof PackedBlobStore)) {
+	// A base pack holds the smallest routing table (publish's default): worth its GET for cold routing and for
+	// routing "auto" / "i8"; an f32 / f16 open would download that table for nothing and reads the files instead.
+	if (!(opts.store instanceof PackedBlobStore) && (cold || routing === "auto" || routing === "i8")) {
 		const packKey = cold ? keys.baseColdPack(gen, rev) : keys.basePack(gen, rev);
 		pre.prefetch(mkey); // in case there is no pack
+		if (!cold) {
+			// Should the pack hold another table than the one asked for (a generation without fine.i8), start that one
+			// as soon as the manifest is in rather than after the pack.
+			pre.peek(mkey)
+				.then((mb) => {
+					const m = mb ? parseManifest(mb, gen, rev) : null;
+					if (!m || !hasDense(m)) return;
+					const files = manifestFiles(m);
+					const want = chooseRouting(m, files, routing).key;
+					if (want !== chooseRouting(m, files, "auto").key) pre.prefetch(want);
+				})
+				.catch(() => {});
+		}
 		const b = await store.get(packKey, undefined, { trace }).catch(() => null);
 		if (b && isPackHeader(b)) {
 			try {
@@ -826,7 +842,8 @@ async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, r
 			}
 		}
 	}
-	// No pack: every base object as soon as the manifest is in (each read is accounted where its bytes are used).
+	// No pack (or not worth one): every base object as soon as the manifest is in (each read is accounted where its
+	// bytes are used).
 	pre.prefetch(mkey);
 	const mb = await pre.peek(mkey).catch(() => null);
 	if (mb) {
@@ -836,7 +853,7 @@ async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, r
 		} catch {
 			/* loadRevState reports it */
 		}
-		if (m) for (const k of baseKeysOf(m, gen, rev, cold ? "cold" : "base", opts.routing ?? "f32")) pre.prefetch(k);
+		if (m) for (const k of baseKeysOf(m, gen, rev, cold ? "cold" : "base", routing)) pre.prefetch(k);
 	}
 	return done("files", null);
 }

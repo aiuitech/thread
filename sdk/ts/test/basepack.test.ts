@@ -60,10 +60,11 @@ describe("base packs", () => {
 		expect(fast.openStats.prefetch.key).toBe(key);
 		expect(c.reads.sort()).toEqual(["idx/bp/base.2.threadpack", "idx/bp/manifest.2.json", "idx/current.json"]);
 		await sameAnswers(plain, fast, b.dim);
-		// the default routing (f32) is not in the pack: that table is read on its own, the rest still comes from the pack
+		// the default routing (f32) is not what a base pack holds: the open reads the files (all requested at once)
 		const c2 = counting(b.store);
 		const f32 = await thread.open({ store: c2.store, cache: false });
-		expect(c2.reads.filter((k) => !k.startsWith("idx/bp/slab/")).sort()).toEqual(["idx/bp/base.2.threadpack", "idx/bp/fine.f32", "idx/bp/manifest.2.json", "idx/current.json"]);
+		expect(f32.openStats.prefetch.source).toBe("files");
+		expect(c2.reads.sort()).toEqual(["idx/bp/coarse.f32", "idx/bp/fine.f32", "idx/bp/manifest.2.json", "idx/bp/pq.bin", "idx/bp/slabs.json", "idx/bp/tombstones.2.u32", "idx/bp/tree.1.bin", "idx/current.json"]);
 		for (const ix of [plain, fast, f32]) ix.close();
 	});
 
@@ -73,7 +74,14 @@ describe("base packs", () => {
 		const c = counting(b.store);
 		const ix = await thread.open({ store: c.store, cache: false, routing: "f16" });
 		expect(ix.openStats.prefetch.source).toBe("files");
-		expect(new Set(c.reads)).toEqual(new Set(["idx/current.json", "idx/bf/base.1.threadpack", "idx/bf/manifest.1.json", "idx/bf/slabs.json", "idx/bf/coarse.f32", "idx/bf/pq.bin", "idx/bf/fine.f16"]));
+		expect(new Set(c.reads)).toEqual(new Set(["idx/current.json", "idx/bf/manifest.1.json", "idx/bf/slabs.json", "idx/bf/coarse.f32", "idx/bf/pq.bin", "idx/bf/fine.f16"]));
+		// routing i8 tries the base pack first (there is none here), then the same
+		const c2 = counting(b.store);
+		const i8 = await thread.open({ store: c2.store, cache: false, routing: "i8" });
+		expect(i8.openStats.prefetch.source).toBe("files");
+		expect(c2.reads).toContain("idx/bf/base.1.threadpack");
+		expect(c2.reads).toContain("idx/bf/fine.i8");
+		i8.close();
 		// every read is accounted in the step that used it
 		expect(ix.openStats.manifest.reads).toBe(1);
 		expect(ix.openStats.slabs.reads).toBe(1);

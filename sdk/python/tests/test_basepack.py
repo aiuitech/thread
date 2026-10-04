@@ -62,6 +62,13 @@ def test_cold_open_is_current_plus_base_pack_and_state_is_identical():
         assert fast.open_stats["prefetch"]["source"] == "base-pack"
         assert sorted(c.reads) == ["idx/bp/base.2.threadpack", "idx/bp/manifest.2.json", "idx/current.json"]
         same_answers(plain, fast, b.dim)
+    # the default routing (f32) is not what a base pack holds: the open reads the files (all requested at once)
+    c2 = Counting(b.store)
+    with open_index(c2, cache=False) as f32:
+        assert f32.open_stats["prefetch"]["source"] == "files"
+        assert sorted(c2.reads) == ["idx/bp/coarse.f32", "idx/bp/fine.f32", "idx/bp/manifest.2.json", "idx/bp/pq.bin",
+                                    "idx/bp/slabs.json", "idx/bp/tombstones.2.u32", "idx/bp/tree.1.bin",
+                                    "idx/current.json"]
 
 
 def test_without_a_pack_reads_start_after_the_manifest_and_are_accounted():
@@ -71,12 +78,17 @@ def test_without_a_pack_reads_start_after_the_manifest_and_are_accounted():
     with open_index(c, cache=False, routing="f16") as ix, \
             open_index(b.store, cache=False, routing="f16", base_pack=False) as plain:
         assert ix.open_stats["prefetch"]["source"] == "files"
-        assert set(c.reads) == {"idx/current.json", "idx/bf/base.1.threadpack", "idx/bf/manifest.1.json",
-                                "idx/bf/slabs.json", "idx/bf/coarse.f32", "idx/bf/pq.bin", "idx/bf/fine.f16"}
+        assert set(c.reads) == {"idx/current.json", "idx/bf/manifest.1.json", "idx/bf/slabs.json", "idx/bf/coarse.f32",
+                                "idx/bf/pq.bin", "idx/bf/fine.f16"}
         assert ix.open_stats["manifest"]["reads"] == 1
         assert ix.open_stats["slabs"]["reads"] == 1
         assert ix.open_stats["base"]["reads"] == 3
         same_answers(plain, ix, b.dim)
+    # routing i8 tries the base pack first (there is none here), then the same
+    c2 = Counting(b.store)
+    with open_index(c2, cache=False, routing="i8") as i8:
+        assert i8.open_stats["prefetch"]["source"] == "files"
+        assert "idx/bf/base.1.threadpack" in c2.reads and "idx/bf/fine.i8" in c2.reads
 
 
 def test_cold_base_pack():

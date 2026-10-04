@@ -54,7 +54,8 @@ class ColdRouting:
         head = self.router.needs_head
         if head:
             ranges.insert(0, BlobRange(0, off))
-        got = self.store.get_ranges(key, ranges, trace=trace) if len(ranges) > 1 and self.store.supports_ranges else None
+        multi = len(ranges) > 1 and self.store.supports_ranges
+        got = self.store.get_ranges(key, ranges, trace=trace) if multi else None
         reads = 1
         if got is None:
             got = [self.store.get(key, r, trace=trace) for r in ranges]

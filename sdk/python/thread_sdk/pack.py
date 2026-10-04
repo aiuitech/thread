@@ -359,7 +359,8 @@ def pack_index(store: BlobStore, dest: str | os.PathLike[str] | BinaryIO, *, gen
     """Writes a snapshot of one revision to `dest` (a path, written to a temp sibling and renamed into place, or an
     open binary file): `idx/current.json` pointing at it, then the objects a cold open reads (`base_keys` with the
     smallest routing table), contiguous, then every other object the revision reads (`snapshot_keys`) in key order;
-    the directory records `{gen, rev, base: [offset, length]}` (`PackedBlobStore.read_base`). `gen` / `rev` pick the revision as `open_index` does (default: what `idx/current.json` names).
+    the directory records `{gen, rev, base: [offset, length]}` (`PackedBlobStore.read_base`). `gen` / `rev` pick
+    the revision as `open_index` does (default: what `idx/current.json` names).
     Two SDKs packing the same revision produce the same bytes."""
     if hasattr(dest, "write"):
         return _pack_into(store, dest, gen, rev, workers)  # type: ignore[arg-type]

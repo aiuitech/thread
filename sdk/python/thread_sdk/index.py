@@ -35,6 +35,7 @@ from .wire import (
     grouped_table_of,
     has_dense,
     keys,
+    manifest_files,
     parse_manifest,
     resolve_lex_config,
     routing_table_bytes,
@@ -161,9 +162,28 @@ def _prefetch_open(store: BlobStore, pre: PrefetchStore, gen: str, rev: int, pac
     if not base_pack:
         return done("none", None)
     mkey = keys.manifest(gen, rev)
-    if not packed:
+    # A base pack holds the smallest routing table (publish's default): worth its GET for cold routing and for
+    # routing "auto" / "i8"; an f32 / f16 open would download that table for nothing and reads the files instead.
+    if not packed and (cold or routing in ("auto", "i8")):
         pack_key = keys.base_cold_pack(gen, rev) if cold else keys.base_pack(gen, rev)
         pre.prefetch(mkey, io)  # in case there is no pack
+        if not cold:
+            # Should the pack hold another table than the one asked for (a generation without fine.i8), start that
+            # one as soon as the manifest is in rather than after the pack.
+            def other_table() -> None:
+                try:
+                    mb = pre.peek(mkey)
+                    m = parse_manifest(mb, gen, rev) if mb is not None else None
+                    if m is None or not has_dense(m):
+                        return
+                    files = manifest_files(m)
+                    want = choose_routing(m, files, routing)[1]
+                    if want != choose_routing(m, files, "auto")[1]:
+                        pre.prefetch(want, io)
+                except Exception:  # noqa: BLE001 - the loaders report it
+                    pass
+
+            threading.Thread(target=other_table, daemon=True).start()
         try:
             b = store.get(pack_key, None, trace=trace)
         except Exception:  # noqa: BLE001 - an unreadable pack only means the separate files
@@ -175,7 +195,8 @@ def _prefetch_open(store: BlobStore, pre: PrefetchStore, gen: str, rev: int, pac
                     return done("base-pack", pack_key)
             except ThreadError as e:
                 log.error("thread_sdk: ignoring the base pack %s: %s", pack_key, e)
-    # No pack: every base object as soon as the manifest is in (each read is accounted where its bytes are used).
+    # No pack (or not worth one): every base object as soon as the manifest is in (each read is accounted where its
+    # bytes are used).
     pre.prefetch(mkey, io)
     try:
         mb = pre.peek(mkey)
@@ -445,7 +466,8 @@ class ThreadIndex:
             if self._cold is not None and self._cold[0] != _cold_key(nxt):
                 self._cold = None
 
-    def _acquire_base(self, rev: RevState, loaded: dict[str, Any] | None = None) -> Base:
+    def _acquire_base(self, rev: RevState, loaded: dict[str, Any] | None = None,
+                      store: BlobStore | None = None) -> Base:
         """The routing table of `rev`'s base files, loaded once (concurrent callers share the load); `loaded["stat"]`
         is set when this call did the load."""
         with self._lock:
@@ -458,7 +480,7 @@ class ThreadIndex:
         if not owner:
             return fut.result()
         try:
-            base = load_base(self._open_store or self.store, rev, self._io, loaded, self._routing)
+            base = load_base(store or self._open_store or self.store, rev, self._io, loaded, self._routing)
         except BaseException as e:
             with self._lock:
                 if self._base is slot:
@@ -497,9 +519,12 @@ class ThreadIndex:
             if self._base is not None and self._base[0] == rev.base_key:
                 return
 
+            # the open's prefetching view, while the open is still running (its codebook and coarse are in it)
+            store = self._open_store or self.store
+
             def run() -> None:
                 try:
-                    self._acquire_base(rev)
+                    self._acquire_base(rev, store=store)
                     with self._lock:
                         self._cold = None  # the full table takes over from cold routing
                 except BaseException as e:  # noqa: BLE001 - cold routing continues
