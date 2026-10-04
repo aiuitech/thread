@@ -16,9 +16,10 @@
  * The footer comes last so a pack streams out without seeking back; a reader does one `head` and one or two range
  * reads to open it.
  */
-import { newTrace, nowMs, phaseStat, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PhaseStat, type PutOptions, MemoryBlobStore } from "./store.js";
-import { loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
-import { concatBytes, decodeJson, ThreadError } from "./wire.js";
+import { newTrace, type BlobTrace, nowMs, phaseStat, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PhaseStat, type PutOptions, MemoryBlobStore } from "./store.js";
+import { baseKeys, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
+import type { RevState } from "./query.js";
+import { chooseRouting, concatBytes, decodeJson, hasDense, keys as indexKeys, ThreadError, type RoutingOption } from "./wire.js";
 
 export const PACK_MAGIC = "THRDPACK";
 export const PACK_VERSION = 1;
@@ -100,6 +101,17 @@ export function parsePackDirectory(b: Uint8Array, dirOff: number, count: number)
 	return { entries, meta };
 }
 
+/** The objects of a pack held in memory, by key (views into `bytes`). */
+export function packEntries(bytes: Uint8Array): { entries: Map<string, Uint8Array>; meta: Record<string, unknown> } {
+	if (bytes.byteLength < PACK_HEADER_BYTES + PACK_FOOTER_BYTES || !isPackHeader(bytes)) throw new ThreadError("not a thread pack (bad header)");
+	const { dirOff, dirLen, count } = parsePackFooter(bytes.subarray(bytes.byteLength - PACK_FOOTER_BYTES));
+	if (dirOff < PACK_HEADER_BYTES || dirOff + dirLen > bytes.byteLength - PACK_FOOTER_BYTES) throw new ThreadError(`pack directory [${dirOff}, +${dirLen}) is outside the pack`);
+	const d = parsePackDirectory(bytes.subarray(dirOff, dirOff + dirLen), dirOff, count);
+	const entries = new Map<string, Uint8Array>();
+	for (const [k, e] of d.entries) entries.set(k, bytes.subarray(e.offset, e.offset + e.length));
+	return { entries, meta: d.meta };
+}
+
 // ---------- reading ----------
 
 /**
@@ -159,6 +171,27 @@ export class PackedBlobStore implements BlobStore {
 	}
 	get rev(): number | undefined {
 		return typeof this.directory.meta.rev === "number" ? this.directory.meta.rev : undefined;
+	}
+
+	/** The `base: [offset, length]` range `packIndex` records: the objects a cold open reads, contiguous. */
+	get baseRange(): BlobRange | null {
+		const b = this.directory.meta.base;
+		if (!Array.isArray(b) || b.length !== 2 || !b.every((x) => Number.isInteger(x) && x >= 0)) return null;
+		return { offset: b[0] as number, length: b[1] as number };
+	}
+
+	/**
+	 * Reads the pack's base range with ONE range read and returns the objects that lie inside it (views into the
+	 * read), for a cold open (`thread.open` does this for a `PackedBlobStore`). Null when the pack records no range.
+	 */
+	async readBase(trace?: BlobTrace): Promise<Map<string, Uint8Array> | null> {
+		const r = this.baseRange;
+		if (!r || r.length === 0) return null;
+		const b = await this.inner.get(this.key, r, trace ? { trace } : undefined);
+		if (!b) throw new ThreadError(`pack ${this.key} disappeared`, 404);
+		const out = new Map<string, Uint8Array>();
+		for (const [k, e] of this.directory.entries) if (e.offset >= r.offset && e.offset + e.length <= r.offset + r.length) out.set(k, b.subarray(e.offset - r.offset, e.offset - r.offset + e.length));
+		return out;
 	}
 
 	private locate(key: string, range: BlobRange | undefined): BlobRange | null {
@@ -236,6 +269,12 @@ export class PackWriter {
 		return this.pos;
 	}
 
+	/** Sets a metadata field of the directory (any time before `finish`; `packIndex` records the base range). */
+	setMeta(key: string, value: unknown): void {
+		if (key === "entries") throw new ThreadError("pack: meta cannot be named entries", 400);
+		this.meta[key] = value;
+	}
+
 	private async emit(b: Uint8Array): Promise<void> {
 		await this.sink.write(b);
 		this.pos += b.byteLength;
@@ -284,13 +323,20 @@ export interface PackIndexResult {
 }
 
 /**
- * Writes a snapshot of one revision to `sink`: `idx/current.json` pointing at it, then every object the revision
- * reads (`snapshotKeys`), in key order. Two SDKs packing the same revision produce the same bytes.
+ * Writes a snapshot of one revision to `sink`: `idx/current.json` pointing at it, then the objects a cold open reads
+ * (`baseKeys` with the smallest routing table), contiguous, then every other object the revision reads
+ * (`snapshotKeys`) in key order. The directory records `{gen, rev, base: [offset, length]}`: the range from
+ * `idx/current.json` to the end of the base objects, so a reader can load a cold base with one range read
+ * (`PackedBlobStore.readBase`). Two SDKs packing the same revision produce the same bytes.
  */
 export async function packIndex(store: BlobStore, sink: PackSink, opts: PackIndexOptions = {}): Promise<PackIndexResult> {
 	const t = await resolveTarget(store, opts.gen, opts.rev);
 	const rev = await loadRevState(store, t.gen, t.rev);
-	const keys = snapshotKeys(rev);
+	const all = snapshotKeys(rev);
+	const inSnapshot = new Set(all);
+	const base = baseKeys(rev, "base", "auto").filter((k) => inSnapshot.has(k));
+	const baseSet = new Set(base);
+	const keys = [...base, ...all.filter((k) => !baseSet.has(k))];
 	const w = new PackWriter(sink, { gen: t.gen, rev: t.rev });
 	await w.add("idx/current.json", new TextEncoder().encode(JSON.stringify({ gen: t.gen, rev: t.rev })));
 	const trace = newTrace();
@@ -305,6 +351,7 @@ export async function packIndex(store: BlobStore, sink: PackSink, opts: PackInde
 	for (let i = 0; i < keys.length; i++) {
 		while (pending.length < window && i + pending.length < keys.length) pending.push(fetch(keys[i + pending.length]));
 		await w.add(keys[i], await pending.shift()!);
+		if (i === base.length - 1) w.setMeta("base", [PACK_HEADER_BYTES, w.written - PACK_HEADER_BYTES]);
 	}
 	const { bytes, count } = await w.finish();
 	return { gen: t.gen, rev: t.rev, count, bytes, keys: ["idx/current.json", ...keys] };
@@ -359,4 +406,125 @@ export async function copyObjects(src: BlobStore, dst: BlobStore, keys?: readonl
 	};
 	await Promise.all(Array.from({ length: Math.max(1, Math.min(opts.concurrency ?? 8, todo.length)) }, worker));
 	return { count, bytes, skipped };
+}
+
+// ---------- base packs ----------
+
+export interface BasePackResult {
+	key: string;
+	bytes: Uint8Array;
+	/** The objects in it, in order. */
+	keys: string[];
+	/** The routing table it holds (`kind: "base"`). */
+	routing: string | null;
+}
+
+/**
+ * The base pack of a revision (`idx/{gen}/base.{rev}.threadpack`): every object a cold open reads (`baseKeys`), so a
+ * reader that knows (gen, rev) from `idx/current.json` loads the revision and its routing table with ONE GET. A cold
+ * base pack (`kind: "cold"`, `idx/{gen}/base.cold.{rev}.threadpack`) leaves the routing table out, for
+ * `coldRouting: "tree"`. The directory records `{gen, rev, kind: "base" | "base-cold", routing}`. Publish writes them
+ * (the Worker's publish / publish-rev); `bench/cold/make_base_pack.mjs` writes them offline.
+ */
+export async function buildBasePack(store: BlobStore, rev: RevState, kind: "base" | "cold" = "base", routing: RoutingOption = "auto"): Promise<BasePackResult> {
+	const ks = baseKeys(rev, kind, routing);
+	const elem = kind === "base" && hasDense(rev.manifest) ? chooseRouting(rev.manifest, rev.files, routing).elem : null;
+	const sink = new MemorySink();
+	const w = new PackWriter(sink, { gen: rev.gen, rev: rev.rev, kind: kind === "cold" ? "base-cold" : "base", routing: elem });
+	const got = await Promise.all(
+		ks.map(async (k) => {
+			const b = await store.get(k);
+			if (!b) throw new ThreadError(`base pack of ${rev.gen} rev ${rev.rev} needs ${k}, which is missing`, 404);
+			return b;
+		}),
+	);
+	for (let i = 0; i < ks.length; i++) await w.add(ks[i], got[i]);
+	await w.finish();
+	return { key: kind === "cold" ? indexKeys.baseColdPack(rev.gen, rev.rev) : indexKeys.basePack(rev.gen, rev.rev), bytes: sink.bytes(), keys: ks, routing: elem };
+}
+
+/**
+ * A read-through view of a store with some objects already in memory (a base pack's, or reads started early):
+ * `get` / `getRanges` / `head` of such a key are served from memory (byte-identical: the same object), everything
+ * else goes to the inner store. A read started early (`prefetch`) keeps its own trace, which the first `get` of the
+ * key adds to the caller's, so per-step accounting (`openStats`) still sees the read where its bytes are used. Used by
+ * `thread.open` for the reads of the open only; read-only.
+ */
+export class PrefetchStore implements BlobStore {
+	private readonly entries = new Map<string, { bytes: Promise<Uint8Array | null>; trace: BlobTrace | null }>();
+	constructor(readonly inner: BlobStore) {}
+
+	/** Serves `key` from `bytes` (accounted elsewhere, e.g. as part of a pack). */
+	set(key: string, bytes: Uint8Array | Promise<Uint8Array | null>): void {
+		const p = Promise.resolve(bytes);
+		p.catch(() => {});
+		this.entries.set(key, { bytes: p, trace: null });
+	}
+
+	/** Starts reading `key` now (once); later `get`s of it wait for this read. */
+	prefetch(key: string): void {
+		if (this.entries.has(key)) return;
+		const trace = newTrace();
+		const p = this.inner.get(key, undefined, { trace });
+		p.catch(() => {});
+		this.entries.set(key, { bytes: p, trace });
+	}
+
+	/** Serves every object of a pack held in memory. */
+	addPack(pack: Uint8Array): Record<string, unknown> {
+		const { entries, meta } = packEntries(pack);
+		for (const [k, b] of entries) this.set(k, b);
+		return meta;
+	}
+
+	has(key: string): boolean {
+		return this.entries.has(key);
+	}
+
+	/** The bytes of a prefetched key without crediting its read to anyone (null when absent or not prefetched). */
+	async peek(key: string): Promise<Uint8Array | null> {
+		const e = this.entries.get(key);
+		return e ? e.bytes : null;
+	}
+
+	private async take(key: string, trace: BlobTrace | undefined): Promise<Uint8Array | null> {
+		const e = this.entries.get(key)!;
+		const b = await e.bytes;
+		if (e.trace && trace) {
+			for (const f of ["reads", "hits", "misses", "r206", "r200", "bytes"] as const) trace[f] += e.trace[f];
+			e.trace = null; // credited once
+		}
+		return b;
+	}
+
+	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+		if (!this.entries.has(key)) return this.inner.get(key, range, opts);
+		const b = await this.take(key, opts?.trace);
+		if (!b) return null;
+		if (!range) return b;
+		if (range.offset < 0 || range.length < 0 || range.offset + range.length > b.byteLength) throw new ThreadError(`${key} [${range.offset}, +${range.length}) is outside the object (${b.byteLength} bytes)`);
+		return b.subarray(range.offset, range.offset + range.length);
+	}
+
+	async getRanges(key: string, ranges: BlobRange[], opts?: GetOptions): Promise<Uint8Array[] | null> {
+		if (!this.entries.has(key)) return this.inner.getRanges ? this.inner.getRanges(key, ranges, opts) : null;
+		const out: Uint8Array[] = [];
+		for (const r of ranges) {
+			const b = await this.get(key, r, opts);
+			if (!b) return null;
+			out.push(b);
+		}
+		return out;
+	}
+
+	async head(key: string): Promise<BlobHead | null> {
+		if (!this.entries.has(key)) return this.inner.head(key);
+		const b = await this.entries.get(key)!.bytes;
+		return b ? { size: b.byteLength, etag: "prefetched" } : null;
+	}
+
+	get list(): ((prefix: string) => Promise<string[]>) | undefined {
+		const inner = this.inner;
+		return inner.list ? (prefix: string) => inner.list!(prefix) : undefined;
+	}
 }

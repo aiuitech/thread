@@ -5,7 +5,7 @@
 2. Python writes on top (upserts with vectors and texts, a delete, a segment compaction); the TS SDK opens the
    result and must return what Python returns;
 3. both SDKs pack that revision into one file: the bytes must be identical, and each SDK must answer the same
-   queries from the other's pack.
+   queries from the other's pack; their base packs (full and cold) of the revision are byte-identical too.
 
 Ids, their order, attrs, payloads, docs, tokens and BM25 scores must match exactly. Cosine scores may differ in the
 last float32 ulps: the wasm build accumulates dot products in 16 SIMD lanes, the native build in 8 scalar partial
@@ -22,6 +22,8 @@ from pathlib import Path
 import pytest
 
 from thread_sdk import FileBlobStore, PackedBlobStore, open_index, pack_index
+from thread_sdk.pack import build_base_pack
+from thread_sdk.revision import load_rev_state
 
 from helpers import rng, unit_rows
 
@@ -131,3 +133,12 @@ def test_typescript_and_python_agree(tmp_path):
     assert from_py_pack["rev"] == rev
     for req, a, b in zip(requests, mine, from_py_pack["results"]):
         same(a, b, json.dumps(req)[:80])
+
+    # 4. Base packs: the same bytes from both SDKs.
+    state = load_rev_state(store, theirs["gen"], rev)
+    for kind in ("base", "cold"):
+        mine_bp = build_base_pack(store, state, kind)
+        out = tmp_path / f"ts-{kind}.threadpack"
+        info = json.loads(node("basepack", tmp_path, str(out), kind))
+        assert info["key"] == mine_bp.key and info["keys"] == mine_bp.keys and info["routing"] == mine_bp.routing
+        assert out.read_bytes() == mine_bp.data

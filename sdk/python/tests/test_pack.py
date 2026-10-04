@@ -279,5 +279,7 @@ def test_pack_open_stats_show_up_in_open_index():
     assert st["reads"] == 2 and st["bytes"] == min(len(pack), 64 * 1024)
     idx = open_index(ps, cache=False)
     assert idx.open_stats["pack"] == st
-    assert idx.open_stats["current"]["reads"] == 1  # the pack's own idx/current.json, a range of the pack
+    # the pack's base range (idx/current.json first, then the base objects) is one range read, before anything else
+    assert idx.open_stats["prefetch"]["source"] == "index-pack" and idx.open_stats["prefetch"]["reads"] == 1
+    assert idx.open_stats["current"]["reads"] == 0 and idx.open_stats["base"]["reads"] == 0
     idx.close()

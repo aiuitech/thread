@@ -14,6 +14,7 @@ from .wire import (
     BytesLike,
     ThreadError,
     build_tomb_state,
+    choose_routing,
     grouped_table_of,
     has_dense,
     keys,
@@ -27,7 +28,7 @@ from .wire import (
     u32_array,
 )
 
-__all__ = ["head_revision", "resolve_target", "load_rev_state", "snapshot_keys"]
+__all__ = ["head_revision", "resolve_target", "load_rev_state", "snapshot_keys", "base_keys", "base_keys_of"]
 
 
 @contextmanager
@@ -153,3 +154,32 @@ def snapshot_keys(rev: RevState) -> list[str]:
     for s in rev.segments:
         out.add(s["key"])
     return sorted(out)
+
+
+def base_keys(rev: RevState, kind: str = "base", routing: str = "auto") -> list[str]:
+    """The objects a cold open of `rev` reads, in the order a base pack stores them: the manifest, the slabs table,
+    the tombstone sets, `coarse.f32`, the PQ codebook, the centroid tree and, for `kind="base"`, the routing table
+    `routing` picks ("auto": the smallest the revision has). A cold base pack (`kind="cold"`, for
+    `cold_routing="tree"`) leaves the routing table out."""
+    return base_keys_of(rev.manifest, rev.gen, rev.rev, kind, routing, rev.slabs is not None)
+
+
+def base_keys_of(m: dict[str, Any], gen: str, rev: int, kind: str = "base", routing: str = "auto",
+                 with_slabs: bool = True) -> list[str]:
+    """`base_keys` from a manifest alone (`with_slabs`: whether the revision has a slabs table, v1 ones may not)."""
+    files = manifest_files(m)
+    out = [keys.manifest(gen, rev)]
+    if has_dense(m) and files.get("slabs") and with_slabs:
+        out.append(files["slabs"])
+    for t in m.get("tombstones") or []:
+        out.append(t["key"])
+    if has_dense(m):
+        out.append(files["coarse"])
+        if files.get("pq"):
+            out.append(files["pq"])
+        tree = m.get("tree")
+        if isinstance(tree, dict) and isinstance(tree.get("key"), str):
+            out.append(tree["key"])
+        if kind == "base":
+            out.append(choose_routing(m, files, routing)[1])
+    return list(dict.fromkeys(out))

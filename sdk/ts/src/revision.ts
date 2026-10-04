@@ -5,7 +5,7 @@
  */
 import { newTrace, nowMs, phaseStat, type BlobStore, type BlobTrace, type PhaseStat } from "./store.js";
 import type { RevState } from "./query.js";
-import { buildTombState, groupedTableOf, hasDense, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, routingTablesOf, slabRevOf, ThreadError, type CurrentPointer, type Manifest } from "./wire.js";
+import { buildTombState, chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, routingTablesOf, slabRevOf, ThreadError, type CurrentPointer, type Manifest, type RoutingOption } from "./wire.js";
 
 export async function getRequired(store: BlobStore, key: string, trace?: BlobTrace): Promise<Uint8Array> {
 	const b = await store.get(key, undefined, trace ? { trace } : undefined);
@@ -128,6 +128,31 @@ export function snapshotKeys(rev: RevState): string[] {
 	for (const t of manifest.tombstones ?? []) out.add(t.key);
 	for (const s of rev.segments) out.add(s.key);
 	return [...out].sort();
+}
+
+/**
+ * The objects a cold open of `rev` reads, in the order a base pack stores them: the manifest, the slabs table, the
+ * tombstone sets, `coarse.f32`, the PQ codebook, the centroid tree and, for `kind: "base"`, the routing table
+ * `routing` picks (`"auto"`: the smallest the revision has). A cold base pack (`kind: "cold"`, for
+ * `coldRouting: "tree"`) leaves the routing table out: cold queries range-read the tree-grouped table instead.
+ */
+export function baseKeys(rev: RevState, kind: "base" | "cold" = "base", routing: RoutingOption = "auto"): string[] {
+	return baseKeysOf(rev.manifest, rev.gen, rev.rev, kind, routing, rev.slabs !== null);
+}
+
+/** `baseKeys` from a manifest alone (`withSlabs`: whether the revision has a slabs table, v1 ones may not). */
+export function baseKeysOf(manifest: Manifest, gen: string, rev: number, kind: "base" | "cold" = "base", routing: RoutingOption = "auto", withSlabs = true): string[] {
+	const files = manifestFiles(manifest);
+	const out = [keys.manifest(gen, rev)];
+	if (hasDense(manifest) && files.slabs && withSlabs) out.push(files.slabs);
+	for (const t of manifest.tombstones ?? []) out.push(t.key);
+	if (hasDense(manifest)) {
+		out.push(files.coarse);
+		if (files.pq) out.push(files.pq);
+		if (manifest.tree?.key) out.push(manifest.tree.key);
+		if (kind === "base") out.push(chooseRouting(manifest, files, routing).key);
+	}
+	return [...new Set(out)];
 }
 
 /** A view of `b` as f32 (copying when the view is not 4-byte aligned). */

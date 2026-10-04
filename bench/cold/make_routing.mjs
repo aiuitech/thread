@@ -5,13 +5,14 @@
  * fake_s3.mjs --overlay or a local file store). Never writes to R2.
  *
  *   node bench/cold/make_routing.mjs [--base data/cold/g4-base] [--out data/cold/base-overlay] [--gen g4]
- *        [--rev 179] [--grouped i8] [--extra-grouped f16,f32] [--current 1]
+ *        [--rev 179] [--grouped i8] [--extra-grouped f16,f32] [--current 1] [--packs 1]
  *
  * Reads `{base}/idx/{gen}/manifest.{rev}.json` and the files it names (fine, tree), writes under `{out}`:
  *   idx/{gen}/fine{.r}.f16, fine{.r}.i8          compact routing tables (sdk/ts/src/routing.ts, the Worker's builder)
  *   idx/{gen}/fine.grouped.{rev+1}.{elem}        tree-grouped table(s): `--grouped` is named by the manifest,
  *                                                `--extra-grouped` ones are written for measurements only
- *   idx/{gen}/manifest.{rev+1}.json              rev + 1 = rev + routing (+ change {op: "publish-rev"})
+ *   idx/{gen}/manifest.{rev+1}.json              rev + 1 = rev + routing + files.base/baseCold (--packs 1)
+ *                                                (+ change {op: "publish-rev"})
  *   idx/current.json                             {gen, rev: rev + 1} (with --current 1, default)
  * The base pack(s) of item 3 are written by make_base_pack.mjs.
  */
@@ -55,7 +56,10 @@ for (const extra of (args["extra-grouped"] ?? "").split(",").filter(Boolean)) {
 	write(sdk.keys.groupedTable(GEN, next, extra), b);
 }
 const { notes: _n, change: _c, ...rest } = m;
-const manifest = { ...rest, rev: next, parentRev: rev, updatedAt: new Date().toISOString(), files, routing: built.routing, change: { op: "publish-rev", routing: { f16: built.routing.f16?.key ?? null, i8: built.routing.i8?.key ?? null, grouped: built.routing.grouped?.key ?? null }, offline: true } };
+// publish-rev names the base packs it writes after the commit (make_base_pack.mjs writes them here).
+const packFiles = { base: sdk.keys.basePack(GEN, next), ...(built.routing.grouped ? { baseCold: sdk.keys.baseColdPack(GEN, next) } : {}) };
+const { base: _b, baseCold: _bc, ...plainFiles } = files;
+const manifest = { ...rest, rev: next, parentRev: rev, updatedAt: new Date().toISOString(), files: { ...plainFiles, ...((args.packs ?? "1") !== "0" ? packFiles : {}) }, routing: built.routing, change: { op: "publish-rev", routing: { f16: built.routing.f16?.key ?? null, i8: built.routing.i8?.key ?? null, grouped: built.routing.grouped?.key ?? null }, offline: true } };
 write(sdk.keys.manifest(GEN, next), JSON.stringify(manifest));
 if ((args.current ?? "1") !== "0") write(sdk.keys.current(), JSON.stringify({ gen: GEN, rev: next }));
 console.log(JSON.stringify(built.routing, null, 1));

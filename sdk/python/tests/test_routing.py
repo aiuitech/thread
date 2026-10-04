@@ -2,48 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import threading
-
 import pytest
 
-from helpers import build_gen, rng, row, unit_rows
-from thread_sdk import MemoryBlobStore, _native, keys, open_index
+from helpers import Gated, add_routing_rev, build_gen, rng, row, unit_rows
+from thread_sdk import _native, keys, open_index
 from thread_sdk.revision import load_rev_state, snapshot_keys
-from thread_sdk.wire import choose_routing, manifest_files
-
-
-def add_routing_rev(store, gen: str, *, tables=("f16", "i8"), stale_fine: bool = False, tree_groups: int = 0,
-                    grouped_elem: str = "i8") -> int:
-    """A revision naming fine.f16 / fine.i8 (and, with `tree_groups`, a centroid tree and the tree-grouped table)
-    made from the generation's means (what publish-rev writes)."""
-    head = json.loads(bytes(store.get(keys.current()))).get("rev", 0)
-    m = json.loads(bytes(store.get(keys.manifest(gen, head))))
-    files = manifest_files(m)
-    fine = bytes(store.get(files["fine"]))
-    rev = head + 1
-    routing = {"fine": f"idx/{gen}/fine.0.f32" if stale_fine else files["fine"]}
-    for elem in tables:
-        b = _native.routing_table_encode(fine, m["dim"], elem)
-        key = keys.routing_table(files["fine"], elem)
-        store.put(key, b)
-        routing[elem] = {"key": key, "bytes": len(b)}
-    extra = {}
-    if tree_groups:
-        tree = _native.build_centroid_tree(fine, m["dim"], tree_groups, 5, 7)
-        tkey = f"idx/{gen}/tree.{rev}.bin"
-        store.put(tkey, tree)
-        g = _native.grouped_table_encode(fine, m["dim"], tree, grouped_elem)
-        _, _, _, groups, rows, data_off, row_bytes, size = _native.grouped_table_info(g)
-        gkey = keys.grouped_table(gen, rev, grouped_elem)
-        store.put(gkey, g)
-        routing["grouped"] = {"key": gkey, "tree": tkey, "elem": grouped_elem, "groups": groups, "rows": rows,
-                              "dataOff": data_off, "rowBytes": row_bytes, "bytes": size}
-        extra["tree"] = {"key": tkey, "groups": tree_groups, "beam": 2}
-    store.put(keys.manifest(gen, rev), json.dumps({**m, "rev": rev, "parentRev": head, "files": files,
-                                                   "routing": routing, **extra}))
-    store.put(keys.current(), json.dumps({"gen": gen, "rev": rev}))
-    return rev
+from thread_sdk.wire import choose_routing
 
 
 def test_encode_decode_and_wire_compat():
@@ -97,23 +61,6 @@ def test_stale_tables_ignored_and_snapshots():
     assert choose_routing(stale.manifest, stale.files, "f16") == ("f32", "idx/gs/fine.f32")
     with open_index(b.store, cache=False, routing="f16") as ix:
         assert ix.query(row(unit_rows(1, b.dim, rng(2)), 0, b.dim)).stats["routing_table"] == "f32"
-
-
-class Gated(MemoryBlobStore):
-    """A memory store whose reads of `key` wait until `release` is set (to hold the full routing table back)."""
-
-    def __init__(self, inner: MemoryBlobStore, key: str) -> None:
-        super().__init__()
-        self.objects = inner.objects
-        self.key = key
-        self.release = threading.Event()
-        self.reads: list[str] = []
-
-    def get(self, key, range=None, *, trace=None, fill=False):
-        self.reads.append(key)
-        if key == self.key:
-            self.release.wait(10)
-        return super().get(key, range, trace=trace, fill=fill)
 
 
 def test_cold_routing_full_beam_equals_flat_then_hands_over():

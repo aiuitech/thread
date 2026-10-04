@@ -24,8 +24,8 @@ from .store import (
     PrefixedBlobStore,
     phase_stat,
 )
-from .pack import PackedBlobStore, store_at
-from .revision import get_required, head_revision, load_rev_state, resolve_target
+from .pack import PackedBlobStore, PrefetchStore, is_pack_header, store_at
+from .revision import base_keys_of, get_required, head_revision, load_rev_state, resolve_target
 from .wire import (
     LEGACY_DEFAULTS,
     BytesLike,
@@ -34,6 +34,8 @@ from .wire import (
     choose_routing,
     grouped_table_of,
     has_dense,
+    keys,
+    parse_manifest,
     resolve_lex_config,
     routing_table_bytes,
 )
@@ -130,6 +132,62 @@ def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, loaded: d
     return Base(rev.base_key, searcher, pq, elem)
 
 
+def _prefetch_index_pack(pre: PrefetchStore, packed: PackedBlobStore | None) -> dict[str, Any] | None:
+    """A `PackedBlobStore`'s recorded base range, read with one range read into `pre` (None when there is none)."""
+    if packed is None:
+        return None
+    t0 = time.perf_counter()
+    trace = BlobTrace()
+    got = packed.read_base(trace)
+    if got is None:
+        return None
+    for k, b in got.items():
+        pre.set(k, b)
+    return {**phase_stat((time.perf_counter() - t0) * 1000, trace), "source": "index-pack", "key": packed.key}
+
+
+def _prefetch_open(store: BlobStore, pre: PrefetchStore, gen: str, rev: int, packed: bool,
+                   base_pack: bool, cold: bool, routing: str, io: ThreadPoolExecutor) -> dict[str, Any]:
+    """Starts the reads of an open before the loaders ask for them: the revision's base pack (one GET, in parallel
+    with the manifest in case there is none), a `PackedBlobStore`'s base range, or, without a pack, every base object
+    as soon as the manifest is in. The loaders then read `pre`, which serves those objects from memory. Returns
+    `open_stats["prefetch"]`."""
+    t0 = time.perf_counter()
+    trace = BlobTrace()
+
+    def done(source: str, key: str | None) -> dict[str, Any]:
+        return {**phase_stat((time.perf_counter() - t0) * 1000, trace), "source": source, "key": key}
+
+    if not base_pack:
+        return done("none", None)
+    mkey = keys.manifest(gen, rev)
+    if not packed:
+        pack_key = keys.base_cold_pack(gen, rev) if cold else keys.base_pack(gen, rev)
+        pre.prefetch(mkey, io)  # in case there is no pack
+        try:
+            b = store.get(pack_key, None, trace=trace)
+        except Exception:  # noqa: BLE001 - an unreadable pack only means the separate files
+            b = None
+        if b is not None and is_pack_header(b):
+            try:
+                meta = pre.add_pack(b)
+                if meta.get("gen") == gen and meta.get("rev") == rev:
+                    return done("base-pack", pack_key)
+            except ThreadError as e:
+                log.error("thread_sdk: ignoring the base pack %s: %s", pack_key, e)
+    # No pack: every base object as soon as the manifest is in (each read is accounted where its bytes are used).
+    pre.prefetch(mkey, io)
+    try:
+        mb = pre.peek(mkey)
+        m = parse_manifest(mb, gen, rev) if mb is not None else None
+    except Exception:  # noqa: BLE001 - load_rev_state reports it
+        m = None
+    if m is not None:
+        for k in base_keys_of(m, gen, rev, "cold" if cold else "base", "f32" if cold else routing):
+            pre.prefetch(k, io)
+    return done("files", None)
+
+
 def _cold_key(rev: RevState) -> str:
     g = grouped_table_of(rev.manifest, rev.files)
     return f"{rev.base_key}|{g['key'] if g else '-'}"
@@ -196,6 +254,8 @@ class ThreadIndex:
         #: (cold key, future of the cold Base) while queries route cold.
         self._cold: tuple[str, Future] | None = None
         self._bg_load: threading.Thread | None = None
+        #: The prefetching view `open` reads through (None after the open).
+        self._open_store: BlobStore | None = None
         self._io = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="thread-io")
         self._jobs = ThreadPoolExecutor(max_workers=job_workers, thread_name_prefix="thread-job")
         self._lock = threading.RLock()
@@ -227,11 +287,13 @@ class ThreadIndex:
         routing: str = "f32",
         cold_routing: str = "off",
         cold_beam: int | None = None,
+        base_pack: bool = True,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
             store = store_at(store)
         pack = store.open_stats if isinstance(store, PackedBlobStore) else None
+        packed = store if isinstance(store, PackedBlobStore) and not prefix else None
         if prefix:
             store = PrefixedBlobStore(store, prefix)
         if cache is None:
@@ -242,12 +304,29 @@ class ThreadIndex:
             store = CachedBlobStore(store, cache)  # type: ignore[arg-type]
         t0 = time.perf_counter()
         timeline: dict[str, Any] = {}
-        g, r = resolve_target(store, gen, rev, timeline)
-        state = load_rev_state(store, g, r, timeline)
-        ix = cls(store, state, gen=gen, pinned=gen is not None and rev is not None, refresh_interval=refresh_interval,
-                 delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
+        # The open's reads go through a prefetching view: a pack's base range, the base pack, or the files started
+        # together. A PackedBlobStore's base range (it starts with idx/current.json) is read before anything else.
+        pre = PrefetchStore(store)
+        from_pack = _prefetch_index_pack(pre, packed) if base_pack else None
+        g, r = resolve_target(pre if from_pack else store, gen, rev, timeline)
+        ix = cls(store, None, gen=gen, pinned=gen is not None and rev is not None,  # type: ignore[arg-type]
+                 refresh_interval=refresh_interval, delta_cache_bytes=delta_cache_bytes,
+                 lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
                  job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), routing=routing,
                  cold_routing=cold_routing, cold_beam=cold_beam)
+        try:
+            # The open's reads go through a prefetching view: the base pack (or the files, started together).
+            if from_pack is not None and pre.has(keys.manifest(g, r)):
+                prefetch = from_pack
+            else:
+                prefetch = _prefetch_open(store, pre, g, r, packed is not None, base_pack, cold_routing == "tree",
+                                          routing, ix._io)
+            state = load_rev_state(pre, g, r, timeline)
+        except BaseException:
+            ix.close()
+            raise
+        ix._rev = state
+        ix._open_store = pre
         loaded: dict[str, Any] = {}
         try:
             if has_dense(state.manifest):
@@ -260,8 +339,9 @@ class ThreadIndex:
         except BaseException:
             ix.close()
             raise
+        ix._open_store = None  # the prefetched bytes are not kept
         none = phase_stat(0, BlobTrace())
-        ix.open_stats = {"total": round((time.perf_counter() - t0) * 1000, 3),
+        ix.open_stats = {"total": round((time.perf_counter() - t0) * 1000, 3), "prefetch": prefetch,
                          **{k: timeline.get(k, none) for k in ("current", "manifest", "slabs")},
                          "base": loaded.get("stat")}
         if pack is not None:
@@ -378,7 +458,7 @@ class ThreadIndex:
         if not owner:
             return fut.result()
         try:
-            base = load_base(self.store, rev, self._io, loaded, self._routing)
+            base = load_base(self._open_store or self.store, rev, self._io, loaded, self._routing)
         except BaseException as e:
             with self._lock:
                 if self._base is slot:
@@ -441,7 +521,7 @@ class ThreadIndex:
         if not owner:
             return fut.result()
         try:
-            base = load_cold_base(self.store, rev, self._io, self._cold_beam, loaded)
+            base = load_cold_base(self._open_store or self.store, rev, self._io, self._cold_beam, loaded)
         except BaseException as e:
             with self._lock:
                 if self._cold is slot:
@@ -787,6 +867,7 @@ def open_index(
     routing: str = "f32",
     cold_routing: str = "off",
     cold_beam: int | None = None,
+    base_pack: bool = True,
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -807,9 +888,13 @@ def open_index(
     - `cold_routing`: "tree" makes a cold open wait only for the centroid tree and the PQ codebook; until the full
       routing table has loaded (in the background), queries rank the cells of the tree's best `cold_beam` groups,
       range-reading just those groups' means from the tree-grouped table (needs `manifest.routing.grouped`; else the
-      open loads the full table as usual). `cold_beam` defaults to `manifest.defaults.beam`, else 16.
+      open loads the full table as usual). `cold_beam` defaults to `manifest.defaults.beam`, else 16;
+    - `base_pack`: (default True) a cold open first GETs the revision's base pack (`idx/{gen}/base.{rev}.threadpack`,
+      `base.cold.{rev}` with `cold_routing="tree"`), every object the open reads in one object, in parallel with the
+      manifest; from a `PackedBlobStore` it reads the pack's recorded base range. Without a pack, the open starts
+      every read as soon as the manifest is in. False: the reads one after another, as before.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
                             io_workers=io_workers, job_workers=job_workers, routing=routing,
-                            cold_routing=cold_routing, cold_beam=cold_beam)
+                            cold_routing=cold_routing, cold_beam=cold_beam, base_pack=base_pack)

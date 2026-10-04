@@ -100,7 +100,10 @@ describe("snapshots", () => {
 		expect(ps.openStats).toMatchObject({ reads: 2, bytes: Math.min(pack.byteLength, 64 * 1024) });
 		const idx = await thread.open({ store: ps, cache: false });
 		expect(idx.openStats.pack).toEqual(ps.openStats);
-		expect(idx.openStats.current.reads).toBe(1); // the pack's own idx/current.json, a range of the pack
+		// the pack's base range (idx/current.json first, then the base objects) is one range read, before anything else
+		expect(idx.openStats.prefetch).toMatchObject({ source: "index-pack", reads: 1 });
+		expect(idx.openStats.current.reads).toBe(0);
+		expect(idx.openStats.base!.reads).toBe(0);
 		idx.close();
 	});
 

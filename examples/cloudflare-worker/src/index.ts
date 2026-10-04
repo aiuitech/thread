@@ -48,7 +48,10 @@ import wasmModule from "../../../crates/thread-wasm/pkg/thread_bg.wasm";
 import init, * as thread from "../../../crates/thread-wasm/pkg/thread.js";
 // Pure-TS builders shared with the SDK (no wasm import of their own: they take this module's bindings).
 import { buildRoutingObjects } from "../../../sdk/ts/src/routing.ts";
-import type { RoutingElem, RoutingTables } from "../../../sdk/ts/src/wire.ts";
+import { buildBasePack } from "../../../sdk/ts/src/pack.ts";
+import { loadRevState as sdkLoadRevState } from "../../../sdk/ts/src/revision.ts";
+import { R2BlobStore } from "../../../sdk/ts/src/store.ts";
+import { groupedTableOf, keys as sdkKeys, type Manifest as SdkManifest, type RoutingElem, type RoutingOption, type RoutingTables } from "../../../sdk/ts/src/wire.ts";
 
 interface Env {
 	BUCKET: R2Bucket;
@@ -1048,6 +1051,41 @@ async function writeRouting(env: Env, gen: string, rev: number, fineKey: string,
 	return routing;
 }
 
+/**
+ * `basePack` option of publish / publish-rev: one object per revision holding everything a cold open reads
+ * (`idx/{gen}/base.{rev}.threadpack`: manifest, slabs table, tombstone sets, coarse, codebook, tree, one routing
+ * table), and a cold variant without the routing table (`base.cold.{rev}.threadpack`) when the revision has a
+ * tree-grouped table. Readers find them by (gen, rev); the manifest names them in files.base / files.baseCold.
+ */
+interface BasePackReq {
+	/** The routing table in the base pack (default "auto": the smallest the revision has). */
+	routing?: RoutingOption;
+	/** Also write the cold base pack (default true; only when the revision has a grouped table). */
+	cold?: boolean;
+}
+
+/** The files.base / files.baseCold names of revision `rev` (set before the commit; the packs are written after it). */
+function basePackFiles(gen: string, rev: number, m: { routing?: RoutingTables; tree?: TreeRef; k1: number; files?: IndexFiles }, req: BasePackReq | false | undefined): Pick<IndexFiles, "base" | "baseCold"> {
+	if (req === false) return {};
+	const cold = req?.cold !== false && groupedTableOf(m as unknown as SdkManifest) !== null;
+	return { base: sdkKeys.basePack(gen, rev), ...(cold ? { baseCold: sdkKeys.baseColdPack(gen, rev) } : {}) };
+}
+
+/** Writes the base pack(s) of a committed revision (built from the objects it names, read back from R2). */
+async function writeBasePacks(env: Env, gen: string, rev: number, req: BasePackReq | false | undefined): Promise<{ key: string; bytes: number; routing: string | null }[]> {
+	if (req === false) return [];
+	const store = new R2BlobStore(env.BUCKET);
+	const rs = await sdkLoadRevState(store, gen, rev);
+	const out: { key: string; bytes: number; routing: string | null }[] = [];
+	const kinds: ("base" | "cold")[] = rs.files.baseCold ? ["base", "cold"] : ["base"];
+	for (const kind of kinds) {
+		const p = await buildBasePack(store, rs, kind, req?.routing ?? "auto");
+		await putBytes(env.BUCKET, p.key, p.bytes);
+		out.push({ key: p.key, bytes: p.bytes.byteLength, routing: p.routing });
+	}
+	return out;
+}
+
 /** The routing request that reproduces a manifest's tables (for a split commit that writes new means). */
 const routingReqOf = (r: RoutingTables | undefined): RoutingReq | null => {
 	if (!r) return null;
@@ -1088,6 +1126,8 @@ interface PublishReq {
 	tree?: TreeReq;
 	/** Compact routing tables (idx/{gen}/fine.f16, fine.i8; manifest.routing). Default `{}` (both); false = none. */
 	routing?: RoutingReq | false;
+	/** Base packs of rev 0 (idx/{gen}/base.0.threadpack, base.cold.0.threadpack). Default `{}`; false = none. */
+	basePack?: BasePackReq | false;
 	/** Automatic compaction thresholds and split cap (manifest.compaction; the driver sends the profile's). */
 	compaction?: CompactionPolicy;
 	/**
@@ -1180,7 +1220,7 @@ async function buildTree(env: Env, gen: string, m: { dim: number; k1: number; k2
 }
 
 async function stagePublish(env: Env, body: PublishReq) {
-	const { gen, coarseKey, fineKey, slabs, setCurrent, codebookKey, overwrite, tree: treeReq, routing: routingReq, ...rest } = body;
+	const { gen, coarseKey, fineKey, slabs, setCurrent, codebookKey, overwrite, tree: treeReq, routing: routingReq, basePack: basePackReq, ...rest } = body;
 	if (!overwrite) {
 		const revs = await listRevs(env, gen);
 		if (revs.length) throw new HttpError(409, `${gen} already has manifest revs ${revs.map((r) => r.rev).join(",")}; use publish-rev to change defaults (or overwrite: true for a rebuild of the same gen)`);
@@ -1237,10 +1277,14 @@ async function stagePublish(env: Env, body: PublishReq) {
 	}
 	const routing = routingReq === false ? undefined : await writeRouting(env, gen, 0, `idx/${gen}/fine.f32`, new Float32Array(fine), body.dim, routingReq ?? {}, false, tree && treeBytes ? { key: tree.key, bytes: treeBytes } : null);
 	// Rev 0 of the generation (manifest.json / slabs.json / slab/{cell:05}); later revisions are manifest.{rev}.json.
-	const manifest = { gen, ...rest, format, tiers, ...(format === 3 ? { pq: { m: pqM } } : {}), ...(tree ? { tree } : {}), ...(routing ? { routing } : {}), rev: 0, createdAt: new Date().toISOString() };
+	const packFiles = basePackFiles(gen, 0, { routing, tree, k1: body.k1 }, basePackReq);
+	// Rev 0 names its files only when it names base packs (older readers use the fixed names either way).
+	const files: IndexFiles | undefined = packFiles.base ? { coarse: `idx/${gen}/coarse.f32`, fine: `idx/${gen}/fine.f32`, pq: format === 3 ? `idx/${gen}/pq.bin` : null, slabs: `idx/${gen}/slabs.json`, ...packFiles } : undefined;
+	const manifest = { gen, ...rest, format, tiers, ...(format === 3 ? { pq: { m: pqM } } : {}), ...(tree ? { tree } : {}), ...(routing ? { routing } : {}), ...(files ? { files } : {}), rev: 0, createdAt: new Date().toISOString() };
 	await putBytes(env.BUCKET, manifestKey(gen, 0), JSON.stringify(manifest));
+	const basePacks = slabTable ? await writeBasePacks(env, gen, 0, basePackReq) : [];
 	if (setCurrent !== false) await putBytes(env.BUCKET, CURRENT_KEY, JSON.stringify({ gen, rev: 0 }));
-	return { ...manifest, current: setCurrent !== false };
+	return { ...manifest, basePacks, current: setCurrent !== false };
 }
 
 // ---------- revisions: object names, manifests, current pointer ----------
@@ -1279,6 +1323,10 @@ interface IndexFiles {
 	fine: string;
 	pq: string | null;
 	slabs: string | null;
+	/** The base pack of the revision that wrote it (base.{rev}.threadpack); inherited by later revisions. */
+	base?: string;
+	/** The cold base pack of that revision (base.cold.{rev}.threadpack). */
+	baseCold?: string;
 }
 
 interface Manifest {
@@ -3054,6 +3102,8 @@ interface PublishRevReq {
 	 * revision (manifest.routing); null removes them. Absent: kept (a new tree does not change them).
 	 */
 	routing?: RoutingReq | null;
+	/** Base packs of the new revision (base.{rev}.threadpack, base.cold.{rev}.threadpack). Default `{}`; false = none. */
+	basePack?: BasePackReq | false;
 	/** Point idx/current.json at this generation even if another one is current (default false). */
 	setCurrent?: boolean;
 	/**
@@ -3119,6 +3169,8 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 		else delete next.tree;
 		if (routing) next.routing = routing;
 		else delete next.routing;
+		const { base: _b, baseCold: _bc, ...plainFiles } = next.files!;
+		next.files = { ...plainFiles, ...basePackFiles(gen, rev + 1, { ...next, files: plainFiles }, body.basePack) };
 		const compaction = resolveCompaction(body.compaction, manifest, body.profile);
 		if (compaction) next.compaction = compaction;
 		else delete next.compaction;
@@ -3127,8 +3179,11 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 		const compactionChange = body.compaction === undefined ? {} : { compaction: { from: manifest.compaction ?? null, to: compaction ?? null } };
 		return { ...next, change: { op: "publish-rev", defaults: { from: prev, to: defaults }, ...treeChange, ...routingChange, ...compactionChange } };
 	});
+	// The packs hold the committed manifest, so they are written after the commit (a reader that sees the revision
+	// first finds no pack and reads the separate files).
+	const basePacks = c.manifest.files?.base ? await writeBasePacks(env, gen, c.rev, body.basePack) : [];
 	const cur = body.setCurrent ? await advanceCurrent(env, gen, c.rev, true) : null;
-	return { gen, rev: c.rev, parentRev: c.parentRev, defaults: c.manifest.defaults, tree: c.manifest.tree ?? null, routing: c.manifest.routing ?? null, compaction: c.manifest.compaction ?? null, conflicts: c.conflicts, currentUpdated: c.currentUpdated || !!cur?.updated };
+	return { gen, rev: c.rev, parentRev: c.parentRev, defaults: c.manifest.defaults, tree: c.manifest.tree ?? null, routing: c.manifest.routing ?? null, basePacks, compaction: c.manifest.compaction ?? null, conflicts: c.conflicts, currentUpdated: c.currentUpdated || !!cur?.updated };
 }
 
 /** Sorted unique ids as a tombstone buffer. */

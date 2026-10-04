@@ -13,12 +13,12 @@ import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobStore, type BlobTrace, type CacheLike, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { compactSegments, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
-import { chooseRouting, groupedTableOf, hasDense, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
-import { asF32, getRequired, loadRevState, resolveTarget, type RevTimeline } from "./revision.js";
+import { chooseRouting, groupedTableOf, hasDense, keys, parseManifest, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
+import { asF32, baseKeysOf, getRequired, loadRevState, resolveTarget, type RevTimeline } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 import { ColdRouting } from "./cold.js";
-import { PackedBlobStore } from "./pack.js";
+import { isPackHeader, PackedBlobStore, PrefetchStore } from "./pack.js";
 
 export * from "./wire.js";
 export * from "./store.js";
@@ -96,6 +96,13 @@ export interface OpenStats {
 	/** The routing table and PQ codebook (`coarse.f32`, `fine.f32`, `pq.bin`) read and loaded into wasm; null without a dense index. */
 	base: BaseStat | null;
 	/**
+	 * How the open's objects were fetched up front (`basePack`): from the revision's base pack (`"base-pack"`), from
+	 * a `PackedBlobStore`'s base range (`"index-pack"`), started all at once after the manifest (`"files"`), or not
+	 * at all (`"none"`, `basePack: false`); the wall time until then and the work of the pack read (objects served
+	 * from a pack count here only; reads started early count in the step that uses them), and the pack key tried.
+	 */
+	prefetch: PhaseStat & { source: "base-pack" | "index-pack" | "files" | "none"; key: string | null };
+	/**
 	 * When the store is a `PackedBlobStore`: its own open (head, tail and directory reads, `PackedBlobStore.openStats`).
 	 * It happened before `open` (when the pack store was created), so it is not part of `total`.
 	 */
@@ -147,6 +154,13 @@ export interface OpenOptions {
 	coldRouting?: "tree" | "off";
 	/** Groups ranked per cold-routed query (default: `manifest.defaults.beam`, else 16). See docs/query-path.md. */
 	coldBeam?: number;
+	/**
+	 * Base packs (default true): a cold open first GETs the revision's base pack
+	 * (`idx/{gen}/base.{rev}.threadpack`, `base.cold.{rev}` with `coldRouting: "tree"`), every object the open reads in
+	 * one object, in parallel with the manifest; from a `PackedBlobStore` it reads the pack's recorded base range. Without
+	 * a pack, the open starts every read as soon as the manifest is in. `false`: the reads one after another, as before.
+	 */
+	basePack?: boolean;
 }
 
 /** One wasm instance per isolate. `Thread.init` once, then `open` indexes. */
@@ -231,6 +245,8 @@ export class ThreadIndex {
 	private revState: RevState;
 	private base: BaseSlot | null = null;
 	private basePromise: Promise<BaseSlot> | null = null;
+	/** The prefetching view the open reads through (null after the open). */
+	private openStore: BlobStore | null = null;
 	/** Cold routing (`coldRouting: "tree"`) while the full routing table loads. */
 	private cold: BaseSlot | null = null;
 	private coldPromise: Promise<BaseSlot> | null = null;
@@ -283,9 +299,15 @@ export class ThreadIndex {
 		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil });
 		const t0 = nowMs();
 		const tl: RevTimeline = {};
-		const target = await resolveTarget(store, opts.gen, opts.rev, tl);
-		const rev = await loadRevState(store, target.gen, target.rev, tl);
+		// The open's reads go through a prefetching view: a pack's base range, the base pack, or the files started
+		// together. A PackedBlobStore's base range (it starts with idx/current.json) is read before anything else.
+		const pre = new PrefetchStore(store);
+		const fromPack = await prefetchIndexPack(pre, opts);
+		const target = await resolveTarget(fromPack ? pre : store, opts.gen, opts.rev, tl);
+		const prefetch = fromPack && pre.has(keys.manifest(target.gen, target.rev)) ? fromPack : await prefetchOpen(store, pre, target.gen, target.rev, opts);
+		const rev = await loadRevState(pre, target.gen, target.rev, tl);
 		const ix = new ThreadIndex(thread, store, rev, opts);
+		ix.openStore = pre;
 		const loaded: { stat?: BaseStat } = {};
 		if (hasDense(rev.manifest)) {
 			if (ix.coldWanted(rev)) {
@@ -294,8 +316,9 @@ export class ThreadIndex {
 				ix.loadFullInBackground();
 			} else await ix.acquireBase(loaded).then((s) => ix.releaseBase(s));
 		}
+		ix.openStore = null; // the prefetched bytes are not kept
 		const none = phaseStat(0, newTrace());
-		ix.openStats = { total: roundMs(nowMs() - t0), wasmInit: thread.initMs, current: tl.current ?? none, manifest: tl.manifest ?? none, slabs: tl.slabs ?? none, base: loaded.stat ?? null };
+		ix.openStats = { total: roundMs(nowMs() - t0), wasmInit: thread.initMs, current: tl.current ?? none, prefetch, manifest: tl.manifest ?? none, slabs: tl.slabs ?? none, base: loaded.stat ?? null };
 		if (opts.store instanceof PackedBlobStore) ix.openStats.pack = opts.store.openStats;
 		return ix;
 	}
@@ -660,7 +683,7 @@ export class ThreadIndex {
 		}
 		if (!this.basePromise) {
 			const rev = this.revState;
-			const p = loadBase(this.store, rev, this.thread.epoch, loaded, this.opts.routing).then((b) => {
+			const p = loadBase(this.openStore ?? this.store, rev, this.thread.epoch, loaded, this.opts.routing).then((b) => {
 				const slot: BaseSlot = { ...b, users: 0, dropped: false };
 				if (this.basePromise === p && !this.closed) {
 					this.base = slot;
@@ -727,7 +750,7 @@ export class ThreadIndex {
 			return Promise.resolve(this.cold);
 		}
 		if (!this.coldPromise) {
-			const p = loadColdBase(this.store, rev, this.thread.epoch, this.opts.coldBeam, loaded).then((b) => {
+			const p = loadColdBase(this.openStore ?? this.store, rev, this.thread.epoch, this.opts.coldBeam, loaded).then((b) => {
 				const slot: BaseSlot = { ...b, users: 0, dropped: false };
 				if (this.coldPromise === p && !this.closed && !this.base) this.cold = slot;
 				else slot.dropped = true; // superseded while loading (or the full table won the race)
@@ -765,6 +788,58 @@ export class ThreadIndex {
 }
 
 // ---------- loading ----------
+
+/** A `PackedBlobStore`'s recorded base range, read with one range read into `pre` (null when there is none). */
+async function prefetchIndexPack(pre: PrefetchStore, opts: OpenOptions): Promise<OpenStats["prefetch"] | null> {
+	if (opts.basePack === false || !(opts.store instanceof PackedBlobStore) || opts.prefix) return null;
+	const t0 = nowMs();
+	const trace = newTrace();
+	const got = await opts.store.readBase(trace);
+	if (!got) return null;
+	for (const [k, b] of got) pre.set(k, b);
+	return { ...phaseStat(nowMs() - t0, trace), source: "index-pack", key: opts.store.key };
+}
+
+/**
+ * Starts the reads of an open before the loaders ask for them: the revision's base pack (one GET, in parallel with
+ * the manifest in case there is none), a `PackedBlobStore`'s base range, or, without a pack, every base object as
+ * soon as the manifest is in (slabs table, tombstone sets, coarse, codebook, routing table or, for cold routing, the
+ * tree). The loaders then read `pre`, which serves those objects from memory.
+ */
+async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, rev: number, opts: OpenOptions): Promise<OpenStats["prefetch"]> {
+	const t0 = nowMs();
+	const trace = newTrace();
+	const done = (source: OpenStats["prefetch"]["source"], key: string | null) => ({ ...phaseStat(nowMs() - t0, trace), source, key });
+	if (opts.basePack === false) return done("none", null);
+	const cold = opts.coldRouting === "tree";
+	const mkey = keys.manifest(gen, rev);
+	if (!(opts.store instanceof PackedBlobStore)) {
+		const packKey = cold ? keys.baseColdPack(gen, rev) : keys.basePack(gen, rev);
+		pre.prefetch(mkey); // in case there is no pack
+		const b = await store.get(packKey, undefined, { trace }).catch(() => null);
+		if (b && isPackHeader(b)) {
+			try {
+				const meta = pre.addPack(b);
+				if (meta.gen === gen && meta.rev === rev) return done("base-pack", packKey);
+			} catch (e) {
+				console.error(`thread-sdk: ignoring the base pack ${packKey}: ${e instanceof Error ? e.message : String(e)}`);
+			}
+		}
+	}
+	// No pack: every base object as soon as the manifest is in (each read is accounted where its bytes are used).
+	pre.prefetch(mkey);
+	const mb = await pre.peek(mkey).catch(() => null);
+	if (mb) {
+		let m: Manifest | null = null;
+		try {
+			m = parseManifest(mb, gen, rev);
+		} catch {
+			/* loadRevState reports it */
+		}
+		if (m) for (const k of baseKeysOf(m, gen, rev, cold ? "cold" : "base", opts.routing ?? "f32")) pre.prefetch(k);
+	}
+	return done("files", null);
+}
 
 function freeBase(b: Base): void {
 	if (b.searcher) safeFree(b.searcher);

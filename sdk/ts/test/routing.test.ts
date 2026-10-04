@@ -1,32 +1,7 @@
 /** Compact routing tables (fine.f16 / fine.i8): building them, opening with `routing`, fallbacks, snapshots. */
 import { describe, expect, it } from "vitest";
-import { asF32, buildRoutingObjects, chooseRouting, groupedTableOf, keys, manifestFiles, snapshotKeys, loadRevState, type BlobStore, type Manifest, type MemoryBlobStore, type RoutingElem } from "../src/index.js";
-import { bruteForce, buildGen, rng, thread, unitRows, w } from "./helpers.js";
-
-/** Adds a revision naming `fine.f16` / `fine.i8` made from the generation's means (what publish-rev writes). */
-export async function addRoutingRev(store: MemoryBlobStore, gen: string, opts: { tables?: ("f16" | "i8")[]; staleFine?: boolean; tree?: { groups: number; elem?: RoutingElem; beam?: number } } = {}): Promise<{ rev: number; manifest: Manifest }> {
-	const cur = JSON.parse(new TextDecoder().decode((await store.get(keys.current()))!)) as { gen: string; rev?: number };
-	const head = cur.rev ?? 0;
-	const m = JSON.parse(new TextDecoder().decode((await store.get(keys.manifest(gen, head)))!)) as Manifest;
-	const files = manifestFiles(m);
-	const fine = asF32((await store.get(files.fine))!, files.fine);
-	const rev = head + 1;
-	let tree = m.tree;
-	let grouped: Parameters<typeof buildRoutingObjects>[1]["grouped"];
-	if (opts.tree) {
-		const bytes = w.build_centroid_tree(fine, m.dim, opts.tree.groups, 5, 7);
-		tree = { key: `idx/${gen}/tree.${rev}.bin`, groups: opts.tree.groups, beam: opts.tree.beam ?? 2 };
-		await store.put(tree.key, bytes);
-		grouped = { gen, rev, treeKey: tree.key, tree: bytes, elem: opts.tree.elem };
-	}
-	const built = buildRoutingObjects(w, { fineKey: files.fine, fine, dim: m.dim, tables: opts.tables, grouped });
-	for (const [k, b] of built.objects) await store.put(k, b);
-	const routing = opts.staleFine ? { ...built.routing, fine: `idx/${gen}/fine.0.f32` } : built.routing;
-	const manifest: Manifest = { ...m, rev, parentRev: head, files, routing, ...(tree ? { tree } : {}) };
-	await store.put(keys.manifest(gen, rev), JSON.stringify(manifest));
-	await store.put(keys.current(), JSON.stringify({ gen, rev }));
-	return { rev, manifest };
-}
+import { asF32, chooseRouting, groupedTableOf, manifestFiles, snapshotKeys, loadRevState, type BlobStore } from "../src/index.js";
+import { addRoutingRev, bruteForce, buildGen, rng, thread, unitRows, w } from "./helpers.js";
 
 const queries = (n: number, dim: number, seed: number) => {
 	const qs = unitRows(n, dim, rng(seed));

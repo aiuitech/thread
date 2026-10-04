@@ -4,13 +4,14 @@
 //   node ts_side.mjs run <dir> [store]   answers the requests in <dir>/requests.json (written by Python) against the
 //                                  index at <store> (a directory or a pack file; default <dir>) and prints them
 //   node ts_side.mjs pack <dir> <file>    packs the current revision of the index in <dir> into <file>
+//   node ts_side.mjs basepack <dir> <file> <kind>   writes the base pack (kind base | cold) of the current revision
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dist = path.join(here, "../../../ts/dist");
-const { Thread, keys } = await import(path.join(dist, "index.js"));
+const { Thread, keys, buildBasePack, loadRevState, resolveTarget } = await import(path.join(dist, "index.js"));
 const { FileBlobStore, packIndexToFile, storeAt } = await import(path.join(dist, "node.js"));
 const wasmModule = new WebAssembly.Module(fs.readFileSync(path.join(dist, "wasm/thread_bg.wasm")));
 const thread = await Thread.init({ wasmModule });
@@ -152,4 +153,9 @@ if (cmd === "build") {
 } else if (cmd === "pack") {
 	const r = await packIndexToFile(store, extra);
 	process.stdout.write(JSON.stringify(r));
-} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | pack <dir> <file>`);
+} else if (cmd === "basepack") {
+	const t = await resolveTarget(store);
+	const r = await buildBasePack(store, await loadRevState(store, t.gen, t.rev), process.argv[5] ?? "base");
+	fs.writeFileSync(extra, r.bytes);
+	process.stdout.write(JSON.stringify({ key: r.key, keys: r.keys, routing: r.routing }));
+} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | pack <dir> <file> | basepack <dir> <file> <kind>`);
