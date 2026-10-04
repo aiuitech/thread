@@ -10,7 +10,7 @@ import json, os, sys
 import numpy as np
 
 SHARD = 2048
-root = os.path.join(os.path.dirname(__file__), "..", "data")
+root = os.path.join(os.path.dirname(__file__), "..", "..", "data")
 out = os.path.join(root, "prep")
 os.makedirs(os.path.join(out, "ingest"), exist_ok=True)
 

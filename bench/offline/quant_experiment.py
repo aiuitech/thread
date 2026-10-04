@@ -36,7 +36,7 @@ Bytes/entry = code bytes + 16 (id / entry) + 4 (per-vector scale; none for PQ).
 Memory: vectors are read with pread-style np.fromfile (not a memmap), so the
 6 GB file lands in page cache rather than this process's RSS.
 
-Usage: .venv/bin/python bench/quant_experiment.py [--nq 500] [--k 100] [--nprobe 22]
+Usage: .venv/bin/python bench/offline/quant_experiment.py [--nq 500] [--k 100] [--nprobe 22]
 Results: printed, and data/idx-g1/quant_experiment.json. Passes are cached in
 data/idx-g1/quant_pass_q{nq}_k{k}.npz, quant_pq.npz, quant_e2e_q{nq}_np{P}.npz.
 """

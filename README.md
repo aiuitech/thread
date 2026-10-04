@@ -346,7 +346,9 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
                       automatic), cell splits, `/index/status`, rollback, gc (`src/index.ts`); `src/main.ts` runs build
                       stages and writes in build slots (Worker Loader); see `worker/README.md`
 - `spikes/worker-loader/` the spike that showed dynamic Workers give each slot its own isolate (FINDINGS.md)
-- `bench/`            dataset prep, shard upload, build driver, query benchmark, compaction driver, update benchmark
+- `bench/`            clients of the deployed Worker (build driver, compaction, query/update/split benchmarks);
+                      `bench/prep/` dataset prep and shard upload; `bench/offline/` local numpy experiments; see
+                      `bench/README.md`
 - `docs/`             `update-path.md`: the update path (revisions, deltas, tombstones, compaction) in detail;
                       `lexical.md`: the lexical index, the docs store and fusion
 - `data/`             (gitignored) dataset and prep output
@@ -470,8 +472,8 @@ consecutive batches, each with its own smaller spans.
 
 ```sh
 # prep dataset (dbpedia-openai-1M-1536-angular) and upload shards
-.venv/bin/python bench/prep_dataset.py
-bench/upload_shards.sh 6
+.venv/bin/python bench/prep/prep_dataset.py
+bench/prep/upload_shards.sh 6
 
 # build wasm and deploy the worker
 cargo build --release --target wasm32-unknown-unknown -p thread-wasm

@@ -18,7 +18,7 @@ One streaming pass over vectors.npy (chunks of CHUNK rows) does the assignment
 of all vectors (top-MMAX cells, coarse pc=2) and the brute-force top-50 for the
 quantization queries. Peak memory is well under 1 GB.
 
-Usage: .venv/bin/python bench/diagnose_recall.py [--q2 300] [--chunk 4096] [--retrain 1]
+Usage: .venv/bin/python bench/offline/diagnose_recall.py [--q2 300] [--chunk 4096] [--retrain 1]
 Results: printed, and data/idx-g1/diagnosis.json. Intermediate passes are
 cached as .npz under data/idx-g1/ (delete them to recompute).
 """
