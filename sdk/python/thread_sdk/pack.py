@@ -8,7 +8,9 @@ Layout (all integers little-endian; docs/portability.md has the specification):
 
     [0, 16)      header: magic "THRDPACK", version u16 (1), flags u16 (0), reserved u32 (0)
     [16, D)      the objects, each at an 8-byte-aligned offset, zero padding between
-    [D, D + L)   directory: UTF-8 JSON {"entries":[[key, offset, length], ...], ...meta}
+    [D, D + L)   directory: UTF-8 JSON {"entries":[[key, offset, length], ...], ...meta}; an entry may carry a
+                 fourth element {"partial": true, "size": n}: it holds only bytes [0, length) of an object of n bytes
+                 (warm packs, see warm.py)
     [end - 32)   footer: directory offset u64, directory length u64, entry count u32, version u16, flags u16,
                  magic "THRDPACK"
 
@@ -87,12 +89,21 @@ def parse_pack_footer(f: Bytes) -> tuple[int, int, int]:
 
 def parse_pack_directory(b: Bytes, dir_off: int, count: int) -> tuple[dict[str, tuple[int, int]], dict[str, Any]]:
     """Entries by key and the writer's metadata; checks every entry lies inside `[PACK_HEADER_BYTES, dir_off)`."""
+    entries, meta, _partial = parse_pack_directory_full(b, dir_off, count)
+    return entries, meta
+
+
+def parse_pack_directory_full(b: Bytes, dir_off: int, count: int
+                              ) -> tuple[dict[str, tuple[int, int]], dict[str, Any], dict[str, int]]:
+    """`parse_pack_directory` plus the partial entries: key -> size of the whole object, for entries marked
+    `{"partial": true, "size": n}` (they hold only the object's first `length` bytes)."""
     j = decode_json(b)
     if not isinstance(j, dict) or not isinstance(j.get("entries"), list):
         raise ThreadError("pack directory has no entries")
     if len(j["entries"]) != count:
         raise ThreadError(f"pack directory lists {len(j['entries'])} entries, footer says {count}")
     entries: dict[str, tuple[int, int]] = {}
+    partial: dict[str, int] = {}
     for e in j["entries"]:
         if (not isinstance(e, list) or len(e) < 3 or not isinstance(e[0], str) or isinstance(e[1], bool)
                 or not isinstance(e[1], int) or isinstance(e[2], bool) or not isinstance(e[2], int)):
@@ -103,8 +114,14 @@ def parse_pack_directory(b: Bytes, dir_off: int, count: int) -> tuple[dict[str, 
         if key in entries:
             raise ThreadError(f"pack directory lists {key} twice")
         entries[key] = (off, ln)
+        x = e[3] if len(e) > 3 else None
+        if isinstance(x, dict) and x.get("partial") is True:
+            size = x.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or size < ln:
+                raise ThreadError(f"pack entry {key}: partial entry needs a size >= its length {ln}")
+            partial[key] = size
     meta = {k: v for k, v in j.items() if k != "entries"}
-    return entries, meta
+    return entries, meta, partial
 
 
 # ---------- reading ----------
@@ -148,8 +165,9 @@ class PackedBlobStore(BlobStore):
             if got is None:
                 raise ThreadError(f"no pack at {key}", 404)
             d = got
-        #: key -> (offset in the pack, length).
-        self.entries, self.meta = parse_pack_directory(d, dir_off, count)
+        #: key -> (offset in the pack, length); `partial`: key -> whole object size, for entries that hold only the
+        #: object's first `length` bytes (warm packs).
+        self.entries, self.meta, self.partial = parse_pack_directory_full(d, dir_off, count)
         #: What opening the pack did (`phase_stat`): the head (counted as a read of 0 bytes), the tail read and, when
         #: the directory does not fit in the tail, the directory read. `open_index` reports it as `open_stats["pack"]`.
         self.open_stats = phase_stat((time.perf_counter() - t0) * 1000, trace)
@@ -177,11 +195,20 @@ class PackedBlobStore(BlobStore):
         if e is None:
             return None
         off, ln = e
+        size = self.partial.get(key)
+        short = f"the pack holds only its first {ln} of {size} bytes" if size is not None and size > ln else None
         if range is None:
+            if short:
+                raise ThreadError(f"{key}: {short}")
             return BlobRange(off, ln)
         if range.offset < 0 or range.length < 0 or range.offset + range.length > ln:
-            raise ThreadError(f"{key} [{range.offset}, +{range.length}) is outside the object ({ln} bytes)")
+            raise ThreadError(f"{key} [{range.offset}, +{range.length}): {short}" if short else
+                              f"{key} [{range.offset}, +{range.length}) is outside the object ({ln} bytes)")
         return BlobRange(off + range.offset, range.length)
+
+    def range_of(self, key: str, range: BlobRange | None = None) -> BlobRange | None:
+        """Where `range` of `key` (default: all of it) lies in the pack, or None when the pack does not hold `key`."""
+        return self._locate(key, range)
 
     def get(self, key, range=None, *, trace=None, fill=False):
         r = self._locate(key, range)
@@ -202,7 +229,7 @@ class PackedBlobStore(BlobStore):
 
     def head(self, key):
         e = self.entries.get(key)
-        return BlobHead(e[1], f"{self.pack.etag}@{e[0]}") if e else None
+        return BlobHead(self.partial.get(key, e[1]), f"{self.pack.etag}@{e[0]}") if e else None
 
     def list(self, prefix):
         return sorted(k for k in self.entries if k.startswith(prefix))
@@ -236,20 +263,26 @@ class PackWriter:
             mv = mv[n:]
         self.written += len(b)
 
-    def add(self, key: str, data: Bytes) -> None:
+    def add(self, key: str, data: Bytes, *, partial_of: int | None = None) -> None:
+        """Adds an object. With `partial_of`, `data` is only the first bytes of an object of `partial_of` bytes (a warm
+        pack's slab prefix): the entry is marked `{"partial": true, "size": partial_of}`."""
         if self._finished:
             raise ThreadError("pack writer is finished", 400)
         if not key:
             raise ThreadError("pack: empty key", 400)
         if key in self._seen:
             raise ThreadError(f"pack: {key} added twice", 400)
+        if partial_of is not None and (isinstance(partial_of, bool) or not isinstance(partial_of, int)
+                                       or partial_of < len(data)):
+            raise ThreadError(f"pack: {key} is {len(data)} bytes, more than its object (partial_of {partial_of})", 400)
         if self.written == 0:
             self._emit(pack_header())
         pad = (_ALIGN - self.written % _ALIGN) % _ALIGN
         if pad:
             self._emit(bytes(pad))
         self._seen.add(key)
-        self.entries.append([key, self.written, len(data)])
+        self.entries.append([key, self.written, len(data)] if partial_of is None
+                            else [key, self.written, len(data), {"partial": True, "size": partial_of}])
         self._emit(data)
 
     def finish(self) -> tuple[int, int]:

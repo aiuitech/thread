@@ -123,6 +123,16 @@ memory can hand out f32 views without copying. Why JSON: the manifests already a
 Flags and the reserved field are zero in version 1 and are the place to put a checksum or compression scheme later;
 a reader must reject a version it does not know.
 
+**Partial entries (warm packs).** An entry may carry a fourth element, `[key, offset, length, {"partial": true,
+"size": n}]`: it holds only bytes `[0, length)` of the object `key`, which is `n` bytes in all. The format stays
+version 1: a reader that predates the marker ignores extra elements, which is why partial entries are only written to
+**warm packs** (`meta.kind: "warm"`), never to index snapshots. A warm pack holds the scan prefixes of an index's
+most-probed slabs, keyed by the slabs' own (immutable) keys; `open({ warmPack })` / `open_index(..., warm_pack=)`
+fetches it with one GET in the background and serves those prefixes from memory (see
+[cold-start.md](cold-start.md#warm-packs)). `PackedBlobStore` serves ranges inside a partial entry, reports the whole
+size from `head`, and refuses a read past the prefix rather than return a short object. Unknown fourth elements
+(anything without `"partial": true`) are ignored.
+
 ## Copying by hand
 
 A pack and a directory are plain files, so the usual tools work: `rsync -a laptop/idx/ bucket-mirror/`, `aws s3

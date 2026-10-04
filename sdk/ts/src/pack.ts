@@ -9,7 +9,9 @@
  *
  *   [0, 16)      header: magic "THRDPACK", version u16 (1), flags u16 (0), reserved u32 (0)
  *   [16, D)      the objects, each at an 8-byte-aligned offset, zero padding between
- *   [D, D + L)   directory: UTF-8 JSON `{"entries":[[key, offset, length], ...], ...meta}`
+ *   [D, D + L)   directory: UTF-8 JSON `{"entries":[[key, offset, length], ...], ...meta}`; an entry may carry a
+ *                fourth element `{"partial": true, "size": n}`: it holds only bytes [0, length) of an object of n bytes
+ *                (warm packs, see warm.ts)
  *   [end - 32)   footer: directory offset u64, directory length u64, entry count u32, version u16, flags u16,
  *                magic "THRDPACK"
  *
@@ -34,6 +36,12 @@ const magicBytes = ascii.encode(PACK_MAGIC);
 export interface PackEntry {
 	offset: number;
 	length: number;
+	/**
+	 * Set when the entry holds only the first `length` bytes of its object (a warm pack's slab prefixes): the size of
+	 * the whole object. Directory form: a fourth element `{"partial": true, "size": n}` (readers that predate it
+	 * ignore it, so only packs meant for prefix seeding, `meta.kind: "warm"`, use it).
+	 */
+	size?: number;
 }
 
 /** The parsed directory of a pack: entries by key plus whatever metadata the writer recorded (`gen`, `rev`). */
@@ -94,7 +102,11 @@ export function parsePackDirectory(b: Uint8Array, dirOff: number, count: number)
 		const [key, offset, length] = e as [string, number, number];
 		if (offset < PACK_HEADER_BYTES || length < 0 || offset + length > dirOff) throw new ThreadError(`pack entry ${key} [${offset}, +${length}) is outside the data area`);
 		if (entries.has(key)) throw new ThreadError(`pack directory lists ${key} twice`);
-		entries.set(key, { offset, length });
+		const x = e[3] as { partial?: unknown; size?: unknown } | undefined;
+		if (x !== undefined && x !== null && typeof x === "object" && x.partial === true) {
+			if (!Number.isInteger(x.size) || (x.size as number) < length) throw new ThreadError(`pack entry ${key}: partial entry needs a size >= its length ${length}`);
+			entries.set(key, { offset, length, size: x.size as number });
+		} else entries.set(key, { offset, length });
 	}
 	const { entries: _e, ...meta } = j;
 	return { entries, meta };
@@ -164,9 +176,18 @@ export class PackedBlobStore implements BlobStore {
 	private locate(key: string, range: BlobRange | undefined): BlobRange | null {
 		const e = this.directory.entries.get(key);
 		if (!e) return null;
-		if (!range) return { offset: e.offset, length: e.length };
-		if (range.offset < 0 || range.length < 0 || range.offset + range.length > e.length) throw new ThreadError(`${key} [${range.offset}, +${range.length}) is outside the object (${e.length} bytes)`);
+		const partial = e.size !== undefined && e.size > e.length;
+		if (!range) {
+			if (partial) throw new ThreadError(`${key}: the pack holds only its first ${e.length} of ${e.size} bytes`);
+			return { offset: e.offset, length: e.length };
+		}
+		if (range.offset < 0 || range.length < 0 || range.offset + range.length > e.length) throw new ThreadError(partial ? `${key} [${range.offset}, +${range.length}): the pack holds only its first ${e.length} of ${e.size} bytes` : `${key} [${range.offset}, +${range.length}) is outside the object (${e.length} bytes)`);
 		return { offset: e.offset + range.offset, length: range.length };
+	}
+
+	/** Where `range` of `key` (default: all of it) lies in the pack, or null when the pack does not hold `key`. */
+	rangeOf(key: string, range?: BlobRange): BlobRange | null {
+		return this.locate(key, range);
 	}
 
 	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
@@ -188,7 +209,7 @@ export class PackedBlobStore implements BlobStore {
 
 	async head(key: string): Promise<BlobHead | null> {
 		const e = this.directory.entries.get(key);
-		return e ? { size: e.length, etag: `${this.pack.etag}@${e.offset}` } : null;
+		return e ? { size: e.size ?? e.length, etag: `${this.pack.etag}@${e.offset}` } : null;
 	}
 
 	async list(prefix: string): Promise<string[]> {
@@ -221,7 +242,7 @@ export class MemorySink implements PackSink {
  * directory lists them in the order added and carries `meta` (`packIndex` records `{gen, rev}`).
  */
 export class PackWriter {
-	private readonly entries: [string, number, number][] = [];
+	private readonly entries: ([string, number, number] | [string, number, number, { partial: true; size: number }])[] = [];
 	private readonly seen = new Set<string>();
 	private pos = 0;
 	private finished = false;
@@ -241,15 +262,21 @@ export class PackWriter {
 		this.pos += b.byteLength;
 	}
 
-	async add(key: string, bytes: Uint8Array): Promise<void> {
+	/**
+	 * Adds an object. With `partialOf`, `bytes` are only the first bytes of an object of `partialOf` bytes (a warm
+	 * pack's slab prefix): the entry is marked `{"partial": true, "size": partialOf}`.
+	 */
+	async add(key: string, bytes: Uint8Array, opts: { partialOf?: number } = {}): Promise<void> {
 		if (this.finished) throw new ThreadError("pack writer is finished", 400);
 		if (!key) throw new ThreadError("pack: empty key", 400);
 		if (this.seen.has(key)) throw new ThreadError(`pack: ${key} added twice`, 400);
+		const partialOf = opts.partialOf;
+		if (partialOf !== undefined && (!Number.isInteger(partialOf) || partialOf < bytes.byteLength)) throw new ThreadError(`pack: ${key} is ${bytes.byteLength} bytes, more than its object (partialOf ${partialOf})`, 400);
 		if (this.pos === 0) await this.emit(packHeader());
 		const pad = (ALIGN - (this.pos % ALIGN)) % ALIGN;
 		if (pad) await this.emit(new Uint8Array(pad));
 		this.seen.add(key);
-		this.entries.push([key, this.pos, bytes.byteLength]);
+		this.entries.push(partialOf !== undefined ? [key, this.pos, bytes.byteLength, { partial: true, size: partialOf }] : [key, this.pos, bytes.byteLength]);
 		await this.emit(bytes);
 	}
 

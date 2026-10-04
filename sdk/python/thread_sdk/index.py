@@ -17,6 +17,7 @@ from .query import QUERY_INFLIGHT, Base, QueryContext, QueryResult, RevState, ex
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
 from .pack import PackedBlobStore, store_at
 from .revision import get_required, head_revision, load_rev_state, resolve_target
+from .warm import WarmPrefixStore, WarmStats, fetch_warm_pack, revision_slab_keys, seed_warm_pack
 from .wire import LEGACY_DEFAULTS, BytesLike, ResolvedLexConfig, ThreadError, has_dense, resolve_lex_config
 from .write import (
     CompactSegmentsResult,
@@ -128,6 +129,11 @@ class ThreadIndex:
         self._closed = False
         #: Where `open` spent its time and reads: `{total, current, manifest, slabs, base}` (see `open_index`).
         self.open_stats: dict[str, Any] = {}
+        #: The warm-pack layer (`warm_pack=`), None without one.
+        self.warm: WarmPrefixStore | None = None
+        self._warm_stats: WarmStats | None = None
+        #: Resolves (with `warm_stats`) once the warm pack is seeded or failed; None without one. Never raises.
+        self.warm_ready: Future | None = None
 
     @classmethod
     def open(
@@ -143,11 +149,13 @@ class ThreadIndex:
         lex_transient_bytes: int = 8 * 1024 * 1024,
         io_workers: int = 32,
         job_workers: int | None = None,
+        warm_pack: str | None = None,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
             store = store_at(store)
-        pack = store.open_stats if isinstance(store, PackedBlobStore) else None
+        packed = store if isinstance(store, PackedBlobStore) else None
+        pack = packed.open_stats if packed is not None else None
         if prefix:
             store = PrefixedBlobStore(store, prefix)
         if cache is None:
@@ -157,12 +165,29 @@ class ThreadIndex:
         if cache:
             store = CachedBlobStore(store, cache)  # type: ignore[arg-type]
         t0 = time.perf_counter()
+        warm: tuple[WarmPrefixStore, Future] | None = None
+        if warm_pack:
+            # The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it.
+            source = packed.inner if packed is not None else store
+            got: Future = Future()
+
+            def fetch() -> None:
+                try:
+                    got.set_result(fetch_warm_pack(source, warm_pack, t0))
+                except BaseException as e:  # noqa: BLE001 - reported through warm_stats
+                    got.set_exception(e)
+
+            threading.Thread(target=fetch, name="thread-warm", daemon=True).start()
+            warm = (WarmPrefixStore(store), got)
+            store = warm[0]
         timeline: dict[str, Any] = {}
         g, r = resolve_target(store, gen, rev, timeline)
         state = load_rev_state(store, g, r, timeline)
         ix = cls(store, state, gen=gen, pinned=gen is not None and rev is not None, refresh_interval=refresh_interval,
                  delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
                  job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)))
+        if warm is not None:
+            ix._start_warm(warm[0], warm[1], warm_pack, t0)  # type: ignore[arg-type]
         loaded: dict[str, Any] = {}
         try:
             if has_dense(state.manifest):
@@ -231,6 +256,42 @@ class ThreadIndex:
         """The lexical / docs segments of the revision, oldest first."""
         return self._rev.segments
 
+    # ---- warm pack ----
+
+    @property
+    def warm_stats(self) -> dict[str, Any] | None:
+        """How loading the warm pack went (`{key, state: loading|ready|failed, fetch, entries, seeded, skipped,
+        seeded_bytes, ready_ms, error?}`), None without one."""
+        return self._warm_stats.as_dict() if self._warm_stats is not None else None
+
+    def _start_warm(self, layer: WarmPrefixStore, got: Future, key: str, t0: float) -> None:
+        """Seeds the warm layer once the warm pack's GET lands (only prefixes of slabs the current revision reads)."""
+        self.warm = layer
+        st = self._warm_stats = WarmStats(key)
+        ready: Future = Future()
+        self.warm_ready = ready
+
+        def done(f: Future) -> None:
+            try:
+                data, stat = f.result()
+                st.fetch = stat
+                if self._closed:
+                    raise ThreadError("index closed while the warm pack loaded")
+                with self._lock:
+                    current = revision_slab_keys(self._rev)
+                r = seed_warm_pack(data, layer, current.__contains__)
+                st.entries, st.seeded, st.skipped, st.seeded_bytes = r["entries"], r["seeded"], r["skipped"], \
+                    r["seeded_bytes"]
+                st.ready_ms = round((time.perf_counter() - t0) * 1000, 3)
+                st.state = "ready"
+            except BaseException as e:  # noqa: BLE001 - a warm pack never fails the index
+                st.state = "failed"
+                st.error = str(e)
+                log.error("thread_sdk: warm pack %s not used: %s", key, e)
+            ready.set_result(st.as_dict())
+
+        got.add_done_callback(done)
+
     # ---- revisions ----
 
     def _check_open(self) -> None:
@@ -263,6 +324,9 @@ class ThreadIndex:
         nxt = load_rev_state(self.store, gen, rev)
         with self._lock:
             self._rev = nxt
+            if self.warm is not None:
+                current = revision_slab_keys(nxt)
+                self.warm.retain(current.__contains__)
             listed = {d["key"] for d in nxt.deltas}
             for k in [k for k in self._delta_cache if k not in listed]:
                 del self._delta_cache[k]
@@ -610,6 +674,7 @@ def open_index(
     lex_transient_bytes: int = 8 * 1024 * 1024,
     io_workers: int = 32,
     job_workers: int | None = None,
+    warm_pack: str | None = None,
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -623,8 +688,14 @@ def open_index(
     - `delta_cache_bytes`: delta segments kept in memory across queries;
     - `lex_transient_bytes`: transient lexical bytes (buckets, posting lists, texts) each segment reader may hold;
     - `io_workers`: threads for reads (shared by concurrent queries; each query keeps at most `inflight` in flight);
-    - `job_workers`: threads for `query_many` and the lexical half of a hybrid search.
+    - `job_workers`: threads for `query_many` and the lexical half of a hybrid search;
+    - `warm_pack`: key of a warm pack (`meta.kind: "warm"`, see warm.py): the scan prefixes of the most-probed slabs in
+      one object. `open` starts ONE GET of it on a background thread and does not wait for it; once it is in, its
+      prefixes (those of slabs the open revision reads) are served from memory in front of the cache, so a query
+      probing those cells skips their prefix reads (phase-2 reads of those slabs still go to the store). Read from
+      `store` (with `prefix`), or from the inner store of a `PackedBlobStore`. `index.warm_ready` (a Future) resolves
+      once it is seeded; `index.warm_stats` says how it went.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
-                            io_workers=io_workers, job_workers=job_workers)
+                            io_workers=io_workers, job_workers=job_workers, warm_pack=warm_pack)

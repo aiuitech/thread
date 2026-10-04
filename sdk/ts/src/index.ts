@@ -18,6 +18,7 @@ import { asF32, getRequired, loadRevState, resolveTarget, type RevTimeline } fro
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 import { PackedBlobStore } from "./pack.js";
+import { fetchWarmPack, revisionSlabKeys, seedWarmPack, WarmPrefixStore, type WarmStats } from "./warm.js";
 
 export * from "./wire.js";
 export * from "./store.js";
@@ -25,6 +26,7 @@ export * from "./s3.js";
 export * from "./lex.js";
 export * from "./fusion.js";
 export * from "./pack.js";
+export * from "./warm.js";
 export type { Base, BaseStat, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
 export { Limiter, QUERY_INFLIGHT, executeQuery } from "./query.js";
@@ -127,6 +129,14 @@ export interface OpenOptions {
 	deltaCacheBytes?: number;
 	/** Transient lexical bytes (buckets, posting lists, texts) each segment reader may hold (default 8 MB). */
 	lexTransientBytes?: number;
+	/**
+	 * Key of a warm pack (`meta.kind: "warm"`, see warm.ts): the scan prefixes of the most-probed slabs in one object.
+	 * `open` starts ONE GET of it right away and does not wait for it; once it is in, its prefixes (those of slabs the
+	 * open revision reads) are served from memory, so a query probing those cells skips their prefix reads. Phase-2
+	 * reads of those slabs still go to the store. The key is read from `store`/`bucket` (with `prefix`), or from the
+	 * inner store of a `PackedBlobStore`. `index.warmReady` resolves when it is seeded; `index.warmStats` says how it went.
+	 */
+	warmPack?: string;
 }
 
 /** One wasm instance per isolate. `Thread.init` once, then `open` indexes. */
@@ -224,6 +234,12 @@ export class ThreadIndex {
 	private segLoading = new Map<string, Promise<LexSegment>>();
 	private lex: { rev: number; gen: string; index: LexIndex; epoch: number } | null = null;
 	private lexLoading: Promise<LexIndex> | null = null;
+	/** The warm-pack layer (`OpenOptions.warmPack`), null without one. */
+	readonly warm: WarmPrefixStore | null = null;
+	/** How loading the warm pack went (null without one); updated in place as it loads. */
+	warmStats: WarmStats | null = null;
+	/** Resolves once the warm pack is seeded (or failed: see `warmStats.error`); null without one. Never rejects. */
+	warmReady: Promise<WarmStats | null> = Promise.resolve(null);
 
 	private constructor(
 		readonly thread: Thread,
@@ -256,10 +272,20 @@ export class ThreadIndex {
 		const cache = opts.cache === false ? null : (opts.cache ?? ((globalThis as { caches?: { default?: CacheLike } }).caches?.default ?? null));
 		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil });
 		const t0 = nowMs();
+		// The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it.
+		let warm: { layer: WarmPrefixStore; got: Promise<{ bytes: Uint8Array; stat: PhaseStat }> } | null = null;
+		if (opts.warmPack) {
+			const source = opts.store instanceof PackedBlobStore ? opts.store.inner : store;
+			const got = fetchWarmPack(source, opts.warmPack, t0);
+			got.catch(() => {});
+			warm = { layer: new WarmPrefixStore(store), got };
+			store = warm.layer;
+		}
 		const tl: RevTimeline = {};
 		const target = await resolveTarget(store, opts.gen, opts.rev, tl);
 		const rev = await loadRevState(store, target.gen, target.rev, tl);
 		const ix = new ThreadIndex(thread, store, rev, opts);
+		if (warm) ix.startWarm(warm.layer, warm.got, opts.warmPack!, t0);
 		const loaded: { stat?: BaseStat } = {};
 		if (hasDense(rev.manifest)) await ix.acquireBase(loaded).then((s) => ix.releaseBase(s));
 		const none = phaseStat(0, newTrace());
@@ -331,10 +357,37 @@ export class ThreadIndex {
 		return p;
 	}
 
+	/** Seeds the warm layer once the warm pack's GET lands (only prefixes of slabs the current revision reads). */
+	private startWarm(layer: WarmPrefixStore, got: Promise<{ bytes: Uint8Array; stat: PhaseStat }>, key: string, t0: number): void {
+		(this as { warm: WarmPrefixStore | null }).warm = layer;
+		const st: WarmStats = { key, state: "loading", fetch: null, entries: 0, seeded: 0, skipped: 0, seededBytes: 0, readyMs: null };
+		this.warmStats = st;
+		this.warmReady = got
+			.then(({ bytes, stat }) => {
+				st.fetch = stat;
+				if (this.closed) throw new ThreadError("index closed while the warm pack loaded");
+				const current = revisionSlabKeys(this.revState);
+				const r = seedWarmPack(bytes, layer, (k) => current.has(k));
+				Object.assign(st, { entries: r.entries, seeded: r.seeded, skipped: r.skipped, seededBytes: r.seededBytes, state: "ready", readyMs: roundMs(nowMs() - t0) });
+				return st;
+			})
+			.catch((e: unknown) => {
+				st.state = "failed";
+				st.error = e instanceof Error ? e.message : String(e);
+				console.error(`thread-sdk: warm pack ${key} not used: ${st.error}`);
+				return st;
+			});
+		this.opts.waitUntil?.(this.warmReady);
+	}
+
 	/** Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. */
 	async useRevision(gen: string, rev: number): Promise<void> {
 		const next = await loadRevState(this.store, gen, rev);
 		this.revState = next;
+		if (this.warm) {
+			const current = revisionSlabKeys(next);
+			this.warm.retain((k) => current.has(k));
+		}
 		const listed = new Set(next.deltas.map((d) => d.key));
 		for (const k of this.deltaCache.keys()) if (!listed.has(k)) this.deltaCache.delete(k);
 		const segs = new Set(next.segments.map((s) => s.key));
