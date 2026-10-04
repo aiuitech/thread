@@ -409,3 +409,41 @@ describe("prefetch on refresh", () => {
 		writer.close();
 	});
 });
+
+describe("Limiter", () => {
+	it("never exceeds its limit, also when newcomers arrive in the tick a slot is released", async () => {
+		const { Limiter } = await import("../src/query.js");
+		for (const max of [1, 3, 12]) {
+			for (const pattern of ["waves", "nullThenSingles"] as const) {
+				const lim = new Limiter(max);
+				let inFlight = 0;
+				let peak = 0;
+				const r = rng(max);
+				const task = async () => {
+					inFlight++;
+					peak = Math.max(peak, inFlight);
+					await new Promise((res) => (r() < 0.5 ? queueMicrotask(res as () => void) : setTimeout(res, r() * 3)));
+					inFlight--;
+				};
+				const all: Promise<unknown>[] = [];
+				if (pattern === "waves") {
+					for (let wave = 0; wave < 20; wave++) {
+						for (let i = 0; i < 25; i++) all.push(lim.run(task, i % 3 === 0));
+						await new Promise((res) => setTimeout(res, r() * 2));
+					}
+				} else {
+					// the pack / S3 phase-2 pattern: a read that returns at once (getRanges -> null), then single reads
+					const job = async () => {
+						const g = await lim.run(async () => null);
+						if (g === null) await Promise.all([1, 2, 3, 4].map(() => lim.run(task)));
+					};
+					all.push(...Array.from({ length: 60 }, job));
+				}
+				await Promise.all(all);
+				expect(peak).toBeLessThanOrEqual(max);
+				expect(lim.peak).toBeLessThanOrEqual(max);
+				expect(peak).toBe(max); // and the limit is used
+			}
+		}
+	});
+});

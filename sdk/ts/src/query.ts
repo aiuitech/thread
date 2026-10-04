@@ -216,16 +216,24 @@ export class Limiter {
 	private active = 0;
 	private queue: (() => void)[] = [];
 	private low: (() => void)[] = [];
+	/** Most reads that were ever in flight at once (tests). */
+	peak = 0;
 	retries = 0;
 	constructor(private max: number) {}
+	/**
+	 * A free slot is taken synchronously; a released slot is handed straight to the next waiter (it is never
+	 * returned to the pool in between), so a newcomer arriving in the same tick cannot slip in: the limit is exact.
+	 */
 	async run<T>(fn: () => Promise<T>, low = false): Promise<T> {
-		if (this.active >= this.max) await new Promise<void>((r) => (low ? this.low : this.queue).push(r));
-		this.active++;
+		if (this.active < this.max) this.active++;
+		else await new Promise<void>((r) => (low ? this.low : this.queue).push(r)); // the releaser hands over its slot
+		if (this.active > this.peak) this.peak = this.active;
 		try {
 			return await fn();
 		} finally {
-			this.active--;
-			(this.queue.shift() ?? this.low.shift())?.();
+			const next = this.queue.shift() ?? this.low.shift();
+			if (next) next();
+			else this.active--;
 		}
 	}
 	/** Runs one read; retries once if the runtime closed it for the connection limit or R2 reported an internal error. */
