@@ -11,6 +11,7 @@
  *        [--cache none|memory|disk] [--disk-dir data/cold/dc-{t}] [--miss-policy whole|range|range+warm]
  *        [--inflight N] [--coalesce BYTES] [--span BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
  *        [--keepalive MS] [--h2] [--drain] (wait for background cache warms before the `warm` scenario)
+ *        [--early-warmup] (create the store with `warmup` before the wasm compiles)
  *
  * Each trial t spawns a fresh child process (fresh TLS/connection pool, fresh wasm, fresh index, empty caches) that
  * runs three scenarios, each on query vectors nobody used before in the run:
@@ -57,6 +58,7 @@ const config = {
 	keepAliveMs: num("keepalive") ?? null,
 	h2: args.h2 === "true",
 	drain: args.drain === "true",
+	earlyWarmup: args["early-warmup"] === "true",
 };
 
 const nowMs = () => performance.now();
@@ -96,18 +98,25 @@ async function child() {
 	ms.import = nowMs() - t;
 	const env = loadEnv(ENV_FILE);
 	const ds = loadDataset();
+	const node = await import(path.join(dist, "node.js"));
+	const makeStore = async () => {
+		const fetchFn = config.keepAliveMs !== null || config.h2 ? await node.nodeFetch({ keepAliveTimeout: config.keepAliveMs ?? 4000, allowH2: config.h2 }) : undefined;
+		const early = config.earlyWarmup ? { warmup: config.inflight ?? 32 } : {};
+		const s3opts = { ...(fetchFn ? { fetch: fetchFn } : {}), ...(config.inflight !== null ? { inflight: config.inflight } : {}), ...(config.coalesceBytes !== null ? { coalesceBytes: config.coalesceBytes } : {}), ...(config.spanBytes !== null ? { spanBytes: config.spanBytes } : {}), ...early };
+		if (useProxy) await proxyCall("POST", "/__reset"); // nothing before this talks to the store
+		return useProxy
+			? new sdk.S3BlobStore({ endpoint: PROXY, bucket: env.S3_BUCKET ?? "vib-bench", region: "auto", accessKeyId: "fake", secretAccessKey: "fake", ...s3opts })
+			: new sdk.S3BlobStore({ endpoint: env.S3_ENDPOINT, bucket: env.S3_BUCKET, region: "auto", accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY, ...s3opts });
+	};
+	// --early-warmup: the store (and its connection warm-up) is created before the wasm compiles, so the handshakes
+	// and Node's lazy fetch globals overlap the wasm compile + init.
+	const earlyStore = config.earlyWarmup ? await makeStore() : null;
 	t = nowMs();
 	const wasmModule = new WebAssembly.Module(fs.readFileSync(path.join(dist, "wasm/thread_bg.wasm")));
 	ms.wasmCompile = nowMs() - t;
 	const thread = await sdk.Thread.init({ wasmModule });
 	ms.wasmInit = thread.initMs;
-	const node = await import(path.join(dist, "node.js"));
-	const fetchFn = config.keepAliveMs !== null || config.h2 ? await node.nodeFetch({ keepAliveTimeout: config.keepAliveMs ?? 4000, allowH2: config.h2 }) : undefined;
-	const s3opts = { ...(fetchFn ? { fetch: fetchFn } : {}), ...(config.inflight !== null ? { inflight: config.inflight } : {}), ...(config.coalesceBytes !== null ? { coalesceBytes: config.coalesceBytes } : {}), ...(config.spanBytes !== null ? { spanBytes: config.spanBytes } : {}) };
-	if (useProxy) await proxyCall("POST", "/__reset"); // nothing above talks to the store
-	const s3 = useProxy
-		? new sdk.S3BlobStore({ endpoint: PROXY, bucket: env.S3_BUCKET ?? "vib-bench", region: "auto", accessKeyId: "fake", secretAccessKey: "fake", ...s3opts })
-		: new sdk.S3BlobStore({ endpoint: env.S3_ENDPOINT, bucket: env.S3_BUCKET, region: "auto", accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY, ...s3opts });
+	const s3 = earlyStore ?? (await makeStore());
 	const store = STORE === "pack" ? await sdk.PackedBlobStore.open(s3, PACK_KEY) : s3;
 	// No options: what a Node user gets by default (a MemoryCache with "range+warm" in front of a remote store).
 	const cache = config.cache === "none" ? false : config.cache === "memory" ? new sdk.MemoryCache() : config.cache === "disk" ? new node.DiskCache(path.resolve(root, (config.diskDir ?? "data/cold-store/dc-{t}").replace("{t}", String(trial)))) : undefined;

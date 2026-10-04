@@ -152,6 +152,15 @@ export async function signV4(i: SigV4Input, keys?: SigningKeyCache): Promise<Rec
 	return out;
 }
 
+/**
+ * Finishes a response whose body we do not need (HEAD, 404, PUT, a 5xx before a retry) by reading it: these bodies
+ * are empty or a few hundred bytes, and reading them keeps the keep-alive connection (cancelling the stream makes
+ * Node's fetch close the socket, so the next request pays a new TCP + TLS handshake).
+ */
+async function settle(r: Response): Promise<void> {
+	await r.arrayBuffer().catch(() => {});
+}
+
 const stripQuotes = (etag: string | null): string => (etag ?? "").replace(/^W\//, "").replace(/^"|"$/g, "");
 
 export class S3BlobStore implements BlobStore {
@@ -204,7 +213,7 @@ export class S3BlobStore implements BlobStore {
 			try {
 				const r = await this.fetchFn(url, { method, headers: signedHeaders, body: body ? (body as Uint8Array<ArrayBuffer>) : undefined });
 				if (r.status >= 500 && attempt < this.retries && method !== "PUT") {
-					await r.body?.cancel();
+					await settle(r);
 					lastErr = new ThreadError(`S3 ${method} ${key}: HTTP ${r.status}`, r.status);
 					continue;
 				}
@@ -225,7 +234,7 @@ export class S3BlobStore implements BlobStore {
 		const headers: Record<string, string> = range ? { range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : {};
 		const r = await this.send("GET", key, headers);
 		if (r.status === 404) {
-			await r.body?.cancel();
+			await settle(r);
 			return null;
 		}
 		if (!r.ok) return this.fail(r, `GET ${key}`);
@@ -242,7 +251,7 @@ export class S3BlobStore implements BlobStore {
 	}
 
 	/**
-	 * Opens up to `n` connections ahead of the first query: `n` concurrent HEADs of `key` (default
+	 * Opens up to `n` connections ahead of the first query: `n` concurrent one-byte GETs of `key` (default
 	 * `idx/current.json`; a 404 is fine), so the TLS handshakes are not on the query's critical path. Errors are
 	 * swallowed. Idle connections are kept by the HTTP client for its keep-alive timeout (undici: 4 s by default;
 	 * see `nodeFetch` in `thread-sdk/node` for a longer one).
@@ -250,14 +259,16 @@ export class S3BlobStore implements BlobStore {
 	warmup(n: number, key = "idx/current.json"): Promise<void> {
 		// A warm-up of at least n connections started in the last 3 s (e.g. at construction) covers this one.
 		if (this.warming && this.warming.n >= n && Date.now() - this.warming.at < 3000) return this.warming.p;
-		const p = Promise.all(Array.from({ length: Math.max(0, n) }, () => this.head(key).catch(() => null))).then(() => {});
+		// A one-byte ranged GET, not a HEAD: Node's fetch does not return a connection to its pool after a HEAD answer
+		// that carries a Content-Length, so a HEAD would warm nothing.
+		const p = Promise.all(Array.from({ length: Math.max(0, n) }, () => this.get(key, { offset: 0, length: 1 }).catch(() => null))).then(() => {});
 		this.warming = { n, at: Date.now(), p };
 		return p;
 	}
 
 	async head(key: string): Promise<BlobHead | null> {
 		const r = await this.send("HEAD", key, {});
-		await r.body?.cancel();
+		await settle(r);
 		if (r.status === 404) return null;
 		if (!r.ok) throw new ThreadError(`S3 HEAD ${key}: HTTP ${r.status}`, 502);
 		return { size: Number(r.headers.get("content-length") ?? 0), etag: stripQuotes(r.headers.get("etag")) };
@@ -274,7 +285,7 @@ export class S3BlobStore implements BlobStore {
 		if (opts.ifAbsent) headers["if-none-match"] = "*";
 		if (opts.ifMatch !== undefined) headers["if-match"] = `"${stripQuotes(opts.ifMatch)}"`;
 		const r = await this.send("PUT", key, headers, body);
-		await r.body?.cancel();
+		await settle(r);
 		if (r.status === 412 || r.status === 409) return null;
 		if (!r.ok) throw new ThreadError(`S3 PUT ${key}: HTTP ${r.status}`, 502);
 		return { size: body.byteLength, etag: stripQuotes(r.headers.get("etag")) };

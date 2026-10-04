@@ -292,7 +292,7 @@ interface BlobStore {
   `If-None-Match: *` / `If-Match`, ListObjectsV2. S3 has no multi-range GET, so a rerank read costs one request per
   record run. The derived signing key is cached per (date, region, service) (`SigningKeyCache`): a request costs
   one SHA-256 and one HMAC (26 us in Node instead of 130 us). `inflight` defaults to 32 (Node: no connection cap)
-  or 6 inside a Worker. `store.warmup(n)` opens `n` connections with HEADs of `idx/current.json`.
+  or 6 inside a Worker. `store.warmup(n)` opens `n` connections with one-byte GETs of `idx/current.json` (not HEADs: Node's `fetch` closes a connection after a HEAD answer with a Content-Length); `new S3BlobStore({ ..., warmup: 32 })` starts that at construction, so creating the store before `Thread.init` overlaps the handshakes (and Node's lazy `fetch` globals) with the wasm compile.
 - `CachedBlobStore(inner, cache, { origin, waitUntil, cacheable, missPolicy, warmConcurrency, warmQueue })`: a cache
   in front of any store, either the Workers Cache API or an in-process `BlobCache`. Objects under `idx/` are
   immutable, so they are cached whole (Cache API: for a year under `${origin}${key}`; `current.json` is never

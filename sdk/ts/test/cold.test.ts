@@ -298,7 +298,7 @@ describe("SigV4 signing-key cache", () => {
 	});
 	it("warmup at construction; a later warm-up of no more connections reuses it", async () => {
 		let heads = 0;
-		const s3 = new S3BlobStore({ endpoint: "https://x.example", bucket: "b", accessKeyId: "a", secretAccessKey: "s", warmup: 4, fetch: async (_u, init) => (init?.method === "HEAD" && heads++, new Response(null, { status: 404 })) });
+		const s3 = new S3BlobStore({ endpoint: "https://x.example", bucket: "b", accessKeyId: "a", secretAccessKey: "s", warmup: 4, fetch: async (_u, init) => (new Headers(init?.headers).get("range") === "bytes=0-0" && heads++, new Response("x", { status: 206, headers: { "content-range": "bytes 0-0/1" } })) });
 		await s3.warmup(4);
 		await s3.warmup(2);
 		expect(heads).toBe(4);
