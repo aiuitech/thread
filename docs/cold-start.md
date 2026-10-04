@@ -399,3 +399,255 @@ only after that is fixed.
 - The Python extension was built with `maturin develop --release` (cargo `release` profile, not the `python` profile
   the README uses; only panic behaviour differs). Python's `load_rev_state` reads the slabs table and tombstone sets
   one after the other (TS reads them concurrently); g4 rev 179 has no tombstone sets, so it does not show here.
+
+## Hot sets, pack order and the open chain
+
+Three ideas measured on the harness above (branch `cold/open`): seed the hottest slab prefixes from one object at
+open (**warm packs**), order a pack so a query's slabs sit together and merge their reads (**tree order +
+`coalesceAcrossSlabs`**), and drop the manifest GET from the open (**inline manifest**). All runs use
+`bench/cold/run_open.sh`: the same benches, queries and profiles as the baseline, through an `--offline` proxy on its
+own port and overlay (`data/cold/open-overlay`), n = 10, files `data/cold/open/*.jsonl`. Cells are medians.
+
+**Phase-2 caveat.** The TS `Limiter` bug (above) makes any path that takes a read slot and releases it without I/O
+look faster in phase 2. A warm-pack layer exposing an always-null `getRanges` did exactly that in a first run (phase 2
+418 -> 321 ms with no warm hit at all); the layer now has `getRanges` only when its inner store does, and an empty
+warm pack measures like the baseline. Warm prefix hits still release slots without I/O, so the warm-pack and pack
+numbers below (`lf-*` files) were taken with the store agent's `Limiter` fix applied locally and never committed;
+the controls (`lf-base`, `lf-pack-key`) ran the same way. Python has no such bug.
+
+### Warm packs
+
+**How skewed is probe frequency?** `bench/cold/hot_cells.mjs` routes queries 1000..2999 (68,000 probes at nprobe 34)
+with the SDK's own routing (only the base is read, never a slab): 3,986 of the 4,103 cells are probed at least once;
+the most-probed cell by 8.9% of the queries; the median probed cell 14 times (0.7%). The skew is real but mild,
+because these queries follow the data distribution (dbpedia queries); a production query log with repeated or
+topical queries may well be more skewed, and `hot_cells.mjs` is the tool to check it.
+
+| top N cells | share of probes (sample) | uniform would be | scan-prefix MiB (= warm pack size) | warm pack bytes |
+|---:|---:|---:|---:|---:|
+| 64 | 7.4% | 1.6% | 18.4 | - |
+| 128 | 12.3% | 3.1% | 33.8 | 35,476,831 |
+| 256 | 20.3% | 6.2% | 62.3 | 65,336,909 |
+| 512 | 33.2% | 12.5% | 116.2 | 121,871,483 |
+| 1024 | 53.2% | 25.0% | 207.6 | - |
+| 305 (by probes per byte, 32 MiB budget) | 15.2% | 7.4% | 32.0 | 33,572,105 |
+
+Hot cells are big cells (a cell is probed often because it is dense), so the pack grows faster than the coverage;
+ranking by probes per prefix byte (`make_warm_pack.mjs --rank density --budget-mb 32`) covers 15.2% of probes in
+32 MiB where the top-count ranking covers 11.6%.
+
+**Hot-set hit rate on queries 0..29** (held out: not in the sample that chose the cells), share of each query's 34
+probes inside the top N:
+
+| N | mean | median | min | max | probes in the set per query (queries 0..29) |
+|---:|---:|---:|---:|---:|---|
+| 128 | 8.4% | 4.4% | 0% | 64.7% | 0 0 8 7 1 2 1 1 1 4 7 0 4 0 0 2 5 3 0 2 0 0 2 22 0 4 4 0 0 6 |
+| 256 | 15.5% | 11.8% | 0% | 67.6% | 7 4 10 9 2 8 2 5 4 6 11 0 6 1 0 4 12 4 4 3 0 0 3 23 0 8 10 2 0 10 |
+| 512 | 28.7% | 26.5% | 0% | 79.4% | 13 16 15 11 8 18 3 12 8 12 17 4 11 4 1 6 17 8 10 4 2 0 7 27 0 14 20 8 0 17 |
+| 1024 | 50.7% | 51.5% | 8.8% | 94.1% | 15 28 21 20 22 32 6 26 18 22 29 8 17 15 4 9 23 13 22 12 6 7 14 28 3 22 29 15 5 26 |
+
+(byte share is a little higher: 11.1 / 19.8 / 35.6 / 57.2% of the prefix bytes.) Close to the sample coverage, so the
+hot set generalizes; it is simply not very hot.
+
+**The format.** A warm pack is a pack (`portability.md`) with `meta.kind: "warm"` whose entries are slab scan
+prefixes under the slabs' own keys, each marked `[key, offset, length, {"partial": true, "size": n}]` (pack version
+stays 1; partial entries appear only in warm packs). `open({ warmPack: key })` / `open_index(..., warm_pack=key)`
+issues ONE GET for it at the very start of the open, never waits for it, and when it lands seeds a `WarmPrefixStore`
+in front of the cache with the prefixes of slabs the open revision reads (`index.warmReady` / `index.warm_ready`,
+`index.warmStats`). A read of a range inside a held prefix is served from memory (a cache hit in the stats); phase-2
+records and whole-object reads go to the store. Behind a cache (Python's default `MemoryCache`, the Workers Cache
+API) a served prefix read that asked for `fill` also fetches the whole slab into that cache in the background, so the
+warm pack does not keep the cache cold. `PrefixSeed` (`seedPrefix(key, bytes)`) is the hook an in-process cache can
+implement to take the prefixes instead (it must keep them prefix-only).
+
+**Measured** (slab-cold: the warm pack was seeded before the query; `--warm-wait slab`):
+
+| TS, proxy | rtt25 phase1 | rtt25 query | phase-1 GETs | warm hits | seeded after open start |
+|---|---:|---:|---:|---:|---:|
+| baseline (`lf-base`) | 127.1 | 551.8 | 34 | 0 | - |
+| N = 128 (35 MB) | 124.8 | 520.5 | 33.5 | 2 | 1.5 s |
+| N = 256 (65 MB) | 119.7 | 516.5 | 36 * | 4 | 2.8 s |
+| N = 512 (122 MB) | 105.3 | 500.5 | 30 | 9.5 | 5.1 s |
+| density, 32 MiB | 130.2 | 541.0 | 33.5 | 2 | 1.5 s |
+
+(* phase-1 GETs include speculative rerank reads that land in phase 1.) N = 512 at the other profiles: slab-cold phase
+1 257 -> 240 ms (rtt60), 162 -> 120 ms (rtt25link500). The query totals move by less than phase 2's run-to-run noise
+(+-30 ms at rtt25, more at rtt60).
+
+| Python, proxy, slab-cold query ms | rtt25 | rtt60 | rtt25link500 |
+|---|---:|---:|---:|
+| baseline | 305.3 | 630.0 | 1037.0 |
+| N = 256 | 294.6 | - | - |
+| N = 512 | 247.6 | 545.6 | 745.3 |
+
+Python gains more (a warm hit skips a whole-slab GET of 8x the prefix bytes, and on a shared link those bytes are the
+bottleneck), but it pays elsewhere: process-cold at rtt25link500 got slower (895 -> 1028 ms) because the 122 MB warm
+GET shares the link with the query's 51 MB, and the `warm` scenario (the same query again) went from 11 ms to 36-74 ms
+because some hot slabs' background fills were still running and their rerank records came from S3.
+
+**Verdict: not worth it for this workload.** A warm pack never helps the first query of a process (35-122 MB arrives
+1.5-5 s after the open starts, at 200 Mbps per response, while the 25 MB base takes 1.1 s), and for later queries it
+removes 2-10 of 34 prefix reads, which shortens phase 1 by 0-22 ms (TS) of a 500-550 ms query whose cost is phase 2's
+~140 record GETs. Per process it costs a download 6-20x the bytes of a whole query. It would pay with a much more
+skewed query log (a hot set of a few dozen cells covering half the probes), with a small pack that arrives with the
+base (<= ~25 MB at 200 Mbps), or in Python on a bandwidth-limited link (-28% slab-cold at rtt25link500).
+
+**Publishing one.** `bench/cold/make_warm_pack.mjs` builds one offline from `hot_cells.mjs`'s counts (from the proxy
+cache; prefixes of unwarmed slabs are holes, like `make_pack.mjs`). In production the counts would come from query
+logs: every query result carries its probed cells (`stats.cells`), a Worker can aggregate them per generation (a
+counter per cell in a Durable Object or Analytics Engine), and `publish` / `publish-rev` would write
+`idx/{gen}/warm.{rev}.threadpack` with `writeWarmPack(store, rev, topCells, sink)` right after the slab revisions it
+names, and could record its key in the manifest so `open` finds it without an option. The Worker's publish is not
+changed here.
+
+### Pack order by centroid-tree group, and cross-slab coalescing
+
+**Adjacency in the baseline pack** (`bench/cold/pack_adjacency.mjs`, queries 0..29, routing only): the pack lists
+slabs in key order, i.e. cell id order, which k-means leaves unrelated to geometry. Pairs of a query's probed slabs
+that are adjacent entries: median 0, mean 0.53 per query, 13 of 30 queries have any. A query's 34 probes fall in a
+median of 7.5 of the tree's 128 groups (2..18).
+
+**Tree order** (`make_pack.mjs --order tree`, `data/cold/open-overlay/packs/g4-cold-tree.threadpack`): slabs grouped by
+centroid-tree group (`idx/g4/tree.105.bin`; the wasm exposes no group-of-cell helper, so `tree_order.mjs` reads the
+tree's CSR member lists, all 4,103 cells are listed), groups chained by group-mean similarity, cells within a group
+chained by nearest neighbour. Adjacent probed pairs: median 16.5, mean 15.9 per query, all 30 queries. Half the
+probed slabs now have a probed neighbour in the pack.
+
+**But a slab entry is [scan prefix | rerank tier | payload]**, so between two adjacent prefixes lies the first
+slab's rerank tier, ~8x its prefix (~1 MB). `coalesceAcrossSlabs: GAP` (TS query option; `PackedBlobStore` only,
+also behind a warm-pack layer) merges phase-1 prefix reads whose gap is at most GAP into one range of the pack:
+
+| layout, gap (planned, queries 0..29) | phase-1 requests | MB read | x prefix bytes |
+|---|---:|---:|---:|
+| key order, any gap up to 1 MiB | 34 | 6.16 | 1.00 |
+| tree order, gap <= 256 KiB | 34 | 6.16 | 1.00 |
+| tree order, 1 MiB | 30 | 9.27 | 1.50 |
+| tree order, 4 MiB | 13.5 | 39.3 | 6.47 |
+| tree-split (not expressible today), gap 0 | 17.5 | 6.16 | 1.00 |
+| tree-split, 256 KiB | 15 | 6.57 | 1.06 |
+
+Measured (TS, `--store pack`, slab-cold phase 1 ms / requests / MB):
+
+| pack, `coalesceAcrossSlabs` | rtt25 | rtt60 |
+|---|---|---|
+| key order, off | 133.7 / 34 / 5.99 | 258.1 / 34 / 5.99 |
+| key order, 1 MiB | 144.1 / 34 / 6.33 | - |
+| tree order, off | 137.1 / 34 / 5.99 | 264.0 / 34 / 5.99 |
+| tree order, 64 KiB (rtt60: 256 KiB) | 138.7 / 34 / 5.99 (no merge) | 260.1 / 34 / 5.99 (no merge) |
+| tree order, 1 MiB | 144.2 / 31 / 8.87 | 259.3 / 31 / 8.87 |
+| tree order, 4 MiB | 868.3 / 17.5 / 36.7 | - |
+
+**No gain.** With whole slabs as pack entries the order puts slabs together but not their prefixes, and merging
+across a rerank tier trades a round trip for ~1 MB at single-stream bandwidth. A **split layout** (each group's
+prefixes contiguous, then its tails) would halve the requests at no extra bytes, but it needs a pack entry with two
+extents (a format change readers before it could not read), and the latency model in `pack_adjacency.mjs` (reads in
+routing order, `inflight` at a time, rtt + bytes at the per-response rate; it is ~20-30 ms optimistic against the
+measured key-order rows) says that pays only when the in-flight limit is small: phase 1 104 -> 94 ms (rtt25) and
+237 -> 210 ms (rtt60) at 12 in flight, 197 -> 147 / 454 -> 322 ms at 6 in flight (a Worker reading S3 over its 6
+connections), and nothing at 32 in flight (61 vs 90 ms: merged reads are fewer but serialize more bytes). Not
+implemented; worth revisiting only for a 6-connection client.
+
+### Inline manifest in current.json
+
+`current.json -> manifest -> slabs table -> base` is the serial chain. The writers in both SDKs now write
+`current.json` as `{"gen", "rev", "manifest": {...}}` when the manifest serializes to at most 16 KB
+(`currentBody` / `current_body`, the same bytes in both SDKs; g4 rev 179's pointer grows from 22 B to 1,058 B).
+Readers use a copy that checks out for (gen, rev), at open and on refresh, and otherwise fetch the manifest as before;
+older readers ignore the field. The Worker's publish is unchanged, so pointers it writes carry no copy.
+
+Measured with the copy in an overlay `idx/current.json` (`data/cold/open-overlay-inline`), process-cold:
+
+| | TS rtt25 | TS rtt60 | Python rtt25 | Python rtt60 |
+|---|---:|---:|---:|---:|
+| open.manifest ms, before -> after | 29.8 -> 0.1 | 66.0 -> 0.1 | 26.2 -> 0 | 61.6 -> 0 |
+| open total ms, before -> after | 1292.8 -> 1271.5 | 2595.2 -> 2532.7 | 1250.2 -> 1229.2 | 2549.8 -> 2486.4 |
+| open requests | 6 -> 5 | 6 -> 5 | 6 -> 5 | 6 -> 5 |
+
+One round trip (the larger pointer costs nothing measurable): ~25 ms at rtt25, ~63 ms at rtt60, ~87 ms against R2
+from this host (the manifest step's median there). **Does it still pay on top of base packs?** A base-pack open
+(`cold/base`) is `current.json -> base pack`, with the manifest GET issued in parallel only as a fallback, so the
+copy saves no round trip there (it saves that fallback request). It does pay for every open that reads the files
+instead of a base pack (`cold/base` fetches all of them as soon as the manifest is in: `current -> manifest -> files`
+becomes `current -> files`), and for every refresh that finds a new revision (`current -> manifest -> slabs table`
+becomes `current -> slabs table`), which is what a long-lived index does every time a writer commits. The cost is
+~1 KB more per `current.json` poll (every 30 s per index). Kept: it is cheap and never slower.
+
+## Options outside the SDK
+
+What deployment can do, reasoned from the baseline (TS, Node, process-cold at rtt25: open chain 161 ms in 3 serial
+GETs, base 1,133 ms for one 25 MB GET, phase 1 183 ms for 34 prefix GETs, phase 2 393 ms for ~140 record GETs).
+**None of these were tested against the owner's AWS or Cloudflare account, deliberately**; the S3 Express estimate is
+the proxy with a shorter first byte, which is a model, not a measurement of the service.
+
+### A CDN in front of the bucket
+
+The objects under `idx/` are immutable, so any CDN can cache them forever; only `idx/current.json` must stay
+uncached (or cached for seconds). What a CDN changes is who pays the origin round trip: the first cold isolate or
+process in a region fills the edge, every later one reads from the edge (first byte ~5-15 ms from a nearby edge
+instead of 25-60 ms from S3, ~75-105 ms from R2 here), and the edge collapses concurrent misses of one object into
+one origin request. For a fleet of cold isolates that is the base (25 MB, 59% of process-cold) and the hot prefixes
+served at edge latency and edge bandwidth; for a single long-lived process it changes little.
+
+- **CloudFront with origin access control (OAC) in front of S3.** A range GET is served from cache when the edge holds
+  the whole object or that range; on a miss CloudFront forwards the range to S3 (possibly widened) and caches the
+  partial response, so the second request for the same slab prefix hits. Multi-range requests are honoured in
+  ascending order. Price: data out to the internet ~$0.085/GB in North America for the first 10 TB (S3 -> CloudFront
+  origin fetches are free) plus ~$0.01 per 10,000 HTTPS requests, versus S3 direct at ~$0.09/GB and $0.0004 per 1,000
+  GETs. A cold TS process reads ~32 MB in ~180 requests (25.7 MB open + 6.5 MB query): ~$0.003 per cold start
+  through CloudFront; a query (~177 requests, 6.2 MB) ~$0.0007, hit or miss, since the edge bills bytes out. Inside the same AWS region S3 -> EC2/Lambda transfer is free, so a CDN there buys latency,
+  not cost.
+- **Cloudflare CDN on an R2 custom domain.** R2 egress is free and the CDN bandwidth is not billed; what you pay is R2
+  Class B reads ($0.36 per million) on cache misses only. On a cold miss the cache fetches from the origin without the
+  client's Range (or, with Origin Range Requests, in 1 MiB-aligned chunks) and answers the range from what it
+  stored; repeated ranges then hit. Caching is per data center unless Tiered Cache is on. Inside Workers this is
+  the same effect the Cache API already gives `CachedBlobStore` (per colo), so it matters mostly for clients outside
+  Workers (Node/Python services) that would otherwise pay R2's 75-105 ms first byte from far away.
+
+Estimated effect on the baseline for a cold process near an edge that already holds the objects (first byte ~10 ms,
+~500 Mbps): open chain 161 -> ~60 ms (3 serial GETs plus the handshake), base 1,133 -> ~430 ms, phase 1 183 -> ~80 ms,
+phase 2 393 -> ~150 ms: process-cold ~1.9 s -> ~0.8 s. The first process per edge pays the full origin cost.
+
+### S3 Express One Zone
+
+Directory buckets in one Availability Zone with single-digit-ms first byte (vs 20-60 ms for S3 Standard). Modelled with
+the proxy at 5 ms first byte (+10 ms on a new connection) and the baseline's 200 Mbps per response, then 1 Gbps per
+response for a client in the same AZ (`run_open.sh` profiles `rtt5`, `rtt5g1`; `data/cold/open/open-base-*-rtt5*`):
+
+| process-cold, median ms | TS rtt25 | TS rtt5 | TS rtt5g1 | Python rtt25 | Python rtt5 | Python rtt5g1 |
+|---|---:|---:|---:|---:|---:|---:|
+| open (current + manifest + slabs) | 157 | 44 | 41 | 135 | 33 | 27 |
+| open.base | 1,139 | 1,076 | 268 | 1,116 | 1,055 | 235 |
+| phase 1 | 188 | 68 | 60 | 448 | 290 | 128 |
+| phase 2 | 394 | 98 | 87 | 2 | 2 | 1 |
+| query | 582 | 170 | 154 | 453 | 296 | 132 |
+| process e2e | 1,966 | 1,356 | 536 | 1,786 | 1,482 | 479 |
+
+The first byte fixes the TS query (582 -> 170 ms: ~175 requests at 12 in flight are ~15 round trips) and the open
+chain; the base load needs bandwidth, which in-AZ placement gives (1,139 -> 268 ms at 1 Gbps). Together a TS cold
+start drops from ~2.0 s to ~0.54 s. The catch is placement: the client must run in that AZ (one AZ, no regional
+redundancy) and the bucket holds a copy of the index (a directory bucket; copy the snapshot with `copyObjects`).
+Price (after the April 2025 cut, us-east-1): storage $0.11/GB-month (g4 rev 179 is ~5.2 GB: ~$0.57/month; S3 Standard
+$0.023/GB), GETs $0.00003 per 1,000 (S3 Standard $0.0004), data retrieval $0.0006/GB on every byte. A cold TS start
+(~180 requests, 32 MB) costs ~$0.000025; a warm query (~177 requests, 6.2 MB) ~$0.000009. Cheaper per request than S3
+Standard, dearer to store.
+
+### Offloading routing to a warm process
+
+The routing table is 25 MB of f32 that every cold isolate downloads and keeps (1.1 s at rtt25, 0.56 s median / 1.1 s
+p90 from R2 here; 25 MB of a 128 MB Workers isolate), to compute one 4,103 x 1,536 product per query (3 ms). A warm
+process holding it (a Durable Object, or a Worker reached through a service binding) answers `route(vector, nprobe)`:
+6 KB in, 34 cell ids out. The PQ codebook (1.6 MB) can stay local or travel with the answer as the per-query table
+(192 x 256 f32, 192 KB).
+
+- **Hop cost h per query:** a service binding to a Worker on the same machine is sub-millisecond to ~1 ms; a Durable
+  Object in the same colo a few ms; a DO placed elsewhere (a DO lives in one location) 20-100 ms of network.
+- **Saving B per cold isolate:** the base load (0.5-1.1 s) and its 25 MB of memory. The routing process loads it once
+  (from R2 in-colo, a few hundred ms) and keeps it while it receives traffic; DOs are evicted when idle, so a quiet
+  index pays that load again, once, for all isolates.
+- **Break-even:** offloading wins while an isolate serves fewer than B / h queries in its lifetime. With B = 560 ms
+  (R2 median): h = 5 ms -> 112 queries, h = 20 ms -> 28, h = 60 ms -> 9; with B = 1.1 s (p90, or rtt25) twice that.
+  Spiky or low-traffic deployments, where most isolates are cold and serve a handful of queries, are on the
+  offloading side; a busy isolate serving thousands of queries is not, unless memory is the constraint.
+- **Cost:** DO requests ($0.15 per million) plus duration while active; a service binding call is billed as a request
+  to the routing Worker. Pair it with `cold/base`'s smaller tables (f16/int8) and tree-grouped cold routing, which
+  shrink B instead of moving it.

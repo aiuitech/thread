@@ -15,6 +15,11 @@ Results, method and analysis: [docs/cold-start.md](../../docs/cold-start.md).
 | `slab_bytes.mjs` | per-slab byte accounting: scan prefix vs rerank tier vs whole slab |
 | `run_baseline.sh` | the whole baseline: warm-up, pack, 3 network profiles x {proxy, pack} x {ts, py}, then r2s3 (`TAG`, `N`, `PROFILES`, `SDKS`, `WARM`, `R2S3`) |
 | `lib.mjs` | dataset, recall, the summary table |
+| `hot_cells.mjs` | probe frequency of a query sample (routing only, no slab reads): coverage curve, held-out hot-set hit rate |
+| `make_warm_pack.mjs` | a warm pack (hot slab prefixes, `open({ warmPack })`) from `hot_cells.mjs`'s counts, sparse like `make_pack.mjs` |
+| `pack_adjacency.mjs` | how close a query's probed slabs sit in a pack, merged-read plans and a phase-1 latency model per layout |
+| `tree_order.mjs`, `route.mjs` | centroid-tree slab order (`make_pack.mjs --order tree`); routing without reading slabs |
+| `run_open.sh` | the cold/open experiments: an offline proxy on its own port/overlay, `TAG`, `ARGS`, `STORES`, `PROFILES` (adds `rtt5`, `rtt5g1`) |
 
 ```sh
 (cd sdk/ts && npm run build)                         # the benches and the proxy use sdk/ts/dist

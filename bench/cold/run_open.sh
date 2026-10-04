@@ -30,6 +30,8 @@ profile_args() {
 	rtt25) echo "--rtt-ms 25 --mbps 200" ;;
 	rtt60) echo "--rtt-ms 60 --mbps 100" ;;
 	rtt25link500) echo "--rtt-ms 25 --mbps 200 --link-mbps 500" ;;
+	rtt5) echo "--rtt-ms 5 --mbps 200" ;;            # S3 Express One Zone-like first byte, same bandwidth
+	rtt5g1) echo "--rtt-ms 5 --mbps 1000" ;;         # and an in-AZ client at 1 Gbps per response
 	*) echo "unknown profile $1" >&2; exit 1 ;;
 	esac
 }
