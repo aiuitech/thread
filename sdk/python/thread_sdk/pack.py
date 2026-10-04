@@ -22,12 +22,13 @@ import io
 import os
 import struct
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Iterable, Sequence
 
 from .revision import load_rev_state, resolve_target, snapshot_keys
-from .store import BlobHead, BlobRange, BlobStore, BlobTrace, Bytes, FileBlobStore, MemoryBlobStore
+from .store import BlobHead, BlobRange, BlobStore, BlobTrace, Bytes, FileBlobStore, MemoryBlobStore, phase_stat
 from .wire import ThreadError, decode_json, dumps
 
 __all__ = [
@@ -121,7 +122,10 @@ class PackedBlobStore(BlobStore):
         self.key = key
         self.supports_ranges = inner.supports_ranges
         self.remote = inner.remote
+        t0 = time.perf_counter()
+        trace = BlobTrace()
         h = inner.head(key)
+        trace.add(reads=1)
         if h is None:
             raise ThreadError(f"no pack at {key}", 404)
         if h.size < PACK_HEADER_BYTES + PACK_FOOTER_BYTES:
@@ -129,7 +133,7 @@ class PackedBlobStore(BlobStore):
         #: Size and etag of the pack object.
         self.pack = h
         tail_len = min(h.size, PACK_TAIL_READ)
-        tail = inner.get(key, BlobRange(h.size - tail_len, tail_len))
+        tail = inner.get(key, BlobRange(h.size - tail_len, tail_len), trace=trace)
         if tail is None:
             raise ThreadError(f"no pack at {key}", 404)
         tail = memoryview(tail)
@@ -140,12 +144,15 @@ class PackedBlobStore(BlobStore):
         if dir_off >= tail_start:
             d: Bytes = tail[dir_off - tail_start: dir_off - tail_start + dir_len]
         else:
-            got = inner.get(key, BlobRange(dir_off, dir_len))
+            got = inner.get(key, BlobRange(dir_off, dir_len), trace=trace)
             if got is None:
                 raise ThreadError(f"no pack at {key}", 404)
             d = got
         #: key -> (offset in the pack, length).
         self.entries, self.meta = parse_pack_directory(d, dir_off, count)
+        #: What opening the pack did (`phase_stat`): the head (counted as a read of 0 bytes), the tail read and, when
+        #: the directory does not fit in the tail, the directory read. `open_index` reports it as `open_stats["pack"]`.
+        self.open_stats = phase_stat((time.perf_counter() - t0) * 1000, trace)
 
     @classmethod
     def from_bytes(cls, data: Bytes, key: str = "index.threadpack") -> "PackedBlobStore":

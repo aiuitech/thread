@@ -124,6 +124,14 @@ in wasm at 4096 x 1536) and the PQ codebook (format 3). `gen` without `rev` read
 current rev when `current.json` names that generation, else the newest `manifest.*.json` listed in the store
 (stores without `list` fall back to rev 0).
 
+`index.openStats` is the cold-start timeline of `open`: `{ total, wasmInit, current, manifest, slabs, base, pack? }`
+where `current` (current.json), `manifest`, `slabs` (slabs table + tombstone sets) and `base` (routing table and
+codebook) are `PhaseStat`s (`base` adds `fetch` and `build` ms and `files: {coarse, fine, pq}` bytes), `wasmInit`
+is how long `Thread.init` took (`thread.initMs`, not part of `total`) and `pack`, for a `PackedBlobStore`, is its
+own open (`head` + tail + directory reads, `PackedBlobStore.openStats`; it happened before `open`). A "read" is a
+request that reached the origin store; with a cache in front, `hits`/`misses` count cache lookups. Python's
+`index.open_stats` has the same fields except `wasmInit`. `bench/cold/` measures these against S3.
+
 Properties: `index.manifest`, `index.gen`, `index.rev`, `index.dim`, `index.cells` (`k1 * k2`), `index.format`
 (1 int8 only, 2 sq4 + sq8, 3 pq + sq8), `index.defaults` (`{nprobe, rerank, pc}`), `index.revision` (parsed
 manifest, slabs table, deltas, tombstone state).
@@ -157,9 +165,15 @@ interface QueryResult {
 		io: { reads; hits; misses; r206; r200; bytes };                   // store accounting (cache hits/misses, origin reads)
 		limiterRetries; attempt; wasmResets; wasmMemMB;
 		timing: { total; route; phase1; phase2; payload };               // ms; CPU-only phases read ~0 in Workers
+		timeline: { route; phase1; phase2; payload; base? };             // PhaseStat per phase (below)
 	};
 }
 ```
+
+`stats.timeline` splits the query into phases, each a `PhaseStat` `{ ms, reads, hits, misses, r206, r200, bytes }`:
+its wall time and the store work that completed during it (the query's trace snapshotted at the phase
+boundaries, so a speculative read issued in phase 1 that lands in phase 2 counts in phase 2). `base` is present
+when this query (re)loaded the routing table (after a wasm reset or a switch of generation).
 
 Scores are cosine similarities: reranked slab hits and delta hits are on the int8 scale and merge directly;
 with `rerank: 0` they are scan-tier (4-bit or PQ) estimates.

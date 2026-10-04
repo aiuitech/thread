@@ -101,6 +101,13 @@ directory shared by every process that uses it and reads only the requested rang
 `gen` without `rev` reads the generation's head (the current rev when `current.json` names that generation, else
 the newest `manifest.*.json` in the store). `ThreadIndex` is a context manager; `close()` releases its threads.
 
+`index.open_stats` is the cold-start timeline of `open_index`: `{total, current, manifest, slabs, base, pack?}`, each
+step a phase stat (`current`: current.json; `manifest`; `slabs`: slabs table + tombstone sets; `base`: routing table
+and codebook, plus `fetch` / `build` ms and `files: {coarse, fine, pq}` bytes; `pack`, for a `PackedBlobStore`, its
+own head + tail + directory reads, `PackedBlobStore.open_stats`, not part of `total`). A "read" is a request that
+reached the origin store; with a cache in front, `hits` / `misses` count cache lookups. Same fields as the
+TypeScript SDK's `index.openStats` (which adds `wasmInit`). `bench/cold/` measures these against S3.
+
 Properties: `manifest` (the stored dict, camelCase keys), `gen`, `rev`, `dim`, `cells` (`k1 * k2`), `format`
 (1 int8 only, 2 sq4 + sq8, 3 pq + sq8), `defaults` (`{nprobe, rerank, pc}`), `has_dense`, `lex_config`
 (`ResolvedLexConfig` or None), `segments`, `revision` (the parsed `RevState`).
@@ -129,8 +136,14 @@ class QueryResult:
                              # rerank, rerank_candidates, rerank_slabs, rerank_reads, rerank_bytes, rerank_local,
                              # spec_records, spec_used, deltas, delta_bytes, delta_scanned, delta_hits, delta_dropped,
                              # delta_top, tombstones, tomb_sets, tomb_dropped,
-                             # io: {reads, hits, misses, r206, r200, bytes}, timing: {total, route, phase1, phase2, payload} (ms)
+                             # io: {reads, hits, misses, r206, r200, bytes}, timing: {total, route, phase1, phase2, payload} (ms),
+                             # timeline: {route, phase1, phase2, payload, base?} (phase stats, below)
 ```
+
+`stats["timeline"]` splits the query into phases, each a phase stat `{ms, reads, hits, misses, r206, r200, bytes}`:
+its wall time and the store work that completed during it (trace snapshots at the phase boundaries). `base` is
+present when this query (re)loaded the routing table (a switch to another generation). Same fields as the
+TypeScript SDK's `stats.timeline`.
 
 `index.query_many(vectors, **options)` runs the queries concurrently against the same snapshot.
 

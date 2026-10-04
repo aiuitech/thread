@@ -40,6 +40,7 @@ __all__ = [
     "MemoryCache",
     "DiskCache",
     "CachedBlobStore",
+    "phase_stat",
 ]
 
 Bytes = bytes | bytearray | memoryview
@@ -81,6 +82,19 @@ class BlobTrace:
     def as_dict(self) -> dict[str, int]:
         with self._lock:
             return {k: getattr(self, k) for k in ("reads", "hits", "misses", "r206", "r200", "bytes")}
+
+
+TRACE_FIELDS = ("reads", "hits", "misses", "r206", "r200", "bytes")
+
+
+def phase_stat(ms: float, after: dict[str, int] | BlobTrace, before: dict[str, int] | BlobTrace | None = None
+               ) -> dict[str, float | int]:
+    """One step of a cold-start timeline (`index.open_stats`, `stats["timeline"]`): its wall time in ms and the store
+    work done during it (the difference of two trace snapshots; `before` defaults to an empty trace). The TypeScript
+    SDK's `PhaseStat` has the same fields."""
+    a = after.as_dict() if isinstance(after, BlobTrace) else after
+    b = (before.as_dict() if isinstance(before, BlobTrace) else before) if before is not None else None
+    return {"ms": round(ms, 3), **{k: a[k] - (b[k] if b else 0) for k in TRACE_FIELDS}}
 
 
 def _trace_read(trace: BlobTrace | None, n: int) -> None:
