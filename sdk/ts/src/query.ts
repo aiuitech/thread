@@ -2,8 +2,9 @@
  * The query path (same semantics as the reference Worker, examples/cloudflare-worker/src/index.ts):
  *  1. route (flat over the cell means by default), build the PQ table (v3),
  *  2. phase 1: read the scan prefix of each probed slab (Range against the cache; a miss reads the whole
- *     object and keeps the local winners' int8 records), scan it as it arrives, filter tombstones, drop the
- *     buffer; scan every delta segment in parallel (int8 scores, no phase 2),
+ *     object and keeps the local winners' int8 records under the "whole" miss policy, or just the prefix under
+ *     "range" / "range+warm"), scan it as it arrives, filter tombstones, drop the buffer; scan every delta
+ *     segment in parallel (int8 scores, no phase 2),
  *  3. phase 2: re-score the global top-T with the int8 rerank records, read with one multi-range request
  *     per slab (speculatively once only a few slabs are left to scan),
  *  4. top-k over reranked slab hits and delta hits, one copy per id.
@@ -24,10 +25,37 @@ export interface QueryOptions {
 	pc?: number;
 	/** Also return each hit's payload bytes (extra range reads for hits whose slab was not read whole). */
 	returnPayload?: boolean;
-	/** Reads in flight per query (default 12; Cache API reads are not held to the 6-connection limit). */
+	/**
+	 * Reads in flight per query. Default: the store's preference (`store.inflight`): 12 through the Cache API (not
+	 * held to the 6-connection limit), 32 against S3 from Node, 6 against S3 inside a Worker; else 12.
+	 */
 	inflight?: number;
 	/** Speculative rerank reads of the running top-T while the last slabs are still scanning (default true). */
 	speculate?: boolean;
+	/**
+	 * Phase 2: rerank records of one slab are read as runs; a run grows while its span stays within this many bytes
+	 * (default `store.coalesceBytes`, else 4096: adjacent records only).
+	 */
+	coalesceBytes?: number;
+	/**
+	 * Phase 2: when the span from a slab's first to last wanted record is at most this many bytes, read it as ONE
+	 * range (default `store.spanBytes`, else 0 = off). Trades bytes for requests on stores without multi-range reads.
+	 */
+	spanBytes?: number;
+	/** Cold-path policy (see `ColdPolicy`); `false` disables an index-wide default. */
+	coldPolicy?: ColdPolicy | false;
+}
+
+/**
+ * Cheaper parameters for a query whose probed slabs are mostly not cached (each miss is an origin round trip):
+ * when more than `threshold` (default 0.5) of the probed slabs would be read from the origin, the query scans
+ * only the best `nprobe` of them and reranks `rerank` candidates (each at most the query's own value). A store
+ * that cannot tell (no `contains`) counts as all misses when remote, all hits when local.
+ */
+export interface ColdPolicy {
+	nprobe?: number;
+	rerank?: number;
+	threshold?: number;
 }
 
 export interface Hit {
@@ -82,7 +110,15 @@ export interface QueryStats {
 	tombstones: number;
 	tombSets: number;
 	tombDropped: number;
-	/** Store accounting for this query (cache hits/misses, origin reads, bytes). */
+	/** Probed slabs whose whole object was in memory (a "whole" miss or a memory-cache hit): their winners' records were local. */
+	wholeSlabs: number;
+	/** Reads in flight and phase-2 merging the query used. */
+	inflight: number;
+	coalesceBytes: number;
+	spanBytes: number;
+	/** Cold-path policy: probed slabs not cached / probed (before the policy), and whether it applied. */
+	cold?: { misses: number; probed: number; applied: boolean };
+	/** Store accounting for this query (cache hits/misses, origin reads, bytes, warm fetches queued). */
 	io: BlobTrace;
 	limiterRetries: number;
 	/** 1, or 2 when the query was retried after a wasm reset. */
@@ -134,11 +170,13 @@ export interface QueryContext {
 	wasmMemBytes: () => number;
 	/** A delta segment (whole), shared between concurrent queries. */
 	getDelta: (ref: DeltaRef, trace: BlobTrace) => Promise<Uint8Array>;
+	/** The index-wide cold-path policy (`OpenOptions.coldPolicy`). */
+	coldPolicy?: ColdPolicy;
 }
 
 export const QUERY_INFLIGHT = 12;
 /** Rerank winners of one slab whose records lie within this span share one range (adjacent records). */
-const MULTI_COALESCE = 4 * 1024;
+export const MULTI_COALESCE = 4 * 1024;
 /** Speculate on the running top-T once only this many slabs are left to scan. */
 const SPEC_AT = 6;
 
@@ -169,6 +207,12 @@ export class Limiter {
 			return await this.run(fn, low);
 		}
 	}
+}
+
+/** Whether probed `cell`'s slab can be read without an origin request (see `ColdPolicy`). */
+export function slabResident(store: BlobStore, rev: RevState, cell: number): boolean {
+	const key = keys.slab(rev.gen, cell, rev.slabs?.[cell] ? slabRevOf(rev.slabs[cell]) : 0);
+	return store.contains?.(key) ?? !store.remote;
 }
 
 export function safeFree(o: { free(): void }): void {
@@ -207,19 +251,20 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	if (!Number.isInteger(k) || k < 1) throw new ThreadError("topK must be an integer >= 1", 400);
 	const defaults = manifest.defaults ?? { nprobe: 1, rerank: 32, pc: 0 };
 	const src = (v: number | undefined): ParamSource => (v !== undefined ? "query" : manifest.defaults ? "manifest" : "legacy");
-	const nprobe = o.nprobe ?? defaults.nprobe;
+	let nprobe = o.nprobe ?? defaults.nprobe;
 	const pc = o.pc ?? defaults.pc;
-	const rerankParam = o.rerank ?? defaults.rerank;
+	let rerankParam = o.rerank ?? defaults.rerank;
 	for (const [name, v, min] of [["nprobe", nprobe, 1], ["pc", pc, 0], ["rerank", rerankParam, 0]] as const) if (!Number.isInteger(v) || v < min) throw new ThreadError(`${name} must be an integer >= ${min}`, 400);
 	const params: QueryParams = { topK: k, nprobe, rerank: rerankParam, pc, source: { nprobe: src(o.nprobe), rerank: src(o.rerank), pc: src(o.pc) } };
 	const speculate = o.speculate ?? true;
+	const inflight = o.inflight ?? store.inflight ?? QUERY_INFLIGHT;
+	const coalesce = o.coalesceBytes ?? store.coalesceBytes ?? MULTI_COALESCE;
+	const spanBytes = o.spanBytes ?? store.spanBytes ?? 0;
+	const coldPolicy = o.coldPolicy === false ? undefined : (o.coldPolicy ?? ctx.coldPolicy);
 	const dim = manifest.dim;
 	const q = w.normalize_vector(qRaw);
-	// Format 1 slabs have no rerank tier: phase 2 is skipped whatever rerank says.
-	const doRerank = format >= 2 && rev.slabs !== null && rerankParam > 0;
-	const T = doRerank ? Math.max(k, rerankParam) : k;
 	const flat = pc === 0 || pc >= manifest.k1;
-	const lim = new Limiter(o.inflight ?? QUERY_INFLIGHT);
+	const lim = new Limiter(inflight);
 	const trace = newTrace();
 	const epoch = ctx.epoch();
 	// Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
@@ -227,7 +272,26 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 
 	// One q·mean per cell: flat routing ranks them, and scan_delta scores every delta entry against its cell.
 	const cellDots = flat || deltas.length ? base.searcher.cell_dots(q) : null;
-	const cells = Array.from(flat ? base.searcher.route_from_dots(cellDots!, nprobe) : base.searcher.route(q, pc, nprobe));
+	let cells = Array.from(flat ? base.searcher.route_from_dots(cellDots!, nprobe) : base.searcher.route(q, pc, nprobe));
+	// Cold-path policy: fewer probes / a smaller rerank when most probed slabs would come from the origin. Cells are in
+	// routing order (best first), so the cold probe set is the best `coldPolicy.nprobe` of them.
+	let cold: QueryStats["cold"];
+	if (coldPolicy && cells.length) {
+		const probed = cells.length;
+		const misses = cells.reduce((a, c) => a + (slabResident(store, rev, c) ? 0 : 1), 0);
+		const applied = misses / probed > (coldPolicy.threshold ?? 0.5);
+		if (applied) {
+			if (coldPolicy.nprobe !== undefined) nprobe = Math.max(1, Math.min(nprobe, coldPolicy.nprobe));
+			if (coldPolicy.rerank !== undefined) rerankParam = Math.max(0, Math.min(rerankParam, coldPolicy.rerank));
+			cells = cells.slice(0, nprobe);
+			params.nprobe = nprobe;
+			params.rerank = rerankParam;
+		}
+		cold = { misses, probed, applied };
+	}
+	// Format 1 slabs have no rerank tier: phase 2 is skipped whatever rerank says.
+	const doRerank = format >= 2 && rev.slabs !== null && rerankParam > 0;
+	const T = doRerank ? Math.max(k, rerankParam) : k;
 	// Format 3: one asymmetric-distance table (m x 256 f32) per query, shared by every probed slab.
 	const table = base.pq ? w.PqTable.from_codebook(q, base.pq) : null;
 	const tRoute = Date.now();
@@ -240,6 +304,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const slabInfo = new Map<number, SlabInfo>();
 	const versions = new Set<number>();
 	let scanned = 0;
+	let wholeSlabs = 0;
 	let slabBytes = 0;
 	let scanBytes = 0;
 	let rerankReads = 0;
@@ -254,14 +319,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		const recLen = si.recLen;
 		const out = new Map<number, Uint8Array>();
 		if (!idxs.length) return out;
-		const runs: { a: number; b: number; members: number[] }[] = [];
-		for (const i of idxs) {
-			const run = runs.at(-1);
-			if (run && (i - run.a + 1) * recLen <= MULTI_COALESCE) {
-				run.b = i;
-				run.members.push(i);
-			} else runs.push({ a: i, b: i, members: [i] });
-		}
+		const runs = coalesceRuns(idxs, recLen, coalesce, spanBytes);
 		const place = (run: (typeof runs)[number], bytes: Uint8Array) => {
 			for (const i of run.members) out.set(i, bytes.subarray((i - run.a) * recLen, (i - run.a + 1) * recLen));
 		};
@@ -336,6 +394,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		cells.map(async (cell) => {
 			const { prefix, full, key, slabRev } = await readSlab(cell);
 			slabBytes += (full ?? prefix).byteLength;
+			if (full && full !== prefix) wholeSlabs++;
 			scanBytes += prefix.byteLength;
 			const hdr = parseSlabHeader(prefix);
 			// Tombstones are applied inside the scan (before top-k insertion): ids deleted or replaced at a rev >= this
@@ -504,6 +563,11 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			tombstones: tomb?.total ?? 0,
 			tombSets: tomb?.sets.length ?? 0,
 			tombDropped,
+			wholeSlabs,
+			inflight,
+			coalesceBytes: coalesce,
+			spanBytes,
+			...(cold ? { cold } : {}),
 			io: trace,
 			limiterRetries: lim.retries,
 			attempt,
@@ -512,6 +576,24 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			timing: { total: tEnd - tStart, route: tRoute - tStart, phase1: tPhase1 - tRoute, phase2: tPhase2 - tPhase1, payload: tEnd - tPhase2 },
 		},
 	};
+}
+
+/**
+ * Groups the ascending record indexes of one slab into runs read as one range each: the whole span when it is at
+ * most `spanBytes`, else greedily while a run's span stays within `coalesceBytes`.
+ */
+export function coalesceRuns(idxs: number[], recLen: number, coalesceBytes: number, spanBytes = 0): { a: number; b: number; members: number[] }[] {
+	if (!idxs.length) return [];
+	if (idxs.length > 1 && (idxs[idxs.length - 1] - idxs[0] + 1) * recLen <= spanBytes) return [{ a: idxs[0], b: idxs[idxs.length - 1], members: [...idxs] }];
+	const runs: { a: number; b: number; members: number[] }[] = [];
+	for (const i of idxs) {
+		const run = runs.at(-1);
+		if (run && (i - run.a + 1) * recLen <= coalesceBytes) {
+			run.b = i;
+			run.members.push(i);
+		} else runs.push({ a: i, b: i, members: [i] });
+	}
+	return runs;
 }
 
 /** Payloads of slab hits whose slab was not in memory: one (multi-)range read per slab. */
