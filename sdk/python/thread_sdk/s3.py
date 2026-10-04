@@ -4,8 +4,9 @@ Single-range GETs, HEAD, PUT and conditional PUT (`If-None-Match: *` for create-
 swap) and ListObjectsV2. S3 has no multi-range GET, so `get_ranges` is not implemented: the SDK issues one request
 per rerank range (in parallel), and a cache in front (`open` adds a `MemoryCache` by default) serves repeat reads.
 
-Connections: one keep-alive `http.client` connection per thread and host (the index's I/O pool threads each keep
-theirs), reopened when the server closed it; `warmup(n, executor)` opens them ahead of the first query. Signing
+Connections: a pool of keep-alive `http.client` connections shared by every thread (at most `max_connections`, default
+`inflight`; a thread takes an idle one or opens one, and waits when all are busy), reopened when the server closed
+them; `warmup(n)` opens them ahead of the first query. Signing
 costs one HMAC per request: the derived signing key of each (date, region, service) is cached.
 """
 
@@ -162,6 +163,7 @@ class S3BlobStore(BlobStore):
         inflight: int | None = None,
         coalesce_bytes: int | None = None,
         span_bytes: int | None = None,
+        max_connections: int | None = None,
     ) -> None:
         if not access_key_id or not secret_access_key:
             raise ThreadError("S3BlobStore needs access_key_id and secret_access_key", 400)
@@ -180,7 +182,13 @@ class S3BlobStore(BlobStore):
         self.retries = retries
         self.timeout = timeout
         self.now = now
-        self._local = threading.local()
+        #: Most connections open at once (shared by all threads); default: `inflight`.
+        self.max_connections = max_connections if max_connections is not None else (inflight or S3_INFLIGHT)
+        self._idle: dict[str, list[http.client.HTTPConnection]] = {}
+        self._open = 0
+        self._pool_cond = threading.Condition()
+        #: Connections opened over the store's life (tests, benchmarks).
+        self.stats = {"opened": 0}
         self.signing_keys = SigningKeyCache(secret_access_key)
         if inflight is not None:
             self.inflight = inflight
@@ -202,23 +210,34 @@ class S3BlobStore(BlobStore):
             path = f"{self.base_path}/{aws_encode(key, True) if key else ''}"
         return host, path or "/"
 
-    def _conn(self, host: str, fresh: bool) -> http.client.HTTPConnection:
-        conns: dict[str, http.client.HTTPConnection] = self._local.__dict__.setdefault("conns", {})
-        c = conns.get(host)
-        if c is not None and fresh:
-            c.close()
-            c = None
-        if c is None:
-            cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
-            c = cls(host, timeout=self.timeout)
-            conns[host] = c
-        return c
+    def _acquire(self, host: str, fresh: bool) -> http.client.HTTPConnection:
+        """A connection to `host` from the shared pool: an idle keep-alive one (unless `fresh`), else a new one while
+        fewer than `max_connections` are open, else the next one released (waits)."""
+        with self._pool_cond:
+            while True:
+                idle = self._idle.setdefault(host, [])
+                if idle and not fresh:
+                    return idle.pop()
+                if self._open < self.max_connections:
+                    self._open += 1
+                    self.stats["opened"] += 1
+                    break
+                if idle:  # fresh wanted, pool full: replace an idle connection
+                    idle.pop().close()
+                    self.stats["opened"] += 1
+                    break
+                self._pool_cond.wait()
+        cls = http.client.HTTPSConnection if self.scheme == "https" else http.client.HTTPConnection
+        return cls(host, timeout=self.timeout)
 
-    def _drop(self, host: str) -> None:
-        conns = self._local.__dict__.get("conns", {})
-        c = conns.pop(host, None)
-        if c is not None:
-            c.close()
+    def _release(self, host: str, conn: http.client.HTTPConnection, reuse: bool) -> None:
+        with self._pool_cond:
+            if reuse:
+                self._idle.setdefault(host, []).append(conn)
+            else:
+                conn.close()
+                self._open -= 1
+            self._pool_cond.notify()
 
     def _send(self, method: str, key: str, headers: dict[str, str], body: bytes | None = None,
               query: dict[str, str] | None = None) -> _Response:
@@ -234,18 +253,20 @@ class S3BlobStore(BlobStore):
         attempts = 1 if method == "PUT" else 1 + self.retries
         last: BaseException | None = None
         for attempt in range(attempts):
-            conn = self._conn(host, fresh=method == "PUT" or attempt > 0)
+            conn = self._acquire(host, fresh=method == "PUT" or attempt > 0)
             try:
                 conn.request(method, path + qs, body=body, headers=signed)
                 r = conn.getresponse()
                 data = r.read()
                 hdrs = {k.lower(): v for k, v in r.getheaders()}
-                if r.will_close:
-                    self._drop(host)
             except _RETRYABLE as e:
-                self._drop(host)
+                self._release(host, conn, False)
                 last = e
                 continue
+            except BaseException:
+                self._release(host, conn, False)
+                raise
+            self._release(host, conn, not r.will_close)
             if r.status >= 500 and attempt + 1 < attempts:
                 last = ThreadError(f"S3 {method} {key}: HTTP {r.status}", r.status)
                 continue
@@ -278,9 +299,9 @@ class S3BlobStore(BlobStore):
         return b
 
     def warmup(self, n: int, executor: Executor | None = None, key: str = "idx/current.json") -> list[Future]:
-        """Opens up to `n` connections ahead of the first query: `n` HEADs of `key` (a 404 is fine). Connections are
-        per thread, so pass the executor whose threads will read (the index's I/O pool: `open_index` does); without
-        one, the HEADs run on new threads. Returns the futures (errors are swallowed)."""
+        """Opens up to `n` connections ahead of the first query: `n` concurrent HEADs of `key` (a 404 is fine); they
+        return to the shared pool, so any thread's later read reuses them. Runs on `executor` (`open_index` passes its
+        I/O pool) or on new threads. Returns the futures (errors are swallowed)."""
 
         def one() -> None:
             try:

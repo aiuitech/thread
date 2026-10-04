@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.server
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 import pytest
@@ -310,3 +311,17 @@ def test_index_over_s3(s3_server):
         r = nocache.query(q, nprobe=8, rerank=40)
         assert r.stats["rerank_reads"] > 0  # single-range reads in parallel, no multi-range on S3
         assert {h.id for h in r.hits[:2]} == {21, 777}
+
+
+def test_s3_connection_pool_is_shared_and_bounded(s3_server):
+    """Connections are pooled across threads: at most `max_connections` open, warmed ones reused by any thread."""
+    s = S3BlobStore(s3_server, "bucket", "AK", "SK", max_connections=4)
+    s.put("idx/x", b"0123456789" * 100)
+    opened = s.stats["opened"]  # the put used a fresh connection
+    for f in s.warmup(4):
+        f.result()
+    assert s.stats["opened"] - opened <= 4
+    with ThreadPoolExecutor(16) as ex:
+        got = list(ex.map(lambda i: bytes(s.get("idx/x", BlobRange(i, 10))), range(200)))
+    assert got == [(b"0123456789" * 100)[i:i + 10] for i in range(200)]
+    assert s._open <= 4 and s.stats["opened"] - opened <= 4
