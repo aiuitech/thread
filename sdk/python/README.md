@@ -97,6 +97,7 @@ directory shared by every process that uses it and reads only the requested rang
 | `lex_transient_bytes` | 8 MB | transient lexical bytes (buckets, posting lists, texts) each segment reader may hold |
 | `io_workers` | 32 | threads for reads, shared by concurrent queries |
 | `job_workers` | 4-16 (CPUs) | threads for `query_many` and the lexical half of a hybrid search |
+| `warm_pack` | - | key of a warm pack (hot slab prefixes in one object): fetched with one GET on a background thread at open, its prefixes then served from memory in front of the cache (`index.warm_ready`, `index.warm_stats`; see docs/cold-start.md, "Warm packs") |
 
 `gen` without `rev` reads the generation's head (the current rev when `current.json` names that generation, else
 the newest `manifest.*.json` in the store). `ThreadIndex` is a context manager; `close()` releases its threads.

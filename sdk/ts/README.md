@@ -117,9 +117,10 @@ once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 | `waitUntil` | - | `ctx.waitUntil`, keeps background cache writes alive |
 | `refreshInterval` | 30 000 ms | a query older than this re-reads `current.json` first (0 = only `refresh()`) |
 | `deltaCacheBytes` | 40 MB | delta segments kept in memory across queries (per index) |
+| `warmPack` | - | key of a warm pack (hot slab prefixes in one object): fetched with one GET in the background at open, its prefixes then served from memory (`index.warmReady`, `index.warmStats`; see docs/cold-start.md, "Warm packs") |
 
 `open` reads `current.json` (a pointer without `rev` means rev 0 = the legacy `idx/{gen}/manifest.json`), the
-manifest, the slabs table and the tombstone sets, and loads the routing table (`coarse.f32` + `fine.f32`, ~25 MB
+manifest (unless `current.json` carries an inline copy, which the SDK writers add), the slabs table and the tombstone sets, and loads the routing table (`coarse.f32` + `fine.f32`, ~25 MB
 in wasm at 4096 x 1536) and the PQ codebook (format 3). `gen` without `rev` reads the generation's head: the
 current rev when `current.json` names that generation, else the newest `manifest.*.json` listed in the store
 (stores without `list` fall back to rev 0).
@@ -149,6 +150,7 @@ manifest, slabs table, deltas, tombstone state).
 | `returnPayload` | false | also return each hit's payload bytes (one extra range read per slab with payloads not already in memory) |
 | `inflight` | 12 | reads in flight per query |
 | `speculate` | true | read the running top-T's rerank records while the last 6 slabs are still scanning |
+| `coalesceAcrossSlabs` | off | `PackedBlobStore` only: merge phase-1 prefix reads of slabs within this many bytes of each other in the pack into one range (`true` = 64 KiB). Measured: no gain on today's packs (docs/cold-start.md) |
 
 Manifests without `defaults` (g1, g2) use `nprobe 1, rerank 32, pc 0`; `params.source` says where each value
 came from (`query`, `manifest`, `legacy`).
