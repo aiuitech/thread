@@ -48,6 +48,11 @@ function fakeS3(objects: Map<string, Uint8Array>) {
 		}
 		if (!cur) return new Response("<Error><Code>NoSuchKey</Code></Error>", { status: 404 });
 		if (method === "HEAD") return new Response(null, { status: 200, headers: { "content-length": String(cur.byteLength), etag: etag(cur) } });
+		const suffix = headers.range?.match(/^bytes=-(\d+)$/);
+		if (suffix) {
+			const a = Math.max(0, cur.byteLength - Number(suffix[1]));
+			return new Response(cur.slice(a), { status: 206, headers: { "content-range": `bytes ${a}-${cur.byteLength - 1}/${cur.byteLength}`, etag: etag(cur) } });
+		}
 		const range = headers.range?.match(/^bytes=(\d+)-(\d+)$/);
 		if (range) {
 			const a = Number(range[1]);
@@ -85,6 +90,16 @@ describe("S3BlobStore", () => {
 		expect(put.headers["x-amz-content-sha256"]).toMatch(/^[0-9a-f]{64}$/);
 		const get = calls.find((c) => c.method === "GET" && c.headers.range)!;
 		expect(get.headers.authorization).toContain("SignedHeaders=host;range;x-amz-content-sha256;x-amz-date");
+	});
+	it("getTail: one suffix-range GET with the object size", async () => {
+		const data = Uint8Array.from({ length: 1000 }, (_, i) => (i * 7) & 0xff);
+		await store.put("tail/obj", data);
+		const t = await store.getTail!("tail/obj", 100);
+		expect(t!.size).toBe(1000);
+		expect(t!.bytes).toEqual(data.slice(900));
+		expect(calls.at(-1)!.headers.range).toBe("bytes=-100");
+		expect((await store.getTail!("tail/obj", 5000))!.bytes).toEqual(data); // longer than the object: all of it
+		expect(await store.getTail!("tail/nope", 10)).toBeNull();
 	});
 	it("virtual-hosted style and session tokens", async () => {
 		const vh = new S3BlobStore({ endpoint: "https://s3.us-east-1.amazonaws.com", bucket: "bucket", region: "us-east-1", accessKeyId: "AK", secretAccessKey: "SK", sessionToken: "tok", pathStyle: false, fetch: fetchFn });

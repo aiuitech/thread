@@ -170,6 +170,35 @@ export class S3BlobStore implements BlobStore {
 		return b;
 	}
 
+	/** One GET with `Range: bytes=-length`; the size comes from `Content-Range` (or the body of a 200). */
+	async getTail(key: string, length: number, opts?: GetOptions): Promise<{ bytes: Uint8Array; size: number; etag?: string } | null> {
+		const r = await this.send("GET", key, { range: `bytes=-${Math.max(1, length)}` });
+		if (r.status === 404) {
+			await r.body?.cancel();
+			return null;
+		}
+		if (r.status === 416) {
+			// an empty object has no last byte
+			await r.body?.cancel();
+			return { bytes: new Uint8Array(0), size: 0 };
+		}
+		if (!r.ok) return this.fail(r, `GET ${key} (tail)`);
+		let bytes = new Uint8Array(await r.arrayBuffer());
+		if (opts?.trace) {
+			opts.trace.reads++;
+			opts.trace.bytes += bytes.byteLength;
+		}
+		if (r.status === 200) {
+			// Range ignored: the whole object
+			const size = bytes.byteLength;
+			bytes = bytes.subarray(Math.max(0, size - length));
+			return { bytes, size, etag: stripQuotes(r.headers.get("etag")) };
+		}
+		const m = /\/(\d+)\s*$/.exec(r.headers.get("content-range") ?? "");
+		if (!m) throw new ThreadError(`S3 GET ${key} (tail): 206 without a Content-Range size`, 502);
+		return { bytes, size: Number(m[1]), etag: stripQuotes(r.headers.get("etag")) };
+	}
+
 	async head(key: string): Promise<BlobHead | null> {
 		const r = await this.send("HEAD", key, {});
 		await r.body?.cancel();

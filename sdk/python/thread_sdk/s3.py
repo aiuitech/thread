@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import http.client
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -226,6 +227,25 @@ class S3BlobStore(BlobStore):
             if len(b) != range.length:
                 raise ThreadError(f"{key} [{range.offset}, +{range.length}): got {len(b)} bytes")
         return b
+
+    def get_tail(self, key, length, *, trace=None):
+        """One GET with `Range: bytes=-length`; the size comes from `Content-Range` (or the body of a 200)."""
+        r = self._send("GET", key, {"range": f"bytes=-{max(1, length)}"})
+        if r.status == 404:
+            return None
+        if r.status == 416:  # an empty object has no last byte
+            return b"", BlobHead(0, _strip_quotes(r.headers.get("etag")))
+        if not 200 <= r.status < 300:
+            raise self._fail(r, f"GET {key} (tail)")
+        b = r.body
+        _trace_read(trace, len(b))
+        etag = _strip_quotes(r.headers.get("etag"))
+        if r.status == 200:  # Range ignored: the whole object
+            return b[max(0, len(b) - length):], BlobHead(len(b), etag)
+        m = re.search(r"/(\d+)\s*$", r.headers.get("content-range", ""))
+        if m is None:
+            raise ThreadError(f"S3 GET {key} (tail): 206 without a Content-Range size", 502)
+        return b, BlobHead(int(m.group(1)), etag)
 
     def head(self, key):
         r = self._send("HEAD", key, {})

@@ -56,8 +56,9 @@ PACK_MAGIC = b"THRDPACK"
 PACK_VERSION = 1
 PACK_HEADER_BYTES = 16
 PACK_FOOTER_BYTES = 32
-#: Bytes a reader fetches from the end of a pack to find the footer (the directory often fits in them).
-PACK_TAIL_READ = 64 * 1024
+#: Bytes a reader fetches from the end of a pack to find the footer and, in the same request, the directory (~43 bytes
+#: per entry: 512 KB covers ~12,000 objects).
+PACK_TAIL_READ = 512 * 1024
 _ALIGN = 8
 _HEADER = struct.Struct("<8sHHI")
 _FOOTER = struct.Struct("<QQIHH8s")
@@ -135,23 +136,32 @@ class PackedBlobStore(BlobStore):
 
     supports_list = True
 
-    def __init__(self, inner: BlobStore, key: str) -> None:
+    def __init__(self, inner: BlobStore, key: str, tail_bytes: int = PACK_TAIL_READ) -> None:
         self.inner = inner
         self.key = key
         self.supports_ranges = inner.supports_ranges
         self.remote = inner.remote
         t0 = time.perf_counter()
         trace = BlobTrace()
-        h = inner.head(key)
-        trace.add(reads=1)
-        if h is None:
-            raise ThreadError(f"no pack at {key}", 404)
+        # One suffix-range request when the store can (footer + directory, no head), else a head and a range.
+        try:
+            got = inner.get_tail(key, tail_bytes, trace=trace)
+            if got is None:
+                raise ThreadError(f"no pack at {key}", 404)
+            tail, h = got
+        except NotImplementedError:
+            hh = inner.head(key)
+            trace.add(reads=1)
+            if hh is None:
+                raise ThreadError(f"no pack at {key}", 404) from None
+            h, tail = hh, None
         if h.size < PACK_HEADER_BYTES + PACK_FOOTER_BYTES:
             raise ThreadError(f"{key} is too small to be a pack ({h.size} bytes)")
         #: Size and etag of the pack object.
         self.pack = h
-        tail_len = min(h.size, PACK_TAIL_READ)
-        tail = inner.get(key, BlobRange(h.size - tail_len, tail_len), trace=trace)
+        tail_len = min(h.size, len(tail) if tail is not None else tail_bytes)
+        if tail is None:
+            tail = inner.get(key, BlobRange(h.size - tail_len, tail_len), trace=trace)
         if tail is None:
             raise ThreadError(f"no pack at {key}", 404)
         tail = memoryview(tail)

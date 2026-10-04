@@ -96,8 +96,18 @@ describe("snapshots", () => {
 		const b = await buildGen("go", 3, { n: 200 });
 		const { bytes: pack } = await packToBytes(b.store);
 		const ps = await PackedBlobStore.fromBytes(pack);
-		// head (counted as a read of 0 bytes) + one tail read: a small directory fits in the tail
-		expect(ps.openStats).toMatchObject({ reads: 2, bytes: Math.min(pack.byteLength, 64 * 1024) });
+		// one suffix-range read (getTail): footer and directory in one request, no head
+		expect(ps.openStats).toMatchObject({ reads: 1, bytes: Math.min(pack.byteLength, 512 * 1024) });
+		// a store without getTail: head (counted as a read of 0 bytes) + one tail read
+		const m = new MemoryBlobStore();
+		m.objects.set("p", { bytes: pack, etag: "e" });
+		const noTail = await PackedBlobStore.open({ get: (k, r, o) => m.get(k, r, o), head: (k) => m.head(k) }, "p");
+		expect(noTail.openStats).toMatchObject({ reads: 2, bytes: Math.min(pack.byteLength, 512 * 1024) });
+		expect([...noTail.directory.entries]).toEqual([...ps.directory.entries]);
+		// a tail read too short for the directory takes one more range read
+		const short = await PackedBlobStore.open(m, "p", 64);
+		expect(short.openStats.reads).toBe(2);
+		expect([...short.directory.entries]).toEqual([...ps.directory.entries]);
 		const idx = await thread.open({ store: ps, cache: false });
 		expect(idx.openStats.pack).toEqual(ps.openStats);
 		// the pack's base range (idx/current.json first, then the base objects) is one range read, before anything else

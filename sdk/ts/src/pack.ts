@@ -25,8 +25,11 @@ export const PACK_MAGIC = "THRDPACK";
 export const PACK_VERSION = 1;
 export const PACK_HEADER_BYTES = 16;
 export const PACK_FOOTER_BYTES = 32;
-/** Bytes a reader fetches from the end of a pack to find the footer (the directory often fits in them). */
-export const PACK_TAIL_READ = 64 * 1024;
+/**
+ * Bytes a reader fetches from the end of a pack to find the footer and, in the same request, the directory: a
+ * directory is ~43 bytes per entry, so 512 KB covers ~12,000 objects (a 4103-cell generation's pack has a 175 KB one).
+ */
+export const PACK_TAIL_READ = 512 * 1024;
 const ALIGN = 8;
 
 const ascii = new TextEncoder();
@@ -133,16 +136,30 @@ export class PackedBlobStore implements BlobStore {
 		public readonly openStats: PhaseStat,
 	) {}
 
-	/** Reads the footer and directory of the pack at `key` in `inner`. */
-	static async open(inner: BlobStore, key: string): Promise<PackedBlobStore> {
+	/**
+	 * Reads the footer and directory of the pack at `key` in `inner`: one suffix-range request (`getTail`) when the
+	 * store has it, else a `head` and a range; a second range only when the directory is larger than the tail read.
+	 */
+	static async open(inner: BlobStore, key: string, tailBytes = PACK_TAIL_READ): Promise<PackedBlobStore> {
 		const t0 = nowMs();
 		const trace = newTrace();
-		const h = await inner.head(key);
-		trace.reads++;
-		if (!h) throw new ThreadError(`no pack at ${key}`, 404);
+		let h: BlobHead;
+		let tail: Uint8Array | null;
+		if (inner.getTail) {
+			const t = await inner.getTail(key, tailBytes, { trace });
+			if (!t) throw new ThreadError(`no pack at ${key}`, 404);
+			h = { size: t.size, etag: t.etag ?? `size-${t.size}` };
+			tail = t.bytes;
+		} else {
+			const hh = await inner.head(key);
+			trace.reads++;
+			if (!hh) throw new ThreadError(`no pack at ${key}`, 404);
+			h = hh;
+			tail = null;
+		}
 		if (h.size < PACK_HEADER_BYTES + PACK_FOOTER_BYTES) throw new ThreadError(`${key} is too small to be a pack (${h.size} bytes)`);
-		const tailLen = Math.min(h.size, PACK_TAIL_READ);
-		const tail = await inner.get(key, { offset: h.size - tailLen, length: tailLen }, { trace });
+		const tailLen = Math.min(h.size, tail ? tail.byteLength : tailBytes);
+		tail ??= await inner.get(key, { offset: h.size - tailLen, length: tailLen }, { trace });
 		if (!tail) throw new ThreadError(`no pack at ${key}`, 404);
 		const { dirOff, dirLen, count } = parsePackFooter(tail.subarray(tail.byteLength - PACK_FOOTER_BYTES));
 		if (dirOff < PACK_HEADER_BYTES || dirOff + dirLen > h.size - PACK_FOOTER_BYTES) throw new ThreadError(`${key}: directory [${dirOff}, +${dirLen}) is outside the pack`);

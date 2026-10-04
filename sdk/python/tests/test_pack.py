@@ -275,8 +275,21 @@ def test_pack_open_stats_show_up_in_open_index():
     pack, _ = pack_to_bytes(b.store)
     ps = PackedBlobStore.from_bytes(pack)
     st = ps.open_stats
-    # head (counted as a read of 0 bytes) + one tail read: a small directory fits in the tail
-    assert st["reads"] == 2 and st["bytes"] == min(len(pack), 64 * 1024)
+    # one suffix-range read (get_tail): footer and directory in one request, no head
+    assert st["reads"] == 1 and st["bytes"] == min(len(pack), 512 * 1024)
+
+    class NoTail(MemoryBlobStore):
+        def get_tail(self, key, length, *, trace=None):
+            raise NotImplementedError
+
+    m = NoTail()
+    m.objects["p"] = (bytes(pack), "e")
+    # a store without get_tail: head (counted as a read of 0 bytes) + one tail read
+    no_tail = PackedBlobStore(m, "p")
+    assert no_tail.open_stats["reads"] == 2 and no_tail.entries == ps.entries
+    # a tail read too short for the directory takes one more range read
+    short = PackedBlobStore(m, "p", tail_bytes=64)
+    assert short.open_stats["reads"] == 3 and short.entries == ps.entries
     idx = open_index(ps, cache=False)
     assert idx.open_stats["pack"] == st
     # the pack's base range (idx/current.json first, then the base objects) is one range read, before anything else
