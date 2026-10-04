@@ -80,7 +80,7 @@ def test_cached_store(tmp_path, kind):
     inner.put("idx/g/slab/00001", body)
     inner.put("idx/current.json", '{"gen":"g"}')
     cache = MemoryCache() if kind == "memory" else DiskCache(tmp_path / "c", max_bytes=12000)
-    s = CachedBlobStore(inner, cache)
+    s = CachedBlobStore(inner, cache, miss_policy="whole")
     t = BlobTrace()
     # a range miss without fill goes to the origin and caches nothing
     assert bytes(s.get("idx/g/slab/00001", BlobRange(10, 20), trace=t)) == body[10:30]
@@ -122,7 +122,7 @@ def test_concurrent_fills_share_one_read():
 
     inner = Slow()
     inner.objects["idx/x"] = (data(1000), "e")
-    s = CachedBlobStore(inner, MemoryCache())
+    s = CachedBlobStore(inner, MemoryCache(), miss_policy="whole")
     out = []
     ts = [threading.Thread(target=lambda: out.append(bytes(s.get("idx/x", BlobRange(0, 10), fill=True))))
           for _ in range(8)]
@@ -246,11 +246,15 @@ class FakeS3(http.server.BaseHTTPRequestHandler):
 def s3_server():
     FakeS3.objects = {}
     FakeS3.calls = []
-    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeS3)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeS3, bind_and_activate=False)
+    srv.request_queue_size = 128  # open_index warms up to 32 connections at once
+    srv.server_bind()
+    srv.server_activate()
     th = threading.Thread(target=srv.serve_forever, daemon=True)
     th.start()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
+    srv.server_close()  # connections still queued are refused, not left waiting
 
 
 def test_s3_store(s3_server):
@@ -295,6 +299,8 @@ def test_index_over_s3(s3_server):
         want = [(h.id, h.score) for h in ref.query(q, nprobe=8).hits]
         r1 = ix.query(q, nprobe=8)
         assert [(h.id, h.score) for h in r1.hits] == want
+        assert r1.stats["io"]["warms"] == 8  # "range+warm": the probed slabs are fetched whole in the background
+        assert ix.store.drain(5)
         r2 = ix.query(q, nprobe=8)
         assert r2.stats["io"]["reads"] == 0  # served by the memory cache
         ix.upsert([777], q)
