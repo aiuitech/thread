@@ -9,10 +9,16 @@
  *   node bench/cold/pack_adjacency.mjs [--proxy http://127.0.0.1:9575] [--from 0] [--count 30]
  *        [--pack data/cold/overlay/packs/g4-cold.threadpack,data/cold/open-overlay/packs/g4-cold-tree.threadpack]
  *        [--gaps 0,65536,262144,1048576,4194304] [--out data/cold/open/pack-adjacency.json]
+ *        [--model rtt25:25:200,rtt60:60:100] [--inflight 12]
  *
  * Layouts: each `--pack` (its real directory), plus virtual ones computed from the slabs table: `key` (cell order,
  * what packIndex writes), `tree` (make_pack.mjs --order tree) and `tree-split` (a layout the pack format cannot
  * express today: within each tree group, all scan prefixes first, then all rerank tiers + payloads).
+ *
+ * `--model name:rtt:mbps` adds a modelled phase-1 time per layout and gap (median over the queries): the merged reads
+ * issued in routing order of their first member, `--inflight` at a time, each taking rtt + bytes at mbps (the proxy's
+ * per-response model, warm connections, no scan CPU). It is a model, for layouts that cannot be measured yet; check
+ * it against a measured layout before trusting it.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -27,6 +33,11 @@ const COUNT = Number(args.count ?? 30);
 const PACKS = (args.pack ?? "data/cold/overlay/packs/g4-cold.threadpack").split(",").filter(Boolean);
 const GAPS = (args.gaps ?? "0,65536,262144,1048576,4194304").split(",").map(Number);
 const OUT = path.resolve(root, args.out ?? "data/cold/open/pack-adjacency.json");
+const MODELS = (args.model ?? "rtt25:25:200,rtt60:60:100").split(",").filter(Boolean).map((m) => {
+	const [name, rtt, mbps] = m.split(":");
+	return { name, rtt: Number(rtt), mbps: Number(mbps) };
+});
+const INFLIGHT = Number(args.inflight ?? 12);
 
 const R = await openRouting(PROXY);
 const { sdk, rev, store } = R;
@@ -94,24 +105,36 @@ layouts.push({ name: "tree", at: wholeLayout(tOrder) });
 	layouts.push({ name: "tree-split", at });
 }
 
-/** Merged phase-1 reads of one query in one layout. */
+/** Merged phase-1 reads of one query in one layout: count, bytes, and each read's size in issue order. */
 function plan(at, cells, gap) {
-	const items = cells.map((c) => ({ off: at.get(c).off, len: scanLen(c) })).sort((a, b) => a.off - b.off);
-	let reqs = 0;
-	let bytes = 0;
-	let end = -Infinity;
-	let start = 0;
+	const rank = new Map(cells.map((c, i) => [c, i]));
+	const items = cells.map((c) => ({ off: at.get(c).off, len: scanLen(c), rank: rank.get(c) })).sort((a, b) => a.off - b.off);
+	const reads = [];
+	let cur = null;
 	for (const it of items) {
-		if (it.off - end <= gap) end = Math.max(end, it.off + it.len);
-		else {
-			if (reqs) bytes += end - start;
-			reqs++;
-			start = it.off;
-			end = it.off + it.len;
+		if (cur && it.off - cur.end <= gap) {
+			cur.end = Math.max(cur.end, it.off + it.len);
+			cur.first = Math.min(cur.first, it.rank);
+		} else {
+			cur = { start: it.off, end: it.off + it.len, first: it.rank };
+			reads.push(cur);
 		}
 	}
-	bytes += end - start;
-	return { reqs, bytes };
+	reads.sort((a, b) => a.first - b.first);
+	return { reqs: reads.length, bytes: reads.reduce((a, r) => a + r.end - r.start, 0), sizes: reads.map((r) => r.end - r.start) };
+}
+
+/** Makespan (ms) of reads issued in order, `INFLIGHT` at a time, each rtt + size at mbps. */
+function makespan(sizes, m) {
+	const slots = new Array(INFLIGHT).fill(0);
+	let end = 0;
+	for (const b of sizes) {
+		let i = 0;
+		for (let j = 1; j < slots.length; j++) if (slots[j] < slots[i]) i = j;
+		slots[i] += m.rtt + (b * 8) / (m.mbps * 1000);
+		end = Math.max(end, slots[i]);
+	}
+	return end;
 }
 
 const MB = 1048576;
@@ -128,15 +151,16 @@ for (const L of layouts) {
 	});
 	const row = { name: L.name, adjacentPairs: { median: median(adj), mean: adj.reduce((a, b) => a + b, 0) / adj.length, max: Math.max(...adj), queriesWithAny: adj.filter((x) => x > 0).length }, byGap: [] };
 	console.log(`\n${L.name}: probed slabs adjacent in the pack (pairs per query) median ${row.adjacentPairs.median}, mean ${row.adjacentPairs.mean.toFixed(2)}, max ${row.adjacentPairs.max}; queries with any: ${row.adjacentPairs.queriesWithAny}/${COUNT}`);
-	console.log("        gap   requests med (mean)   MB read med (mean)   x prefix bytes");
+	console.log(`        gap   requests med (mean)   MB read med (mean)   x prefix bytes${MODELS.map((m) => `   model ${m.name} ms`).join("")}`);
 	for (const gap of GAPS) {
 		const ps = queries.map((q) => plan(L.at, q.cells, gap));
 		const reqs = ps.map((p) => p.reqs);
 		const bytes = ps.map((p) => p.bytes);
 		const ratio = ps.map((p, i) => p.bytes / prefixBytes[i]);
-		const r = { gap, reqsMedian: median(reqs), reqsMean: reqs.reduce((a, b) => a + b, 0) / reqs.length, bytesMedian: median(bytes), bytesMean: bytes.reduce((a, b) => a + b, 0) / bytes.length, ratioMedian: median(ratio) };
+		const model = Object.fromEntries(MODELS.map((m) => [m.name, median(ps.map((p) => makespan(p.sizes, m)))]));
+		const r = { gap, reqsMedian: median(reqs), reqsMean: reqs.reduce((a, b) => a + b, 0) / reqs.length, bytesMedian: median(bytes), bytesMean: bytes.reduce((a, b) => a + b, 0) / bytes.length, ratioMedian: median(ratio), model };
 		row.byGap.push(r);
-		console.log(`${String(gap).padStart(11)}   ${String(r.reqsMedian).padStart(12)} (${r.reqsMean.toFixed(1)})   ${(r.bytesMedian / MB).toFixed(2).padStart(12)} (${(r.bytesMean / MB).toFixed(2)})   ${r.ratioMedian.toFixed(2).padStart(14)}`);
+		console.log(`${String(gap).padStart(11)}   ${String(r.reqsMedian).padStart(12)} (${r.reqsMean.toFixed(1)})   ${(r.bytesMedian / MB).toFixed(2).padStart(12)} (${(r.bytesMean / MB).toFixed(2)})   ${r.ratioMedian.toFixed(2).padStart(14)}${MODELS.map((m) => String(model[m.name].toFixed(0)).padStart(10 + m.name.length)).join("")}`);
 	}
 	out.layouts.push(row);
 }
