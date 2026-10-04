@@ -6,6 +6,11 @@
  *   node bench/cold/cold_bench.mjs --store r2s3|proxy|pack [--n 10] [--queries 0] [--nprobe N] [--rerank R]
  *        [--proxy http://127.0.0.1:9555] [--pack-key packs/g4-cold.threadpack] [--label TEXT]
  *        [--out data/cold/NAME.jsonl] [--env sdk/ts/examples/basic/.env.secrets]
+ *        [--routing f32|f16|i8|auto] [--cold-routing tree] [--cold-beam N] [--base-pack 0|1] [--gen G --rev R]
+ *
+ * The open options are thread.open's: `--routing` (routing table), `--cold-routing tree` (+ `--cold-beam`: route the
+ * first queries over the tree's groups while the full table loads), `--base-pack 0` (no base pack, no prefetch: the
+ * reads of the open one after another, the behaviour before base packs), `--gen/--rev` (pin a revision).
  *
  * Each trial t spawns a fresh child process (fresh TLS/connection pool, fresh wasm, fresh index, empty caches) that
  * runs three scenarios, each on query vectors nobody used before in the run:
@@ -36,6 +41,15 @@ const ENV_FILE = args.env ?? "sdk/ts/examples/basic/.env.secrets";
 const nprobe = args.nprobe !== undefined ? Number(args.nprobe) : undefined;
 const rerank = args.rerank !== undefined ? Number(args.rerank) : undefined;
 const dist = path.join(root, "sdk/ts/dist");
+/** thread.open options from the command line. */
+const openOpts = () => ({
+	...(args.routing ? { routing: args.routing } : {}),
+	...(args["cold-routing"] ? { coldRouting: args["cold-routing"] } : {}),
+	...(args["cold-beam"] ? { coldBeam: Number(args["cold-beam"]) } : {}),
+	...(args["base-pack"] !== undefined ? { basePack: args["base-pack"] !== "0" } : {}),
+	...(args.gen ? { gen: args.gen } : {}),
+	...(args.rev !== undefined ? { rev: Number(args.rev) } : {}),
+});
 
 const nowMs = () => performance.now();
 const r1 = (x) => (x === null || x === undefined ? null : Math.round(x * 10) / 10);
@@ -71,7 +85,7 @@ async function child() {
 		: new sdk.S3BlobStore({ endpoint: env.S3_ENDPOINT, bucket: env.S3_BUCKET, region: "auto", accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY });
 	const store = STORE === "pack" ? await sdk.PackedBlobStore.open(s3, PACK_KEY) : s3;
 	// No `cache` option: what a Node user gets by default (the Cache API does not exist in Node, so: none).
-	const index = await thread.open({ store });
+	const index = await thread.open({ store, ...openOpts() });
 	const os = index.openStats;
 	const qopts = { topK: 10, ...(nprobe !== undefined ? { nprobe } : {}), ...(rerank !== undefined ? { rerank } : {}) };
 	const emit = (row) => process.stdout.write("@@ROW " + JSON.stringify(row) + "\n");
@@ -85,7 +99,7 @@ async function child() {
 		const tl = st.timeline;
 		const ids = res.hits.map((h) => h.id);
 		const sum = (f, ...ps) => ps.reduce((a, p) => a + (p ? p[f] : 0), 0);
-		const openPhases = withOpen ? [os.pack, os.current, os.manifest, os.slabs, os.base] : [];
+		const openPhases = withOpen ? [os.pack, os.prefetch, os.current, os.manifest, os.slabs, os.base] : [];
 		emit({
 			kind: "trial",
 			schema: SCHEMA,
@@ -101,12 +115,18 @@ async function child() {
 			rerank: res.params.rerank,
 			recall: recallAt(ids, ds.truth(qi)),
 			ids,
+			routing: st.routing,
+			routingTable: st.routingTable,
+			cells: st.cells,
+			cold: st.cold ?? null,
+			prefetchSource: withOpen ? os.prefetch?.source ?? null : null,
 			ms: {
 				boot: withOpen ? ms.boot : null,
 				import: withOpen ? r1(ms.import) : null,
 				wasmCompile: withOpen ? r1(ms.wasmCompile) : null,
 				wasmInit: withOpen ? r1(ms.wasmInit) : null,
 				pack: withOpen && os.pack ? r1(os.pack.ms) : null,
+				prefetch: withOpen && os.prefetch ? r1(os.prefetch.ms) : null,
 				current: withOpen ? r1(os.current.ms) : null,
 				manifest: withOpen ? r1(os.manifest.ms) : null,
 				slabs: withOpen ? r1(os.slabs.ms) : null,
@@ -122,6 +142,7 @@ async function child() {
 			},
 			reqs: {
 				pack: withOpen && os.pack ? os.pack.reads : null,
+				prefetch: withOpen && os.prefetch ? os.prefetch.reads : null,
 				current: withOpen ? os.current.reads : null,
 				manifest: withOpen ? os.manifest.reads : null,
 				slabs: withOpen ? os.slabs.reads : null,
@@ -134,6 +155,7 @@ async function child() {
 			},
 			bytes: {
 				pack: withOpen && os.pack ? os.pack.bytes : null,
+				prefetch: withOpen && os.prefetch ? os.prefetch.bytes : null,
 				current: withOpen ? os.current.bytes : null,
 				manifest: withOpen ? os.manifest.bytes : null,
 				slabs: withOpen ? os.slabs.bytes : null,
@@ -207,6 +229,7 @@ async function parent() {
 		rerank: rerank ?? "manifest",
 		signUsPerRequest: await signMicrobench(sdk),
 		label: args.label ?? null,
+		open: openOpts(),
 		git,
 		date: new Date().toISOString(),
 	};

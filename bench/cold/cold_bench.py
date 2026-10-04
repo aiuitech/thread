@@ -5,6 +5,10 @@ The same bench as bench/cold/cold_bench.mjs (TypeScript SDK): same CLI, same sce
     sdk/python/.venv/bin/python bench/cold/cold_bench.py --store r2s3|proxy|pack [--n 10] [--queries 0]
         [--nprobe N] [--rerank R] [--proxy http://127.0.0.1:9555] [--pack-key packs/g4-cold.threadpack]
         [--label TEXT] [--out data/cold/NAME.jsonl] [--env sdk/ts/examples/basic/.env.secrets]
+        [--routing f32|f16|i8|auto] [--cold-routing tree] [--cold-beam N] [--base-pack 0|1] [--gen G --rev R]
+
+The open options are open_index's (`routing`, `cold_routing`, `cold_beam`, `base_pack`, `gen`/`rev`), as in
+cold_bench.mjs.
 
 Each trial t spawns a fresh interpreter (fresh connections, fresh native module import, fresh index, empty caches):
   process-cold  query (offset + 2t): import thread_sdk, open the index, one query
@@ -114,6 +118,24 @@ def r1(x: float | None) -> float | None:
 # ---------- child: one trial ----------
 
 
+def open_opts() -> dict[str, Any]:
+    """open_index options from the command line."""
+    o: dict[str, Any] = {}
+    if "routing" in ARGS:
+        o["routing"] = ARGS["routing"]
+    if "cold-routing" in ARGS:
+        o["cold_routing"] = ARGS["cold-routing"]
+    if "cold-beam" in ARGS:
+        o["cold_beam"] = int(ARGS["cold-beam"])
+    if "base-pack" in ARGS:
+        o["base_pack"] = ARGS["base-pack"] != "0"
+    if "gen" in ARGS:
+        o["gen"] = ARGS["gen"]
+    if "rev" in ARGS:
+        o["rev"] = int(ARGS["rev"])
+    return o
+
+
 def child() -> None:
     t_entry = time.time() * 1000
     spawn_at = float(ARGS["spawn-at"])
@@ -135,7 +157,7 @@ def child() -> None:
         s3 = S3BlobStore(env["S3_ENDPOINT"], env["S3_BUCKET"], env["S3_ACCESS_KEY_ID"], env["S3_SECRET_ACCESS_KEY"])
     store = PackedBlobStore(s3, PACK_KEY) if STORE == "pack" else s3
     # No cache argument: the default for a remote store (a 256 MB MemoryCache).
-    index = open_index(store)
+    index = open_index(store, **open_opts())
     os_ = index.open_stats
     qopts: dict[str, Any] = {"top_k": 10}
     if NPROBE is not None:
@@ -157,7 +179,8 @@ def child() -> None:
         tl = st["timeline"]
         ids = [h.id for h in res.hits]
         pack = os_.get("pack")
-        open_phases = [pack, os_["current"], os_["manifest"], os_["slabs"], os_["base"]] if with_open else []
+        open_phases = [pack, os_.get("prefetch"), os_["current"], os_["manifest"], os_["slabs"], os_["base"]] \
+            if with_open else []
 
         def osum(f: str) -> int:
             return sum(p[f] for p in open_phases if p)
@@ -180,12 +203,18 @@ def child() -> None:
             "rerank": res.params["rerank"],
             "recall": recall_at(ids, ds.truth(qi)),
             "ids": ids,
+            "routing": st["routing"],
+            "routingTable": st.get("routing_table"),
+            "cells": st["cells"],
+            "cold": st.get("cold"),
+            "prefetchSource": os_["prefetch"]["source"] if with_open and os_.get("prefetch") else None,
             "ms": {
                 "boot": o(ms["boot"]),
                 "import": o(r1(ms["import"])),
                 "wasmCompile": None,
                 "wasmInit": None,
                 "pack": r1(pack["ms"]) if with_open and pack else None,
+                "prefetch": r1(os_["prefetch"]["ms"]) if with_open and os_.get("prefetch") else None,
                 "current": o(r1(os_["current"]["ms"])),
                 "manifest": o(r1(os_["manifest"]["ms"])),
                 "slabs": o(r1(os_["slabs"]["ms"])),
@@ -201,6 +230,7 @@ def child() -> None:
             },
             "reqs": {
                 "pack": pack["reads"] if with_open and pack else None,
+                "prefetch": os_["prefetch"]["reads"] if with_open and os_.get("prefetch") else None,
                 "current": o(os_["current"]["reads"]),
                 "manifest": o(os_["manifest"]["reads"]),
                 "slabs": o(os_["slabs"]["reads"]),
@@ -213,6 +243,7 @@ def child() -> None:
             },
             "bytes": {
                 "pack": pack["bytes"] if with_open and pack else None,
+                "prefetch": os_["prefetch"]["bytes"] if with_open and os_.get("prefetch") else None,
                 "current": o(os_["current"]["bytes"]),
                 "manifest": o(os_["manifest"]["bytes"]),
                 "slabs": o(os_["slabs"]["bytes"]),
@@ -411,6 +442,7 @@ def parent() -> None:
         "rerank": RERANK if RERANK is not None else "manifest",
         "signUsPerRequest": sign_microbench(),
         "label": ARGS.get("label"),
+        "open": open_opts(),
         "git": git,
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
