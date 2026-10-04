@@ -46,6 +46,7 @@
  */
 import wasmModule from "../../../crates/thread-wasm/pkg/thread_bg.wasm";
 import init, * as thread from "../../../crates/thread-wasm/pkg/thread.js";
+import { compileFilter, validateSchema, type AttrFilterExpr, type AttrSchema } from "../../../sdk/ts/src/attrs.ts";
 
 interface Env {
 	BUCKET: R2Bucket;
@@ -1233,6 +1234,8 @@ interface Manifest {
 	k1: number;
 	k2: number;
 	dim: number;
+	/** Attribute schema (thread-sdk `configureAttrs`): named fields packed into each entry's attrs word. */
+	attrs?: AttrSchema;
 	m: number;
 	probeCoarse: number;
 	vectors: number;
@@ -2296,6 +2299,10 @@ interface QueryParams {
 	beam: number | null;
 	mode: CacheMode;
 	rerank: number | null;
+	/** Attribute filter (field conditions under manifest.attrs; `{attrs: ...}` on the raw word without a schema). */
+	filter: AttrFilterExpr | null;
+	/** With a filter: cells to scan at most while widening past nprobe (default 4 x nprobe). */
+	maxNprobe: number | null;
 	gen: string;
 	rev: number;
 	tStart: number;
@@ -2330,6 +2337,18 @@ async function handleQuery(request: Request, env: Env, ctx: ExecutionContext, ur
 	const probeCoarse = optIntParam(url, "pc", 0);
 	// rerank = scan-tier candidates re-scored with the int8 tier (formats 2 and 3); 0 disables phase 2.
 	const rerank = optIntParam(url, "rerank", 0);
+	// filter = an attribute filter expression as JSON (also accepted in a JSON body as `filter`); maxNprobe bounds
+	// the widening of a filtered query's probes.
+	let filter: AttrFilterExpr | null = null;
+	const filterRaw = url.searchParams.get("filter");
+	if (filterRaw) {
+		try {
+			filter = JSON.parse(filterRaw) as AttrFilterExpr;
+		} catch {
+			throw new HttpError(400, "filter must be a JSON object");
+		}
+	}
+	const maxNprobe = optIntParam(url, "maxNprobe", 1);
 	// route = flat | beam (pruned routing through the centroid tree), beam = tree groups searched.
 	const routeRaw = url.searchParams.get("route");
 	if (routeRaw !== null && routeRaw !== "" && !ROUTE_MODES.includes(routeRaw as RouteMode)) throw new HttpError(400, `route must be ${ROUTE_MODES.join("|")}`);
@@ -2353,10 +2372,12 @@ async function handleQuery(request: Request, env: Env, ctx: ExecutionContext, ur
 		if (buf.byteLength % 4) throw new HttpError(400, "query body must be little-endian f32 values");
 		q = new Float32Array(buf);
 	} else {
-		const body = await readJson<{ vector: unknown }>(request);
+		const body = await readJson<{ vector: unknown; filter?: unknown }>(request);
 		if (!Array.isArray(body?.vector) || body.vector.length > MAX_QUERY_BYTES / 4 || !body.vector.every((x) => typeof x === "number")) throw new HttpError(400, "vector must be an array of numbers");
 		q = Float32Array.from(body.vector as number[]);
+		if (body.filter !== undefined && body.filter !== null) filter = body.filter as AttrFilterExpr;
 	}
+	if (filter !== null && (typeof filter !== "object" || Array.isArray(filter))) throw new HttpError(400, "filter must be a JSON object of field conditions");
 	// Finite and nonzero (normalize_vector would otherwise yield NaN scores).
 	let norm2 = 0;
 	for (const x of q) {
@@ -2364,7 +2385,7 @@ async function handleQuery(request: Request, env: Env, ctx: ExecutionContext, ur
 		norm2 += x * x;
 	}
 	if (!(norm2 > 0)) throw new HttpError(400, "query vector must have nonzero norm");
-	const p: QueryParams = { k, nprobe, probeCoarse, route, beam, mode: cacheParam, rerank, gen, rev, tStart, tGen, dbg };
+	const p: QueryParams = { k, nprobe, probeCoarse, route, beam, mode: cacheParam, rerank, filter, maxNprobe, gen, rev, tStart, tGen, dbg };
 	return withWasmRecovery("query", (attempt) => runQuery(request, env, ctx, q, p, attempt));
 }
 
@@ -2400,6 +2421,17 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	// Bounded by the index shape (route_from_dots / route allocate per probe); rejected, not clamped.
 	if (nprobe > manifest.k1 * manifest.k2) throw new HttpError(400, `nprobe must be <= ${manifest.k1 * manifest.k2} (k1*k2)`);
 	if (probeCoarse > manifest.k1) throw new HttpError(400, `pc must be <= ${manifest.k1} (k1)`);
+	// The attribute filter, compiled against the generation's schema (thread-sdk's attrs module); applied inside
+	// every scan before top-k insertion. With one, phase 1 may widen past nprobe (see slabPhase).
+	let filterWords: Uint32Array;
+	try {
+		filterWords = compileFilter(manifest.attrs ? validateSchema(manifest.attrs as AttrSchema) : null, p.filter);
+	} catch (e) {
+		throw new HttpError(400, e instanceof Error ? e.message : String(e));
+	}
+	const filtered = filterWords.length > 0;
+	if (p.maxNprobe !== null && p.maxNprobe < nprobe) throw new HttpError(400, `maxNprobe must be >= nprobe (${nprobe})`);
+	const maxNprobe = filtered ? Math.min(manifest.k1 * manifest.k2, p.maxNprobe ?? nprobe * 4) : nprobe;
 	const q = thread.normalize_vector(qRaw);
 	const dim = manifest.dim;
 	const format = manifest.format ?? (rv.slabs ? 2 : 1);
@@ -2426,7 +2458,9 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	// cell_dots_for for just the cells the delta segments hold entries in (see deltaQc).
 	const cellDots = flat && !useBeam ? base.searcher.cell_dots(q) : null;
 	if (useBeam) useTree(base, tree!);
-	const cells = Array.from(useBeam ? base.searcher.route_beam(q, beam!, nprobe) : flat ? base.searcher.route_from_dots(cellDots!, nprobe) : base.searcher.route(q, probeCoarse, nprobe));
+	// Routed to the widening bound; an unfiltered query scans exactly its nprobe cells.
+	const routeN = Math.max(nprobe, maxNprobe);
+	const cells = Array.from(useBeam ? base.searcher.route_beam(q, beam!, routeN) : flat ? base.searcher.route_from_dots(cellDots!, routeN) : base.searcher.route(q, probeCoarse, routeN));
 	const nCells = manifest.k1 * manifest.k2;
 	let qcPartial: { qc: Float32Array; filled: Uint8Array } | null = null;
 	let dotsComputed = cellDots ? nCells : 0;
@@ -2474,9 +2508,11 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	let rerankMultipart = 0;
 	let specReadN = 0;
 	let tombDropped = 0;
-	// Out-parameter of thread.scan/scan_pq/scan_delta: [scanned, tombstoned entries skipped]. Shared: each scan is
-	// synchronous and read right after the call.
-	const scanStats = new Uint32Array(2);
+	let filterDropped = 0;
+	let scannedCells = 0;
+	// Out-parameter of thread.scan/scan_pq/scan_delta: [scanned, tombstoned entries skipped, filtered out]. Shared:
+	// each scan is synchronous and read right after the call.
+	const scanStats = new Uint32Array(3);
 	const noTomb = new Uint8Array(0);
 	/**
 	 * Reads the rerank records `idxs` (ascending) of one slab: one multi-range request (rr=multi), else
@@ -2552,8 +2588,8 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			specReads.set(cell, fetchRecords(cell, idxs, true).catch(() => null));
 		}
 	};
-	const slabPhase = Promise.all(
-		cells.map(async (cell) => {
+	/** Scans one cell; `batchEnd` is the index past the last cell of the batch it belongs to (the speculation cue). */
+	const scanCell = async (cell: number, batchEnd: number): Promise<void> => {
 			const src = await fetchScanSource(env, ctx, rv, cell, mode, rs, lim);
 			tLastSlab = Date.now();
 			if (src.outcome === "hit" || src.outcome === "mem") cacheHits++;
@@ -2575,13 +2611,14 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			let hits: Uint8Array;
 			if (info.version === 3) {
 				if (!table) throw new HttpError(500, `slab ${cell} is v3 but ${gen} has no PQ codebook`);
-				hits = thread.scan_pq(prefix, table, q, T, skip, scanStats);
-				for (let r = 1; r < dbg.scanRepeat; r++) hits = thread.scan_pq(prefix, table, q, T, skip, scanStats);
+				hits = thread.scan_pq(prefix, table, q, T, skip, filterWords, scanStats);
+				for (let r = 1; r < dbg.scanRepeat; r++) hits = thread.scan_pq(prefix, table, q, T, skip, filterWords, scanStats);
 			} else {
-				hits = thread.scan(prefix, q, T, skip, scanStats);
-				for (let r = 1; r < dbg.scanRepeat; r++) hits = thread.scan(prefix, q, T, skip, scanStats);
+				hits = thread.scan(prefix, q, T, skip, filterWords, scanStats);
+				for (let r = 1; r < dbg.scanRepeat; r++) hits = thread.scan(prefix, q, T, skip, filterWords, scanStats);
 			}
 			tombDropped += scanStats[1];
+			filterDropped += scanStats[2];
 			const centroid = doRerank && info.version >= 2 ? (dbg.copy ? thread.slab_centroid(prefix) : centroidFromBytes(prefix, info)) : null;
 			versions.add(info.version);
 			scanned += info.count;
@@ -2599,12 +2636,26 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 				}
 			}
 			slabsDone++;
-			if (dbg.spec && !specFired && cells.length - slabsDone <= dbg.specAt) {
+			// Speculate once only a few slabs of the last batch are left: an unfiltered query has one batch; a filtered
+			// one may widen, so its batch is known to be last only at the bound or once T candidates match.
+			if (dbg.spec && !specFired && batchEnd - slabsDone <= dbg.specAt && (!filtered || batchEnd >= cells.length || cand.size >= T)) {
 				specFired = true;
 				speculate();
 			}
-		}),
-	);
+	};
+	// Phase 1 in batches: the first nprobe cells, then (filtered queries only) more cells in routing order until T
+	// distinct candidates passed the filter or maxNprobe cells were scanned (the same rule as thread-sdk).
+	const slabPhase = (async () => {
+		let to = Math.min(nprobe, cells.length);
+		await Promise.all(cells.slice(0, to).map((cell) => scanCell(cell, to)));
+		scannedCells = to;
+		const step = Math.max(4, Math.ceil(nprobe / 2));
+		while (filtered && cand.size < T && scannedCells < cells.length) {
+			to = Math.min(cells.length, scannedCells + step);
+			await Promise.all(cells.slice(scannedCells, to).map((cell) => scanCell(cell, to)));
+			scannedCells = to;
+		}
+	})();
 	// ---- delta segments: every entry is scored with its int8 record (scores on the reranked scale, no phase 2).
 	// A delta entry is skipped in the scan if its id is in a tombstone set newer than the rev that added the delta.
 	const deltaHits: { id: number; score: number; seq: number }[] = [];
@@ -2620,8 +2671,9 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			deltaBytes += bytes.byteLength;
 			deltaScanned += d.count;
 			// Sets with rev > addedRev (revs are integers) = tombFor(addedRev + 1); compactCells' deltaTomb is the same union.
-			const hits = thread.scan_delta(bytes, q, deltaQc(d, bytes), T, tomb ? tombFor(tomb, d.addedRev + 1) : noTomb, scanStats);
+			const hits = thread.scan_delta(bytes, q, deltaQc(d, bytes), T, tomb ? tombFor(tomb, d.addedRev + 1) : noTomb, filterWords, scanStats);
 			deltaDropped += scanStats[1];
+			filterDropped += scanStats[2];
 			for (const h of parseHits(hits)) deltaHits.push({ id: h.id, score: h.score, seq: d.seq });
 			tDeltaEnd = Date.now();
 		}),
@@ -2708,7 +2760,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 		rev: rv.rev,
 		ids: results.map((r) => r.id),
 		scores: results.map((r) => r.score),
-		cells,
+		cells: cells.slice(0, scannedCells),
 		stats: {
 			scanned,
 			slabBytes,
@@ -2763,6 +2815,12 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			tombstones: tomb?.total ?? 0,
 			tombSets: tomb?.sets.length ?? 0,
 			tombDropped,
+			// Attribute filter: entries it dropped (among those that would have entered a top-T), distinct scan-tier
+			// candidates, and the widening bound (= nprobe without a filter).
+			filtered,
+			filterDropped,
+			candidates: cand.size,
+			maxNprobe,
 			limiterRetries: lim.retries,
 			cache: mode,
 			cacheHits,

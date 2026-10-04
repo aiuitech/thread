@@ -43,15 +43,18 @@ def answer(index, req: dict):
     """The Python side of ts_side.mjs `answer`, in the same JSON shape."""
     if req["kind"] == "query":
         r = index.query(req["vector"], top_k=req["topK"], nprobe=req["nprobe"], rerank=req["rerank"],
-                        return_payload=True)
-        return [[h.id, h.score, h.attrs, h.source, h.payload.decode()] for h in r.hits]
+                        return_payload=True, filter=req.get("filter"), max_nprobe=req.get("maxNprobe"))
+        return {"hits": [[h.id, h.score, h.attrs, h.source, h.payload.decode()] for h in r.hits], "cells": r.stats["cells"]}
     if req["kind"] == "search":
         r = index.search(text=req.get("text"), vector=req.get("vector"), top_k=req["topK"],
-                         dense={"nprobe": req["nprobe"]}, docs="text")
-        return {"mode": r.mode, "hits": [[h.id, h.score, [h.doc.meta, h.doc.text] if h.doc else None] for h in r.hits]}
+                         dense={"nprobe": req["nprobe"]}, docs="text", filter=req.get("filter"))
+        return {"mode": r.mode,
+                "hits": [[h.id, h.score, [h.doc.meta, h.doc.text, h.doc.attrs] if h.doc else None] for h in r.hits]}
     if req["kind"] == "lexical":
-        r = index.lexical_search(req["text"], req["topK"])
+        r = index.lexical_search(req["text"], req["topK"], filter=req.get("filter"))
         return {"tokens": r.tokens, "hits": [[h.id, h.score] for h in r.hits], "numDocs": r.stats["num_docs"]}
+    if req["kind"] == "compile":
+        return list(index.compile_filter(req["filter"]))
     raise AssertionError(req["kind"])
 
 
@@ -80,6 +83,7 @@ def test_typescript_and_python_agree(tmp_path):
     with open_index(store) as index:
         assert (index.gen, index.rev) == (ts["gen"], ts["rev"])
         assert len(index.manifest["deltas"]) == 3 and len(index.segments) == 4 and len(index.manifest["tombstones"]) == 5
+        assert [f["name"] for f in index.attr_schema["fields"]] == ["kind", "public", "team"]
         for req, want in zip(ts["requests"], ts["results"]):
             got = json.loads(json.dumps(answer(index, req)))
             same(got, want, json.dumps(req)[:80])
@@ -88,12 +92,19 @@ def test_typescript_and_python_agree(tmp_path):
         fresh = unit_rows(30, index.dim, rng(123))
         ids = list(range(30000, 30030))
         index.upsert(ids, fresh, texts=[f"python wrote {i} galaxy item{i % 5}" for i in ids],
-                     metas=[f"py{i}" for i in ids], attrs=[i % 11 for i in ids], payloads=[f"pp{i}" for i in ids])
+                     metas=[f"py{i}" for i in ids],
+                     attrs=[{"kind": ["doc", "note", "ticket"][i % 3], "public": i % 4 == 0, "team": i % 7} for i in ids],
+                     payloads=[f"pp{i}" for i in ids])
         index.upsert([10003, 20000], [list(fresh[0:32]), list(fresh[32:64])], texts=["replaced by python", None],
-                     metas=["py-r1", "py-r2"])
+                     metas=["py-r1", "py-r2"], attrs=[{"kind": "ticket", "public": True}, 5])
+        # the schema grows from Python (a field; the 2-bit enum is full), existing fields keep their layout
+        with pytest.raises(Exception, match="fit"):
+            index.configure_attrs(kind={"values": ["doc", "note", "ticket", "memo"]})
+        index.configure_attrs(year={"bits": 7, "min": 1970})
+        index.upsert([40001], texts=["memo from python"], metas=["py-memo"], attrs=[{"kind": "note", "year": 2024}])
         index.delete([30001, 10004])
         c = index.compact_segments()
-        assert c.merged == 6
+        assert c.merged == 7
         index.upsert([40000], texts=["text only from python galaxy"], metas=["py-text"])
         requests = []
         qr = rng(77)
@@ -108,6 +119,15 @@ def test_typescript_and_python_agree(tmp_path):
         requests.append({"kind": "search", "text": "python item2", "vector": list(fresh[64:96]), "topK": 8,
                          "nprobe": 5})
         requests.append({"kind": "search", "text": "galaxy", "vector": None, "topK": 6, "nprobe": 4})
+        for i, f in enumerate([{"kind": "ticket"}, {"public": True, "team": {"$in": [0, 3, 6]}}, {"kind": "note", "year": 2024},
+                               {"year": {"$gte": 2020}}, {"kind": {"$nin": ["doc"]}, "team": {"$lt": 4}}]):
+            requests.append({"kind": "query", "vector": list(fresh[i * 32 : (i + 1) * 32]), "topK": 6, "nprobe": 2,
+                             "rerank": 40, "filter": f, "maxNprobe": 3 + i * 3})
+            requests.append({"kind": "lexical", "text": ["python", "galaxy", "memo", "python item2", "replaced"][i],
+                             "topK": 6, "filter": f})
+            requests.append({"kind": "search", "text": ["python galaxy", "item1", "memo python", "galaxy", "wrote"][i],
+                             "vector": list(fresh[(i + 10) * 32 : (i + 11) * 32]), "topK": 6, "nprobe": 4, "filter": f})
+            requests.append({"kind": "compile", "filter": f})
         mine = [json.loads(json.dumps(answer(index, r))) for r in requests]
         rev = index.rev
     (tmp_path / "requests.json").write_text(json.dumps({"requests": requests}))

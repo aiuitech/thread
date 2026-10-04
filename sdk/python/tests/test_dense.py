@@ -349,3 +349,103 @@ def test_cold_start_timeline_open_stats_and_query_timeline():
     assert (c2.open_stats["base"]["reads"], c2.open_stats["base"]["misses"], c2.open_stats["base"]["hits"]) == (0, 0, 3)
     c1.close()
     c2.close()
+
+
+def _truth_of(b: Built, q, k: int, keep) -> list[int]:
+    """Brute-force top-k among the vectors whose index passes `keep`."""
+    return [i for i in brute_force(b.vectors, b.dim, q, len(b.vectors) // b.dim) if keep(i)][:k]
+
+
+def test_attribute_filters_dense():
+    """Filters apply inside the slab and delta scans, probes widen, recall holds among the matching entries."""
+    b = build_gen("gf", 3, attrs=lambda i: i % 4)
+    with open_index(b.store, cache=False) as index:
+        assert index.attr_schema is None
+        # unfiltered: params and stats keep their shape, no widening
+        plain = index.query(row(b.vectors, 0, 16), nprobe=3)
+        assert plain.params == {"top_k": 10, "nprobe": 3, "rerank": 20, "pc": 0,
+                                "source": {"nprobe": "query", "rerank": "manifest", "pc": "manifest"}}
+        assert len(plain.stats["cells"]) == 3 and plain.stats["filter_dropped"] == 0
+        assert [h.attrs for h in plain.hits] == [h.id % 4 for h in plain.hits]
+        r = rng(3)
+        hit = 0
+        for i in range(20):
+            q = unit_rows(1, b.dim, r)
+            cls = i % 4
+            res = index.query(q, top_k=10, nprobe=8, rerank=40, filter={"attrs": cls})
+            assert len(res.hits) == 10
+            assert all(h.attrs == cls and h.id % 4 == cls for h in res.hits)
+            assert res.params["filter"] is True and res.params["max_nprobe"] == 8
+            assert res.stats["filter_dropped"] > 0
+            truth = set(_truth_of(b, q, 10, lambda j: j % 4 == cls))
+            hit += sum(1 for h in res.hits if h.id in truth)
+        assert hit / 200 >= 0.9
+        # widening: nprobe 2 is not enough for T = 40 matching candidates of one class
+        q = unit_rows(1, b.dim, rng(5))
+        wide = index.query(q, top_k=5, nprobe=2, rerank=40, filter={"attrs": {"$in": [1]}})
+        assert wide.params["max_nprobe"] == 8
+        assert len(wide.stats["cells"]) > 2
+        assert len(wide.stats["cells"]) == 8 or wide.stats["candidates"] >= 40
+        assert all(h.attrs == 1 for h in wide.hits)
+        capped = index.query(q, top_k=5, nprobe=2, rerank=40, filter={"attrs": {"$in": [1]}}, max_nprobe=2)
+        assert capped.stats["cells"] == wide.stats["cells"][:2]
+        with pytest.raises(ThreadError, match="max_nprobe"):
+            index.query(q, nprobe=4, filter={"attrs": 1}, max_nprobe=3)
+        none = index.query(q, nprobe=2, filter={"attrs": 9})
+        assert none.hits == [] and len(none.stats["cells"]) == 8
+        # compiled words are accepted as is; an unknown field is rejected
+        words = index.compile_filter({"attrs": {"$gte": 2}})
+        assert all(h.attrs >= 2 for h in index.query(q, nprobe=8, filter=words).hits)
+        with pytest.raises(ThreadError, match="no attribute schema"):
+            index.query(q, filter={"tenant": 1})
+        # delta entries are filtered too
+        fresh = unit_rows(2, b.dim, rng(9))
+        index.upsert([5000, 5001], fresh, attrs=[7, 2])
+        d7 = index.query(row(fresh, 0, 16), top_k=3, nprobe=8, filter={"attrs": 7})
+        assert [(h.id, h.source) for h in d7.hits] == [(5000, "delta")]
+        d2 = index.query(row(fresh, 1, 16), top_k=3, nprobe=8, filter={"attrs": {"$in": [2]}})
+        assert (d2.hits[0].id, d2.hits[0].source, d2.hits[0].attrs) == (5001, "delta", 2)
+        assert all(h.source == "slab" and h.attrs == 2 for h in d2.hits[1:])
+        d0 = index.query(row(fresh, 0, 16), top_k=3, nprobe=8, filter={"attrs": {"$ne": 7}})
+        assert 5000 not in [h.id for h in d0.hits] and d0.stats["filter_dropped"] >= 1
+        # the remote (thread-pool) path widens the same way
+        with open_index(RemoteLike(b.store, True), cache=False) as remote:
+            w2 = remote.query(q, top_k=5, nprobe=2, rerank=40, filter={"attrs": {"$in": [1]}})
+            assert w2.stats["cells"] == wide.stats["cells"]
+            assert [h.id for h in w2.hits] == [h.id for h in wide.hits]
+
+
+def test_attribute_schema():
+    """Named fields packed into the word, filtered by field, unpacked from hits; the schema only grows."""
+    b = build_gen("gs", 2)
+    with open_index(b.store, cache=False) as index:
+        cfg = index.configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr"]}, public="bool")
+        assert cfg.rev == 1
+        assert [(f["name"], f["offset"], f["bits"]) for f in index.attr_schema["fields"]] == [("tenant", 0, 12), ("lang", 12, 2), ("public", 14, 1)]
+        assert index.pack_attrs({"tenant": 5, "lang": "fr", "public": True}) == 5 + (2 << 12) + (1 << 14)
+        fresh = unit_rows(4, b.dim, rng(21))
+        index.upsert([100, 101, 102, 103], fresh,
+                     attrs=[{"tenant": 5, "lang": "en", "public": True}, {"tenant": 5, "lang": "fr"},
+                            {"tenant": 6, "lang": "en", "public": True}, 0])
+        q = row(fresh, 0, 16)
+        t5 = index.query(q, top_k=10, nprobe=8, filter={"tenant": 5})
+        assert sorted(h.id for h in t5.hits) == [100, 101]
+        assert index.unpack_attrs(t5.hits[0].attrs) == {"tenant": 5, "lang": "en", "public": True}
+        pub = index.query(q, top_k=10, nprobe=8, filter={"public": True, "lang": {"$in": ["en", "de"]}})
+        assert sorted(h.id for h in pub.hits) == [100, 102]
+        assert all(h.attrs == 0 for h in index.query(q, top_k=10, nprobe=8, filter={"tenant": {"$lt": 1}}).hits)
+        with pytest.raises(ThreadError, match="not a valid enum"):
+            index.upsert([104], row(fresh, 0, 16), attrs=[{"lang": "it"}])
+        with pytest.raises(ThreadError, match="number field"):
+            index.query(q, filter={"lang": {"$gt": 1}})
+        with pytest.raises(ThreadError, match="layout"):
+            index.configure_attrs(tenant={"bits": 8})
+        with pytest.raises(ThreadError, match="fit"):
+            index.configure_attrs(lang={"values": ["en", "fr", "de", "it"]})
+        with pytest.raises(ThreadError, match="only add"):
+            index.configure_attrs({"fields": [{"name": "tenant", "type": "number", "offset": 0, "bits": 8}]})
+        grown = index.configure_attrs(lang={"values": ["en", "fr", "de"]}, year={"bits": 7, "min": 1970})
+        assert grown.rev == 3
+        assert [(f["name"], f["offset"], f["bits"]) for f in index.attr_schema["fields"]] == [("tenant", 0, 12), ("lang", 12, 2), ("public", 14, 1), ("year", 15, 7)]
+        assert index.pack_attrs({"lang": "de", "year": 2001}) == (3 << 12) + (31 << 15)
+        assert sorted(h.id for h in index.query(q, top_k=10, nprobe=8, filter={"tenant": 5}).hits) == [100, 101]

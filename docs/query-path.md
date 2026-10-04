@@ -42,6 +42,10 @@ response's `stats.params` shows the values used and where each came from (`query
    the query ends; format 2 with `thread.scan`. Reads are issued as a sliding window of 12 in flight per query
    (`QUERY_INFLIGHT`). Cache API reads are not held to the Workers limit of 6 open connections (measured in
    `data/bench-latency.txt`); R2 reads are retried once if the runtime cancels them for the connection limit.
+   With an attribute filter (`filter=` JSON, [filtering.md](filtering.md)) the scan tests each candidate's attrs
+   word (in the entry table, inside the prefix) before it can enter the heap, and once the first `nprobe` slabs
+   are scanned the query keeps scanning cells in routing order, in batches, until `T` candidates match or
+   `maxNprobe` (default 4 x nprobe) cells were scanned.
 2. **Rerank.** The global top-T (after `merge`) is grouped by slab, and the winners of each slab are read with ONE
    multi-range Cache API request (`Range: bytes=a-b, c-d, ...`, one range per record, adjacent records within 4 KB
    merged; the 206 multipart/byteranges answer is parsed in `cacheMatchMulti`), then re-scored with

@@ -16,9 +16,10 @@ from array import array
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import _native
+from .attrs import AttrSchema, define_attrs, pack_attrs, schema_extends, validate_schema
 from .store import BlobStore, unique_suffix
 from .wire import (
     ThreadError,
@@ -41,6 +42,7 @@ __all__ = [
     "UpsertResult",
     "DeleteResult",
     "ConfigureLexicalResult",
+    "ConfigureAttrsResult",
     "CompactSegmentsResult",
     "create_lexical_generation",
 ]
@@ -88,6 +90,15 @@ class ConfigureLexicalResult:
     gen: str
     rev: int
     config: dict[str, Any]
+    conflicts: int
+    current_updated: bool
+
+
+@dataclass
+class ConfigureAttrsResult:
+    gen: str
+    rev: int
+    schema: AttrSchema
     conflicts: int
     current_updated: bool
 
@@ -271,9 +282,9 @@ class _Batch:
     metas: list[str | None] | None
 
 
-def _prepare_batch(ids_in: Iterable[int], vectors: Any, attrs: Iterable[int] | None, payloads: Sequence[bytes | str] | None,
+def _prepare_batch(ids_in: Iterable[int], vectors: Any, attrs: Iterable[Any] | None, payloads: Sequence[bytes | str] | None,
                    texts: Sequence[str | None] | None, metas: Sequence[str | None] | None, dim: int,
-                   lex: ResolvedLexConfig | None) -> _Batch:
+                   lex: ResolvedLexConfig | None, schema: AttrSchema | None) -> _Batch:
     ids = _u32(ids_in, "ids")
     n = len(ids)
     if n == 0:
@@ -292,12 +303,16 @@ def _prepare_batch(ids_in: Iterable[int], vectors: Any, attrs: Iterable[int] | N
         raise ThreadError(f"{len(metas_l)} metas for {n} ids", 400)
     if (texts_l is not None or metas_l is not None) and lex is None:
         raise ThreadError("texts/metas need a lexical configuration (index.configure_lexical)", 400)
+    # One attribute word per document: field values under the schema or a raw u32; stored with the vector and in docs.
+    attrs_a = array("I", [pack_attrs(schema, a) for a in attrs]) if attrs is not None else None
+    if attrs_a is not None and len(attrs_a) != n:
+        raise ThreadError(f"{len(attrs_a)} attrs for {n} ids", 400)
     if vectors is None:
         if texts_l is None and metas_l is None:
             raise ThreadError("an upsert needs vectors, texts or metas", 400)
-        if attrs is not None or payloads is not None:
-            raise ThreadError("attrs/payloads belong to vectors", 400)
-        return _Batch(ids, None, None, None, texts_l, metas_l)
+        if payloads is not None:
+            raise ThreadError("payloads belong to vectors", 400)
+        return _Batch(ids, None, attrs_a, None, texts_l, metas_l)
     if dim == 0:
         raise ThreadError("this generation has no dense index: upsert texts/metas only", 400)
     # A buffer (numpy array of shape (n, dim) or (n * dim,), array('f'), raw f32 bytes) goes to the native side as
@@ -325,9 +340,6 @@ def _prepare_batch(ids_in: Iterable[int], vectors: Any, attrs: Iterable[int] | N
         raise ThreadError(f"vector {bad} (id {ids[bad]}) has zero or non-finite norm", 400)
     if len(unit) != n * dim * 4:
         raise ThreadError(f"vectors has {len(unit) // 4} floats, expected {n} x {dim}", 400)
-    attrs_a = _u32(attrs, "attrs") if attrs is not None else None
-    if attrs_a is not None and len(attrs_a) != n:
-        raise ThreadError(f"{len(attrs_a)} attrs for {n} vectors", 400)
     payloads_l = [p.encode("utf-8") if isinstance(p, str) else bytes(p) for p in payloads] if payloads is not None else None
     if payloads_l is not None and len(payloads_l) != n:
         raise ThreadError(f"{len(payloads_l)} payloads for {n} vectors", 400)
@@ -358,7 +370,7 @@ def _encode_segment(ctx: WriterContext, seq: int, lex: ResolvedLexConfig, b: _Ba
     job = _native.SegmentJob(dumps(lex.tokenizer or {}), lex.k1, lex.b, lex.lengths, lex.bucket_terms, lex.docs,
                              lex.text, lex.bucket_docs)
     for i, id in enumerate(b.ids):
-        job.add(id, b.texts[i] if b.texts else None, b.metas[i] if b.metas else None)
+        job.add(id, b.texts[i] if b.texts else None, b.metas[i] if b.metas else None, b.attrs[i] if b.attrs is not None else 0)
     data = job.finish()
     key = _put_unique(ctx.store, keys.segment(ctx.gen, seq), data)
     return _EncodedSegment(key, len(data), {"seq": seq, "key": key, "count": len(b.ids), "bytes": len(data),
@@ -422,7 +434,7 @@ def _tomb_bytes(ids: array) -> bytes:
     return _native.tombstones_merge(b"", ids) if len(ids) else b""
 
 
-def upsert(ctx: WriterContext, ids: Iterable[int], vectors: Any = None, *, attrs: Iterable[int] | None = None,
+def upsert(ctx: WriterContext, ids: Iterable[int], vectors: Any = None, *, attrs: Iterable[Any] | None = None,
            payloads: Sequence[bytes | str] | None = None, texts: Sequence[str | None] | None = None,
            metas: Sequence[str | None] | None = None, replace: bool = True) -> UpsertResult:
     t0 = time.perf_counter()
@@ -433,8 +445,9 @@ def upsert(ctx: WriterContext, ids: Iterable[int], vectors: Any = None, *, attrs
     def make(rev: int, manifest: dict[str, Any], files: dict[str, Any]) -> dict[str, Any]:
         lex = resolve_lex_config(manifest)
         if st["batch"] is None:
+            schema = validate_schema(manifest["attrs"]) if manifest.get("attrs") else None
             st["batch"] = _prepare_batch(ids, vectors, attrs, payloads, texts, metas,
-                                         manifest["dim"] if has_dense(manifest) else 0, lex)
+                                         manifest["dim"] if has_dense(manifest) else 0, lex, schema)
         batch: _Batch = st["batch"]
         want_seg = lex is not None and (batch.texts is not None or batch.metas is not None)
         nxt = _inherit(manifest)
@@ -544,6 +557,28 @@ def configure_lexical(ctx: WriterContext, config: dict[str, Any]) -> ConfigureLe
 
     c = _commit_rev(ctx, make)
     return ConfigureLexicalResult(gen, c.rev, config, c.conflicts, c.current_updated)
+
+
+def configure_attrs(ctx: WriterContext, spec: Mapping[str, Any]) -> ConfigureAttrsResult:
+    """Commits a manifest revision carrying the attribute schema (`manifest.attrs`): `spec` is either a field spec
+    (`{"tenant": {"bits": 12}, "lang": {"values": ["en", "fr"]}, "public": "bool"}`, laid out in order) or a schema
+    dict. A schema may only grow: every existing field keeps its name, type, offset and width (an enum may append
+    values), since stored words are not rewritten."""
+    store, gen = ctx.store, ctx.gen
+    _writable(store)
+    is_schema = isinstance(spec.get("fields"), list)
+    out: dict[str, Any] = {"schema": validate_schema(spec) if is_schema else define_attrs(spec)}
+
+    def make(rev: int, manifest: dict[str, Any], files: dict[str, Any]) -> dict[str, Any]:
+        prev = validate_schema(manifest["attrs"]) if manifest.get("attrs") else None
+        if prev is not None and not is_schema:
+            out["schema"] = define_attrs(spec, prev)
+        if prev is not None and not schema_extends(prev, out["schema"]):
+            raise ThreadError("the attribute schema can only add fields or enum values (existing fields keep their layout)", 400)
+        return {**_inherit(manifest), "attrs": out["schema"], "change": {"op": "configure-attrs", "writer": "thread-sdk-python"}}
+
+    c = _commit_rev(ctx, make)
+    return ConfigureAttrsResult(gen, c.rev, out["schema"], c.conflicts, c.current_updated)
 
 
 def compact_segments(ctx: WriterContext) -> CompactSegmentsResult:

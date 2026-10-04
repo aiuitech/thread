@@ -4,6 +4,8 @@
  * JS over `Uint8Array`s (no wasm), so headers can be parsed without copying a slab into wasm memory.
  */
 
+import type { AttrSchema } from "./attrs.js";
+
 export class ThreadError extends Error {
 	constructor(
 		message: string,
@@ -311,6 +313,8 @@ export interface Manifest {
 	nextSeq?: number;
 	/** Lexical / docs configuration (absent: the generation has no lexical index and no docs store). */
 	lex?: LexConfig;
+	/** Attribute schema: named fields packed into each document's 32-bit `attrs` word (absent: the raw word). */
+	attrs?: AttrSchema;
 	/** Lexical / docs segments, oldest first (a compaction's base first). */
 	segments?: SegmentRef[];
 }

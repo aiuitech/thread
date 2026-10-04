@@ -8,6 +8,7 @@
  *     per slab (speculatively once only a few slabs are left to scan),
  *  4. top-k over reranked slab hits and delta hits, one copy per id.
  */
+import { compileFilter, validateSchema, type AttrFilterExpr } from "./attrs.js";
 import type { BlobRange, BlobStore, BlobTrace, PhaseStat } from "./store.js";
 import { newTrace, nowMs, phaseStat, roundMs, snapTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
@@ -28,6 +29,17 @@ export interface QueryOptions {
 	inflight?: number;
 	/** Speculative rerank reads of the running top-T while the last slabs are still scanning (default true). */
 	speculate?: boolean;
+	/**
+	 * Attribute filter: field conditions compiled against `manifest.attrs` (or already compiled words). Applied
+	 * inside every scan before top-k insertion, so filtered-out entries never take candidate slots.
+	 */
+	filter?: AttrFilterExpr | Uint32Array;
+	/**
+	 * With a filter: keep scanning cells in routing order beyond `nprobe`, in batches, until `max(topK, rerank)`
+	 * matching candidates were seen or this many cells were scanned (default 4 x nprobe, at most every cell;
+	 * `nprobe` disables widening). Unfiltered queries never widen.
+	 */
+	maxNprobe?: number;
 }
 
 export interface Hit {
@@ -50,6 +62,9 @@ export interface QueryParams {
 	rerank: number;
 	pc: number;
 	source: { nprobe: ParamSource; rerank: ParamSource; pc: ParamSource };
+	/** Present with a filter: the widening bound in effect. */
+	filter?: true;
+	maxNprobe?: number;
 }
 
 /** Loading a generation's routing table and PQ codebook (`openStats.base`, `timeline.base`). */
@@ -85,8 +100,11 @@ export interface QueryStats {
 	rev: number;
 	format: number;
 	routing: "flat" | "tree";
-	/** Probed cells, in routing order. */
+	/** Probed cells, in routing order (beyond `nprobe` when a filtered query widened). */
 	cells: number[];
+	/** Entries the attribute filter dropped (among those that would have entered a top-T) and distinct scan-tier candidates. */
+	filterDropped: number;
+	candidates: number;
 	/** Entries scanned (slabs) and bytes of scan prefixes / of slab objects transferred. */
 	scanned: number;
 	scanBytes: number;
@@ -168,6 +186,8 @@ export interface QueryContext {
 }
 
 export const QUERY_INFLIGHT = 12;
+/** A filtered query's default `maxNprobe`, as a multiple of `nprobe`. */
+export const FILTER_WIDEN = 4;
 /** Rerank winners of one slab whose records lie within this span share one range (adjacent records). */
 const MULTI_COALESCE = 4 * 1024;
 /** Speculate on the running top-T once only this many slabs are left to scan. */
@@ -242,7 +262,13 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const pc = o.pc ?? defaults.pc;
 	const rerankParam = o.rerank ?? defaults.rerank;
 	for (const [name, v, min] of [["nprobe", nprobe, 1], ["pc", pc, 0], ["rerank", rerankParam, 0]] as const) if (!Number.isInteger(v) || v < min) throw new ThreadError(`${name} must be an integer >= ${min}`, 400);
-	const params: QueryParams = { topK: k, nprobe, rerank: rerankParam, pc, source: { nprobe: src(o.nprobe), rerank: src(o.rerank), pc: src(o.pc) } };
+	// The attribute filter, compiled against the generation's schema; with one, probing may widen past nprobe.
+	const filterWords = o.filter instanceof Uint32Array ? o.filter : compileFilter(manifest.attrs ? validateSchema(manifest.attrs) : null, o.filter);
+	const filtered = filterWords.length > 0;
+	const nCells = manifest.k1 * manifest.k2;
+	if (o.maxNprobe !== undefined && (!Number.isInteger(o.maxNprobe) || o.maxNprobe < nprobe)) throw new ThreadError(`maxNprobe must be an integer >= nprobe (${nprobe})`, 400);
+	const maxNprobe = filtered ? Math.min(nCells, o.maxNprobe ?? nprobe * FILTER_WIDEN) : nprobe;
+	const params: QueryParams = { topK: k, nprobe, rerank: rerankParam, pc, source: { nprobe: src(o.nprobe), rerank: src(o.rerank), pc: src(o.pc) }, ...(filtered ? { filter: true as const, maxNprobe } : {}) };
 	const speculate = o.speculate ?? true;
 	const dim = manifest.dim;
 	const q = w.normalize_vector(qRaw);
@@ -259,7 +285,8 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 
 	// One q·mean per cell: flat routing ranks them, and scan_delta scores every delta entry against its cell.
 	const cellDots = flat || deltas.length ? base.searcher.cell_dots(q) : null;
-	const cells = Array.from(flat ? base.searcher.route_from_dots(cellDots!, nprobe) : base.searcher.route(q, pc, nprobe));
+	// Routed to the widening bound; an unfiltered query scans exactly its nprobe cells.
+	const cells = Array.from(flat ? base.searcher.route_from_dots(cellDots!, Math.max(nprobe, maxNprobe)) : base.searcher.route(q, pc, Math.max(nprobe, maxNprobe)));
 	// Format 3: one asymmetric-distance table (m x 256 f32) per query, shared by every probed slab.
 	const table = base.pq ? w.PqTable.from_codebook(q, base.pq) : null;
 	const tRoute = nowMs();
@@ -279,6 +306,8 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	let rerankBytes = 0;
 	let specReadN = 0;
 	let tombDropped = 0;
+	let filterDropped = 0;
+	let scannedCells = 0;
 	const stats = { rerankLocal: 0, specUsed: 0, specRecords: 0 };
 
 	/** Reads the rerank records `idxs` (ascending) of one slab: one multi-range request, else one read per run. */
@@ -365,22 +394,24 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		return { prefix: bytes, full, key, slabRev };
 	};
 
-	const slabPhase = Promise.all(
-		cells.map(async (cell) => {
+	/** Scans one cell; `batchEnd` is the index past the last cell of the batch it belongs to (the speculation cue). */
+	const scanCell = async (cell: number, batchEnd: number): Promise<void> => {
 			const { prefix, full, key, slabRev } = await readSlab(cell);
 			slabBytes += (full ?? prefix).byteLength;
 			scanBytes += prefix.byteLength;
 			const hdr = parseSlabHeader(prefix);
-			// Tombstones are applied inside the scan (before top-k insertion): ids deleted or replaced at a rev >= this
-			// slab's revision (every set for rev-0 slabs). scanStats receives [entries scanned, tombstoned skipped].
+			// Tombstones and the attribute filter are applied inside the scan (before top-k insertion): ids deleted or
+			// replaced at a rev >= this slab's revision (every set for rev-0 slabs), entries whose attrs fail the filter.
+			// scanStats receives [entries scanned, tombstoned skipped, filtered out].
 			const tombs = tomb ? tombFor(tomb, slabRev) : NO_TOMBSTONES;
-			const scanStats = new Uint32Array(2);
+			const scanStats = new Uint32Array(3);
 			let hits: Uint8Array;
 			if (hdr.version === 3) {
 				if (!table) throw new ThreadError(`slab ${cell} is v3 but ${gen} has no PQ codebook`);
-				hits = w.scan_pq(prefix, table, q, T, tombs, scanStats);
-			} else hits = w.scan(prefix, q, T, tombs, scanStats);
+				hits = w.scan_pq(prefix, table, q, T, tombs, filterWords, scanStats);
+			} else hits = w.scan(prefix, q, T, tombs, filterWords, scanStats);
 			tombDropped += scanStats[1];
+			filterDropped += scanStats[2];
 			versions.add(hdr.version);
 			scanned += hdr.count;
 			packed.push(hits);
@@ -402,12 +433,26 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			}
 			if (!rerankable) return;
 			slabsDone++;
-			if (speculate && !specFired && cells.length - slabsDone <= SPEC_AT) {
+			// Speculate once only a few slabs of the last batch are left: an unfiltered query has one batch; a filtered
+			// one may widen, so its batch is known to be last only at the bound or once T candidates match.
+			if (speculate && !specFired && batchEnd - slabsDone <= SPEC_AT && (!filtered || batchEnd >= cells.length || cand.size >= T)) {
 				specFired = true;
 				fireSpeculation();
 			}
-		}),
-	);
+	};
+	// Phase 1 in batches: the first nprobe cells, then (filtered queries only) more cells in routing order until
+	// T distinct candidates passed the filter or maxNprobe cells were scanned.
+	const slabPhase = (async () => {
+		let to = Math.min(nprobe, cells.length);
+		await Promise.all(cells.slice(0, to).map((cell) => scanCell(cell, to)));
+		scannedCells = to;
+		const step = Math.max(4, Math.ceil(nprobe / 2));
+		while (filtered && cand.size < T && scannedCells < cells.length) {
+			to = Math.min(cells.length, scannedCells + step);
+			await Promise.all(cells.slice(scannedCells, to).map((cell) => scanCell(cell, to)));
+			scannedCells = to;
+		}
+	})();
 
 	// Delta segments: every entry scored with its int8 record (reranked scale, no phase 2). A delta hit is dropped
 	// if its id is in a tombstone set newer than the rev that added the segment.
@@ -422,9 +467,10 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			const hdr = parseDeltaHeader(bytes);
 			deltaScanned += hdr.count;
 			// A delta entry is hidden by the sets newer than the rev that added its segment (applied inside the scan).
-			const scanStats = new Uint32Array(2);
-			const hits = w.scan_delta(bytes, q, cellDots!, T, tomb ? tombForDelta(tomb, d.addedRev) : NO_TOMBSTONES, scanStats);
+			const scanStats = new Uint32Array(3);
+			const hits = w.scan_delta(bytes, q, cellDots!, T, tomb ? tombForDelta(tomb, d.addedRev) : NO_TOMBSTONES, filterWords, scanStats);
 			deltaDropped += scanStats[1];
+			filterDropped += scanStats[2];
 			for (const h of parseHits(hits)) {
 				const e = deltaEntry(bytes, hdr, h.idx);
 				deltaHits.push({ id: h.id, score: h.score, attrs: e.attrs, payload: o.returnPayload ? bytes.slice(hdr.payloadOff + e.payloadOff, hdr.payloadOff + e.payloadOff + e.payloadLen) : null });
@@ -519,7 +565,9 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			rev: rev.rev,
 			format,
 			routing: flat ? "flat" : "tree",
-			cells,
+			cells: cells.slice(0, scannedCells),
+			filterDropped,
+			candidates: cand.size,
 			scanned,
 			scanBytes,
 			slabBytes,

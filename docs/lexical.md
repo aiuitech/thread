@@ -86,21 +86,24 @@ exactly the posting lists of the query's terms and nothing else. A length array 
 id -> length table of 8 bytes per document read whole per query, or resident per isolate; inline lengths cost
 about one to two bytes per posting instead (the `byte` option one).
 
-### `docs` (`docs.rs`, magic `THRDDOCS`, version 1)
+### `docs` (`docs.rs`, magic `THRDDOCS`, version 2)
 
 ```
-0   magic "THRDDOCS"   8 version u32 = 1   12 n u32   16 bucket count B u32   20 bucket_docs u32   24 flags u32 (bit 0: texts stored)
+0   magic "THRDDOCS"   8 version u32 = 2   12 n u32   16 bucket count B u32   20 bucket_docs u32   24 flags u32 (bit 0: texts stored, bit 1: attrs stored)
 32  dir_off u64 (= 64)   40 dir_len u64 (= 16 B)   48 buckets_off u64   56 buckets_len u64
 directory: B x (first id u32, bucket len u32, bucket offset u64), ascending
-bucket entry: id varint, meta len varint, meta (UTF-8), text len varint, [text offset varint]  (offset in the text region)
+bucket entry: id varint, [attrs varint, with bit 1], meta len varint, meta (UTF-8), text len varint, [text offset varint]  (offset in the text region)
 text region: align8(buckets end) .. section end
 ```
 
 `meta` is whatever the application wants back with a hit (a title, a JSON object, an external key). Texts sit in
 their own region so resolving a title never pays for the text; a hit's text is one more range read, only when asked
-for. This is the one document store of the index: dense hits and lexical hits resolve through the same section.
-(The dense slabs still carry their per-entry `attrs` and `payload`; `docs` is the recommended place for anything
-larger than a few bytes, since slab payloads are duplicated `m` times.)
+for. `attrs` is the document's 32-bit attribute word, the same one its dense entry carries ([filtering.md](filtering.md));
+a text query resolves it here to apply a filter, and a writer sets bit 1 only when some document's word is non-zero
+(version 1 sections, without the bit, still read with every word 0). This is the one document store of the index:
+dense hits and lexical hits resolve through the same section. (The dense slabs still carry their per-entry `attrs`
+and `payload`; `docs` is the recommended place for anything larger than a few bytes, since slab payloads are
+duplicated `m` times.)
 
 ### Container and `meta`
 
@@ -130,7 +133,7 @@ the Cache API, or one request per range on a miss):
 
 | round | reads | kept |
 |---|---|---|
-| open | container header + table (576 bytes, usually with `meta`) | per isolate |
+| open | container header + table + `meta` (the first 1 KB) | per isolate |
 | headers | `terms` (96 B), `postings` (16 B), `docs` (64 B) headers | per isolate |
 | directories | terms directory (~22 B per bucket) + docs directory (16 B per bucket) | per isolate |
 | lookup | one bucket per distinct query term (~3-5 KB each at 256 terms per bucket) | transient |
@@ -144,7 +147,8 @@ the resident parts are a few KB per segment (20k documents: 2.5 KB terms directo
 The dense query and the lexical query run concurrently at depth `recallK`; the two id lists are fused with
 Reciprocal Rank Fusion (`score = Σ weight / (rrfK + rank)`, float64, ties by id; `fusion.rs` and `sdk/ts/src/fusion.ts`
 compute identical sums) and the top k is resolved through `docs` when asked. Each hit reports its rank and score in
-each list it appeared in.
+each list it appeared in. With an attribute filter the lexical list is taken deeper, each candidate's word is
+resolved through `docs` and non-matching candidates are dropped before fusion ([filtering.md](filtering.md#text-queries-post-filtering-through-the-docs-store)).
 
 Tombstones use the dense index's rule for deltas: a segment added at manifest rev `a` is filtered by the union of
 the tombstone sets with `rev > a` (`tombForSegment`), inside the scan before top-k insertion. Replace semantics
@@ -154,9 +158,9 @@ newest segment first, skipping hidden copies.
 
 ## Updates and compaction
 
-`index.upsert({ids, vectors?, texts?, metas?})` writes, in one manifest revision: a dense delta segment for the
-vectors (as before), a lexical/docs segment for the texts and metadata (`SegmentJob`: tokenize, build `terms` +
-`postings` + `docs`), and the tombstone set. Vectors are optional when the generation has a lexical configuration
+`index.upsert({ids, vectors?, texts?, metas?, attrs?})` writes, in one manifest revision: a dense delta segment for the
+vectors (as before), a lexical/docs segment for the texts, metadata and attribute words (`SegmentJob`: tokenize,
+build `terms` + `postings` + `docs`), and the tombstone set. Vectors are optional when the generation has a lexical configuration
 (text-only documents are found by text alone), texts/metas are optional (dense-only upserts are unchanged). The
 delta and the segment share the `seq`. `index.delete(ids)` is one tombstone set, as before, and hides both sides.
 
@@ -253,8 +257,8 @@ thread seg merge --out base.thread [--tombstones a.u32,b.u32] seg1.thread seg2.t
 thread tokenize [--tokenizer '{"identifiers":"both"}'] "INC-12345 failed"
 ```
 
-`docs.jsonl` is one object per line with an integer `id`, a `text` and an optional `meta` (a string, or any JSON
-value stored as its text). A segment file built here is byte-for-byte what an upsert writes, so a corpus can be
+`docs.jsonl` is one object per line with an integer `id`, a `text`, an optional `attrs` (the u32 attribute word)
+and an optional `meta` (a string, or any JSON value stored as its text). A segment file built here is byte-for-byte what an upsert writes, so a corpus can be
 indexed locally and uploaded as `idx/{gen}/seg/base.0.thread` with a matching `segments` entry in rev 0.
 
 ## Not done

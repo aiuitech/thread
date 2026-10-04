@@ -8,9 +8,10 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal, Sequence
+from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from . import _native
+from .attrs import AttrFilterExpr, AttrSchema, compile_filter, pack_attrs, unpack_attrs, validate_schema
 from .fusion import DEFAULT_RRF_K, rrf
 from .lex import DocRecord, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import QUERY_INFLIGHT, Base, QueryContext, QueryResult, RevState, execute_query
@@ -20,11 +21,13 @@ from .revision import get_required, head_revision, load_rev_state, resolve_targe
 from .wire import LEGACY_DEFAULTS, BytesLike, ResolvedLexConfig, ThreadError, has_dense, resolve_lex_config
 from .write import (
     CompactSegmentsResult,
+    ConfigureAttrsResult,
     ConfigureLexicalResult,
     DeleteResult,
     UpsertResult,
     WriterContext,
     compact_segments,
+    configure_attrs,
     configure_lexical,
     delete_ids,
     lex_config_from_kwargs,
@@ -231,6 +234,24 @@ class ThreadIndex:
         """The lexical / docs segments of the revision, oldest first."""
         return self._rev.segments
 
+    @property
+    def attr_schema(self) -> AttrSchema | None:
+        """The attribute schema (`manifest["attrs"]`), or None: the raw 32-bit word is then the one field, `attrs`."""
+        a = self._rev.manifest.get("attrs")
+        return validate_schema(a) if a else None
+
+    def pack_attrs(self, values: Any) -> int:
+        """Packs field values into a document's attrs word under the schema (`{"tenant": 5, "lang": "en"}`)."""
+        return pack_attrs(self.attr_schema, values)
+
+    def unpack_attrs(self, word: int) -> dict[str, Any]:
+        """The field values of a hit's `attrs` word under the schema."""
+        return unpack_attrs(self.attr_schema, word)
+
+    def compile_filter(self, filter: AttrFilterExpr | None) -> Any:
+        """Compiles a filter expression against the schema into the words `query(filter=...)` takes."""
+        return compile_filter(self.attr_schema, filter)
+
     # ---- revisions ----
 
     def _check_open(self) -> None:
@@ -336,11 +357,16 @@ class ThreadIndex:
         return_payload: bool = False,
         inflight: int = QUERY_INFLIGHT,
         speculate: bool = True,
+        filter: Any = None,
+        max_nprobe: int | None = None,
     ) -> QueryResult:
         """Nearest neighbours of `vector` (any norm; normalized): a list of floats, an `array('f')`, a numpy array or
         raw f32 bytes of `dim` values. `nprobe` slabs are scanned, the best `rerank` scan-tier candidates re-scored
         with the int8 tier (0 = scan-tier scores only), `pc` coarse groups probed (0 = flat routing); absent ones take
-        the manifest defaults."""
+        the manifest defaults. `filter`: an attribute filter (field conditions under the schema, e.g. `{"tenant": 5,
+        "lang": {"$in": ["en", "fr"]}}`, or compiled words) applied inside every scan before top-k insertion; with
+        one, probing widens past `nprobe` in routing order until `max(top_k, rerank)` candidates match or
+        `max_nprobe` cells were scanned (default 4 x nprobe)."""
         self._check_open()
         if not self.has_dense:
             raise ThreadError("this generation has no dense index (lexical only): use search(text=...)", 400)
@@ -349,8 +375,11 @@ class ThreadIndex:
         loaded: dict[str, Any] = {}
         base = self._acquire_base(rev, loaded)
         ctx = QueryContext(self.store, rev, base, self._io, self._get_delta)
+        words = filter if filter is None or not isinstance(filter, Mapping) else compile_filter(
+            validate_schema(rev.manifest["attrs"]) if rev.manifest.get("attrs") else None, filter)
         r = execute_query(ctx, vector, top_k=top_k, nprobe=nprobe, rerank=rerank, pc=pc,
-                          return_payload=return_payload, inflight=inflight, speculate=speculate)
+                          return_payload=return_payload, inflight=inflight, speculate=speculate, filter=words,
+                          max_nprobe=max_nprobe)
         if "stat" in loaded:  # this query (re)loaded the routing table (a switch to another generation)
             r.stats["timeline"]["base"] = loaded["stat"]
         return r
@@ -408,10 +437,12 @@ class ThreadIndex:
         fut.set_result(index)
         return index
 
-    def lexical_search(self, text: str, k: int = 10) -> LexSearchResult:
-        """BM25 top `k` for `text` over the revision's lexical segments."""
+    def lexical_search(self, text: str, k: int = 10, *, filter: Any = None) -> LexSearchResult:
+        """BM25 top `k` for `text` over the revision's lexical segments; `filter` is an attribute filter expression
+        or its compiled words (see `LexIndex.search`)."""
         self._check_open()
-        return self._lex_index().search(text, k)
+        words = compile_filter(self.attr_schema, filter) if isinstance(filter, Mapping) else filter
+        return self._lex_index().search(text, k, filter=words)
 
     def tokenize(self, text: str) -> list[str]:
         """The query's tokens under the index's tokenizer."""
@@ -440,11 +471,15 @@ class ThreadIndex:
         weights: dict[str, float] | None = None,
         dense: dict[str, Any] | None = None,
         docs: bool | Literal["text"] = False,
+        filter: AttrFilterExpr | None = None,
     ) -> SearchResult:
         """Searches by text, by vector, or by both: the dense list (`query`, options in `dense`) and the lexical list
         (BM25 over the segments) run concurrently at depth `recall_k` and are fused with Reciprocal Rank Fusion
         (`rrf_k`, list `weights` `{dense, lexical}`; defaults from `manifest.lex.defaults`); a single list is returned
-        as is. With `docs`, hits are resolved through the `docs` store (`"text"`: the stored text too)."""
+        as is. With `docs`, hits are resolved through the `docs` store (`"text"`: the stored text too). `filter`
+        (field conditions under the attribute schema) applies to both lists: the dense scan drops non-matching
+        entries before top-k insertion (widening its probes up to `dense["max_nprobe"]`), the BM25 list is taken
+        deeper and resolved through the `docs` store."""
         self._check_open()
         t0 = time.perf_counter()
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
@@ -469,10 +504,12 @@ class ThreadIndex:
         both = has_text and has_vector
         depth = max(recall_k, top_k) if both else top_k
         timing = {"dense": 0.0, "lexical": 0.0, "docs": 0.0}
+        # The filter is compiled once and applied to both lists.
+        words = compile_filter(self.attr_schema, filter) if filter else None
 
         def run_lex() -> LexSearchResult:
             t = time.perf_counter()
-            r = self.lexical_search(text, depth)  # type: ignore[arg-type]
+            r = self.lexical_search(text, depth, filter=words)  # type: ignore[arg-type]
             timing["lexical"] = round((time.perf_counter() - t) * 1000, 3)
             return r
 
@@ -481,7 +518,7 @@ class ThreadIndex:
         lex_r: LexSearchResult | None = None
         if has_vector:
             t = time.perf_counter()
-            dense_r = self.query(vector, **{**(dense or {}), "top_k": depth})
+            dense_r = self.query(vector, **{**(dense or {}), "top_k": depth, **({"filter": words} if words else {})})
             timing["dense"] = round((time.perf_counter() - t) * 1000, 3)
         if lex_fut is not None:
             lex_r = lex_fut.result()
@@ -536,7 +573,7 @@ class ThreadIndex:
         ids: Iterable[int],
         vectors: Any = None,
         *,
-        attrs: Iterable[int] | None = None,
+        attrs: Iterable[Any] | None = None,
         payloads: Sequence[bytes | str] | None = None,
         texts: Sequence[str | None] | None = None,
         metas: Sequence[str | None] | None = None,
@@ -545,7 +582,9 @@ class ThreadIndex:
         """Adds or replaces documents: one delta segment (vectors: `n * dim` floats flat, one row per id, or an
         `(n, dim)` numpy array; any norm), one lexical/docs segment (`texts` indexed by BM25, `metas` stored in the
         docs store; needs `configure_lexical`) and, with `replace` (default), a tombstone set hiding older copies of
-        the ids, committed as a new manifest revision; the index then reads that revision. Up to 4096 per call."""
+        the ids, committed as a new manifest revision; the index then reads that revision. `attrs`: one attribute
+        word per document, as field values under the schema (`{"tenant": 5, "lang": "en"}`) or a raw u32; stored
+        with the vector and in the docs store, and what `filter` tests. Up to 4096 per call."""
         r = upsert(self._writer(), ids, vectors, attrs=attrs, payloads=payloads, texts=texts, metas=metas,
                    replace=replace)
         self.use_revision(r.gen, r.rev)
@@ -563,6 +602,15 @@ class ThreadIndex:
         may use snake_case (`bucket_terms=64, text=True, lengths="byte", defaults={"rrf_k": 10}`). Existing
         documents are not indexed retroactively: upsert them again with their texts."""
         r = configure_lexical(self._writer(), lex_config_from_kwargs(config, kwargs))
+        self.use_revision(r.gen, r.rev)
+        return r
+
+    def configure_attrs(self, spec: Mapping[str, Any] | None = None, **fields: Any) -> ConfigureAttrsResult:
+        """Declares (or extends) the attribute schema: named fields packed into each document's 32-bit attrs word, in
+        declaration order (`configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr"]}, public="bool")`, or a
+        schema dict), as a manifest revision. Existing fields keep their layout (an enum may append values);
+        documents written before keep their words."""
+        r = configure_attrs(self._writer(), {**(spec or {}), **fields})
         self.use_revision(r.gen, r.rev)
         return r
 

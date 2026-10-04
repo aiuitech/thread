@@ -69,7 +69,7 @@ describe("lexical-only generation", () => {
 		expect(res.mode).toBe("lexical");
 		expect(res.hits.map((h) => h.id)).toEqual([3, 10]);
 		expect(res.hits[0].lexical?.rank).toBe(1);
-		expect(res.hits[0].doc).toEqual({ id: 3, meta: "Retry notes", text: DOCS[1].text });
+		expect(res.hits[0].doc).toEqual({ id: 3, meta: "Retry notes", attrs: 0, text: DOCS[1].text });
 		expect(res.hits[1].doc?.meta).toBe(JSON.stringify({ title: "Deploy failure" }));
 		expect(res.lexical?.tokens).toEqual(["deploy", "retri"]);
 		expect(res.lexical?.found).toBe(2);
@@ -90,7 +90,7 @@ describe("lexical-only generation", () => {
 
 		// docs: unknown ids are absent, the empty document has an entry
 		const d = await index.docs([7, 12345, 42], { text: true });
-		expect(d.docs.get(7)).toEqual({ id: 7, meta: "empty", text: "" });
+		expect(d.docs.get(7)).toEqual({ id: 7, meta: "empty", attrs: 0, text: "" });
 		expect(d.docs.has(12345)).toBe(false);
 		expect(d.docs.get(42)?.meta).toBe("Galaxy");
 
@@ -269,6 +269,55 @@ describe("hybrid search on a dense generation", () => {
 		index.close();
 	});
 
+	it("attribute filters on the lexical list, hybrid search and docs", async () => {
+		const b = await buildGen("gl", 3);
+		const index = await thread.open({ store: b.store, cache: false });
+		await index.configureLexical({ text: true });
+		await index.configureAttrs({ lang: { values: ["en", "fr"] }, public: "bool" });
+		const fresh = unitRows(4, b.dim, rng(8));
+		await index.upsert({
+			ids: [1000, 1001, 1002, 1003],
+			vectors: fresh,
+			texts: ["alpha bravo", "alpha bravo charlie", "alpha", "alpha bravo delta"],
+			metas: ["A", "B", "C", "D"],
+			attrs: [{ lang: "en", public: true }, { lang: "fr", public: true }, { lang: "en" }, { lang: "fr" }],
+		});
+		// a text-only document carries attrs too (they live in the docs store)
+		await index.upsert({ ids: [2000], texts: ["alpha alpha alpha bravo"], metas: ["T"], attrs: [{ lang: "en", public: true }] });
+		const all = await index.search({ text: "alpha bravo", topK: 10 });
+		expect(all.hits.map((h) => h.id)).toEqual([1000, 2000, 1001, 1003, 1002]);
+		const en = await index.search({ text: "alpha bravo", topK: 10, filter: { lang: "en" }, docs: true });
+		expect(en.hits.map((h) => h.id)).toEqual([1000, 2000, 1002]);
+		expect(en.hits.map((h) => index.unpackAttrs(h.doc!.attrs).lang)).toEqual(["en", "en", "en"]);
+		expect(en.lexical?.stats.filterDropped).toBe(2);
+		expect(en.lexical?.stats.depth).toBe(40);
+		const pubFr = await index.search({ text: "alpha", topK: 2, filter: { public: true, lang: "fr" } });
+		expect(pubFr.hits.map((h) => h.id)).toEqual([1001]);
+		// the list deepens until k match: with a depth of 1 the first round sees one candidate (1000), which fails
+		const deep = await index.lexicalSearch("alpha bravo", 2, { filter: index.compileFilter({ lang: "fr" }), filterDepth: 1 });
+		expect(deep.hits.map((h) => h.id)).toEqual([1001, 1003]);
+		expect(deep.stats.depth).toBe(8);
+		expect((await index.lexicalSearch("alpha", 1, { filter: index.compileFilter({ lang: "fr" }), filterDepth: 1, maxDepth: 1 })).hits).toEqual([]); // depth is never below k; capped at 1 here
+		// hybrid: both lists filtered, so the fused result holds only matching ids; docs carry the word
+		const hy = await index.search({ text: "alpha bravo", vector: fresh.subarray(0, 16), topK: 5, dense: { nprobe: 8 }, filter: { lang: "fr" }, docs: true });
+		expect(hy.mode).toBe("hybrid");
+		expect(hy.hits.map((h) => h.id).sort()).toEqual([1001, 1003]);
+		expect(hy.hits.every((h) => index.unpackAttrs(h.doc!.attrs).lang === "fr")).toBe(true);
+		expect(hy.dense!.hits.every((h) => h.id === 1001 || h.id === 1003)).toBe(true);
+		expect(hy.lexical!.hits.map((h) => h.id)).toEqual([1001, 1003]);
+		// dense-only through search(), filtered by a bool
+		const pub = await index.search({ vector: fresh.subarray(0, 16), topK: 5, dense: { nprobe: 8 }, filter: { public: true } });
+		expect(pub.hits.map((h) => h.id).sort()).toEqual([1000, 1001]);
+		// docs() returns the word; a replace rewrites it (newest copy wins) and a compaction keeps it
+		expect((await index.docs([1002, 2000])).docs.get(2000)?.attrs).toBe(index.packAttrs({ lang: "en", public: true }));
+		await index.upsert({ ids: [1002], texts: ["alpha"], metas: ["C2"], attrs: [{ lang: "fr", public: true }] });
+		expect((await index.search({ text: "alpha", topK: 10, filter: { lang: "fr", public: true } })).hits.map((h) => h.id).sort()).toEqual([1001, 1002]);
+		await index.compactSegments();
+		expect((await index.search({ text: "alpha", topK: 10, filter: { lang: "fr", public: true } })).hits.map((h) => h.id).sort()).toEqual([1001, 1002]);
+		expect((await index.docs([1002])).docs.get(1002)).toMatchObject({ meta: "C2", attrs: index.packAttrs({ lang: "fr", public: true }) });
+		index.close();
+	});
+
 	it("manifest round trip: segments, lex config and change records", async () => {
 		const b = await buildGen("gm", 2);
 		const index = await thread.open({ store: b.store, cache: false });
@@ -339,7 +388,7 @@ describe("LexSegment paging", () => {
 		// docs: entries then texts
 		const d = { rounds: 0, ranges: 0, bytes: 0 };
 		const got = (await seg.run(() => seg.reader.docs_get(Uint32Array.from([3, 4, 8997]), true), d, trace)) as ({ id: number; meta: string; text: string } | null)[];
-		expect(got[0]).toEqual({ id: 3, meta: "meta 1", text: rows[1] });
+		expect(got[0]).toEqual({ id: 3, meta: "meta 1", text: rows[1], attrs: 0 });
 		expect(got[1]).toBeNull();
 		expect(got[2]?.meta).toBe("meta 2999");
 		expect(d.rounds).toBeLessThanOrEqual(2);

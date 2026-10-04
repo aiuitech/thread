@@ -22,7 +22,7 @@ variance between sessions was up to ~30%.
 | monthly cost, 1M vectors + 1M queries | about $21 | about $1-2 (R2 ~$0.10, Workers CPU/requests ~$1) | |
 | monthly cost, 1M vectors + 10M queries | about $111 | about $10 | |
 | vector limit per index | 5M | bounded by centroid table in RAM (~8k cells at 1536 dims today) | |
-| metadata filtering | yes | attrs field only (not wired) | |
+| metadata filtering | yes | fields packed into a 32-bit word, applied inside the scan; selective filters widen the probes (docs/filtering.md) | |
 | payload returned with hits | metadata, size-limited | arbitrary bytes co-located in the slab | |
 | freshness | seconds (WAL + executors) | upsert visible within 30 s; 2000 vectors in 3.3 s, delete 0.8 s | |
 | build | managed, async | 27-30 min for 975k vectors, entirely inside Workers (one deployment, 8 build slots via the Worker Loader; g4 used an 8-Worker pool) | |

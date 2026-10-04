@@ -111,8 +111,15 @@ impl SegmentBuilder {
 
     /// Adds a document: `text` is tokenized into the lexical index (when the segment has one;
     /// `None` indexes an empty document) and stored when the segment keeps texts; `meta` (default
-    /// `""`) goes into `docs`. Returns the number of tokens indexed. Fails on a duplicate id.
-    pub fn add(&mut self, id: u32, text: Option<&str>, meta: Option<&str>) -> Result<usize, Error> {
+    /// `""`) and `attrs` (the document's attribute word, the same its dense entry carries) go into
+    /// `docs`. Returns the number of tokens indexed. Fails on a duplicate id.
+    pub fn add(
+        &mut self,
+        id: u32,
+        text: Option<&str>,
+        meta: Option<&str>,
+        attrs: u32,
+    ) -> Result<usize, Error> {
         let mut n = 0;
         if let (Some(tok), Some(lex)) = (&mut self.tokenizer, &mut self.lex) {
             let tokens = tok.tokenize(text.unwrap_or(""));
@@ -121,7 +128,7 @@ impl SegmentBuilder {
         }
         if let Some(d) = &mut self.docs {
             // a duplicate id is caught above when there is a lexical index, here otherwise
-            d.add(id, meta.unwrap_or(""), text)?;
+            d.add_attrs(id, meta.unwrap_or(""), text, attrs)?;
         }
         self.tokens += n as u64;
         Ok(n)
@@ -134,12 +141,13 @@ impl SegmentBuilder {
         tokens: &[String],
         meta: Option<&str>,
         text: Option<&str>,
+        attrs: u32,
     ) -> Result<(), Error> {
         if let Some(lex) = &mut self.lex {
             lex.add(id, tokens)?;
         }
         if let Some(d) = &mut self.docs {
-            d.add(id, meta.unwrap_or(""), text)?;
+            d.add_attrs(id, meta.unwrap_or(""), text, attrs)?;
         }
         self.tokens += tokens.len() as u64;
         Ok(())
@@ -343,7 +351,7 @@ mod tests {
     fn build(opts: &SegmentOptions, rows: &[(u32, &str, &str)]) -> Vec<u8> {
         let mut b = SegmentBuilder::new(opts).unwrap();
         for (id, text, meta) in rows {
-            b.add(*id, Some(text), Some(meta)).unwrap();
+            b.add(*id, Some(text), Some(meta), *id % 3).unwrap();
         }
         assert_eq!(b.len() as usize, rows.len());
         b.finish().unwrap()
@@ -389,6 +397,14 @@ mod tests {
             .unwrap();
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), vec![3, 10]);
         let got = docs.get(&[3, 10, 7, 5]).unwrap();
+        assert_eq!(
+            docs.lookup(&[3, 10])
+                .unwrap()
+                .iter()
+                .map(|e| e.as_ref().unwrap().attrs)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
         assert_eq!(got[0], Some(("t3".into(), DOCS[1].1.into())));
         assert_eq!(got[1], Some(("t10".into(), DOCS[0].1.into())));
         assert_eq!(got[2], Some(("t7".into(), String::new())));
@@ -419,8 +435,8 @@ mod tests {
         })
         .is_err());
         let mut b = SegmentBuilder::new(&SegmentOptions::default()).unwrap();
-        b.add(1, Some("x y"), None).unwrap();
-        assert!(b.add(1, Some("z"), None).is_err());
+        b.add(1, Some("x y"), None, 0).unwrap();
+        assert!(b.add(1, Some("z"), None, 0).is_err());
     }
 
     #[test]
@@ -472,6 +488,7 @@ mod tests {
         );
         let d = seg.docs(&merged).unwrap().unwrap();
         assert_eq!(d.n(), 5);
+        assert_eq!(d.lookup(&[10]).unwrap()[0].as_ref().unwrap().attrs, 1);
         let got = d.get(&[3, 7, 99]).unwrap();
         assert_eq!(got[0], Some(("t3-v2".into(), DOCS[1].1.into())));
         assert_eq!(got[1], Some(("t7".into(), String::new())));

@@ -40,6 +40,8 @@ recover from a trap. After rebuilding the wasm, `sdk/ts/scripts/sync-wasm.sh` co
 node bench/driver.mjs --gen g4 --profile edge
 node bench/query_bench.mjs --gen g4 --n 1000 --concurrency 50          # manifest defaults
 node bench/query_bench.mjs --gen g4 --n 1000 --concurrency 50 --nprobe 22 --rerank 100
+# filtered queries (g4's words are all 0, so only {"attrs":0} or {"attrs":{"$none":...}} match; a schema'd index takes field conditions)
+node bench/query_bench.mjs --gen g4 --n 1000 --concurrency 50 --filter '{"attrs":{"$lt":1}}' --maxNprobe 68
 
 # change a generation's query defaults (new manifest revision; isolates pick it up within 30 s)
 curl -X POST -H "authorization: Bearer $TOKEN" $URL/build/publish-rev -d '{"gen":"g4","defaults":{"nprobe":34,"rerank":150}}'
@@ -70,6 +72,39 @@ node bench/driver.mjs --gen g4 --publish-rev --compaction profile \
   [--compactMaxDeltas N --compactMaxDeltaMB N --compactMaxTombstones N --compactMaxCellEntries N \
    --compactCellsPerRun N --compactDeadlineMs N --compactSplitCellsPerRun N]      # --compaction 0 removes it
 ```
+
+## Storage cleanup
+
+After a generation is published and its build has stopped, `POST /build/delete-prefix` can remove
+`build/{gen}/partials/`, `build/{gen}/parts/` and `build/{gen}/pq/partials/`. Query serving reads the published
+objects under `idx/{gen}/`, not these intermediates. Send `{ "prefix": "build/g4/parts/", "dryRun": true }`
+first, inspect the object count and bytes, then repeat with `dryRun: false`. The build driver now does this
+automatically unless `--gcBuild 0` is set; older builds may still have leftovers.
+
+For superseded index objects, use `POST /build/gc` with `{ "gen": "g4", "keep": 2, "graceSec": 300,
+"dryRun": true }` before repeating with `dryRun: false`. This keeps objects referenced by the newest two
+revisions and protects recent writes. Older revisions can become unreadable; see [GC](update-path.md#gc).
+
+### Cleanup on 2026-10-04
+
+Removed the following build intermediates after checking that their counts and bytes matched the dry run,
+their newest objects were more than an hour old, and the published generations answered queries:
+
+| generation | objects removed | bytes removed |
+|---|---:|---:|
+| g2 | 623 | 16,479,425,168 |
+| g3 | 1,053 | 32,655,614,160 |
+| g4 | 911 | 22,057,584,560 |
+| total | 2,587 | 71,192,623,888 |
+
+Every cleaned prefix was empty afterward. Manifests, current pointer, and the first benchmark query's top-10
+IDs and scores matched before and after for g2 rev 0, g3 rev 0, g4 rev 179 and g5 rev 32, with `cache=none`.
+Index GC dry runs found no garbage in g2–g5. g1's GC failed because `idx/g1/slabs.json` is missing; its build
+intermediates were retained for possible repair. The allowlisted test scratch prefixes were already empty.
+
+Locally, removed `data/dbpedia_openai_1M.tgz` (5,098,686,329 bytes) after both archive members, `vectors.npy`
+and `tests.jsonl`, matched their extracted copies by size and SHA-256. Kept the extracted dataset, prepared
+ingest shards, benchmark inputs and results, and offline experiment data.
 
 ## Lexical segments on local files
 

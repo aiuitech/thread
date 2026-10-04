@@ -5,7 +5,7 @@ one sitting: what the objects are, how a query reads them, how updates avoid rew
 code lives. The other pages go deeper: [query-path.md](query-path.md) (slab formats, the two-phase query, caching,
 routing), [build-pipeline.md](build-pipeline.md) (how an index is built), [profiles.md](profiles.md) (the layout
 knobs), [update-path.md](update-path.md) (revisions, deltas, tombstones, compaction) and [lexical.md](lexical.md)
-(BM25 segments, the document store, fusion).
+(BM25 segments, the document store, fusion) and [filtering.md](filtering.md) (attribute filters).
 
 ## The dense index in one paragraph
 
@@ -13,10 +13,11 @@ Two-level spherical k-means (`k1` coarse groups x `k2` fine cells; `k1=1` is a f
 Every vector is written into the slabs of its `m` nearest fine cells (multi-assignment), so a single probed slab
 already contains the query's neighbourhood. A slab is one immutable object holding the residuals of its members
 (`x - centroid`) twice: a compact **scan tier** (PQ-192 codes since g4, 4-bit codes in g2/g3) and an int8
-**rerank tier**, plus ids and an optional payload section. A query routes against the cached centroid table,
-range-reads the scan tier of `nprobe` slabs, scans them with a bounded top-k heap, merges and dedupes, then
-re-scores the best `rerank` candidates (150 by default) with their int8 records. Storage is traded for fewer bytes
-read per query everywhere. Updates never rewrite an object: an upsert or delete adds a small delta segment and/or
+**rerank tier**, plus ids, a 32-bit attribute word per entry and an optional payload section. A query routes
+against the cached centroid table, range-reads the scan tier of `nprobe` slabs, scans them with a bounded top-k
+heap (an attribute filter and the tombstones are tested before an entry can enter it; a selective filter widens
+the probes), merges and dedupes, then re-scores the best `rerank` candidates (150 by default) with their int8
+records. Storage is traded for fewer bytes read per query everywhere. Updates never rewrite an object: an upsert or delete adds a small delta segment and/or
 tombstone set plus a new manifest *revision*; compaction folds them into new slab revisions, automatically once a
 revision exceeds the generation's compaction thresholds; cells that outgrow a cap are split in two.
 
@@ -60,7 +61,8 @@ Everything numeric is in Rust (`crates/thread-core`), exposed to JS through wasm
 to Python through PyO3 (`crates/thread-py`). The SDKs do the I/O and hand bytes to the kernels; the Worker is one
 such host that also runs the build.
 
-- `crates/thread-core`   format, quantization, k-means accumulators, router, scan; lexical side: `source`
+- `crates/thread-core`   format, quantization, k-means accumulators, router, scan, `filter` (attribute clauses
+                      the scans apply before top-k insertion); lexical side: `source`
                       (demand paging), `container`, `tokenize`, `lex` (terms/postings), `docs`, `segment`,
                       `fusion`, `excerpts`, `rerank`
 - `crates/thread-wasm`   wasm-bindgen jobs: FlatKmeansJob, TreeKmeansJob, IncKmeansJob, Reducer, AssignJob, SlabJob,

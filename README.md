@@ -29,6 +29,9 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
   millisecond.
 - **Vectors and text, one id space.** BM25 search over the same documents, fused with the vector results by rank.
   One upsert adds a vector, its text and its metadata; one delete hides all three.
+- **Filters that cost nothing extra.** Every document carries a 32-bit attribute word (named fields: a tenant, a
+  language, flags, a date) that lives inside the bytes a query reads anyway. A filter is applied inside the scan,
+  before candidates are chosen, and a selective filter widens its probes instead of returning less.
 - **Writes without rebuilds.** Upserts and deletes append small segments and a new manifest revision. Compaction
   folds them back in automatically, in the background, without a failed query.
 
@@ -55,10 +58,14 @@ const { hits } = await index.query(embedding, { topK: 10 });     // [{ id, score
 
 // text, vectors, or both (fused by Reciprocal Rank Fusion), with the stored document
 const r = await index.search({ text: "deploy failed", vector: embedding, topK: 10, docs: true });
-// r.hits[0] = { id, score, dense?: { rank, score }, lexical?: { rank, score }, doc?: { id, meta } }
+// r.hits[0] = { id, score, dense?: { rank, score }, lexical?: { rank, score }, doc?: { id, meta, attrs } }
+
+// filter by attributes (named fields packed into each document's 32-bit word; see docs/filtering.md)
+await index.configureAttrs({ tenant: { bits: 12 }, lang: { values: ["en", "fr", "de"] }, public: "bool" });
+const f = await index.search({ text: "deploy failed", vector: embedding, topK: 10, filter: { tenant: 42, lang: { $in: ["en", "fr"] } } });
 
 // write
-await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: ["...", "..."], metas: ["A", "B"] });
+await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: ["...", "..."], metas: ["A", "B"], attrs: [{ tenant: 42, lang: "en" }, { tenant: 7 }] });
 await index.delete([1000]);
 ```
 
@@ -73,8 +80,9 @@ from thread_sdk import FileBlobStore, S3BlobStore, open_index
 store = S3BlobStore.r2(account_id, "my-bucket", access_key_id, secret_access_key)   # or FileBlobStore("/data/idx")
 with open_index(store) as index:
     hits = index.query(embedding, top_k=10).hits
-    r = index.search(text="deploy failed", vector=embedding, top_k=10, docs=True)
-    index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["A", "B"])
+    index.configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr", "de"]}, public="bool")   # once
+    r = index.search(text="deploy failed", vector=embedding, top_k=10, docs=True, filter={"tenant": 42})
+    index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["A", "B"], attrs=[{"tenant": 42}, {"tenant": 7}])
 ```
 
 Python reads the same bucket the Worker serves from, a local directory holding a copy of it, or a pack
@@ -105,32 +113,37 @@ methodology: [docs/benchmarks.md](docs/benchmarks.md).
 | cost, 1M vectors + 10M queries/month | ~$111 | ~$10 | |
 | index size | managed | 5.1 GB in R2 | |
 | upsert of 2000 vectors | | 3.3 s, visible within 30 s | |
+| metadata filtering | indexed properties | fields packed into a 32-bit word, tested inside the scan; selective filters widen the probes | |
 
-Where it is a near drop-in for Vectorize: `query`, `upsert`, `delete`, `topK`, metadata returned per hit. Where it
-is not: ids are u32, distance is cosine only, and there is no server-side metadata filtering yet (hits carry a
-small `attrs` field for client-side filtering). The [mapping table](sdk/ts/README.md#vectorize-mapping) lists
-every call.
+Where it is a near drop-in for Vectorize: `query`, `upsert`, `delete`, `topK`, metadata returned per hit, and
+metadata filters (`$eq`, `$ne`, `$in`, `$nin`, `$lt`, `$lte`, `$gt`, `$gte`) over fields packed into a 32-bit
+attribute word. Where it is not: ids are u32, distance is cosine only, and filterable metadata is bounded by that
+word (a tenant, a language, flags, a date: see [docs/filtering.md](docs/filtering.md)). The
+[mapping table](sdk/ts/README.md#vectorize-mapping) lists every call.
 
 ## How it works, briefly
 
 Vectors are clustered into a few thousand cells. Each cell is one immutable object, a **slab**, holding its
 members' residuals twice: compact product-quantized codes for scanning and int8 codes for re-scoring. A query
 scores the cell centroids (the only thing kept in memory), range-reads the scan prefix of the best few dozen
-slabs, keeps a bounded top-k, then re-scores the best 150 candidates with a handful of multi-range reads. Text
-lives in **segments** beside the slabs: BM25 postings and a document store, read in two range-request rounds per
-query. Updates append delta segments and tombstone sets under a new manifest revision; compaction folds them into
-new slab revisions and splits cells that grow too large.
+slabs, keeps a bounded top-k, then re-scores the best 150 candidates with a handful of multi-range reads. Each
+entry's attribute word sits in that prefix, so a filter is tested before an entry can take a candidate slot, and
+a selective filter scans more cells in routing order until it has enough matches. Text lives in **segments**
+beside the slabs: BM25 postings and a document store, read in two range-request rounds per query. Updates append
+delta segments and tombstone sets under a new manifest revision; compaction folds them into new slab revisions
+and splits cells that grow too large.
 
 All the arithmetic is Rust (`crates/thread-core`), compiled to wasm for Workers and Node and to a native extension
 for Python. The SDKs and the Worker only do I/O. [docs/architecture.md](docs/architecture.md) has the whole
 picture; [docs/query-path.md](docs/query-path.md), [docs/update-path.md](docs/update-path.md) and
-[docs/lexical.md](docs/lexical.md) have the details.
+[docs/lexical.md](docs/lexical.md) have the details; [docs/filtering.md](docs/filtering.md) covers attribute
+filters.
 
 ## What is in the repo
 
 | path | what |
 |---|---|
-| `crates/thread-core` | the engine: formats, quantization, k-means, routing, scan, BM25, fusion |
+| `crates/thread-core` | the engine: formats, quantization, k-means, routing, scan, attribute filters, BM25, fusion |
 | `crates/thread-wasm`, `crates/thread-py` | wasm-bindgen and PyO3 bindings over the engine |
 | `crates/thread-cli` | native CLI for lexical segments (`thread seg build\|inspect\|search\|merge`, `thread tokenize`) |
 | `sdk/ts`, `sdk/python` | the `thread-sdk` packages (npm, PyPI) |
@@ -140,10 +153,13 @@ picture; [docs/query-path.md](docs/query-path.md), [docs/update-path.md](docs/up
 
 ## Status
 
-Version 0.1.0. The query path, the lexical index and hybrid search are tested end to end from both SDKs and the
-Worker, including a cross-check that Python and TypeScript return the same results from the same bucket. The SDK
-write path is marked experimental: it writes the same objects the Worker does, but the two have not yet been
-cross-verified against each other in production. Compaction and GC of slabs run in the Worker only.
+Version 0.1.0. The query path, the lexical index, hybrid search, attribute filtering and packs are tested end to
+end from both SDKs and the Worker, including a cross-check that Python and TypeScript return the same results
+(ids, scores, documents, compiled filters and the cells a filtered query scans) from the same bucket or pack. The
+SDK write path is marked experimental: it writes the same objects the Worker does, but the two have not yet been
+cross-verified against each other in production. Compaction and GC of slabs run in the Worker only. Filtering is
+new in this version: the attribute word is bounded to 32 bits, text queries post-filter through the document
+store, and there is no `$or` ([docs/filtering.md](docs/filtering.md#not-done)).
 
 ## Development
 

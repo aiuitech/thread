@@ -14,7 +14,8 @@ const thread = await Thread.init({ wasmModule });                   // once per 
 const index = await thread.open({ bucket: env.BUCKET, waitUntil: (p) => ctx.waitUntil(p) });
 const { hits } = await index.query(embedding, { topK: 10 });  // dense: [{ id, score, attrs, source }, ...]
 const r = await index.search({ text: "deploy failed", vector: embedding, topK: 10, docs: true });
-// hybrid: r.hits = [{ id, score, dense?: {rank, score}, lexical?: {rank, score}, doc?: {id, meta} }, ...]
+// hybrid: r.hits = [{ id, score, dense?: {rank, score}, lexical?: {rank, score}, doc?: {id, meta, attrs} }, ...]
+const f = await index.search({ text: "deploy failed", vector: embedding, topK: 10, filter: { tenant: 42, lang: { $in: ["en", "fr"] } } });
 ```
 
 ## Install
@@ -149,16 +150,20 @@ manifest, slabs table, deltas, tombstone state).
 | `returnPayload` | false | also return each hit's payload bytes (one extra range read per slab with payloads not already in memory) |
 | `inflight` | 12 | reads in flight per query |
 | `speculate` | true | read the running top-T's rerank records while the last 6 slabs are still scanning |
+| `filter` | - | an attribute filter (see [Filtering](#filtering)): field conditions, or the compiled words |
+| `maxNprobe` | 4 x nprobe | with a filter: how many cells a selective filter may scan in all, in routing order, until `max(topK, rerank)` candidates match (`nprobe` = no widening) |
 
 Manifests without `defaults` (g1, g2) use `nprobe 1, rerank 32, pc 0`; `params.source` says where each value
-came from (`query`, `manifest`, `legacy`).
+came from (`query`, `manifest`, `legacy`); with a filter `params` also carries `filter: true` and the `maxNprobe` in
+effect.
 
 ```ts
 interface QueryResult {
 	hits: { id: number; score: number; attrs: number; payload?: Uint8Array; source: "slab" | "delta" }[];
 	params: { topK; nprobe; rerank; pc; source: { nprobe; rerank; pc } };
 	stats: {
-		gen; rev; format; routing: "flat" | "tree"; cells: number[];     // probed cells
+		gen; rev; format; routing: "flat" | "tree"; cells: number[];     // cells scanned (beyond nprobe when a filter widened)
+		filterDropped; candidates;                                       // entries the filter dropped, distinct scan-tier candidates
 		scanned; scanBytes; slabBytes;                                   // phase 1
 		rerank; rerankCandidates; rerankSlabs; rerankReads; rerankBytes; rerankLocal; specRecords; specUsed;  // phase 2
 		deltas; deltaBytes; deltaScanned; deltaHits; deltaDropped; deltaTop; tombstones; tombSets; tombDropped;
@@ -193,12 +198,13 @@ a vector a dense generation.
 | `recallK` | `lex.defaults.recallK`, else max(topK, 50) | depth of each list before fusion |
 | `rrfK` | `lex.defaults.rrfK`, else 60 | RRF constant |
 | `weights` | `lex.defaults.weights`, else 1 / 1 | `{dense, lexical}` list weights |
-| `dense` | - | `QueryOptions` of the dense list (nprobe, rerank, ...) |
+| `dense` | - | `QueryOptions` of the dense list (nprobe, rerank, maxNprobe, ...) |
 | `docs` | false | `true`: resolve each hit's metadata through the `docs` store; `"text"`: the stored text too |
+| `filter` | - | an attribute filter applied to both lists (see [Filtering](#filtering)) |
 
 ```ts
 interface SearchResult {
-	hits: { id; score; dense?: { rank; score }; lexical?: { rank; score }; doc?: { id; meta; text? } | null }[];
+	hits: { id; score; dense?: { rank; score }; lexical?: { rank; score }; doc?: { id; meta; attrs; text? } | null }[];
 	mode: "dense" | "lexical" | "hybrid";        // one list is returned as is; two are fused with RRF
 	params: { topK; recallK; rrfK; weights };
 	dense?: QueryResult;                         // the dense query's full result
@@ -207,9 +213,44 @@ interface SearchResult {
 }
 ```
 
-`index.lexicalSearch(text, k)` is the BM25 list alone, `index.tokenize(text)` the query's tokens, `index.docs(ids,
-{text})` the document store (`Map<id, {id, meta, text?}>`, newest live copy of each id, tombstone-aware).
-`index.lexConfig`, `index.segments` and `index.hasDense` describe the generation.
+`index.lexicalSearch(text, k, {filter?})` is the BM25 list alone, `index.tokenize(text)` the query's tokens,
+`index.docs(ids, {text})` the document store (`Map<id, {id, meta, attrs, text?}>`, newest live copy of each id,
+tombstone-aware). `index.lexConfig`, `index.segments`, `index.attrSchema` and `index.hasDense` describe the
+generation.
+
+### Filtering
+
+Every document carries a 32-bit attribute word, stored with its vector (inside the scan prefix every query reads)
+and in its `docs` entry; a filter is a condition on that word, applied inside the scan before an entry can take a
+candidate slot. A schema names fields inside the word (design and knobs: [docs/filtering.md](../../docs/filtering.md)):
+
+```ts
+await index.configureAttrs({ tenant: { bits: 12 }, lang: { values: ["en", "fr", "de"] }, public: "bool", year: { bits: 7, min: 1970 } });
+await index.upsert({ ids, vectors, texts, metas, attrs: [{ tenant: 42, lang: "en", public: true, year: 2024 }, { tenant: 7 }] });
+const r = await index.query(embedding, { topK: 10, filter: { tenant: 42, lang: { $in: ["en", "fr"] }, year: { $gte: 2020 } } });
+const h = await index.search({ text: "deploy failed", vector: embedding, filter: { public: true }, docs: true });
+index.unpackAttrs(r.hits[0].attrs);      // { tenant: 42, lang: "en", public: true, year: 2024 }
+```
+
+| in a filter | fields | meaning |
+|---|---|---|
+| `field: value`, `{ $eq }`, `{ $ne }` | all | equal / not equal |
+| `{ $in: [...] }`, `{ $nin: [...] }` | all | in / not in a list |
+| `{ $lt, $lte, $gt, $gte }` | number | a range (combined into one test) |
+| `{ $any, $all, $none }` (a bit mask) | number | some / every / no bit of the mask set |
+
+Conditions on different fields are ANDed; there is no `$or`. Field specs: `{ bits }` (an unsigned integer, with
+an optional `min`), `{ values: [...] }` (an enum) or `"bool"`; the fields are laid out in order and must fit 32
+bits. A later `configureAttrs` may add fields or enum values but never changes an existing field's layout. Without a
+schema the one field is `attrs`, the raw word (`filter: { attrs: { $any: 1 } }`); `attrs` in an upsert may always be
+given as raw numbers.
+
+What it costs: the dense scan reads nothing extra and tests the word only for candidates that would have entered
+the top-T. A selective filter (few matches among the `nprobe` cells) makes the query scan more cells in routing
+order, in batches, until `max(topK, rerank)` candidates match or `maxNprobe` cells were scanned (default 4 x nprobe):
+`stats.cells` lists what was scanned. The BM25 list is filtered after scoring: it is taken deeper (4 x k, then 4x
+more up to 65 536) and each candidate's word is resolved through the `docs` store, one bucket read per candidate.
+`index.compileFilter(expr)` returns the compiled words a filter turns into (reusable across queries).
 
 ### `index.refresh(): Promise<boolean>`
 
@@ -228,7 +269,8 @@ afterwards.
 
 ```ts
 await index.configureLexical({ text: true, lengths: "exact", bucketTerms: 256 });   // once: manifest.lex (a revision)
-const r = await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: ["...", "..."], metas: ["Title A", "Title B"], attrs: [5, 6] });
+await index.configureAttrs({ tenant: { bits: 12 }, lang: { values: ["en", "fr"] } });                // once: manifest.attrs (a revision)
+const r = await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: ["...", "..."], metas: ["Title A", "Title B"], attrs: [{ tenant: 5, lang: "en" }, 6] });
 // { gen, rev, seq, count, cells, distinctCells, keys: { delta, segment, tombstones, manifest }, bytes, conflicts, casConflicts, currentUpdated, ms }
 await index.upsert({ ids: [1002], texts: ["text-only document"], metas: ["C"] });   // no vector: found by text alone
 await index.delete([1000]);           // { gen, rev, count, key, conflicts, ... } (hides the vector, the text and the doc)
@@ -324,13 +366,13 @@ directory or a bucket to write on top of it. Format and rationale: [docs/portabi
 
 | Vectorize | thread-sdk |
 |---|---|
-| `env.VECTORIZE.query(vector, { topK, returnMetadata })` | `index.query(vector, { topK, returnPayload })`: `hits[].id/score`; `attrs` (u32) and `payload` (bytes) are the metadata |
+| `env.VECTORIZE.query(vector, { topK, returnMetadata })` | `index.query(vector, { topK, returnPayload })`: `hits[].id/score`; `attrs` (u32, `unpackAttrs` for the fields) and `payload` (bytes) are the metadata |
 | `matches[].id` (string) | `hits[].id` (u32) |
-| `upsert([{ id, values, metadata }])` | `index.upsert({ ids, vectors, attrs?, payloads? })` (replace semantics by default) |
+| `upsert([{ id, values, metadata }])` | `index.upsert({ ids, vectors, attrs?, payloads? })` (replace semantics by default; `attrs` as field values under `configureAttrs`) |
 | `insert(...)` | `index.upsert({ ..., replace: false })` |
 | `deleteByIds(ids)` | `index.delete(ids)` |
 | `getByIds` | not available (no id -> slab map; keep ids -> data in your own store) |
-| metadata filters | not available; `attrs` is returned per hit for client-side filtering |
+| `query(vector, { filter: { field: { $eq | $ne | $in | $nin | $lt | $lte | $gt | $gte } } })` on indexed metadata | `index.query(vector, { filter })` with the same operators (plus `$any`/`$all`/`$none` bit tests) over fields packed into the 32-bit word (`configureAttrs`); no `$or` |
 | `returnMetadata` | `search({ docs: true })`: the `docs` store's metadata string (and text) per hit |
 | (no equivalent) | `search({ text })`: BM25 and hybrid search over the same ids |
 | `describe()` | `index.manifest`, `index.dim`, `index.cells`, `index.defaults` |

@@ -12,18 +12,23 @@
 //! ```text
 //! Header, 64 bytes
 //! 0   magic "THRDDOCS"
-//! 8   version u32 = 1
+//! 8   version u32 = 2 (1 still read: no attrs)
 //! 12  n u32              documents
 //! 16  bucket count B u32 = ceil(n / bucket_docs)
 //! 20  bucket_docs u32
-//! 24  flags u32          bit 0: texts stored
+//! 24  flags u32          bit 0: texts stored; bit 1: attrs stored (version 2)
 //! 28  reserved u32
 //! 32  dir_off u64 (= 64)   40 dir_len u64 (= 16 B)   48 buckets_off u64   56 buckets_len u64
 //! directory: B entries (first id u32, bucket len u32, bucket offset u64), ascending by first id
-//! bucket entry: id varint, meta len varint, meta (UTF-8), text len varint, text offset varint
-//!   (only when text len > 0; relative to the text region, which starts at
+//! bucket entry: id varint, [attrs varint, when bit 1], meta len varint, meta (UTF-8), text len varint,
+//!   text offset varint (only when text len > 0; relative to the text region, which starts at
 //!   align8(buckets_off + buckets_len) and runs to the end of the section)
 //! ```
+//!
+//! `attrs` is the document's 32-bit attribute word, the same one its dense entry carries (see
+//! `crate::filter`): a lexical query resolves it here to apply an attribute filter to its hits.
+//! A writer sets bit 1 only when some document has a non-zero word, so the common case costs
+//! nothing; readers of version 1 sections see every attrs as 0.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +38,7 @@ use crate::tomb::Tombstones;
 use crate::varint;
 
 pub const MAGIC: &[u8; 8] = b"THRDDOCS";
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const HEADER_LEN: u64 = 64;
 pub const DIR_ENTRY_LEN: u64 = 16;
 /// Documents per bucket unless the builder is told otherwise: a bucket of titles is ~5 KB, one
@@ -41,6 +46,7 @@ pub const DIR_ENTRY_LEN: u64 = 16;
 pub const DEFAULT_BUCKET_DOCS: u32 = 128;
 pub const PLAN_GAP: u64 = 4096;
 const FLAG_TEXT: u32 = 1;
+const FLAG_ATTRS: u32 = 2;
 
 #[inline]
 fn align8(x: u64) -> u64 {
@@ -55,11 +61,11 @@ fn u64_at(buf: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(buf[o..o + 8].try_into().unwrap())
 }
 
-/// Builds a `docs` section from `(id, meta, text)` in any id order.
+/// Builds a `docs` section from `(id, meta, text, attrs)` in any id order.
 pub struct DocsBuilder {
     bucket_docs: u32,
     with_text: bool,
-    docs: BTreeMap<u32, (String, String)>,
+    docs: BTreeMap<u32, (String, String, u32)>,
 }
 
 impl Default for DocsBuilder {
@@ -98,8 +104,19 @@ impl DocsBuilder {
     pub fn contains(&self, id: u32) -> bool {
         self.docs.contains_key(&id)
     }
-    /// Adds a document. Fails on a duplicate id or `id == u32::MAX`.
+    /// Adds a document with attrs 0. Fails on a duplicate id or `id == u32::MAX`.
     pub fn add(&mut self, id: u32, meta: &str, text: Option<&str>) -> Result<(), Error> {
+        self.add_attrs(id, meta, text, 0)
+    }
+
+    /// Adds a document with its attribute word. Fails on a duplicate id or `id == u32::MAX`.
+    pub fn add_attrs(
+        &mut self,
+        id: u32,
+        meta: &str,
+        text: Option<&str>,
+        attrs: u32,
+    ) -> Result<(), Error> {
         if id == u32::MAX {
             return Err(Error::Format("document id u32::MAX is reserved".into()));
         }
@@ -111,8 +128,13 @@ impl DocsBuilder {
         } else {
             String::new()
         };
-        self.docs.insert(id, (meta.to_string(), text));
+        self.docs.insert(id, (meta.to_string(), text, attrs));
         Ok(())
+    }
+
+    /// Whether any document has a non-zero attribute word (the section then stores them).
+    pub fn has_attrs(&self) -> bool {
+        self.docs.values().any(|d| d.2 != 0)
     }
 
     pub fn write_to(&self, out: &mut Vec<u8>) -> Result<(), Error> {
@@ -126,13 +148,17 @@ impl DocsBuilder {
         let buckets_off = align8(HEADER_LEN + dir_len);
         let start = out.len();
         out.resize(start + buckets_off as usize, 0);
-        let entries: Vec<(&u32, &(String, String))> = self.docs.iter().collect();
+        let with_attrs = self.has_attrs();
+        let entries: Vec<(&u32, &(String, String, u32))> = self.docs.iter().collect();
         let mut dir: Vec<u8> = Vec::with_capacity(dir_len as usize);
         let mut texts: Vec<u8> = Vec::new();
         for chunk in entries.chunks(bd) {
             let b_start = out.len() as u64 - start as u64;
-            for (id, (meta, text)) in chunk {
+            for (id, (meta, text, attrs)) in chunk {
                 varint::put(out, **id as u64);
+                if with_attrs {
+                    varint::put(out, *attrs as u64);
+                }
                 varint::put(out, meta.len() as u64);
                 out.extend_from_slice(meta.as_bytes());
                 varint::put(out, text.len() as u64);
@@ -159,7 +185,9 @@ impl DocsBuilder {
         h[12..16].copy_from_slice(&(n as u32).to_le_bytes());
         h[16..20].copy_from_slice(&(b_count as u32).to_le_bytes());
         h[20..24].copy_from_slice(&self.bucket_docs.to_le_bytes());
-        h[24..28].copy_from_slice(&(if self.with_text { FLAG_TEXT } else { 0 }).to_le_bytes());
+        let flags =
+            if self.with_text { FLAG_TEXT } else { 0 } | if with_attrs { FLAG_ATTRS } else { 0 };
+        h[24..28].copy_from_slice(&flags.to_le_bytes());
         h[32..40].copy_from_slice(&HEADER_LEN.to_le_bytes());
         h[40..48].copy_from_slice(&dir_len.to_le_bytes());
         h[48..56].copy_from_slice(&buckets_off.to_le_bytes());
@@ -176,10 +204,18 @@ impl DocsBuilder {
     }
 }
 
-/// `meta.docs`.
-pub fn meta_json(n: u32, with_text: bool, bucket_docs: u32, nbytes: u64) -> String {
+/// `meta.docs` (`"attrs":true` only when the section stores attribute words, so the common
+/// meta stays short enough for a container's open prefix).
+pub fn meta_json(
+    n: u32,
+    with_text: bool,
+    with_attrs: bool,
+    bucket_docs: u32,
+    nbytes: u64,
+) -> String {
+    let attrs = if with_attrs { r#","attrs":true"# } else { "" };
     format!(
-        r#"{{"version":{VERSION},"n":{n},"text":{with_text},"bucket_docs":{bucket_docs},"nbytes":{nbytes}}}"#
+        r#"{{"version":{VERSION},"n":{n},"text":{with_text}{attrs},"bucket_docs":{bucket_docs},"nbytes":{nbytes}}}"#
     )
 }
 
@@ -194,6 +230,8 @@ pub struct DocEntry {
     pub id: u32,
     pub meta: String,
     pub text: Range,
+    /// The document's attribute word (0 in sections without attrs).
+    pub attrs: u32,
 }
 
 /// The `docs` section over any [`ByteSource`]. `open` reads the 64-byte header only.
@@ -203,6 +241,7 @@ pub struct Docs<S: ByteSource> {
     buckets: u32,
     bucket_docs: u32,
     with_text: bool,
+    with_attrs: bool,
     directory: Range,
     bucket_bytes: Range,
     text_bytes: Range,
@@ -217,15 +256,17 @@ impl<S: ByteSource> Docs<S> {
             ));
         }
         let version = u32_at(&head, 8);
-        if version != VERSION {
+        if version != 1 && version != VERSION {
             return Err(Error::Format(format!(
-                "unsupported docs version {version} (expected {VERSION})"
+                "unsupported docs version {version} (expected 1 or {VERSION})"
             )));
         }
         let n = u32_at(&head, 12);
         let buckets = u32_at(&head, 16);
         let bucket_docs = u32_at(&head, 20);
-        let with_text = u32_at(&head, 24) & FLAG_TEXT != 0;
+        let flags = u32_at(&head, 24);
+        let with_text = flags & FLAG_TEXT != 0;
+        let with_attrs = version >= 2 && flags & FLAG_ATTRS != 0;
         let directory = Range::new(u64_at(&head, 32), u64_at(&head, 40));
         let bucket_bytes = Range::new(u64_at(&head, 48), u64_at(&head, 56));
         drop(head);
@@ -252,6 +293,7 @@ impl<S: ByteSource> Docs<S> {
             buckets,
             bucket_docs,
             with_text,
+            with_attrs,
             directory,
             bucket_bytes,
             text_bytes: Range::new(text_off, total - text_off),
@@ -273,6 +315,10 @@ impl<S: ByteSource> Docs<S> {
     pub fn has_text(&self) -> bool {
         self.with_text
     }
+    /// Whether the section stores attribute words (else every document's attrs is 0).
+    pub fn has_attrs(&self) -> bool {
+        self.with_attrs
+    }
     pub fn bucket_count(&self) -> u32 {
         self.buckets
     }
@@ -289,7 +335,13 @@ impl<S: ByteSource> Docs<S> {
         self.text_bytes.len
     }
     pub fn meta_json(&self) -> String {
-        meta_json(self.n, self.with_text, self.bucket_docs, self.nbytes())
+        meta_json(
+            self.n,
+            self.with_text,
+            self.with_attrs,
+            self.bucket_docs,
+            self.nbytes(),
+        )
     }
 
     /// The directory: one range (blob-absolute) a host fetches once and keeps.
@@ -332,6 +384,11 @@ impl<S: ByteSource> Docs<S> {
     /// Parses the entry at `pos` (advancing it); `None` on corrupt bytes.
     fn parse_entry(&self, buf: &[u8], pos: &mut usize) -> Option<DocEntry> {
         let id = u32::try_from(varint::read(buf, pos)).ok()?;
+        let attrs = if self.with_attrs {
+            u32::try_from(varint::read(buf, pos)).ok()?
+        } else {
+            0
+        };
         let ml = varint::read(buf, pos) as usize;
         let meta = buf.get(*pos..pos.checked_add(ml)?)?;
         *pos += ml;
@@ -349,6 +406,7 @@ impl<S: ByteSource> Docs<S> {
             id,
             meta: String::from_utf8_lossy(meta).into_owned(),
             text,
+            attrs,
         })
     }
 
@@ -503,7 +561,7 @@ pub fn merge<S: ByteSource>(
             vec![String::new(); live.len()]
         };
         for (e, t) in live.into_iter().zip(texts) {
-            b.add(e.id, &e.meta, Some(&t))?;
+            b.add_attrs(e.id, &e.meta, Some(&t), e.attrs)?;
         }
     }
     Ok(b)
@@ -594,8 +652,9 @@ mod tests {
                 assert_eq!(entries, got.into_iter().flatten().collect::<Vec<_>>());
                 assert_eq!(
                     d.meta_json(),
-                    meta_json(300, with_text, bd, bytes.len() as u64)
+                    meta_json(300, with_text, false, bd, bytes.len() as u64)
                 );
+                assert!(!d.has_attrs());
             }
         }
         let empty = DocsBuilder::new().finish().unwrap();
@@ -603,6 +662,68 @@ mod tests {
         assert_eq!(d.n(), 0);
         assert_eq!(d.lookup(&[0]).unwrap(), vec![None]);
         assert!(d.entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attrs_roundtrip_merge_and_version_1() {
+        let mut b = DocsBuilder::new().bucket_docs(3).with_text(true);
+        for i in 0..20u32 {
+            b.add_attrs(
+                i * 5,
+                &format!("m{i}"),
+                Some(if i % 2 == 0 { "t" } else { "" }),
+                i % 7,
+            )
+            .unwrap();
+        }
+        assert!(b.has_attrs());
+        let bytes = b.finish().unwrap();
+        let d = Docs::open(bytes.as_slice()).unwrap();
+        assert!(d.has_attrs());
+        assert_eq!(u32_at(&bytes, 8), VERSION);
+        let ids: Vec<u32> = (0..20).map(|i| i * 5).collect();
+        for (i, e) in d.lookup(&ids).unwrap().into_iter().enumerate() {
+            let e = e.unwrap();
+            assert_eq!(
+                (e.id, e.attrs, e.meta.as_str()),
+                (i as u32 * 5, i as u32 % 7, format!("m{i}").as_str())
+            );
+        }
+        assert_eq!(d.get(&[10]).unwrap()[0], Some(("m2".into(), "t".into())));
+        assert!(d.meta_json().contains(r#""attrs":true"#));
+        // merge keeps the newest copy's attrs
+        let mut nb = DocsBuilder::new();
+        nb.add_attrs(10, "m2-new", None, 99).unwrap();
+        let newer = nb.finish().unwrap();
+        let dn = Docs::open(newer.as_slice()).unwrap();
+        let m = merge(&[(&d, None), (&dn, None)], 4, false)
+            .unwrap()
+            .finish()
+            .unwrap();
+        let dm = Docs::open(m.as_slice()).unwrap();
+        let got = dm.lookup(&[10, 15]).unwrap();
+        assert_eq!(
+            (
+                got[0].as_ref().unwrap().attrs,
+                got[0].as_ref().unwrap().meta.as_str()
+            ),
+            (99, "m2-new")
+        );
+        assert_eq!(got[1].as_ref().unwrap().attrs, 3);
+        // a section whose documents all have attrs 0 is written without them (flag clear)
+        let mut z = DocsBuilder::new();
+        z.add_attrs(1, "a", None, 0).unwrap();
+        let zb = z.finish().unwrap();
+        assert!(!Docs::open(zb.as_slice()).unwrap().has_attrs());
+        // a version-1 section (no flag bit, no attrs varint) reads with attrs 0
+        let mut v1 = zb.clone();
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let d1 = Docs::open(v1.as_slice()).unwrap();
+        assert!(!d1.has_attrs());
+        assert_eq!(d1.lookup(&[1]).unwrap()[0].as_ref().unwrap().attrs, 0);
+        // version 1 with the attrs flag set is still read as having none
+        v1[24..28].copy_from_slice(&FLAG_ATTRS.to_le_bytes());
+        assert!(!Docs::open(v1.as_slice()).unwrap().has_attrs());
     }
 
     #[test]

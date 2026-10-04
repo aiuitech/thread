@@ -32,6 +32,9 @@ pub const ENTRY_LEN: u64 = 32;
 pub const NAME_LEN: usize = 16;
 /// Sections the table can hold within [`Container::plan_open`]'s single fetch.
 pub const PLAN_OPEN_SECTIONS: u64 = 16;
+/// Bytes [`Container::plan_open`] fetches: the header, a 16-entry table and room for a typical
+/// `meta` section (which follows the table), so a cold open needs one fetch.
+pub const PLAN_OPEN_BYTES: u64 = 1024;
 
 /// Reserved section names of a thread segment (`segment.rs`).
 /// UTF-8 JSON, free-form (`format`, `version`, `tokenizer`, per-section summaries); the core
@@ -118,14 +121,13 @@ impl Container {
         Ok(Container { sections, len })
     }
 
-    /// What a host fetches before `open`: the header plus a table of up to
-    /// [`PLAN_OPEN_SECTIONS`] entries, in one range (clip it to the blob's length). If the table
-    /// is longer, `open` returns `Missing` with the rest.
+    /// What a host fetches before `open`: [`PLAN_OPEN_BYTES`] from the start (the header, a table
+    /// of up to [`PLAN_OPEN_SECTIONS`] entries and usually the `meta` behind it), in one range
+    /// (clip it to the blob's length). If the table is longer, `open` returns `Missing` with the
+    /// rest.
     pub fn plan_open() -> Plan {
-        Plan::from(vec![Range::new(
-            0,
-            HEADER_LEN + PLAN_OPEN_SECTIONS * ENTRY_LEN,
-        )])
+        const _: () = assert!(PLAN_OPEN_BYTES >= HEADER_LEN + PLAN_OPEN_SECTIONS * ENTRY_LEN);
+        Plan::from(vec![Range::new(0, PLAN_OPEN_BYTES)])
     }
 
     /// Size of the blob the table was read from.

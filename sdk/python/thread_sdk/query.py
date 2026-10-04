@@ -18,6 +18,7 @@ deadlock the pool. For a local store (memory, disk) reads are cheap and everythi
 from __future__ import annotations
 
 import functools
+import math
 import threading
 import time
 from concurrent.futures import Executor, Future
@@ -31,6 +32,8 @@ from .wire import LEGACY_DEFAULTS, TombState, ThreadError, keys, slab_rev_of, to
 __all__ = ["Hit", "QueryResult", "RevState", "Base", "QUERY_INFLIGHT", "execute_query"]
 
 QUERY_INFLIGHT = 12
+#: A filtered query's default `max_nprobe`, as a multiple of `nprobe`.
+FILTER_WIDEN = 4
 #: Rerank winners of one slab whose records lie within this span share one range (adjacent records).
 MULTI_COALESCE = 4 * 1024
 #: Speculate on the running top-T once only this many slabs are left to scan.
@@ -174,7 +177,12 @@ def execute_query(
     return_payload: bool = False,
     inflight: int = QUERY_INFLIGHT,
     speculate: bool = True,
+    filter: Any = None,
+    max_nprobe: int | None = None,
 ) -> QueryResult:
+    """`filter`: a compiled attribute filter (the words `compile_filter` returns; None or empty = none), applied
+    inside every scan before top-k insertion. With one, probing widens past `nprobe` in batches (routing order)
+    until T distinct candidates match or `max_nprobe` cells were scanned (default 4 x nprobe)."""
     store, rev, base, io = ctx.store, ctx.rev, ctx.base, ctx.io
     manifest, gen, fmt, tomb, deltas = rev.manifest, rev.gen, rev.format, rev.tomb, rev.deltas
     t_start = time.perf_counter()
@@ -187,8 +195,16 @@ def execute_query(
     nprobe_v = _int_param("nprobe", nprobe if nprobe is not None else defaults["nprobe"], 1)
     pc_v = _int_param("pc", pc if pc is not None else defaults["pc"], 0)
     rerank_v = _int_param("rerank", rerank if rerank is not None else defaults["rerank"], 0)
+    words = filter if filter is not None and len(filter) else None
+    filtered = words is not None
+    n_cells = manifest["k1"] * manifest["k2"]
+    if max_nprobe is not None and (isinstance(max_nprobe, bool) or not isinstance(max_nprobe, int) or max_nprobe < nprobe_v):
+        raise ThreadError(f"max_nprobe must be an integer >= nprobe ({nprobe_v})", 400)
+    max_nprobe_v = min(n_cells, max_nprobe if max_nprobe is not None else nprobe_v * FILTER_WIDEN) if filtered else nprobe_v
     params = {"top_k": k, "nprobe": nprobe_v, "rerank": rerank_v, "pc": pc_v,
               "source": {"nprobe": src(nprobe), "rerank": src(rerank), "pc": src(pc)}}
+    if filtered:
+        params.update(filter=True, max_nprobe=max_nprobe_v)
     # Format 1 slabs have no rerank tier: phase 2 is skipped whatever rerank says.
     do_rerank = fmt >= 2 and rev.slabs is not None and rerank_v > 0
     T = max(k, rerank_v) if do_rerank else k
@@ -203,11 +219,15 @@ def execute_query(
         query = base.searcher.query(q_raw, dots=flat or bool(deltas), codebook=base.pq)
     except ValueError as e:
         raise ThreadError(str(e), 400) from e
-    cells = base.searcher.route(query, 0 if flat else pc_v, nprobe_v)
+    # Routed to the widening bound; an unfiltered query scans exactly its nprobe cells.
+    cells = base.searcher.route(query, 0 if flat else pc_v, max(nprobe_v, max_nprobe_v))
     t_route = time.perf_counter()
     tr_route = trace.as_dict()
 
-    run = _native.QueryRun(query, T, do_rerank, return_payload)
+    try:
+        run = _native.QueryRun(query, T, do_rerank, return_payload, words)
+    except ValueError as e:
+        raise ThreadError(str(e), 400) from e
     slab_keys: dict[int, str] = {}
     lock = threading.Lock()
     st = {"rerank_reads": 0, "rerank_bytes": 0}
@@ -274,13 +294,17 @@ def execute_query(
             full = b.obj
         return b, full, slab_rev
 
-    def slab_task(cell: int) -> None:
+    def slab_task(cell: int, batch_end: int) -> None:
+        """Scans one cell; `batch_end` is the index past the last cell of its batch (the speculation cue)."""
         nonlocal spec_fired
         prefix, full, slab_rev = read_slab(cell)
-        # Tombstones are applied inside the scan (before top-k insertion): ids deleted or replaced at a rev >= this
-        # slab's revision (every set for rev-0 slabs).
+        # Tombstones and the attribute filter are applied inside the scan (before top-k insertion): ids deleted or
+        # replaced at a rev >= this slab's revision (every set for rev-0 slabs), entries whose attrs fail the filter.
         rerankable, done = run.add_slab(cell, prefix, full, tomb_for(tomb, slab_rev) if tomb else None)
-        if not (parallel and speculate and rerankable and len(cells) - done <= SPEC_AT):
+        # Speculate once only a few slabs of the last batch are left: an unfiltered query has one batch; a filtered
+        # one may widen, so its batch is known to be last only at the bound or once T candidates match.
+        if not (parallel and speculate and rerankable and batch_end - done <= SPEC_AT
+                and (not filtered or batch_end >= len(cells) or run.candidates() >= T)):
             return
         with lock:
             if spec_fired:
@@ -298,18 +322,32 @@ def execute_query(
         for d, fut in zip(deltas, delta_reads):
             run.add_delta(fut.result(), tomb_for_delta(tomb, d["addedRev"]) if tomb else None)
 
+    # Phase 1 in batches: the first nprobe cells (the deltas are scanned meanwhile), then (filtered queries only)
+    # more cells in routing order until T distinct candidates passed the filter or max_nprobe cells were scanned.
+    to = min(nprobe_v, len(cells))
     if parallel:
-        slab_futs = [io.submit(slab_task, c) for c in cells]
+        slab_futs = [io.submit(slab_task, c, to) for c in cells[:to]]
         try:
             scan_deltas()
         finally:
             _wait_all(slab_futs)
-        for f in spec_futs:
-            f.exception()  # wait; a failed speculative read only means phase 2 reads those records itself
     else:
-        for c in cells:
-            slab_task(c)
+        for c in cells[:to]:
+            slab_task(c, to)
         scan_deltas()
+    scanned_cells = to
+    step = max(4, math.ceil(nprobe_v / 2))
+    while filtered and run.candidates() < T and scanned_cells < len(cells):
+        to = min(len(cells), scanned_cells + step)
+        batch = cells[scanned_cells:to]
+        if parallel:
+            _wait_all([io.submit(slab_task, c, to) for c in batch])
+        else:
+            for c in batch:
+                slab_task(c, to)
+        scanned_cells = to
+    for f in spec_futs:
+        f.exception()  # wait; a failed speculative read only means phase 2 reads those records itself
     t_phase1 = time.perf_counter()
     tr_phase1 = trace.as_dict()
 
@@ -336,7 +374,9 @@ def execute_query(
             "rev": rev.rev,
             "format": fmt,
             "routing": "flat" if flat else "tree",
-            "cells": cells,
+            "cells": cells[:scanned_cells],
+            "filter_dropped": rs["filter_dropped"],
+            "candidates": run.candidates(),
             "scanned": rs["scanned"],
             "scan_bytes": rs["scan_bytes"],
             "slab_bytes": rs["slab_bytes"],

@@ -102,16 +102,19 @@ const textOf = (i) => `${WORDS[i % 12]} ${WORDS[(i * 7) % 12]} ${WORDS[(i * 5 + 
 /** Runs one request against an index; the shape Python compares. */
 async function answer(index, req) {
 	if (req.kind === "query") {
-		const r = await index.query(Float32Array.from(req.vector), { topK: req.topK, nprobe: req.nprobe, rerank: req.rerank, returnPayload: true });
-		return r.hits.map((h) => [h.id, h.score, h.attrs, h.source, new TextDecoder().decode(h.payload)]);
+		const r = await index.query(Float32Array.from(req.vector), { topK: req.topK, nprobe: req.nprobe, rerank: req.rerank, returnPayload: true, filter: req.filter ?? undefined, maxNprobe: req.maxNprobe ?? undefined });
+		return { hits: r.hits.map((h) => [h.id, h.score, h.attrs, h.source, new TextDecoder().decode(h.payload)]), cells: r.stats.cells };
 	}
 	if (req.kind === "search") {
-		const r = await index.search({ text: req.text ?? undefined, vector: req.vector ? Float32Array.from(req.vector) : undefined, topK: req.topK, dense: { nprobe: req.nprobe }, docs: "text" });
-		return { mode: r.mode, hits: r.hits.map((h) => [h.id, h.score, h.doc ? [h.doc.meta, h.doc.text ?? null] : null]) };
+		const r = await index.search({ text: req.text ?? undefined, vector: req.vector ? Float32Array.from(req.vector) : undefined, topK: req.topK, dense: { nprobe: req.nprobe }, docs: "text", filter: req.filter ?? undefined });
+		return { mode: r.mode, hits: r.hits.map((h) => [h.id, h.score, h.doc ? [h.doc.meta, h.doc.text ?? null, h.doc.attrs] : null]) };
 	}
 	if (req.kind === "lexical") {
-		const r = await index.lexicalSearch(req.text, req.topK);
+		const r = await index.lexicalSearch(req.text, req.topK, req.filter ? { filter: index.compileFilter(req.filter) } : {});
 		return { tokens: r.tokens, hits: r.hits.map((h) => [h.id, h.score]), numDocs: r.stats.numDocs };
+	}
+	if (req.kind === "compile") {
+		return Array.from(index.compileFilter(req.filter));
 	}
 	throw new Error(`unknown request ${req.kind}`);
 }
@@ -122,12 +125,15 @@ if (cmd === "build") {
 	const vectors = await buildGen(store, "gi");
 	const index = await thread.open({ store, cache: false });
 	await index.configureLexical({ text: true, bucketTerms: 8, defaults: { rrfK: 30 } });
+	// an attribute schema; ids < 10040 get packed field values, the next batch raw words
+	await index.configureAttrs({ kind: { values: ["doc", "note", "ticket"] }, public: "bool", team: { bits: 6 } });
 	const r = rng(9);
 	const fresh = unitRows(60, DIM, r);
 	const ids = Array.from({ length: 60 }, (_, i) => 10000 + i);
-	await index.upsert({ ids: ids.slice(0, 40), vectors: fresh.subarray(0, 40 * DIM), texts: ids.slice(0, 40).map(textOf), metas: ids.slice(0, 40).map((i) => `m${i}`), attrs: ids.slice(0, 40).map((i) => i % 7), payloads: ids.slice(0, 40).map((i) => `p${i}`) });
-	await index.upsert({ ids: ids.slice(40), vectors: fresh.subarray(40 * DIM), texts: ids.slice(40).map(textOf), metas: ids.slice(40).map((i) => `m${i}`) });
-	await index.upsert({ ids: [20000, 20001, 20002], texts: ["galaxy budget review", "galaxy galaxy", "deployments failed"], metas: ["g0", "g1", "g2"] });
+	const attrsOf = (i) => ({ kind: ["doc", "note", "ticket"][i % 3], public: i % 2 === 0, team: i % 5 });
+	await index.upsert({ ids: ids.slice(0, 40), vectors: fresh.subarray(0, 40 * DIM), texts: ids.slice(0, 40).map(textOf), metas: ids.slice(0, 40).map((i) => `m${i}`), attrs: ids.slice(0, 40).map(attrsOf), payloads: ids.slice(0, 40).map((i) => `p${i}`) });
+	await index.upsert({ ids: ids.slice(40), vectors: fresh.subarray(40 * DIM), texts: ids.slice(40).map(textOf), metas: ids.slice(40).map((i) => `m${i}`), attrs: ids.slice(40).map((i) => i % 7) });
+	await index.upsert({ ids: [20000, 20001, 20002], texts: ["galaxy budget review", "galaxy galaxy", "deployments failed"], metas: ["g0", "g1", "g2"], attrs: [{ kind: "note", public: true }, { kind: "ticket" }, { team: 3 }] });
 	await index.upsert({ ids: [5, 10001], vectors: fresh.subarray(50 * DIM, 52 * DIM), texts: ["replaced five", "replaced 10001 galaxy"], metas: ["r5", "r10001"] });
 	await index.delete([7, 10002, 20001]);
 	const requests = [];
@@ -138,6 +144,14 @@ if (cmd === "build") {
 	for (const t of ["galaxy budget", "deployment review", "alpha kilo item3", "replaced", "nothing-here"]) requests.push({ kind: "lexical", text: t, topK: 10 });
 	for (const [t, i] of [["alpha bravo", 0], ["galaxy", 51], ["budget item7", 9]]) requests.push({ kind: "search", text: t, vector: Array.from(fresh.subarray(i * DIM, (i + 1) * DIM)), topK: 8, nprobe: 6 });
 	requests.push({ kind: "search", text: "deployments failed", vector: null, topK: 5, nprobe: 4 });
+	// filtered: field conditions on the schema (dense, with widening; lexical; hybrid) and the compiled words themselves
+	const filters = [{ kind: "doc" }, { public: true, team: { $gte: 2 } }, { kind: { $in: ["note", "ticket"] }, public: false }, { team: { $gt: 1, $lt: 4 } }, { kind: { $ne: "doc" } }];
+	for (const [i, f] of filters.entries()) {
+		requests.push({ kind: "query", vector: Array.from(fresh.subarray(i * DIM, (i + 1) * DIM)), topK: 6, nprobe: 2, rerank: 40, filter: f, maxNprobe: 2 + i * 3 });
+		requests.push({ kind: "lexical", text: ["alpha", "galaxy budget", "deployments", "item3 review", "bravo"][i], topK: 6, filter: f });
+		requests.push({ kind: "search", text: ["alpha bravo", "galaxy", "deployments", "budget", "echo"][i], vector: Array.from(fresh.subarray((i + 20) * DIM, (i + 21) * DIM)), topK: 6, nprobe: 4, filter: f });
+		requests.push({ kind: "compile", filter: f });
+	}
 	const results = [];
 	for (const req of requests) results.push(await answer(index, req));
 	fs.writeFileSync(path.join(dir, "ts-results.json"), JSON.stringify({ gen: index.gen, rev: index.rev, requests, results }));

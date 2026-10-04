@@ -10,6 +10,7 @@ import { asF32 } from "./index.js";
 import { safeFree } from "./query.js";
 import type { BlobStore } from "./store.js";
 import type * as W from "./wasm/thread.js";
+import { defineAttrs, packAttrs, schemaExtends, validateSchema, type AttrFieldSpec, type AttrSchema, type AttrValues } from "./attrs.js";
 import { buildTombState, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
 
 export interface UpsertInput {
@@ -19,8 +20,11 @@ export interface UpsertInput {
 	 * a lexical configuration: documents without a vector are only found by text.
 	 */
 	vectors?: Float32Array | number[] | (Float32Array | number[])[];
-	/** One u32 per vector (default 0). */
-	attrs?: ArrayLike<number>;
+	/**
+	 * One attribute word per document (default 0): field values under the generation's schema (`{tenant: 5, lang:
+	 * "en"}`) or a raw u32. Stored with the vector (slab/delta entry) and in the `docs` store; what `filter` tests.
+	 */
+	attrs?: ArrayLike<AttrValues>;
 	/** One payload per vector (strings are UTF-8 encoded). */
 	payloads?: (Uint8Array | string)[];
 	/**
@@ -81,6 +85,14 @@ export interface ConfigureLexicalResult {
 	gen: string;
 	rev: number;
 	config: LexConfig;
+	conflicts: number;
+	currentUpdated: boolean;
+}
+
+export interface ConfigureAttrsResult {
+	gen: string;
+	rev: number;
+	schema: AttrSchema;
 	conflicts: number;
 	currentUpdated: boolean;
 }
@@ -240,7 +252,7 @@ interface Batch {
 }
 
 /** Validates the batch and returns ids and unit-normalized vectors (a copy). */
-function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | null): Batch {
+function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | null, schema: AttrSchema | null): Batch {
 	const ids = u32(input.ids, "ids");
 	const n = ids.length;
 	if (n === 0) throw new ThreadError("empty batch", 400);
@@ -252,10 +264,12 @@ function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | 
 	if (texts && texts.length !== n) throw new ThreadError(`${texts.length} texts for ${n} ids`, 400);
 	if (metas && metas.length !== n) throw new ThreadError(`${metas.length} metas for ${n} ids`, 400);
 	if ((texts || metas) && !lex) throw new ThreadError("texts/metas need a lexical configuration (index.configureLexical)", 400);
+	if (input.attrs && input.attrs.length !== n) throw new ThreadError(`${input.attrs.length} attrs for ${n} ids`, 400);
+	const attrs = input.attrs ? Uint32Array.from({ length: n }, (_, i) => packAttrs(schema, input.attrs![i])) : null;
 	if (input.vectors === undefined) {
 		if (!texts && !metas) throw new ThreadError("an upsert needs vectors, texts or metas", 400);
-		if (input.attrs || input.payloads) throw new ThreadError("attrs/payloads belong to vectors", 400);
-		return { ids, vectors: null, attrs: null, payloads: null, texts, metas };
+		if (input.payloads) throw new ThreadError("payloads belong to vectors", 400);
+		return { ids, vectors: null, attrs, payloads: null, texts, metas };
 	}
 	if (dim === 0) throw new ThreadError("this generation has no dense index: upsert texts/metas only", 400);
 	const v = input.vectors;
@@ -279,8 +293,6 @@ function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | 
 		const inv = 1 / Math.sqrt(ss);
 		for (let j = i * dim; j < (i + 1) * dim; j++) vectors[j] *= inv;
 	}
-	const attrs = input.attrs ? u32(input.attrs, "attrs") : null;
-	if (attrs && attrs.length !== n) throw new ThreadError(`${attrs.length} attrs for ${n} vectors`, 400);
 	const enc = new TextEncoder();
 	const payloads = input.payloads ? input.payloads.map((p) => (typeof p === "string" ? enc.encode(p) : p)) : null;
 	if (payloads && payloads.length !== n) throw new ThreadError(`${payloads.length} payloads for ${n} vectors`, 400);
@@ -310,7 +322,7 @@ async function encodeSegment(ctx: WriterContext, seq: number, lex: ResolvedLexCo
 	let finished = false;
 	const epoch = ctx.thread.epoch;
 	try {
-		for (let i = 0; i < b.ids.length; i++) job.add(b.ids[i], b.texts?.[i] ?? undefined, b.metas?.[i] ?? undefined);
+		for (let i = 0; i < b.ids.length; i++) job.add(b.ids[i], b.texts?.[i] ?? undefined, b.metas?.[i] ?? undefined, b.attrs?.[i] ?? 0);
 		finished = true;
 		bytes = job.finish();
 	} finally {
@@ -399,7 +411,7 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0 };
 		const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
 			const lex = resolveLexConfig(manifest);
-			const batch = (st.batch ??= prepareBatch(input, hasDense(manifest) ? manifest.dim : 0, lex));
+			const batch = (st.batch ??= prepareBatch(input, hasDense(manifest) ? manifest.dim : 0, lex, manifest.attrs ? validateSchema(manifest.attrs) : null));
 			const wantSeg = lex !== null && (batch.texts !== null || batch.metas !== null);
 			const next = inherit(manifest);
 			const newRev = rev + 1;
@@ -462,6 +474,25 @@ export async function configureLexical(ctx: WriterContext, config: LexConfig): P
 		return { ...inherit(manifest), lex: config, change: { op: "configure-lex", writer: "thread-sdk" } };
 	});
 	return { gen, rev: c.rev, config, conflicts: c.conflicts, currentUpdated: c.currentUpdated };
+}
+
+/**
+ * Commits a manifest revision carrying the attribute schema (`manifest.attrs`). A schema may only grow: every
+ * existing field keeps its name, type, offset and width (an enum may append values), since stored words are not
+ * rewritten.
+ */
+export async function configureAttrs(ctx: WriterContext, spec: Record<string, AttrFieldSpec> | AttrSchema): Promise<ConfigureAttrsResult> {
+	const { store, gen } = ctx;
+	writable(store);
+	const isSchema = "fields" in spec && Array.isArray((spec as AttrSchema).fields);
+	let schema: AttrSchema = isSchema ? validateSchema(spec as AttrSchema) : defineAttrs(spec as Record<string, AttrFieldSpec>);
+	const c = await commitRev(ctx, async ({ manifest }) => {
+		const prev = manifest.attrs ? validateSchema(manifest.attrs) : null;
+		if (prev && !isSchema) schema = defineAttrs(spec as Record<string, AttrFieldSpec>, prev);
+		if (prev && !schemaExtends(prev, schema)) throw new ThreadError("the attribute schema can only add fields or enum values (existing fields keep their layout)", 400);
+		return { ...inherit(manifest), attrs: schema, change: { op: "configure-attrs", writer: "thread-sdk" } };
+	});
+	return { gen, rev: c.rev, schema, conflicts: c.conflicts, currentUpdated: c.currentUpdated };
 }
 
 /**
