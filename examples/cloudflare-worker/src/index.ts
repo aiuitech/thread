@@ -44,8 +44,8 @@
  * (defaults: {nprobe, rerank, pc, route?}) that /query uses for absent parameters, the centroid tree (tree: {key,
  * groups, beam, ...}) and, from rev 1 on, its files, deltas and tombstone sets. See docs/update-path.md.
  */
-import wasmModule from "../pkg/thread_bg.wasm";
-import init, * as thread from "../pkg/thread.js";
+import wasmModule from "../../../crates/thread-wasm/pkg/thread_bg.wasm";
+import init, * as thread from "../../../crates/thread-wasm/pkg/thread.js";
 
 interface Env {
 	BUCKET: R2Bucket;

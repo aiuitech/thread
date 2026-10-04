@@ -23,7 +23,7 @@
  * plus length and go to R2 through a FixedLengthStream, so this isolate never holds a whole object.
  */
 import { WorkerEntrypoint } from "cloudflare:workers";
-import wasmModule from "../pkg/thread_bg.wasm";
+import wasmModule from "../../../crates/thread-wasm/pkg/thread_bg.wasm";
 import stageBundle from "virtual:thread-stage-bundle";
 import app from "./index.ts";
 

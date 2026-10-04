@@ -26,7 +26,7 @@ revisions (see [Updates](#updates-manifest-revisions-deltas-tombstones-compactio
 exceeds the generation's compaction thresholds; cells that outgrow a cap are split in two.
 
 Everything numeric is in Rust (`crates/thread-core`), exposed to JS through
-wasm-bindgen (`crates/thread-wasm`). The Worker (`worker/`) is an I/O shell that
+wasm-bindgen (`crates/thread-wasm`). The Worker (`examples/cloudflare-worker/`) is an I/O shell that
 streams R2 objects through the wasm kernels so no stage holds more than a few
 tens of MB; the SDKs (`sdk/`) are the same query path as a library, plus the lexical
 side, the write path and the fused `search`: `sdk/ts` for TypeScript over the wasm, and
@@ -342,15 +342,16 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
                       compaction)
 - `sdk/python/`       `thread-sdk` (PyPI): the same library for Python (S3/R2, directory and memory stores,
                       memory/disk caches), wire-compatible with `sdk/ts` (see `sdk/python/README.md`)
-- `worker/`           `cf`-managed Worker: build-stage endpoints, `/query`, `/upsert`, `/delete`, compaction (manual and
-                      automatic), cell splits, `/index/status`, rollback, gc (`src/index.ts`); `src/main.ts` runs build
-                      stages and writes in build slots (Worker Loader); see `worker/README.md`
-- `spikes/worker-loader/` the spike that showed dynamic Workers give each slot its own isolate (FINDINGS.md)
+- `examples/`         deployment targets. `cloudflare-worker/`: the `cf`-managed `vib-bench` Worker: build-stage
+                      endpoints, `/query`, `/upsert`, `/delete`, compaction (manual and automatic), cell splits,
+                      `/index/status`, rollback, gc (`src/index.ts`); `src/main.ts` runs build stages and writes in
+                      build slots (Worker Loader); see `examples/cloudflare-worker/README.md`
 - `bench/`            clients of the deployed Worker (build driver, compaction, query/update/split benchmarks);
                       `bench/prep/` dataset prep and shard upload; `bench/offline/` local numpy experiments; see
                       `bench/README.md`
 - `docs/`             `update-path.md`: the update path (revisions, deltas, tombstones, compaction) in detail;
-                      `lexical.md`: the lexical index, the docs store and fusion
+                      `lexical.md`: the lexical index, the docs store and fusion; `worker-loader.md`: the
+                      spike that showed dynamic Workers give each build slot its own isolate
 - `data/`             (gitignored) dataset and prep output
 
 ## Build pipeline (all stages run in the Worker, driven from a laptop)
@@ -388,16 +389,16 @@ PQ: one 12 MB residual object, a 1.5 MB codebook and a 1.8 MB partial).
 
 The driver needs many heavy jobs in parallel (k-means map and assign use 60-100 MB each), but concurrent requests
 to one Worker can share a single 128 MB isolate. Until g4 that meant a pool of eight identical scripts
-(vib-bench-0..7). Now there is one deployment: `worker/src/main.ts` forwards `POST /build/<stage>?slot=<id>` to
+(vib-bench-0..7). Now there is one deployment: `examples/cloudflare-worker/src/main.ts` forwards `POST /build/<stage>?slot=<id>` to
 the dynamic Worker `thread-build:<bundle hash>:slot-<id>` (`env.LOADER.get`), which runs a second bundle of the
-same `worker/src/index.ts` in its own isolate with its own 128 MB and `limits.cpuMs` 300,000. The driver keeps a
+same `examples/cloudflare-worker/src/index.ts` in its own isolate with its own 128 MB and `limits.cpuMs` 300,000. The driver keeps a
 free list of slot ids `0..THREAD_SLOTS-1` (default 8) and sends one job per slot at a time; retries, bodies and auth
 are unchanged. R2 reaches the slots through a loopback RPC entrypoint (`BucketRpc`; an R2 binding cannot be put in a
 dynamic Worker's env) and a shim that gives the bundle an R2Bucket-shaped `env.BUCKET`; object bodies stream
 through the orchestrator in both directions. Writes (`/upsert`, `/delete`) run in the `writer` slot and the
 automatic compaction spreads its cells over slots `auto-0..3`. `?slot=local` runs a request in the query isolate
-(debugging). Design and measurements of the isolation: `spikes/worker-loader/FINDINGS.md`; deploy notes and
-routing: `worker/README.md`.
+(debugging). Design and measurements of the isolation: [docs/worker-loader.md](docs/worker-loader.md); deploy notes and
+routing: `examples/cloudflare-worker/README.md`.
 
 g5 was built this way with the same seed and profile as g4 (`node bench/driver.mjs --gen g5 --profile edge
 --setCurrent 0`, `data/build-g5.log`): identical k-means, PQ, assignment and slab statistics, recall@10 95.12% at
@@ -477,11 +478,11 @@ bench/prep/upload_shards.sh 6
 
 # build wasm and deploy the worker
 cargo build --release --target wasm32-unknown-unknown -p thread-wasm
-wasm-bindgen --target web --experimental-reset-state-function --out-dir worker/pkg --out-name thread target/wasm32-unknown-unknown/release/thread_wasm.wasm
-(cd worker && cf deploy --secrets-file .env.secrets)   # run from worker/, not the repo root
+wasm-bindgen --target web --experimental-reset-state-function --out-dir crates/thread-wasm/pkg --out-name thread target/wasm32-unknown-unknown/release/thread_wasm.wasm
+(cd examples/cloudflare-worker && cf deploy --secrets-file .env.secrets)   # run from the example dir, not the repo root
 # That is the only deployment: build stages and writes run in build slots (dynamic Workers of vib-bench,
-# one isolate per slot id, see "Build slots" above and worker/README.md). The stage bundle the slots run is
-# built by the same `cf deploy` (vite plugin in worker/vite.config.ts). THREAD_ORCH / THREAD_SLOTS point the
+# one isolate per slot id, see "Build slots" above and examples/cloudflare-worker/README.md). The stage bundle the slots run is
+# built by the same `cf deploy` (vite plugin in examples/cloudflare-worker/vite.config.ts). THREAD_ORCH / THREAD_SLOTS point the
 # drivers at another deployment / change the build width (default 8).
 
 # build an index generation (edge profile), then benchmark queries
@@ -575,5 +576,5 @@ to `data/slabs-{gen}.json` and passed to `publish`. The g2 build was
 (g2's manifest predates profiles). The g1 two-level build was
 `--k1 64 --k2 64 --pc 2 --m 3 --perShard 42 --sampleGroups 10 --coarseIters 8 --fineIters 5 --minCount 0 --assignShards 4 --incremental 0 --candidates 0`.
 
-`worker/.env.secrets` holds `BUILD_TOKEN=<random>`; every endpoint except
+`examples/cloudflare-worker/.env.secrets` holds `BUILD_TOKEN=<random>`; every endpoint except
 `/health` requires `Authorization: Bearer <token>`.

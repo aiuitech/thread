@@ -1,5 +1,5 @@
 /**
- * The query path (same semantics as the reference Worker, worker/src/index.ts):
+ * The query path (same semantics as the reference Worker, examples/cloudflare-worker/src/index.ts):
  *  1. route (flat over the cell means by default), build the PQ table (v3),
  *  2. phase 1: read the scan prefix of each probed slab (Range against the cache; a miss reads the whole
  *     object and keeps the local winners' int8 records), scan it as it arrives, filter tombstones, drop the

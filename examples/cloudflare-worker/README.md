@@ -15,8 +15,8 @@ vite.config.ts plugin `thread-stage-bundle`: bundles src/index.ts a second time 
 
 ```sh
 cargo build --release --target wasm32-unknown-unknown -p thread-wasm      # from the repo root
-wasm-bindgen --target web --experimental-reset-state-function --out-dir worker/pkg --out-name thread target/wasm32-unknown-unknown/release/thread_wasm.wasm
-cd worker && cf deploy --secrets-file .env.secrets                     # BUILD_TOKEN=...
+wasm-bindgen --target web --experimental-reset-state-function --out-dir crates/thread-wasm/pkg --out-name thread target/wasm32-unknown-unknown/release/thread_wasm.wasm
+cd examples/cloudflare-worker && cf deploy --secrets-file .env.secrets  # BUILD_TOKEN=...
 ```
 
 `cf deploy` runs `vite build`, which builds the stage bundle as part of the same build (no separate step).
@@ -47,4 +47,4 @@ written through a `FixedLengthStream`, so the orchestrator isolate never holds a
 `POST /build/probe {waitUntilMs?, tag?}` reports where a request ran (slot, isolate id, wasm memory, Cache API) and
 optionally writes `tmp/probe/{tag}` from `ctx.waitUntil` after a delay (`delete-prefix` `tmp/probe/` removes it).
 
-Background on the design: `spikes/worker-loader/FINDINGS.md`.
+Background on the design: [docs/worker-loader.md](../../docs/worker-loader.md).

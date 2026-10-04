@@ -1,6 +1,6 @@
 # Incremental updates: manifest revisions, delta segments, tombstones, compaction
 
-Status: implemented in the Worker (`worker/src/index.ts`) on top of the Rust delta kernels (`DeltaJob`,
+Status: implemented in the Worker (`examples/cloudflare-worker/src/index.ts`) on top of the Rust delta kernels (`DeltaJob`,
 `scan_delta`, `delta_records_for_cell`, `slab_to_records`, `filter_hits`, `split_slab`, `split_slab_records`, ...),
 including automatic compaction after writes and cell splitting. Benchmarks: `bench/update_bench.mjs` ->
 `data/bench-updates.txt` (and `--only trigger` -> `data/bench-trigger.txt`), `bench/split_bench.mjs` ->
@@ -354,9 +354,9 @@ Centroids otherwise stay fixed between full rebuilds. Schedule a full rebuild wh
 
 ## Build slots (Worker Loader) instead of the pool
 
-The spike (`spikes/worker-loader/FINDINGS.md`) showed that every dynamic Worker id runs in its own isolate with its
+The spike ([worker-loader.md](worker-loader.md)) showed that every dynamic Worker id runs in its own isolate with its
 own 128 MB, so the vib-bench-0..7 pool was replaced by one deployment: `vib-bench` forwards `/build/<stage>?slot=N`,
-`/upsert` and `/delete` to dynamic slot Workers that run the same code (`worker/README.md`). For the update path
+`/upsert` and `/delete` to dynamic slot Workers that run the same code (`examples/cloudflare-worker/README.md`). For the update path
 this means: writes run in the `writer` slot by default (no query isolate ever holds a DeltaJob; checked with two
 2000-vector upserts through the query URL: query isolates stayed at 54 MB, where the query Worker taking such writes
 reached 78 MB), manual compactions use slots `admin` (plan, commit) and `cmp-0..7` (cells), and automatic runs spread

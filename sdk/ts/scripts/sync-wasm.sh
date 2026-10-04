@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Copies the wasm-bindgen output of crates/thread-wasm (worker/pkg) into the SDK.
+# Copies the wasm-bindgen output of crates/thread-wasm (crates/thread-wasm/pkg) into the SDK.
 # Run after rebuilding the wasm:
 #   cargo build --release --target wasm32-unknown-unknown -p thread-wasm
-#   wasm-bindgen --target web --experimental-reset-state-function --out-dir worker/pkg --out-name thread \
+#   wasm-bindgen --target web --experimental-reset-state-function --out-dir crates/thread-wasm/pkg --out-name thread \
 #       target/wasm32-unknown-unknown/release/thread_wasm.wasm
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
-src="${1:-$here/../../worker/pkg}"
+src="${1:-$here/../../crates/thread-wasm/pkg}"
 dst="$here/src/wasm"
 mkdir -p "$dst"
 for f in thread.js thread.d.ts thread_bg.wasm thread_bg.wasm.d.ts; do

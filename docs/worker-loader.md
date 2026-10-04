@@ -4,6 +4,10 @@ Orchestrator `vib-loader-spike` (https://vib-loader-spike.aiuitech.workers.dev) 
 `BUCKET` (R2 `vib-bench`), `BUILD_TOKEN` (secret) and `LOADER` (`bindings.workerLoader()`).
 Experiments: `node test.mjs <mem|local|r2|build|cold|cleanup>` (usage in the header of test.mjs).
 
+The spike's code (`spikes/worker-loader/`: `src/dynamic.ts`, `src/index.ts`, `test.mjs`) is no longer in the tree;
+`git show 32b3027:spikes/worker-loader/<file>` has it. What it proved is built into the Cloudflare Worker example
+(`examples/cloudflare-worker/src/main.ts`).
+
 ## Short answer
 Yes. Every dynamic Worker id runs in its own isolate with its own 128 MB. Requirements:
 1. R2 cannot be passed into a dynamic Worker's `env` (`DataCloneError`); pass an RPC stub

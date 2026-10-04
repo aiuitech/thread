@@ -13,5 +13,5 @@
 		"skipLibCheck": true,
 		"allowJs": true
 	},
-	"include": ["src", "cloudflare.config.ts", ".cloudflare/types", "pkg/*.d.ts"]
+	"include": ["src", "cloudflare.config.ts", ".cloudflare/types", "../../crates/thread-wasm/pkg/*.d.ts"]
 }

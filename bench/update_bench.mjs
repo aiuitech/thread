@@ -56,7 +56,7 @@ const BASE = process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
 // isolates instead (A/B).
 const WRITE_SLOT = process.env.THREAD_WRITE_SLOT ?? "writer";
 const WRITE = `${BASE} (slot ${WRITE_SLOT})`;
-const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
+const TOKEN = fs.readFileSync(path.join(root, "examples/cloudflare-worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
 const prep = JSON.parse(fs.readFileSync(path.join(root, "data/prep/manifest.json"), "utf8"));
 const dim = prep.dim;
 const GEN = args.gen ?? "g4";

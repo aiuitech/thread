@@ -4,7 +4,7 @@
  *   node sdk/ts/scripts/verify.mjs [--n 50] [--nprobe 34] [--rerank 150] [--k 10] [--store r2|s3] [--example URL] [--main URL]
  * For each of the first n queries of data/prep/queries.f32 it POSTs the vector to the example's /search (JSON) and
  * to the main Worker's /query (octet-stream) with the same nprobe/rerank, then compares the top-k id sets, the
- * recall@k of each against data/prep/groundtruth.u32 and the client latencies. Tokens: worker/.env.secrets
+ * recall@k of each against data/prep/groundtruth.u32 and the client latencies. Tokens: examples/cloudflare-worker/.env.secrets
  * (BUILD_TOKEN, main Worker) and sdk/examples/basic/.env.secrets (AUTH_TOKEN, example).
  */
 import fs from "node:fs";
@@ -20,7 +20,7 @@ const store = args.store ?? "r2";
 const EXAMPLE = args.example ?? process.env.THREAD_SDK_URL ?? "https://vib-sdk-example.aiuitech.workers.dev";
 const MAIN = args.main ?? process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
 const envOf = (f) => Object.fromEntries(fs.readFileSync(f, "utf8").split("\n").filter((l) => l.includes("=")).map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]));
-const mainToken = envOf(path.join(root, "worker/.env.secrets")).BUILD_TOKEN;
+const mainToken = envOf(path.join(root, "examples/cloudflare-worker/.env.secrets")).BUILD_TOKEN;
 const exampleToken = envOf(path.join(root, "sdk/examples/basic/.env.secrets")).AUTH_TOKEN;
 const prep = JSON.parse(fs.readFileSync(path.join(root, "data/prep/manifest.json"), "utf8"));
 const dim = prep.dim;

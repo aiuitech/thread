@@ -5,7 +5,7 @@
  *   node bench/compact.mjs [--gen g4] [--cells all|1,2,3] [--purge 1] [--maxCellEntries N] [--chunk 48] [--concurrency 8] [--cellConcurrency 3] [--gc 0|1]
  *
  * Every stage runs in a build slot of the orchestrator (THREAD_ORCH, default https://vib-bench.aiuitech.workers.dev):
- * POST /build/<stage>?slot=<id>, one dynamic Worker isolate per slot id (see worker/src/main.ts).
+ * POST /build/<stage>?slot=<id>, one dynamic Worker isolate per slot id (see examples/cloudflare-worker/src/main.ts).
  *
  * 1. compact-plan   (slot admin): head rev = baseRev, the cells to rewrite: cells of every delta segment, plus,
  *                    with --purge, the cells an earlier compaction rewrote at a rev <= the newest tombstone set
@@ -33,7 +33,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
+const TOKEN = fs.readFileSync(path.join(root, "examples/cloudflare-worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
 const ORCH = process.env.THREAD_ORCH ?? process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
 const POOL = Array.from({ length: Number(process.env.THREAD_SLOTS ?? 8) }, (_, i) => `cmp-${i}`);
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);

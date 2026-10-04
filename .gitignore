@@ -7,7 +7,7 @@
 .mypy_cache/
 target/
 node_modules/
-/worker/pkg/
+/crates/thread-wasm/pkg/
 dist/
 build/
 build-bundle/

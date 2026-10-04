@@ -312,7 +312,7 @@ prefixes and uses the rest of the object instead of re-reading it.
 
 ```sh
 npm install
-npm run sync-wasm      # copy worker/pkg/{thread.js,thread.d.ts,thread_bg.wasm,...} into src/wasm
+npm run sync-wasm      # copy crates/thread-wasm/pkg/{thread.js,thread.d.ts,thread_bg.wasm,...} into src/wasm
 npm test               # vitest: wire formats, stores, SigV4, end-to-end with the wasm in Node
 npm run build          # dist/ (tsc + wasm assets)
 cd examples/basic && npm install && cf deploy --secrets-file .env.secrets

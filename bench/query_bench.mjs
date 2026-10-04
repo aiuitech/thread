@@ -14,7 +14,7 @@
  * against the dataset's exact top-10 ground truth, plus the server-reported
  * slab cache hit rate (cache=mem: in-isolate Map, edge: Cache API, none: direct R2).
  * --extra "mode=fetchonly&scanRepeat=3": raw query-string debug switches passed to /query (see DebugOpts in
- * worker/src/index.ts). --json FILE appends one JSON summary line per measured pass.
+ * examples/cloudflare-worker/src/index.ts). --json FILE appends one JSON summary line per measured pass.
  * --extras "a|b|c": interleaved A/B mode. Request i runs query vector floor(i/m) with config (i+floor(i/m))%m
  * (m configs, order rotated per vector), so
  * every config sees the same queries and the same network conditions over time; a per-config summary follows
@@ -33,7 +33,7 @@ for (let i = 2; i < process.argv.length; i++) {
 	else args[m[1]] = "true";
 }
 const BASE = process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
-const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
+const TOKEN = fs.readFileSync(path.join(root, "examples/cloudflare-worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "data/prep/manifest.json"), "utf8"));
 const dim = manifest.dim;
 const N = Number(args.n ?? 1000);

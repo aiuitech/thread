@@ -86,7 +86,7 @@ function releaseSlot(s) {
 	if (next) next(s);
 	else freeSlots.push(s);
 }
-const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
+const TOKEN = fs.readFileSync(path.join(root, "examples/cloudflare-worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
 const manifest = JSON.parse(fs.readFileSync(path.join(root, "data/prep/manifest.json"), "utf8"));
 
 /**

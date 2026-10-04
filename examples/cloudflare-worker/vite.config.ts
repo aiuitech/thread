@@ -8,7 +8,7 @@ import { defineConfig, type Plugin } from "vite";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const STAGE_ENTRY = path.join(here, "src/index.ts");
-const WASM_FILE = path.join(here, "pkg/thread_bg.wasm");
+const WASM_FILE = path.join(here, "../../crates/thread-wasm/pkg/thread_bg.wasm");
 /** Module path of the wasm file inside a dynamic slot Worker (the orchestrator passes its own compiled module). */
 const SLOT_WASM_PATH = "thread_bg.wasm";
 const VIRTUAL_ID = "virtual:thread-stage-bundle";

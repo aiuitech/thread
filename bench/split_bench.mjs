@@ -30,7 +30,7 @@ for (let i = 2; i < process.argv.length; i++) {
 	else args[m[1]] = "true";
 }
 const BASE = process.env.THREAD_URL ?? "https://vib-bench.aiuitech.workers.dev";
-const TOKEN = fs.readFileSync(path.join(root, "worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
+const TOKEN = fs.readFileSync(path.join(root, "examples/cloudflare-worker/.env.secrets"), "utf8").trim().split("=").slice(1).join("=");
 const H = { authorization: `Bearer ${TOKEN}` };
 const prep = JSON.parse(fs.readFileSync(path.join(root, "data/prep/manifest.json"), "utf8"));
 const dim = prep.dim;
