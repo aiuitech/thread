@@ -19,7 +19,7 @@ client-observed from a laptop, sequential, one request to each Worker at a time.
 
 - Every query returned the same ten ids in the same order as the reference Worker (no float-tie differences
   showed up at n = 300).
-- Recall@10 at nprobe 34 / rerank 150 is 95.17 % over 300 queries, matching the README's 95.1 % for g4 (the
+- Recall@10 at nprobe 34 / rerank 150 is 95.17 % over 300 queries, matching docs/benchmarks.md's 95.1 % for g4 (the
   first 50 queries alone are a harder sample: 93.4 % for both implementations).
 - SDK stats per query (mean, warm): 6.22 MB scanned over 34 slab prefixes, 12.1 rerank reads for 12.0 slabs
   with winners (one multi-range Cache API request per slab), 147.2 of 150 rerank records already in memory from

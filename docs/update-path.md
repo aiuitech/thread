@@ -6,6 +6,50 @@ including automatic compaction after writes and cell splitting. Benchmarks: `ben
 `data/bench-updates.txt` (and `--only trigger` -> `data/bench-trigger.txt`), `bench/split_bench.mjs` ->
 `data/bench-split.txt`.
 
+## Summary
+
+Every change is a new manifest revision `idx/{gen}/manifest.{rev}.json` (rev 0 = `manifest.json` from `publish`);
+`idx/current.json` is `{gen, rev}`. A revision lists its files (`coarse`, `fine`, `pq`, slabs table), its delta
+segments (`delta/{seq}.vibd`, each with the rev that added it) and its tombstone sets (`tombstones.{rev}.u32`, the
+ids deleted or replaced at that rev). Nothing is overwritten, so every object can stay in the edge cache for a year
+and a query always reads a consistent snapshot.
+
+- `POST /upsert` (JSON `{ids, vectors, attrs?, payloads?}` or a binary f32 body with `x-ids`/`?firstId=`, up to
+  4096 vectors): one delta segment (`DeltaJob`: primary cell, found through the centroid tree when the manifest has
+  one, + 4-bit/int8/PQ codes against the cell mean) and a tombstone set for the ids (replace semantics: older
+  copies stop resolving), committed as rev + 1. Responds `{gen, rev, seq, cells, ms, bytes, conflicts}`.
+- `POST /delete {ids}`: one tombstone set, rev + 1.
+- Writers serialize on a create-only PUT of `manifest.{rev+1}.json` (R2 `onlyIf: {etagDoesNotMatch: "*"}`),
+  retry on a lost race, and advance `current.json` with an etag compare-and-swap.
+- Queries scan every delta segment with `scan_delta` (int8 scores, no phase 2) next to the probed slabs and apply
+  the tombstone rule: a slab hit is dropped if its id is in a set with rev >= the slab's revision (every set for
+  rev-0 slabs); a delta hit if its id is in a set newer than the rev that added the delta. New data is visible
+  within 30 s (current.json TTL), or immediately with `?rev=` from the write response.
+- **Automatic compaction** (`manifest.compaction`, profile defaults: more than 16 segments, 32 MB of segments or
+  50,000 tombstone ids): after an upsert/delete commit that exceeds a threshold, the writer takes
+  `idx/{gen}/compact.lock` (create-only PUT, stale after 10 min) and compacts a bounded slice in `ctx.waitUntil`:
+  whole segments, oldest first, up to `cellsPerRun` (256) cells, purge cells when the tombstone threshold is
+  exceeded, nothing committed after `deadlineMs` (27 s) from the trigger; the commit is the usual create-only
+  manifest PUT + current.json CAS (a lost race is recorded as `conflict`, the next write triggers again).
+  `GET /index/status` shows the pressure, thresholds, lock and the latest runs.
+- **Cell splitting:** a compaction splits every rewritten cell whose entry count would exceed `maxCellEntries`
+  (edge 3000, local 1000): 2-means over the cell's decoded entries (`split_slab`), every entry re-encoded against
+  its new mean (`split_slab_records`), the cell keeps mean A and a new cell k is appended with mean B; the revision
+  gets `fine.{rev}.f32` (k + 1 means), `k2` + 1 and a rebuilt centroid tree, and query isolates load the new base
+  on their first query of it. Automatic runs split only in slices of at most `splitCellsPerRun` (160) cells. See
+  [Cell splitting](#cell-splitting).
+- `node bench/compact.mjs --gen g4 [--purge 1] [--maxCellEntries N]` (or `POST /build/compact`): rewrites every
+  cell holding delta entries from its old slab's records minus tombstones plus the delta records
+  (`slab/{cell}.{rev}`), commits a revision without the folded deltas, and drops the tombstone sets nothing can
+  reference any more. A delta is folded only when every cell it touches is rewritten; a partial compaction
+  (`--cells`) keeps the rest. `--purge` also rewrites cells earlier compactions wrote, so the replace/delete sets
+  can be dropped. `POST /build/gc {gen, dryRun: false}` deletes objects no recent revision references.
+
+Writes run in the `writer` build slot (the Worker forwards `/upsert` and `/delete` there unless `?slot=local`):
+`DeltaJob` holds a ~25 MB copy of the means (~50 MB while it is passed in), and wasm memory never shrinks, so a
+write must not run in an isolate that serves queries. (Until g4 the benchmarks sent writes to vib-bench-0 of the
+build pool for the same reason.)
+
 ## Objects and revisions
 
 All index objects stay immutable (the edge cache depends on it). Every change is new objects plus a new
@@ -289,15 +333,21 @@ the build slots now multiply (above).
 
 ## Measured (g4, `data/bench-updates.txt`)
 
-- Visibility: the inserted test queries are found at rank 1 (100%, counting identical twin queries) and in the
-  top 10 (100%) right after the upsert (with `?rev=`). Deleted ids never appear again. Recall@10 of the original
-  ground truth stays within 0.02 points of the baseline (95.12%) with 20 deltas, after deletes, after
-  compaction and after 2000-vector replaces.
-- Query cost of deltas (interleaved A/B, c=50): +5.6 ms p50 / +5.4 ms mean with 20 segments (12 MB, 5000
-  tombstones), +2.4 ms with 5 (3 MB); about 0.45 ms per MB, all CPU in `scan_delta`.
-- Compaction of 5000 inserted vectors (2151 cells, 3.0 GB read + 3.0 GB written over the former 8-Worker pool): 43-51 s
-  wall. After it, latency is back at the no-delta baseline and all tombstone sets were dropped. Deleting the
-  vectors and compacting with `purge` returns byte-identical slabs and recall equal to the baseline.
+`bench/update_bench.mjs` inserts the 5000 test queries as ids 1,000,000+i, deletes and replaces them, and compacts.
+
+| | |
+|---|---|
+| upsert latency (writer Worker, client) | with the centroid tree (128 groups, beam 8): 100: 1.16 s, 500: 1.43 s, 2000: 3.27 s; same session without it (exhaustive primary-cell search, ~2.6 ms/vector): 1.42 / 2.49 / 7.48 s (`data/bench-tree.txt`). An earlier session measured 0.86 / 1.86 / 5.07 s exhaustive (250: 1.13 s); ~0.5-0.9 s is sequential R2 round trips |
+| bytes written per upsert | 2528 B per vector (delta segment) + 4 B per id (tombstones) + ~1-3 KB manifest |
+| delete latency | ~0.75 s (1000 or 5000 ids) |
+| visibility | own id at rank 1 for 100% of the inserted queries (counting the 894 queries that have an identical twin), in the top 10 for 100%, right after the upsert (with `?rev=`); deleted ids never returned |
+| recall@10 vs baseline (95.12%, nprobe 34) | within 0.02 points with 20 deltas, after deletes, after compaction and after 2000-vector replaces |
+| query cost of deltas (c=50, interleaved A/B) | +2.4 ms p50 with 5 segments (3 MB), +5.6 ms p50 / +5.4 ms mean with 20 (12 MB, 5000 tombstones); ~0.45 ms per MB, all CPU in `scan_delta` |
+| compaction of 5000 vectors | 2151 cells, 3.0 GB read + 3.0 GB written, 43-51 s over the former 8-Worker pool; latency back at the no-delta baseline; all tombstone sets dropped |
+| cleanup | delete everything + `compact --purge` -> the original slabs again (byte-identical, checked by MD5 on a sample cell), recall = baseline; `gc` then deleted 12.2 GB of superseded objects |
+| automatic compaction over build slots (`--only trigger`, `data/bench-trigger-slots.txt`) | 17th upsert of 250 vectors triggers it; the cells are spread over 4 slots: 606 cells (3 segments folded) in 16.7 s, trigger -> new rev 18.9 s; 0 failed out of 7,779 background queries; query isolates stay at 54 MB of wasm memory |
+| automatic compaction, single writer (before the build slots, `data/bench-trigger.txt`) | 17th upsert of 250 vectors triggers it; trigger -> new rev 18.8 s (228 cells = 1 segment in 16.5 s, commit 1.1 s) on vib-bench-0; 0 failed queries out of 9,555 background queries; p50 (interleaved A/B, c=50) 76.8 ms clean, 81.9 ms at 17 segments, 79.3 ms after the run; cleanup back to a clean head at 95.13% |
+| cell split (`bench/split_bench.mjs`, `data/bench-split.txt`) | 7 cells over 2400 entries split (k 4096 -> 4103): largest cell 3109 -> 2257 entries, recall@10 95.12% -> 95.13%, query isolates' wasm memory unchanged (54 MB) |
 
 ## GC
 

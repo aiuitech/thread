@@ -12,7 +12,7 @@
  * pq/partials/) are deleted (`--gcBuild 0` keeps them, e.g. to rerun finalize).
  *
  * A profile sets every layout knob and the query defaults recorded in the manifest;
- * explicit flags override it (see PROFILES below and README.md). The default profile is
+ * explicit flags override it (see PROFILES below and docs/profiles.md). The default profile is
  * `edge`: flat 4096 cells, m=3, format 3 (PQ-192 scan + sq8 rerank tiers), defaults
  * nprobe 34 / rerank 150 (g4's 95% point; g4 itself was built with 26 and moved to 34 by publish-rev). `--format 2` builds the g2/g3 layout (sq4 scan tier, no PQ stage).
  *

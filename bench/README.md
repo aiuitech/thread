@@ -21,4 +21,4 @@ offline/          numpy experiments on local files only (g1 era; data/idx-g1, da
 ```
 
 Order for a fresh setup: `prep/prep_dataset.py`, `prep/upload_shards.sh`, deploy `examples/cloudflare-worker/`, `driver.mjs`, then
-any benchmark. The full commands are in the top-level README ("Running").
+any benchmark. The full commands are in [docs/operations.md](../docs/operations.md).

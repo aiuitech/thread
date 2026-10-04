@@ -1,6 +1,6 @@
 # Lexical search and unified docs
 
-thread searches by vector (the IVF index of `README.md`) and by text (BM25), over one id space, and fuses the two
+thread searches by vector (the IVF index of `docs/architecture.md`) and by text (BM25), over one id space, and fuses the two
 lists. This document is the design of the text side and of the document store: what the objects hold, how a query
 reads them from blob storage, how updates and compaction work, and which knobs trade index size for query speed.
 The code is `crates/thread-core/src/{source,container,tokenize,lex,docs,segment,fusion,excerpts,rerank}.rs`, the
