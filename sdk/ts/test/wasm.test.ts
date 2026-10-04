@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { keys, ThreadIndex, type Manifest } from "../src/index.js";
-import { bruteForce, buildGen, rng, thread, unitRows, type Built } from "./helpers.js";
+import { bruteForce, buildGen, FakeCache, rng, thread, unitRows, type Built } from "./helpers.js";
 
 async function recall(index: ThreadIndex, b: Built, nq: number, k: number, qopts: Parameters<ThreadIndex["query"]>[1] = {}): Promise<number> {
 	const r = rng(7);
@@ -154,6 +154,58 @@ describe("end to end (wasm in node, MemoryBlobStore)", () => {
 		expect(a.manifest.nextSeq).toBe(5);
 		expect(a.manifest.parentRev).toBe(1);
 		a.close();
+	});
+
+	it("cold-start timeline: openStats and stats.timeline account every read", async () => {
+		const b = await buildGen("gt", 3);
+		const index = await thread.open({ store: b.store, cache: false });
+		const os = index.openStats;
+		expect(os.wasmInit).toBe(thread.initMs);
+		expect(os.current).toMatchObject({ reads: 1, hits: 0, misses: 0 });
+		expect(os.current.bytes).toBe(b.store.objects.get(keys.current())!.bytes.byteLength);
+		expect(os.manifest).toMatchObject({ reads: 1, bytes: b.store.objects.get(keys.manifest("gt", 0))!.bytes.byteLength });
+		expect(os.slabs.reads).toBe(1); // slabs table, no tombstone sets yet
+		const base = os.base!;
+		expect(base.reads).toBe(3); // coarse, fine, pq
+		expect(base.files.pq).toBeGreaterThan(0);
+		expect(base.bytes).toBe(base.files.coarse + base.files.fine + base.files.pq);
+		expect(base.fetch + base.build).toBeLessThanOrEqual(base.ms + 0.01);
+		for (const p of [os.current, os.manifest, os.slabs, base]) expect(p.ms).toBeGreaterThanOrEqual(0);
+		expect(os.total).toBeGreaterThanOrEqual(os.current.ms + os.manifest.ms + os.slabs.ms + base.ms - 0.01);
+
+		const res = await index.query(b.vectors.subarray(0, 16), { nprobe: 4 });
+		const tl = res.stats.timeline;
+		expect(tl.base).toBeUndefined();
+		expect(tl.route.reads).toBe(0);
+		expect(tl.phase1.reads).toBeGreaterThanOrEqual(4); // one scan-prefix read per probed slab (+ speculative reads)
+		const sum = (f: "reads" | "bytes") => tl.route[f] + tl.phase1[f] + tl.phase2[f] + tl.payload[f];
+		expect(sum("reads")).toBe(res.stats.io.reads);
+		expect(sum("bytes")).toBe(res.stats.io.bytes);
+		expect(tl.phase1.ms).toBe(res.stats.timing.phase1);
+		expect(tl.phase2.ms).toBe(res.stats.timing.phase2);
+
+		// A delete adds a tombstone set: a fresh open reads it in the `slabs` step.
+		await index.delete([5]);
+		const again = await thread.open({ store: b.store, cache: false });
+		expect(again.openStats.slabs.reads).toBe(2);
+		// After a wasm reset the next query reloads the routing table and reports it.
+		thread.reset("test");
+		const r2 = await again.query(b.vectors.subarray(0, 16), { nprobe: 4 });
+		expect(r2.stats.timeline.base?.reads).toBe(3);
+		index.close();
+		again.close();
+
+		// Behind a cache: a cold open misses and fills, a second open is all cache hits.
+		const cache = new FakeCache();
+		const c1 = await thread.open({ store: b.store, cache });
+		expect(c1.openStats.base!.misses).toBe(3);
+		expect(c1.openStats.base!.reads).toBe(3);
+		await new Promise((r) => setTimeout(r, 0));
+		const c2 = await thread.open({ store: b.store, cache });
+		expect(c2.openStats.current.reads).toBe(1); // current.json is never cached
+		expect(c2.openStats.base).toMatchObject({ reads: 0, misses: 0, hits: 3 });
+		c1.close();
+		c2.close();
 	});
 
 	it("wasm reset: the routing table is rebuilt and the query retried", async () => {

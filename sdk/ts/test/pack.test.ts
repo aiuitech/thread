@@ -92,6 +92,18 @@ describe("snapshots", () => {
 		li.close();
 	});
 
+	it("PackedBlobStore.open records its reads, and thread.open reports them as openStats.pack", async () => {
+		const b = await buildGen("go", 3, { n: 200 });
+		const { bytes: pack } = await packToBytes(b.store);
+		const ps = await PackedBlobStore.fromBytes(pack);
+		// head (counted as a read of 0 bytes) + one tail read: a small directory fits in the tail
+		expect(ps.openStats).toMatchObject({ reads: 2, bytes: Math.min(pack.byteLength, 64 * 1024) });
+		const idx = await thread.open({ store: ps, cache: false });
+		expect(idx.openStats.pack).toEqual(ps.openStats);
+		expect(idx.openStats.current.reads).toBe(1); // the pack's own idx/current.json, a range of the pack
+		idx.close();
+	});
+
 	it("a pack answers like the store it was taken from, is a pinned snapshot, and is read-only", async () => {
 		const b = await buildGen("gp", 3, { n: 300 });
 		const src = await thread.open({ store: b.store, cache: false });

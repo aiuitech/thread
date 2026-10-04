@@ -3,22 +3,47 @@
  * the manifest, slabs table and tombstone sets that revision reads. No wasm here, so the pack writer and other
  * tools can use it without an index.
  */
-import type { BlobStore } from "./store.js";
+import { newTrace, nowMs, phaseStat, type BlobStore, type BlobTrace, type PhaseStat } from "./store.js";
 import type { RevState } from "./query.js";
 import { buildTombState, hasDense, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, slabRevOf, ThreadError, type CurrentPointer, type Manifest } from "./wire.js";
 
-export async function getRequired(store: BlobStore, key: string): Promise<Uint8Array> {
-	const b = await store.get(key);
+export async function getRequired(store: BlobStore, key: string, trace?: BlobTrace): Promise<Uint8Array> {
+	const b = await store.get(key, undefined, trace ? { trace } : undefined);
 	if (!b) throw new ThreadError(`missing object ${key}`, 404);
 	return b;
 }
 
+/**
+ * Wall time and store work of the steps of opening a revision (`index.openStats`): `current` (current.json, or
+ * listing the generation's manifests), `manifest`, `slabs` (the slabs table and the tombstone sets, read
+ * concurrently). Filled in by `resolveTarget` / `loadRevState` when passed.
+ */
+export interface RevTimeline {
+	current?: PhaseStat;
+	manifest?: PhaseStat;
+	slabs?: PhaseStat;
+}
+
+/** Runs `fn` with a fresh trace and records its wall time and store work as `timeline[name]` (when a timeline is given). */
+async function timed<T>(timeline: RevTimeline | undefined, name: keyof RevTimeline, fn: (trace: BlobTrace | undefined) => Promise<T>): Promise<T> {
+	if (!timeline) return fn(undefined);
+	const t0 = nowMs();
+	const trace = newTrace();
+	try {
+		return await fn(trace);
+	} finally {
+		timeline[name] = phaseStat(nowMs() - t0, trace);
+	}
+}
+
 /** The newest manifest revision of `gen` present in the store (needs `list`), else 0 (legacy `manifest.json`). */
-export async function headRevision(store: BlobStore, gen: string): Promise<number> {
+export async function headRevision(store: BlobStore, gen: string, trace?: BlobTrace): Promise<number> {
 	if (!store.list) return 0;
 	const prefix = `idx/${gen}/manifest.`;
 	let head = -1;
-	for (const key of await store.list(prefix)) {
+	const listed = await store.list(prefix);
+	if (trace) trace.reads++; // a listing (its size is not accounted)
+	for (const key of listed) {
 		const m = key.slice(prefix.length).match(/^(?:(\d+)\.)?json$/);
 		if (m) head = Math.max(head, m[1] ? Number(m[1]) : 0);
 	}
@@ -31,30 +56,34 @@ export async function headRevision(store: BlobStore, gen: string): Promise<numbe
  * generation, else the newest manifest in the store); else `idx/current.json` (rev absent = 0, the legacy
  * `idx/{gen}/manifest.json`).
  */
-export async function resolveTarget(store: BlobStore, gen?: string, rev?: number): Promise<CurrentPointer> {
-	if (gen !== undefined && rev !== undefined) return { gen, rev };
-	const cur = await store.get(keys.current());
-	if (!cur) {
-		if (gen === undefined) throw new ThreadError("no published index (idx/current.json missing)", 404);
-		return { gen, rev: await headRevision(store, gen) };
-	}
-	const c = parseCurrent(cur);
-	if (gen === undefined || gen === c.gen) return rev !== undefined ? { gen: c.gen, rev } : c;
-	return { gen, rev: await headRevision(store, gen) };
+export function resolveTarget(store: BlobStore, gen?: string, rev?: number, timeline?: RevTimeline): Promise<CurrentPointer> {
+	return timed(timeline, "current", async (trace) => {
+		if (gen !== undefined && rev !== undefined) return { gen, rev };
+		const cur = await store.get(keys.current(), undefined, trace ? { trace } : undefined);
+		if (!cur) {
+			if (gen === undefined) throw new ThreadError("no published index (idx/current.json missing)", 404);
+			return { gen, rev: await headRevision(store, gen, trace) };
+		}
+		const c = parseCurrent(cur);
+		if (gen === undefined || gen === c.gen) return rev !== undefined ? { gen: c.gen, rev } : c;
+		return { gen, rev: await headRevision(store, gen, trace) };
+	});
 }
 
 /** Loads a revision: manifest (falling back to nothing else: rev 0 is `manifest.json`), slabs table, tombstone sets. */
-export async function loadRevState(store: BlobStore, gen: string, rev: number): Promise<RevState> {
-	const mb = await store.get(keys.manifest(gen, rev));
-	if (!mb) throw new ThreadError(`no manifest ${keys.manifest(gen, rev)}`, 404);
-	const manifest = parseManifest(mb, gen, rev);
+export async function loadRevState(store: BlobStore, gen: string, rev: number, timeline?: RevTimeline): Promise<RevState> {
+	const manifest = await timed(timeline, "manifest", async (trace) => {
+		const mb = await store.get(keys.manifest(gen, rev), undefined, trace ? { trace } : undefined);
+		if (!mb) throw new ThreadError(`no manifest ${keys.manifest(gen, rev)}`, 404);
+		return parseManifest(mb, gen, rev);
+	});
 	const files = manifestFiles(manifest);
 	const format = manifest.format ?? 1;
 	const cells = manifest.k1 * manifest.k2;
-	const [slabs, sets] = await Promise.all([
+	const [slabs, sets] = await timed(timeline, "slabs", (trace) => Promise.all([
 		(async () => {
 			if (!files.slabs || !hasDense(manifest)) return null;
-			const b = await store.get(files.slabs);
+			const b = await store.get(files.slabs, undefined, trace ? { trace } : undefined);
 			// v1 generations may predate slabs tables: their slabs are read whole.
 			if (!b && format < 2 && !manifest.files) return null;
 			if (!b) throw new ThreadError(`missing ${files.slabs}`, 404);
@@ -62,12 +91,12 @@ export async function loadRevState(store: BlobStore, gen: string, rev: number): 
 		})(),
 		Promise.all(
 			(manifest.tombstones ?? []).map(async (t) => {
-				const b = await getRequired(store, t.key);
+				const b = await getRequired(store, t.key, trace);
 				if (b.byteLength % 4 !== 0) throw new ThreadError(`${t.key} is not u32-aligned`);
 				return { rev: t.rev, ids: new Uint32Array(b.slice().buffer) };
 			}),
 		),
-	]);
+	]));
 	if (format >= 2 && !slabs && hasDense(manifest)) throw new ThreadError(`${files.slabs} missing for format ${format}`);
 	return { gen, rev, manifest, files, format, slabs, deltas: manifest.deltas ?? [], segments: manifest.segments ?? [], tomb: sets.length ? buildTombState(sets) : null, baseKey: `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}` };
 }
