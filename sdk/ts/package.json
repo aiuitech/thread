@@ -1,7 +1,7 @@
 {
   "name": "thread-sdk",
   "version": "0.1.0",
-  "description": "Query and update a thread blob-native vector index (slabs in R2 or any S3-compatible store) from Cloudflare Workers",
+  "description": "Query and update a thread blob-native search index (slabs and segments in R2, any S3-compatible store, a directory or a single pack file) from Cloudflare Workers and Node",
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.js",
@@ -10,6 +10,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
     },
     "./wasm/thread_bg.wasm": {
       "types": "./dist/wasm/module.d.ts",

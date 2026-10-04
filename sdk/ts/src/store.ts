@@ -142,6 +142,20 @@ export class MemoryBlobStore implements BlobStore {
 		return b;
 	}
 
+	async getRanges(key: string, ranges: BlobRange[], opts?: GetOptions): Promise<Uint8Array[] | null> {
+		const o = this.objects.get(key);
+		if (!o) return null;
+		const out = ranges.map((r) => {
+			if (r.offset < 0 || r.length < 0 || r.offset + r.length > o.bytes.byteLength) throw new ThreadError(`${key} [${r.offset}, +${r.length}) is outside the object (${o.bytes.byteLength} bytes)`);
+			return o.bytes.slice(r.offset, r.offset + r.length);
+		});
+		if (opts?.trace) {
+			opts.trace.reads++;
+			opts.trace.bytes += out.reduce((a, b) => a + b.byteLength, 0);
+		}
+		return out;
+	}
+
 	async head(key: string): Promise<BlobHead | null> {
 		const o = this.objects.get(key);
 		return o ? { size: o.bytes.byteLength, etag: o.etag } : null;

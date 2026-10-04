@@ -15,23 +15,10 @@ from .attrs import AttrFilterExpr, AttrSchema, compile_filter, pack_attrs, unpac
 from .fusion import DEFAULT_RRF_K, rrf
 from .lex import DocRecord, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import QUERY_INFLIGHT, Base, QueryContext, QueryResult, RevState, execute_query
-from .store import BlobStore, BlobTrace, CachedBlobStore, BlobCache, MemoryCache, PrefixedBlobStore
-from .wire import (
-    LEGACY_DEFAULTS,
-    ResolvedLexConfig,
-    ThreadError,
-    build_tomb_state,
-    has_dense,
-    keys,
-    manifest_files,
-    manifest_rev_of_key,
-    parse_current,
-    parse_manifest,
-    parse_slabs_table,
-    resolve_lex_config,
-    u32_array,
-    BytesLike,
-)
+from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore
+from .pack import store_at
+from .revision import get_required, head_revision, load_rev_state, resolve_target
+from .wire import LEGACY_DEFAULTS, BytesLike, ResolvedLexConfig, ThreadError, has_dense, resolve_lex_config
 from .write import (
     CompactSegmentsResult,
     ConfigureAttrsResult,
@@ -49,6 +36,7 @@ from .write import (
 
 __all__ = ["ThreadIndex", "open_index", "SearchHit", "SearchResult", "Rank", "resolve_target", "load_rev_state",
            "head_revision"]
+_ = (resolve_target, load_rev_state, head_revision)  # re-exported from here for compatibility
 
 log = logging.getLogger("thread_sdk")
 
@@ -86,78 +74,12 @@ class SearchResult:
     stats: dict[str, Any]
 
 
-def _get_required(store: BlobStore, key: str | None) -> BytesLike:
-    assert key is not None
-    b = store.get(key)
-    if b is None:
-        raise ThreadError(f"missing object {key}", 404)
-    return b
-
-
-def head_revision(store: BlobStore, gen: str) -> int:
-    """The newest manifest revision of `gen` present in the store (needs `list`), else 0 (legacy `manifest.json`)."""
-    if not store.supports_list:
-        return 0
-    prefix = f"idx/{gen}/manifest."
-    head = -1
-    for key in store.list(prefix):
-        r = manifest_rev_of_key(key[len(prefix):])
-        if r is not None:
-            head = max(head, r)
-    if head < 0:
-        raise ThreadError(f"no manifest for generation {gen}", 404)
-    return head
-
-
-def resolve_target(store: BlobStore, gen: str | None = None, rev: int | None = None) -> tuple[str, int]:
-    """The (gen, rev) to read: both given; `gen` alone at its head (current.json's rev when it names that
-    generation, else the newest manifest in the store); else `idx/current.json` (rev absent = 0)."""
-    if gen is not None and rev is not None:
-        return gen, rev
-    cur = store.get(keys.current())
-    if cur is None:
-        if gen is None:
-            raise ThreadError("no published index (idx/current.json missing)", 404)
-        return gen, head_revision(store, gen)
-    cgen, crev = parse_current(cur)
-    if gen is None or gen == cgen:
-        return cgen, rev if rev is not None else crev
-    return gen, head_revision(store, gen)
-
-
-def load_rev_state(store: BlobStore, gen: str, rev: int) -> RevState:
-    """Loads a revision: manifest, slabs table, tombstone sets."""
-    mb = store.get(keys.manifest(gen, rev))
-    if mb is None:
-        raise ThreadError(f"no manifest {keys.manifest(gen, rev)}", 404)
-    manifest = parse_manifest(mb, gen, rev)
-    files = manifest_files(manifest)
-    fmt = manifest.get("format") or 1
-    cells = manifest["k1"] * manifest["k2"]
-    slabs = None
-    slabs_key = files.get("slabs")
-    if slabs_key and has_dense(manifest):
-        b = store.get(slabs_key)
-        if b is not None:
-            slabs = parse_slabs_table(b, cells, slabs_key)
-        elif fmt >= 2 or manifest.get("files"):
-            # v1 generations may predate slabs tables: their slabs are read whole.
-            raise ThreadError(f"missing {files['slabs']}", 404)
-    sets = [(t["rev"], u32_array(_get_required(store, t["key"]), t["key"])) for t in manifest.get("tombstones") or []]
-    if fmt >= 2 and slabs is None and has_dense(manifest):
-        raise ThreadError(f"{files['slabs']} missing for format {fmt}")
-    return RevState(gen=gen, rev=rev, manifest=manifest, files=files, format=fmt, slabs=slabs,
-                    deltas=list(manifest.get("deltas") or []), segments=list(manifest.get("segments") or []),
-                    tomb=build_tomb_state(sets) if sets else None,
-                    base_key=f"{gen}|{files['coarse']}|{files['fine']}|{files.get('pq') or '-'}")
-
-
 def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor) -> Base:
     """Loads the routing table (and PQ codebook) of a revision's generation into native memory."""
     m, files = rev.manifest, rev.files
-    fc = io.submit(_get_required, store, files["coarse"])
-    ff = io.submit(_get_required, store, files["fine"])
-    fp = io.submit(_get_required, store, files["pq"]) if files.get("pq") else None
+    fc = io.submit(get_required, store, files["coarse"])
+    ff = io.submit(get_required, store, files["fine"])
+    fp = io.submit(get_required, store, files["pq"]) if files.get("pq") else None
     c, f, p = fc.result(), ff.result(), fp.result() if fp else None
     if rev.format == 3 and p is None:
         raise ThreadError(f"format 3 generation {rev.gen} has no PQ codebook")
@@ -201,7 +123,7 @@ class ThreadIndex:
     @classmethod
     def open(
         cls,
-        store: BlobStore,
+        store: BlobStore | str | os.PathLike[str],
         *,
         prefix: str = "",
         gen: str | None = None,
@@ -214,6 +136,8 @@ class ThreadIndex:
         job_workers: int | None = None,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
+        if not isinstance(store, BlobStore):
+            store = store_at(store)
         if prefix:
             store = PrefixedBlobStore(store, prefix)
         if cache is None:
@@ -696,7 +620,7 @@ class ThreadIndex:
 
 
 def open_index(
-    store: BlobStore,
+    store: BlobStore | str | os.PathLike[str],
     *,
     prefix: str = "",
     gen: str | None = None,
@@ -708,7 +632,8 @@ def open_index(
     io_workers: int = 32,
     job_workers: int | None = None,
 ) -> ThreadIndex:
-    """Opens the index under `store`.
+    """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
+    file (`store_at`).
 
     - `prefix`: key prefix in front of `idx/` (several indexes in one bucket);
     - `gen` / `rev`: read a specific generation / revision (default: `idx/current.json`); with both, the index is

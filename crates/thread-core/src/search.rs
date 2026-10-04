@@ -30,6 +30,7 @@ pub struct ScanStats {
 /// tombstone `skip` set before insertion. Both run only for a score that would
 /// enter the heap; the entry's `attrs` word is read only when there is a filter.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn offer(topk: &mut TopK, skip: Option<&Tombstones>, filter: Option<&AttrFilter>, st: &mut ScanStats, id: u32, attrs: impl FnOnce() -> u32, s: f32, idx: u32) {
     if s > topk.threshold() {
         if let Some(f) = filter {

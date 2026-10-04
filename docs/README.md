@@ -1,7 +1,7 @@
 # thread docs
 
 Start with [architecture.md](architecture.md) if you want to know how it works, [operations.md](operations.md)
-if you want to run it, and the SDK READMEs ([TypeScript](../sdk/ts/README.md), [Python](../sdk/python/README.md))
+if you want to run it, [portability.md](portability.md) if you want to move or ship one, and the SDK READMEs ([TypeScript](../sdk/ts/README.md), [Python](../sdk/python/README.md))
 if you want to use it.
 
 | page | what it covers |
@@ -11,6 +11,7 @@ if you want to use it.
 | [query-path.md](query-path.md) | slab formats, the two-phase query (scan, rerank, speculative reads), caching of revisions and bases, wasm trap recovery, the centroid tree and beam routing |
 | [profiles.md](profiles.md) | the `edge` and `local` layouts, what each knob trades, manifest query defaults and how to change them |
 | [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual and automatic), cell splitting, GC |
+| [portability.md](portability.md) | moving an index: copying between stores, snapshotting one revision, packs (one file, queried in place) and their format |
 | [lexical.md](lexical.md) | BM25 segments, the `docs` store, the tokenizer, fusion, size-vs-speed tuning, the native CLI |
 | [filtering.md](filtering.md) | attribute filters: the 32-bit word and its schema, filter expressions and their compiled clauses, pre-filtering inside the scan with probe widening, post-filtering of text queries |
 | [build-pipeline.md](build-pipeline.md) | the build stages, build slots (Worker Loader), PQ codebook training, incremental k-means, finalize |

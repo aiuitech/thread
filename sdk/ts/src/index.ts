@@ -14,8 +14,9 @@ import { CachedBlobStore, PrefixedBlobStore, R2BlobStore, type BlobStore, type B
 import { executeQuery, safeFree, type Base, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { compactSegments, configureAttrs, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
+import { hasDense, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
+import { asF32, getRequired, loadRevState, resolveTarget } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchOptions, type LexSearchResult } from "./lex.js";
-import { buildTombState, hasDense, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, resolveLexConfig, ThreadError, type CurrentPointer, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 
 export * from "./wire.js";
@@ -24,6 +25,7 @@ export * from "./store.js";
 export * from "./s3.js";
 export * from "./lex.js";
 export * from "./fusion.js";
+export * from "./pack.js";
 export type { Base, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, RevState } from "./query.js";
 export { FILTER_WIDEN, Limiter, QUERY_INFLIGHT, executeQuery } from "./query.js";
 export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
@@ -658,76 +660,7 @@ export class ThreadIndex {
 
 // ---------- loading ----------
 
-async function getRequired(store: BlobStore, key: string): Promise<Uint8Array> {
-	const b = await store.get(key);
-	if (!b) throw new ThreadError(`missing object ${key}`, 404);
-	return b;
-}
-
-/** The newest manifest revision of `gen` present in the store (needs `list`), else 0 (legacy `manifest.json`). */
-export async function headRevision(store: BlobStore, gen: string): Promise<number> {
-	if (!store.list) return 0;
-	const prefix = `idx/${gen}/manifest.`;
-	let head = -1;
-	for (const key of await store.list(prefix)) {
-		const m = key.slice(prefix.length).match(/^(?:(\d+)\.)?json$/);
-		if (m) head = Math.max(head, m[1] ? Number(m[1]) : 0);
-	}
-	if (head < 0) throw new ThreadError(`no manifest for generation ${gen}`, 404);
-	return head;
-}
-
-/**
- * The (gen, rev) to read: both given; `gen` alone at its head (current.json's rev when it names that
- * generation, else the newest manifest in the store); else `idx/current.json` (rev absent = 0, the legacy
- * `idx/{gen}/manifest.json`).
- */
-export async function resolveTarget(store: BlobStore, gen?: string, rev?: number): Promise<CurrentPointer> {
-	if (gen !== undefined && rev !== undefined) return { gen, rev };
-	const cur = await store.get(keys.current());
-	if (!cur) {
-		if (gen === undefined) throw new ThreadError("no published index (idx/current.json missing)", 404);
-		return { gen, rev: await headRevision(store, gen) };
-	}
-	const c = parseCurrent(cur);
-	if (gen === undefined || gen === c.gen) return rev !== undefined ? { gen: c.gen, rev } : c;
-	return { gen, rev: await headRevision(store, gen) };
-}
-
-/** Loads a revision: manifest (falling back to nothing else: rev 0 is `manifest.json`), slabs table, tombstone sets. */
-export async function loadRevState(store: BlobStore, gen: string, rev: number): Promise<RevState> {
-	const mb = await store.get(keys.manifest(gen, rev));
-	if (!mb) throw new ThreadError(`no manifest ${keys.manifest(gen, rev)}`, 404);
-	const manifest = parseManifest(mb, gen, rev);
-	const files = manifestFiles(manifest);
-	const format = manifest.format ?? 1;
-	const cells = manifest.k1 * manifest.k2;
-	const [slabs, sets] = await Promise.all([
-		(async () => {
-			if (!files.slabs || !hasDense(manifest)) return null;
-			const b = await store.get(files.slabs);
-			// v1 generations may predate slabs tables: their slabs are read whole.
-			if (!b && format < 2 && !manifest.files) return null;
-			if (!b) throw new ThreadError(`missing ${files.slabs}`, 404);
-			return parseSlabsTable(b, cells, files.slabs);
-		})(),
-		Promise.all(
-			(manifest.tombstones ?? []).map(async (t) => {
-				const b = await getRequired(store, t.key);
-				if (b.byteLength % 4 !== 0) throw new ThreadError(`${t.key} is not u32-aligned`);
-				return { rev: t.rev, ids: new Uint32Array(b.slice().buffer) };
-			}),
-		),
-	]);
-	if (format >= 2 && !slabs && hasDense(manifest)) throw new ThreadError(`${files.slabs} missing for format ${format}`);
-	return { gen, rev, manifest, files, format, slabs, deltas: manifest.deltas ?? [], segments: manifest.segments ?? [], tomb: sets.length ? buildTombState(sets) : null, baseKey: `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}` };
-}
-
-/** A view of `b` as f32 (copying when the view is not 4-byte aligned). */
-export function asF32(b: Uint8Array, what: string): Float32Array {
-	if (b.byteLength % 4 !== 0) throw new ThreadError(`${what} is not f32-aligned`);
-	return b.byteOffset % 4 === 0 ? new Float32Array(b.buffer, b.byteOffset, b.byteLength / 4) : new Float32Array(b.slice().buffer);
-}
+export { asF32, headRevision, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
 
 /** Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. */
 export async function loadBase(store: BlobStore, rev: RevState, epoch: number): Promise<Base> {

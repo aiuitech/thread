@@ -5,7 +5,7 @@
 		"declaration": true,
 		"rootDir": "src",
 		"outDir": "dist",
-		"types": ["@cloudflare/workers-types"],
+		"types": ["@cloudflare/workers-types", "node"],
 		"allowJs": false
 	},
 	"include": ["src/**/*.ts"],

@@ -3,7 +3,9 @@
 1. the TS SDK builds a generation on disk and writes to it (deltas, lexical segments, replacements, deletes); Python
    opens the same directory and must return the TS results for every recorded query;
 2. Python writes on top (upserts with vectors and texts, a delete, a segment compaction); the TS SDK opens the
-   result and must return what Python returns.
+   result and must return what Python returns;
+3. both SDKs pack that revision into one file: the bytes must be identical, and each SDK must answer the same
+   queries from the other's pack.
 
 Ids, their order, attrs, payloads, docs, tokens and BM25 scores must match exactly. Cosine scores may differ in the
 last float32 ulps: the wasm build accumulates dot products in 16 SIMD lanes, the native build in 8 scalar partial
@@ -19,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from thread_sdk import FileBlobStore, open_index
+from thread_sdk import FileBlobStore, PackedBlobStore, open_index, pack_index
 
 from helpers import rng, unit_rows
 
@@ -31,8 +33,8 @@ pytestmark = pytest.mark.skipif(shutil.which("node") is None or not DIST.exists(
                                 reason="needs node and a built sdk/ts/dist (cd sdk/ts && npm run build)")
 
 
-def node(cmd: str, d: Path) -> str:
-    r = subprocess.run(["node", str(SCRIPT), cmd, str(d)], capture_output=True, text=True, timeout=300)
+def node(cmd: str, d: Path, *extra: str) -> str:
+    r = subprocess.run(["node", str(SCRIPT), cmd, str(d), *extra], capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stderr
     return r.stdout
 
@@ -132,4 +134,20 @@ def test_typescript_and_python_agree(tmp_path):
     theirs = json.loads(node("run", tmp_path))
     assert theirs["rev"] == rev
     for req, a, b in zip(requests, mine, theirs["results"]):
+        same(a, b, json.dumps(req)[:80])
+
+    # 3. One file. Both SDKs pack the revision: same bytes; each answers from the other's pack.
+    py_pack, ts_pack = tmp_path / "py.threadpack", tmp_path / "ts.threadpack"
+    r = pack_index(store, py_pack)
+    assert (r.gen, r.rev) == (theirs["gen"], rev)
+    t = json.loads(node("pack", tmp_path, str(ts_pack)))
+    assert (t["gen"], t["rev"], t["count"], t["bytes"]) == (r.gen, r.rev, r.count, r.bytes)
+    assert py_pack.read_bytes() == ts_pack.read_bytes()
+    with open_index(ts_pack) as packed:
+        assert isinstance(packed.store, PackedBlobStore) and packed.rev == rev
+        for req, a in zip(requests, mine):
+            same(json.loads(json.dumps(answer(packed, req))), a, json.dumps(req)[:80])
+    from_py_pack = json.loads(node("run", tmp_path, str(py_pack)))
+    assert from_py_pack["rev"] == rev
+    for req, a, b in zip(requests, mine, from_py_pack["results"]):
         same(a, b, json.dumps(req)[:80])

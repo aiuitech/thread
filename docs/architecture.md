@@ -79,10 +79,11 @@ such host that also runs the build.
 - `crates/thread-py`     PyO3 extension (`thread_sdk._native`): Searcher, PqCodebook, the per-query `QueryRun`
                       (scan, merge, rerank), DeltaJob, tombstones, AssignJob/SlabJob, LexTokenizer, SegmentJob,
                       SegmentReader (paged), merge_segments
-- `sdk/ts/`           `thread-sdk` (npm): the query path as a library (R2/S3/memory stores, Cache API), the
-                      lexical index, `search` (dense, lexical, hybrid), the write path (upsert with texts, delete,
-                      segment compaction). See [sdk/ts/README.md](../sdk/ts/README.md)
-- `sdk/python/`       `thread-sdk` (PyPI): the same library for Python (S3/R2, directory and memory stores,
+- `sdk/ts/`           `thread-sdk` (npm): the query path as a library (R2/S3/memory stores, Cache API; directory
+                      stores and packs via `thread-sdk/node`), the lexical index, `search` (dense, lexical, hybrid),
+                      the write path (upsert with texts, delete, segment compaction), snapshots and packs
+                      (`pack.ts`, see [portability.md](portability.md)). See [sdk/ts/README.md](../sdk/ts/README.md)
+- `sdk/python/`       `thread-sdk` (PyPI): the same library for Python (S3/R2, directory, pack and memory stores,
                       memory/disk caches), wire-compatible with `sdk/ts`. See
                       [sdk/python/README.md](../sdk/python/README.md)
 - `examples/`         deployment targets. `cloudflare-worker/`: the `cf`-managed `vib-bench` Worker: build-stage
