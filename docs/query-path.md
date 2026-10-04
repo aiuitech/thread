@@ -171,7 +171,26 @@ error = what the table changes in a delta entry's base score (over the f32 probe
 | cold beam 16, i8 rows | tree 0.8 MB + 0.97 MB | 95.90% | 41.7% | 99.8% | |
 | cold beam 32, i8 rows | tree 0.8 MB + 1.86 MB | 98.67% | 70.3% | 99.9% | |
 
-(f16 rows route like f32 rows within 0.02 points at every beam, at twice the bytes of i8 rows.) The beam, not the
+(f16 rows route like f32 rows within 0.02 points at every beam, at twice the bytes of i8 rows.)
+
+### End-to-end recall@10 (2000 queries over R2)
+
+`bench/cold/routing_recall.mjs`: the TypeScript SDK over R2's S3 API (read-only range reads, cached locally),
+g4 rev 180, nprobe 34, rerank 150, against the dataset's ground truth. Cold modes hold the full table back, so every
+query routes cold (a real index switches to the full table after its first queries).
+
+| mode | recall@10 | vs f32 | probe overlap | same top 10 as f32 |
+|---|---:|---:|---:|---:|
+| flat f32 | 95.11% | | | |
+| flat f16 | 95.11% | -0.01 | 99.98% | 100.0% |
+| flat i8 | 95.11% | -0.01 | 99.82% | 99.6% |
+| cold beam 8 (i8 rows) | 94.36% | -0.75 | 90.57% | 90.3% |
+| cold beam 16 | 94.93% | -0.18 | 95.90% | 96.4% |
+| cold beam 32 | 95.10% | -0.01 | 98.67% | 98.9% |
+
+The compact tables cost nothing measurable; cold routing costs what beam routing costs (query-path.md "Centroid
+tree and beam routing": beam 8 -0.6 to -0.8 points), and only for the queries that run before the full table is in.
+`coldBeam` defaults to `defaults.beam` (32 on g4): 1.9 MB of group rows for the first query, recall unchanged. The beam, not the
 row precision, decides cold routing's agreement: beam 8 misses ~3 of 34 cells, beam 32 fewer than 1.
 
 ### Bytes and time before the first query (g4 rev 180, fake S3 proxy)

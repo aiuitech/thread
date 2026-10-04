@@ -485,5 +485,7 @@ round trip for its groups.
 
 Probe agreement over 2000 queries (no slab reads, `routing_agreement.mjs`): f16 99.98%, i8 99.82%, cold beam
 8 / 16 / 32 with i8 rows 90.6% / 95.9% / 98.7% of flat-f32 probes (full table in query-path.md). End-to-end recall@10
-over 2000 queries against R2 (`routing_recall.mjs`): see query-path.md. On the 10 process-cold queries of the bench
-every mode returns the baseline's recall except cold beam 8 / 16 (one / two queries lose a neighbour).
+over 2000 queries against R2 (`routing_recall.mjs`, every query routed by the mode): f32 95.11%, f16 95.11%, i8
+95.11% (same top 10 as f32 for 99.6% of queries), cold beam 8 / 16 / 32 94.36% / 94.93% / 95.10%. On the 10
+process-cold queries of the bench every mode returns the baseline's recall except cold beam 8 / 16 (one / two
+queries lose a neighbour).
