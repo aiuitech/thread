@@ -9,7 +9,7 @@
  *        store / cache options (absent = the SDK's defaults):
  *        [--legacy] (the pre-cold-store defaults: no cache, inflight 12, no warm-up)
  *        [--cache none|memory|disk] [--disk-dir data/cold/dc-{t}] [--miss-policy whole|range|range+warm]
- *        [--inflight N] [--coalesce BYTES] [--span BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
+ *        [--inflight N] [--coalesce BYTES] [--span BYTES] [--chunk BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
  *        [--keepalive MS] [--h2] [--drain] (wait for background cache warms before the `warm` scenario)
  *        [--early-warmup] (create the store with `warmup` before the wasm compiles)
  *
@@ -51,8 +51,9 @@ const config = {
 	diskDir: args["disk-dir"] ?? null,
 	missPolicy: args["miss-policy"] ?? null,
 	inflight: num("inflight") ?? (LEGACY ? 12 : null),
-	coalesceBytes: num("coalesce") ?? null,
+	coalesceBytes: num("coalesce") ?? (LEGACY ? 4096 : null),
 	spanBytes: num("span") ?? null,
+	chunkBytes: num("chunk") ?? (LEGACY ? 0 : null),
 	warmup: args.warmup === "false" ? 0 : (num("warmup") ?? (LEGACY ? 0 : null)),
 	coldPolicy: args["cold-nprobe"] || args["cold-rerank"] ? { ...(num("cold-nprobe") !== undefined ? { nprobe: num("cold-nprobe") } : {}), ...(num("cold-rerank") !== undefined ? { rerank: num("cold-rerank") } : {}) } : null,
 	keepAliveMs: num("keepalive") ?? null,
@@ -102,7 +103,7 @@ async function child() {
 	const makeStore = async () => {
 		const fetchFn = config.keepAliveMs !== null || config.h2 ? await node.nodeFetch({ keepAliveTimeout: config.keepAliveMs ?? 4000, allowH2: config.h2 }) : undefined;
 		const early = config.earlyWarmup ? { warmup: config.inflight ?? 32 } : {};
-		const s3opts = { ...(fetchFn ? { fetch: fetchFn } : {}), ...(config.inflight !== null ? { inflight: config.inflight } : {}), ...(config.coalesceBytes !== null ? { coalesceBytes: config.coalesceBytes } : {}), ...(config.spanBytes !== null ? { spanBytes: config.spanBytes } : {}), ...early };
+		const s3opts = { ...(fetchFn ? { fetch: fetchFn } : {}), ...(config.inflight !== null ? { inflight: config.inflight } : {}), ...(config.coalesceBytes !== null ? { coalesceBytes: config.coalesceBytes } : {}), ...(config.spanBytes !== null ? { spanBytes: config.spanBytes } : {}), ...(config.chunkBytes !== null ? { chunkBytes: config.chunkBytes } : {}), ...early };
 		if (useProxy) await proxyCall("POST", "/__reset"); // nothing before this talks to the store
 		return useProxy
 			? new sdk.S3BlobStore({ endpoint: PROXY, bucket: env.S3_BUCKET ?? "vib-bench", region: "auto", accessKeyId: "fake", secretAccessKey: "fake", ...s3opts })

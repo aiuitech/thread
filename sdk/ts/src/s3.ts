@@ -34,7 +34,7 @@ export interface S3BlobStoreOptions {
 	 * cap, 6 inside a Worker (the Workers limit of simultaneous open connections per request).
 	 */
 	inflight?: number;
-	/** Phase-2 range merging defaults for queries (`QueryOptions.coalesceBytes` / `spanBytes`). */
+	/** Phase-2 range merging defaults for queries (`QueryOptions.coalesceBytes`, default 128 KB / `spanBytes`). */
 	coalesceBytes?: number;
 	spanBytes?: number;
 	/**
@@ -55,6 +55,11 @@ export interface S3BlobStoreOptions {
 /** Reads in flight per query against S3 directly: no connection cap outside Workers, 6 inside. */
 export const S3_INFLIGHT = 32;
 export const S3_INFLIGHT_WORKERS = 6;
+/**
+ * Phase-2 range merging against S3 (no multi-range GET): a slab's wanted rerank records are read as runs of up to
+ * 128 KB, which halves the requests of a cold query for ~45% more bytes (docs/cold-start.md).
+ */
+export const S3_COALESCE = 128 * 1024;
 
 const enc = new TextEncoder();
 const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, "0"));
@@ -177,7 +182,7 @@ export class S3BlobStore implements BlobStore {
 	readonly pathStyle: boolean;
 	readonly remote = true;
 	readonly inflight: number;
-	readonly coalesceBytes: number | undefined;
+	readonly coalesceBytes: number;
 	readonly spanBytes: number | undefined;
 	readonly signingKeys: SigningKeyCache;
 	readonly chunkBytes: number;
@@ -187,7 +192,7 @@ export class S3BlobStore implements BlobStore {
 	private readonly now: () => number;
 	constructor(private readonly opts: S3BlobStoreOptions) {
 		this.inflight = opts.inflight ?? (inWorkers() ? S3_INFLIGHT_WORKERS : S3_INFLIGHT);
-		this.coalesceBytes = opts.coalesceBytes;
+		this.coalesceBytes = opts.coalesceBytes ?? S3_COALESCE;
 		this.spanBytes = opts.spanBytes;
 		this.signingKeys = new SigningKeyCache(opts.secretAccessKey);
 		this.chunkBytes = opts.chunkBytes ?? 8 * 1024 * 1024;

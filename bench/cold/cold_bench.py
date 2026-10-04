@@ -8,7 +8,7 @@ The same bench as bench/cold/cold_bench.mjs (TypeScript SDK): same CLI, same sce
         store / cache options (absent = the SDK's defaults), the same as cold_bench.mjs:
         [--legacy] (the pre-cold-store defaults: MemoryCache with "whole" misses, inflight 12, no warm-up)
         [--cache none|memory|disk] [--disk-dir data/cold-store/dc-{t}] [--miss-policy whole|range|range+warm]
-        [--inflight N] [--coalesce BYTES] [--span BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
+        [--inflight N] [--coalesce BYTES] [--span BYTES] [--chunk BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
         [--drain] (wait for background cache warms before the `warm` scenario)
 
 Each trial t spawns a fresh interpreter (fresh connections, fresh native module import, fresh index, empty caches):
@@ -78,8 +78,9 @@ CONFIG: dict[str, Any] = {
     "diskDir": ARGS.get("disk-dir"),
     "missPolicy": ARGS.get("miss-policy", "whole" if LEGACY else None),
     "inflight": _num("inflight") if "inflight" in ARGS else (12 if LEGACY else None),
-    "coalesceBytes": _num("coalesce"),
+    "coalesceBytes": _num("coalesce") if "coalesce" in ARGS else (4096 if LEGACY else None),
     "spanBytes": _num("span"),
+    "chunkBytes": _num("chunk") if "chunk" in ARGS else (0 if LEGACY else None),
     "warmup": 0 if ARGS.get("warmup") == "false" else (_num("warmup") if "warmup" in ARGS else (0 if LEGACY else None)),
     "coldPolicy": ({**({"nprobe": _num("cold-nprobe")} if "cold-nprobe" in ARGS else {}),
                     **({"rerank": _num("cold-rerank")} if "cold-rerank" in ARGS else {})}
@@ -157,7 +158,8 @@ def child() -> None:
     env = load_env(ENV_FILE)
     ds = Dataset()
     kw = {k: v for k, v in (("inflight", CONFIG["inflight"]), ("coalesce_bytes", CONFIG["coalesceBytes"]),
-                              ("span_bytes", CONFIG["spanBytes"])) if v is not None}
+                              ("span_bytes", CONFIG["spanBytes"]),
+                              ("chunk_bytes", CONFIG["chunkBytes"])) if v is not None}
     if use_proxy:
         s3 = S3BlobStore(PROXY, env.get("S3_BUCKET", "vib-bench"), "fake", "fake", **kw)
     else:

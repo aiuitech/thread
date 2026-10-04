@@ -156,7 +156,7 @@ manifest, slabs table, deltas, tombstone state).
 | `returnPayload` | false | also return each hit's payload bytes (one extra range read per slab with payloads not already in memory) |
 | `inflight` | the store's: 12 (Cache API), 32 (S3 from Node), 6 (S3 inside a Worker) | reads in flight per query |
 | `speculate` | true | read the running top-T's rerank records while the last 6 slabs are still scanning |
-| `coalesceBytes` | the store's, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while the range stays within this many bytes |
+| `coalesceBytes` | the store's: 128 KB for `S3BlobStore`, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while the range stays within this many bytes |
 | `spanBytes` | the store's, else 0 (off) | phase 2: read a slab's records as ONE range from the first to the last wanted record when that span is at most this |
 | `coldPolicy` | `OpenOptions.coldPolicy` | `{ nprobe?, rerank?, threshold? }`: when more than `threshold` (default 0.5) of the probed slabs are not cached, scan only the best `nprobe` of them and rerank `rerank` (each capped at the query's value); `false` disables it for this query |
 
@@ -288,11 +288,14 @@ interface BlobStore {
 
 - `R2BlobStore(bucket)`: the binding (`R2BucketLike`, structural). Conditional puts use `onlyIf`.
 - `S3BlobStore({ endpoint, bucket, region, accessKeyId, secretAccessKey, sessionToken?, pathStyle?, fetch?, inflight?,
-  coalesceBytes?, spanBytes? })`: plain `fetch` + SigV4 (WebCrypto), single-range GETs, HEAD, PUT with
+  coalesceBytes?, spanBytes?, chunkBytes?, chunkConcurrency?, warmup? })`: plain `fetch` + SigV4 (WebCrypto), single-range GETs, HEAD, PUT with
   `If-None-Match: *` / `If-Match`, ListObjectsV2. S3 has no multi-range GET, so a rerank read costs one request per
   record run. The derived signing key is cached per (date, region, service) (`SigningKeyCache`): a request costs
   one SHA-256 and one HMAC (26 us in Node instead of 130 us). `inflight` defaults to 32 (Node: no connection cap)
-  or 6 inside a Worker. `store.warmup(n)` opens `n` connections with one-byte GETs of `idx/current.json` (not HEADs: Node's `fetch` closes a connection after a HEAD answer with a Content-Length); `new S3BlobStore({ ..., warmup: 32 })` starts that at construction, so creating the store before `Thread.init` overlaps the handshakes (and Node's lazy `fetch` globals) with the wasm compile.
+  or 6 inside a Worker; `coalesceBytes` to 128 KB (rerank records read as runs of up to 128 KB: half the requests
+  of a cold query for ~45% more bytes). A whole-object GET of an object larger than `chunkBytes` (8 MiB) is split
+  into parallel range GETs (`chunkConcurrency` 4), since one S3 stream is bandwidth-bound and the routing table is
+  25 MB on g4. `store.warmup(n)` opens `n` connections with one-byte GETs of `idx/current.json` (not HEADs: Node's `fetch` closes a connection after a HEAD answer with a Content-Length); `new S3BlobStore({ ..., warmup: 32 })` starts that at construction, so creating the store before `Thread.init` overlaps the handshakes (and Node's lazy `fetch` globals) with the wasm compile.
 - `CachedBlobStore(inner, cache, { origin, waitUntil, cacheable, missPolicy, warmConcurrency, warmQueue })`: a cache
   in front of any store, either the Workers Cache API or an in-process `BlobCache`. Objects under `idx/` are
   immutable, so they are cached whole (Cache API: for a year under `${origin}${key}`; `current.json` is never

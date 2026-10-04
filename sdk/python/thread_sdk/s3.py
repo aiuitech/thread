@@ -33,6 +33,9 @@ __all__ = ["S3BlobStore", "SigningKeyCache", "sign_v4", "derive_signing_key", "a
 EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 #: Reads in flight per query against S3 directly (no per-process connection cap).
 S3_INFLIGHT = 32
+#: Phase-2 range merging against S3 (no multi-range GET): a slab's wanted rerank records are read as runs of up to
+#: 128 KB, which halves the requests of a cold query for ~45% more bytes (docs/cold-start.md).
+S3_COALESCE = 128 * 1024
 
 
 def aws_encode(s: str, keep_slash: bool) -> str:
@@ -204,7 +207,7 @@ class S3BlobStore(BlobStore):
         self.signing_keys = SigningKeyCache(secret_access_key)
         if inflight is not None:
             self.inflight = inflight
-        self.coalesce_bytes = coalesce_bytes
+        self.coalesce_bytes = coalesce_bytes if coalesce_bytes is not None else S3_COALESCE
         self.span_bytes = span_bytes
 
     @classmethod

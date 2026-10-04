@@ -97,12 +97,16 @@ evicting least recently used objects beyond `max_bytes` (order in memory, and in
 restarts). A restart is then not a cold start. A `DiskCache` is also a `FileBlobStore`, so warming a laptop from a
 bucket is a copy: `copy_objects(s3, disk, snapshot_keys(index.revision))`.
 
-**Connections.** `S3BlobStore` uses `http.client` with one keep-alive connection per thread and host (the index's
-I/O pool threads each keep theirs; a connection the server closed is reopened and the request retried), so there is
-no third-party HTTP client and no extra dependency. `open_index` warms `inflight` (32) of them with HEADs of
-`idx/current.json` on the I/O pool while it loads the index (`warmup`), so the first query does not pay the TLS
-handshakes. Signing costs one HMAC per request: the derived SigV4 key is cached per (date, region, service)
-(`SigningKeyCache`; ~5 us instead of ~9 us per request).
+**Connections.** `S3BlobStore` uses `http.client` with a pool of keep-alive connections shared by every thread (at
+most `max_connections`, default `inflight` = 32; a thread takes an idle connection or opens one, and waits when all
+are busy; a connection the server closed is reopened and the request retried), so there is no third-party HTTP
+client and no extra dependency. Before, each I/O thread kept its own connection, so a cold process opened one per
+thread (33). `open_index` warms `inflight` of them with HEADs of `idx/current.json` while it loads the index
+(`warmup`), so the first query does not pay the TLS handshakes. Signing costs one HMAC per request: the derived SigV4 key is cached per (date, region, service)
+(`SigningKeyCache`; ~5 us instead of ~9 us per request). `S3BlobStore(..., inflight=32, coalesce_bytes=128 << 10,
+chunk_bytes=8 << 20, chunk_concurrency=4, max_connections=inflight, warmup=0)`: rerank records are read as runs of
+up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whole-object GET larger than
+`chunk_bytes` becomes parallel range GETs (one S3 stream is bandwidth-bound; the routing table is 25 MB on g4).
 
 ## API
 
@@ -155,7 +159,7 @@ Properties: `manifest` (the stored dict, camelCase keys), `gen`, `rev`, `dim`, `
 | `return_payload` | False | also return each hit's payload bytes |
 | `inflight` | the store's: 32 for `S3BlobStore`, else 12 | reads in flight per query (remote stores) |
 | `speculate` | True | read the running top-T's rerank records while the last 6 slabs are still scanning (remote stores) |
-| `coalesce_bytes` | the store's, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while it stays within this many bytes |
+| `coalesce_bytes` | the store's: 128 KB for `S3BlobStore`, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while it stays within this many bytes |
 | `span_bytes` | the store's, else 0 (off) | phase 2: read a slab's records as ONE range from the first to the last wanted one when that span is at most this |
 | `cold_policy` | `open_index(cold_policy=)` | `{"nprobe", "rerank", "threshold"}`: when more than `threshold` (default 0.5) of the probed slabs are not cached, scan only the best `nprobe` and rerank `rerank` (each capped at the query's value); `False` disables it |
 
