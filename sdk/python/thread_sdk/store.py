@@ -2,7 +2,8 @@
 against any S3-compatible endpoint (`S3BlobStore`, see s3.py), a local directory (`FileBlobStore`, e.g. a synced
 copy of the bucket), memory (`MemoryBlobStore`, tests and small indexes) and, in front of any of them, a cache of
 the immutable index objects (`CachedBlobStore` over a `MemoryCache` or a `DiskCache`), which plays the part the
-Workers Cache API plays for the TypeScript SDK.
+Workers Cache API plays for the TypeScript SDK. What a cache miss reads is the cache store's `miss_policy` (see
+`CachedBlobStore`).
 
 A store may return a `memoryview` into a larger buffer (the whole object fetched on a cache miss); callers must not
 assume they got exactly the bytes asked for in their own buffer. Every method is safe to call from several threads.
@@ -13,13 +14,15 @@ from __future__ import annotations
 import errno
 import hashlib
 import os
+import logging
 import tempfile
 import threading
+import time
 import uuid
-from collections import OrderedDict
-from concurrent.futures import Future
+from collections import OrderedDict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, NamedTuple, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 from .wire import ThreadError
 
@@ -40,7 +43,13 @@ __all__ = [
     "MemoryCache",
     "DiskCache",
     "CachedBlobStore",
+    "MISS_POLICIES",
 ]
+
+log = logging.getLogger("thread_sdk")
+
+#: What a cache store does on a miss of a `fill` range read (a slab's scan prefix); see `CachedBlobStore`.
+MISS_POLICIES = ("whole", "range", "range+warm")
 
 Bytes = bytes | bytearray | memoryview
 
@@ -71,6 +80,9 @@ class BlobTrace:
     r200: int = 0
     #: Bytes transferred into the process.
     bytes: int = 0
+    #: Cache stores with the "range+warm" miss policy: whole-object fetches this call's misses queued in the
+    #: background (not part of `reads` / `bytes`; `CachedBlobStore.warm_stats` counts what they transferred).
+    warms: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def add(self, **counts: int) -> None:
@@ -80,7 +92,7 @@ class BlobTrace:
 
     def as_dict(self) -> dict[str, int]:
         with self._lock:
-            return {k: getattr(self, k) for k in ("reads", "hits", "misses", "r206", "r200", "bytes")}
+            return {k: getattr(self, k) for k in ("reads", "hits", "misses", "r206", "r200", "bytes", "warms")}
 
 
 def _trace_read(trace: BlobTrace | None, n: int) -> None:
@@ -98,6 +110,21 @@ class BlobStore:
     supports_ranges = False
     #: Whether reads cross a network (`open` puts a memory cache in front of remote stores by default).
     remote = False
+    #: Preferred reads in flight per query (a query's `inflight` default; 12 when None).
+    inflight: int | None = None
+    #: Preferred phase-2 range merging (a query's `coalesce_bytes` / `span_bytes` defaults when not None).
+    coalesce_bytes: int | None = None
+    span_bytes: int | None = None
+
+    def contains(self, key: str) -> bool | None:
+        """Whether `key` can be read without an origin request (in a local cache); None when the store cannot tell.
+        Used by the cold-path query policy."""
+        return None
+
+    def warmup(self, n: int, executor: ThreadPoolExecutor | None = None) -> list[Future]:
+        """Opens up to `n` connections ahead of the first query (remote stores; a no-op here). With `executor`, the
+        work runs on its threads (whose connections the queries then reuse)."""
+        return []
 
     def get(self, key: str, range: BlobRange | None = None, *, trace: BlobTrace | None = None,
             fill: bool = False) -> Bytes | None:
@@ -339,6 +366,15 @@ class PrefixedBlobStore(BlobStore):
         self.supports_list = inner.supports_list
         self.supports_ranges = inner.supports_ranges
         self.remote = inner.remote
+        self.inflight = inner.inflight
+        self.coalesce_bytes = inner.coalesce_bytes
+        self.span_bytes = inner.span_bytes
+
+    def contains(self, key):
+        return self.inner.contains(self.prefix + key)
+
+    def warmup(self, n, executor=None):
+        return self.inner.warmup(n, executor)
 
     def get(self, key, range=None, *, trace=None, fill=False):
         return self.inner.get(self.prefix + key, range, trace=trace, fill=fill)
@@ -364,6 +400,10 @@ class PrefixedBlobStore(BlobStore):
 class BlobCache:
     """Whole immutable objects by key. `get_range` lets a cache serve part of an object without reading it all."""
 
+    #: The miss policy a `CachedBlobStore` over this cache uses by default. In-process caches warm in the background;
+    #: a cache shared by many processes (an edge cache) may prefer "whole".
+    default_miss_policy = "range+warm"
+
     def get(self, key: str) -> Bytes | None:
         raise NotImplementedError
 
@@ -385,6 +425,10 @@ class BlobCache:
         mv = memoryview(b)
         return [mv[r.offset : r.offset + r.length] for r in ranges]
 
+    def contains(self, key: str) -> bool:
+        """Whether the object is cached (no I/O beyond a lookup)."""
+        return self.get(key) is not None
+
     def put(self, key: str, data: bytes) -> None:
         raise NotImplementedError
 
@@ -398,6 +442,9 @@ class MemoryCache(BlobCache):
         self.held = 0
         self._items: OrderedDict[str, bytes] = OrderedDict()
         self._lock = threading.Lock()
+
+    def contains(self, key):
+        return key in self._items
 
     def get(self, key):
         with self._lock:
@@ -420,103 +467,130 @@ class MemoryCache(BlobCache):
                 self.held -= len(ev)
 
 
-class DiskCache(BlobCache):
-    """Whole immutable objects as files in a directory (default limit 4 GB, least recently used evicted first),
-    shared by every process that points at it. Range reads read only the range."""
+#: A hit refreshes the file's mtime at most this often (seconds), so the LRU order survives a restart.
+_TOUCH_EVERY = 60.0
 
-    def __init__(self, directory: str | os.PathLike[str], max_bytes: int = 4 * 1024**3) -> None:
-        self.dir = os.path.abspath(os.fspath(directory))
+
+class DiskCache(FileBlobStore, BlobCache):
+    """Whole immutable objects as files in a directory (default limit 4 GB, least recently used evicted first), shared
+    by every process that points at it. The directory has the bucket layout (`{dir}/idx/{gen}/slab/00123`), the
+    same one the TypeScript SDK's `DiskCache` writes, so the two SDKs can share a cache directory, and the cache is
+    also a directory store (`FileBlobStore`): `copy_objects(s3, disk_cache, snapshot_keys(rev))` pre-warms it with one
+    revision. Range reads read only the range. The LRU order is kept in memory and, coarsely, in the files' mtimes,
+    which the startup scan sorts by; a file another process evicted reads as a miss."""
+
+    def __init__(self, directory: str | os.PathLike[str], max_bytes: int = 4 * 1024**3, *,
+                 miss_policy: str = "range+warm") -> None:
+        super().__init__(directory)
+        self.dir = self.root
         self.max_bytes = max_bytes
+        self.default_miss_policy = miss_policy
         os.makedirs(self.dir, exist_ok=True)
-        self._lock = threading.Lock()
-        self._sizes: OrderedDict[str, int] = OrderedDict()
+        self._lru_lock = threading.Lock()
+        #: key -> [size, last touch (s)], least recently used first
+        self._sizes: OrderedDict[str, list[float]] = OrderedDict()
         entries = []
-        for name in os.listdir(self.dir):
-            if name.startswith(".tmp-"):
-                continue
+        for dirpath, dirnames, filenames in os.walk(self.dir):
+            rel = os.path.relpath(dirpath, self.dir)
+            rel = "" if rel == "." else rel.replace(os.sep, "/") + "/"
+            dirnames[:] = [d for d in dirnames if not (rel == "" and d == ".thread-lock.d")]
+            for name in filenames:
+                if name.startswith(".tmp-") or name == ".thread-lock":
+                    continue
+                try:
+                    st = os.stat(os.path.join(dirpath, name))
+                except FileNotFoundError:
+                    continue
+                entries.append((st.st_mtime, rel + name, st.st_size))
+        for mtime, key, size in sorted(entries):
+            self._sizes[key] = [size, mtime]
+        self.held = sum(int(v[0]) for v in self._sizes.values())
+
+    def contains(self, key):
+        return key in self._sizes
+
+    def _touch(self, key: str, size: int | None) -> None:
+        now = time.time()
+        touch = False
+        with self._lru_lock:
+            e = self._sizes.get(key)
+            if e is None:
+                if size is None:
+                    return
+                self._sizes[key] = [size, now]
+                self.held += size
+                evict = self._evict_locked()
+            else:
+                self._sizes.move_to_end(key)
+                evict = []
+                if now - e[1] > _TOUCH_EVERY:
+                    e[1] = now
+                    touch = True
+        if touch:
             try:
-                st = os.stat(os.path.join(self.dir, name))
+                os.utime(self.path(key))
+            except OSError:
+                pass
+        self._unlink(evict)
+
+    def _forget(self, key: str) -> None:
+        with self._lru_lock:
+            e = self._sizes.pop(key, None)
+            if e is not None:
+                self.held -= int(e[0])
+
+    def _evict_locked(self) -> list[str]:
+        out = []
+        while self.held > self.max_bytes and len(self._sizes) > 1:
+            old, e = self._sizes.popitem(last=False)
+            self.held -= int(e[0])
+            out.append(old)
+        return out
+
+    def _unlink(self, keys_: list[str]) -> None:
+        for k in keys_:
+            try:
+                os.unlink(self.path(k))
             except FileNotFoundError:
-                continue
-            entries.append((st.st_mtime_ns, name, st.st_size))
-        for _, name, size in sorted(entries):
-            self._sizes[name] = size
-        self.held = sum(self._sizes.values())
+                pass
 
-    @staticmethod
-    def _name(key: str) -> str:
-        return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-    def _touch(self, name: str) -> None:
-        with self._lock:
-            if name in self._sizes:
-                self._sizes.move_to_end(name)
-
-    def get(self, key):
-        name = self._name(key)
-        try:
-            with open(os.path.join(self.dir, name), "rb") as f:
-                b = f.read()
-        except FileNotFoundError:
-            return None
-        self._touch(name)
+    def get(self, key, range=None, *, trace=None, fill=False):
+        b = super().get(key, range, trace=trace)
+        if b is None:
+            self._forget(key)
+        else:
+            self._touch(key, len(b) if range is None else None)
         return b
 
     def get_range(self, key, offset, length):
-        name = self._name(key)
         try:
-            with open(os.path.join(self.dir, name), "rb") as f:
-                size = os.fstat(f.fileno()).st_size
-                if offset + length > size:
-                    raise ThreadError(f"cached {key} is {size} bytes, need {offset + length}")
-                f.seek(offset)
-                b = f.read(length)
-        except FileNotFoundError:
-            return None
-        self._touch(name)
-        return b
+            return self.get(key, BlobRange(offset, length))
+        except ThreadError as e:
+            raise ThreadError(f"cached {key}: {e}") from e
 
-    def get_ranges(self, key, ranges):
-        name = self._name(key)
-        try:
-            with open(os.path.join(self.dir, name), "rb") as f:
-                size = os.fstat(f.fileno()).st_size
-                out = []
-                for r in ranges:
-                    _check_range(key, size, r)
-                    f.seek(r.offset)
-                    out.append(f.read(r.length))
-        except FileNotFoundError:
-            return None
-        self._touch(name)
+    def get_ranges(self, key, ranges, *, trace=None, fill=False):
+        out = super().get_ranges(key, ranges, trace=trace)
+        if out is None:
+            self._forget(key)
+        else:
+            self._touch(key, None)
         return out
 
-    def put(self, key, data):
-        if len(data) > self.max_bytes:
-            return
-        name = self._name(key)
-        fd, tmp = tempfile.mkstemp(dir=self.dir, prefix=".tmp-")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-            os.replace(tmp, os.path.join(self.dir, name))
-        except BaseException:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-            raise
-        evict = []
-        with self._lock:
-            self.held += len(data) - self._sizes.pop(name, 0)
-            self._sizes[name] = len(data)
-            while self.held > self.max_bytes and len(self._sizes) > 1:
-                old, size = self._sizes.popitem(last=False)
-                self.held -= size
-                evict.append(old)
-        for old in evict:
-            try:
-                os.unlink(os.path.join(self.dir, old))
-            except FileNotFoundError:
-                pass
+    def put(self, key, data, *, if_absent=False, if_match=None, content_type=None):
+        b = _encode(data)
+        if len(b) > self.max_bytes:
+            return None
+        h = super().put(key, b, if_absent=if_absent, if_match=if_match, content_type=content_type)
+        if h is not None:
+            with self._lru_lock:
+                old = self._sizes.pop(key, None)
+                if old is not None:
+                    self.held -= int(old[0])
+                self._sizes[key] = [h.size, time.time()]
+                self.held += h.size
+                evict = self._evict_locked()
+            self._unlink(evict)
+        return h
 
 
 def _not_current(key: str) -> bool:
@@ -525,22 +599,72 @@ def _not_current(key: str) -> bool:
 
 class CachedBlobStore(BlobStore):
     """A cache in front of another store. Index objects under `idx/` are immutable (every revision writes new keys),
-    so whole objects are cached and ranges served from them; `current.json` is never cached. A miss of a `fill`
-    read fetches the whole object once (concurrent misses of the same key share one fetch) and returns the range
-    as a view into it."""
+    so whole objects are cached and ranges served from them; `current.json` is never cached.
 
-    def __init__(self, inner: BlobStore, cache: BlobCache, *, cacheable: Callable[[str], bool] = _not_current) -> None:
+    `miss_policy` decides what a miss of a `fill` range read (a slab's scan prefix) does:
+
+    - "whole": read the whole object once (concurrent misses of the same key share one read), cache it and return
+      the range as a view into it, so the query also has that slab's rerank records in memory. Right for a cache
+      many processes share, where the first query pays the transfer for everybody.
+    - "range": read exactly the range from the origin and cache nothing (whole-object reads are not cached either).
+    - "range+warm" (default for `MemoryCache` / `DiskCache`): read exactly the range now and fetch the whole object
+      into the cache in the background: `warm_concurrency` fetches at once (one while foreground reads are in
+      flight), at most `warm_queue` queued, deduplicated, never on the query's critical path.
+
+    Reads without `fill` (rerank records, lexical postings) never fetch whole objects."""
+
+    def __init__(self, inner: BlobStore, cache: BlobCache, *, cacheable: Callable[[str], bool] = _not_current,
+                 miss_policy: str | None = None, warm_concurrency: int = 2, warm_queue: int = 1024,
+                 inflight: int | None = None, coalesce_bytes: int | None = None,
+                 span_bytes: int | None = None) -> None:
         self.inner = inner
         self.cache = cache
         self.cacheable = cacheable
+        self.miss_policy = miss_policy or getattr(cache, "default_miss_policy", "range+warm")
+        if self.miss_policy not in MISS_POLICIES:
+            raise ThreadError(f"miss_policy must be one of {', '.join(MISS_POLICIES)}", 400)
         self.supports_put = inner.supports_put
         self.supports_list = inner.supports_list
         self.supports_ranges = True
         self.remote = inner.remote
+        self.inflight = inflight if inflight is not None else inner.inflight
+        self.coalesce_bytes = coalesce_bytes if coalesce_bytes is not None else inner.coalesce_bytes
+        self.span_bytes = span_bytes if span_bytes is not None else inner.span_bytes
+        self.warm_concurrency = warm_concurrency
+        self.warm_queue = warm_queue
+        #: Background warm fetches: queued, fetched, bytes, failed, dropped (queue full).
+        self.warm_stats = {"queued": 0, "fetched": 0, "bytes": 0, "failed": 0, "dropped": 0}
         self._fills: dict[str, Future] = {}
         self._lock = threading.Lock()
+        self._warm_q: deque[str] = deque()
+        self._warming: set[str] = set()
+        self._warm_active = 0
+        self._foreground = 0
+        self._idle = threading.Condition(self._lock)
+        self._warm_pool: ThreadPoolExecutor | None = None
 
-    def _fill(self, key: str, trace: BlobTrace | None) -> bytes | None:
+    def contains(self, key):
+        if not self.cacheable(key):
+            return self.inner.contains(key)
+        return self.cache.contains(key) or bool(self.inner.contains(key))
+
+    def warmup(self, n, executor=None):
+        return self.inner.warmup(n, executor)
+
+    def _origin(self, fn: Callable[[], Any]) -> Any:
+        """Runs a foreground origin read (counted, so background warms yield to it)."""
+        with self._lock:
+            self._foreground += 1
+        try:
+            return fn()
+        finally:
+            with self._lock:
+                self._foreground -= 1
+                idle = self._foreground == 0
+            if idle:
+                self._pump()
+
+    def _fill(self, key: str, trace: BlobTrace | None, cache: bool = True) -> bytes | None:
         fut: Future = Future()
         with self._lock:
             pending = self._fills.get(key)
@@ -549,9 +673,9 @@ class CachedBlobStore(BlobStore):
         if pending is not None:
             return pending.result()
         try:
-            full = self.inner.get(key, None, trace=trace)
+            full = self._origin(lambda: self.inner.get(key, None, trace=trace))
             full = None if full is None else bytes(full)
-            if full is not None:
+            if full is not None and cache:
                 self.cache.put(key, full)
             fut.set_result(full)
             return full
@@ -561,6 +685,96 @@ class CachedBlobStore(BlobStore):
         finally:
             with self._lock:
                 self._fills.pop(key, None)
+                self._idle.notify_all()
+
+    def _warm(self, key: str, trace: BlobTrace | None) -> None:
+        """Queues a background whole-object fetch of `key` ("range+warm")."""
+        if self.warm_concurrency <= 0 or self.cache.contains(key):
+            return
+        with self._lock:
+            if key in self._warming or key in self._fills:
+                return
+            if len(self._warm_q) >= self.warm_queue:
+                self.warm_stats["dropped"] += 1
+                return
+            self._warming.add(key)
+            self._warm_q.append(key)
+            self.warm_stats["queued"] += 1
+        if trace is not None:
+            trace.add(warms=1)
+        self._pump()
+
+    def _pump(self) -> None:
+        starts = []
+        with self._lock:
+            cap = self.warm_concurrency if self._foreground == 0 else min(1, self.warm_concurrency)
+            while self._warm_active < cap and self._warm_q:
+                self._warm_active += 1
+                starts.append(self._warm_q.popleft())
+            if starts and self._warm_pool is None:
+                self._warm_pool = ThreadPoolExecutor(max_workers=max(1, self.warm_concurrency),
+                                                     thread_name_prefix="thread-warm")
+        for key in starts:
+            try:
+                self._warm_pool.submit(self._warm_one, key)  # type: ignore[union-attr]
+            except RuntimeError:  # interpreter shutting down
+                self._warm_done(key)
+
+    def _warm_one(self, key: str) -> None:
+        try:
+            if not self.cache.contains(key):
+                full = self.inner.get(key)
+                if full is not None:
+                    full = bytes(full)
+                    self.cache.put(key, full)
+                    with self._lock:
+                        self.warm_stats["fetched"] += 1
+                        self.warm_stats["bytes"] += len(full)
+        except Exception as e:  # noqa: BLE001 - a failed warm only means a later miss reads the origin
+            with self._lock:
+                self.warm_stats["failed"] += 1
+            log.error("thread_sdk: warm fetch of %s failed: %s", key, e)
+        finally:
+            self._warm_done(key)
+
+    def _warm_done(self, key: str) -> None:
+        with self._lock:
+            self._warm_active -= 1
+            self._warming.discard(key)
+            self._idle.notify_all()
+        self._pump()
+
+    def drain(self, timeout: float | None = None) -> bool:
+        """Waits until no background warm fetch or whole-object fill is queued or running (tests, benchmarks).
+        Returns False on timeout."""
+        with self._lock:
+            return self._idle.wait_for(lambda: not (self._warm_active or self._warm_q or self._fills), timeout)
+
+    def close(self) -> None:
+        """Stops the warm thread (queued warms are dropped)."""
+        with self._lock:
+            self._warm_q.clear()
+            pool, self._warm_pool = self._warm_pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _miss_fill(self, key: str, ranges: Sequence[BlobRange], single: bool, trace: BlobTrace | None) -> Any:
+        if self.miss_policy == "whole":
+            full = self._fill(key, trace)
+            if full is None:
+                return None
+            for r in ranges:
+                _check_range(key, len(full), r)
+            mv = memoryview(full)
+            return [mv[r.offset : r.offset + r.length] for r in ranges]
+        if single:
+            b = self._origin(lambda: self.inner.get(key, ranges[0], trace=trace))
+            got = None if b is None else [b]
+        else:
+            got = self._origin(lambda: self.inner.get_ranges(key, ranges, trace=trace))
+        if got is not None and self.miss_policy == "range+warm":
+            self._warm(key, trace)
+        return got
 
     def get(self, key, range=None, *, trace=None, fill=False):
         if not self.cacheable(key):
@@ -573,15 +787,11 @@ class CachedBlobStore(BlobStore):
         if trace is not None:
             trace.add(misses=1)
         if range is None:
-            return self._fill(key, trace)
+            return self._fill(key, trace, cache=self.miss_policy != "range")
         if fill:
-            full = self._fill(key, trace)
-            if full is None:
-                return None
-            if range.offset + range.length > len(full):
-                raise ThreadError(f"{key} is {len(full)} bytes, need {range.offset + range.length}")
-            return memoryview(full)[range.offset : range.offset + range.length]
-        return self.inner.get(key, range, trace=trace)
+            got = self._miss_fill(key, [range], True, trace)
+            return None if got is None else got[0]
+        return self._origin(lambda: self.inner.get(key, range, trace=trace))
 
     def get_ranges(self, key, ranges, *, trace=None, fill=False):
         if not ranges:
@@ -596,14 +806,8 @@ class CachedBlobStore(BlobStore):
         if trace is not None:
             trace.add(misses=1)
         if fill:
-            full = self._fill(key, trace)
-            if full is None:
-                return None
-            for r in ranges:
-                _check_range(key, len(full), r)
-            mv = memoryview(full)
-            return [mv[r.offset : r.offset + r.length] for r in ranges]
-        return self.inner.get_ranges(key, ranges, trace=trace)
+            return self._miss_fill(key, ranges, False, trace)
+        return self._origin(lambda: self.inner.get_ranges(key, ranges, trace=trace))
 
     def head(self, key):
         return self.inner.head(key)

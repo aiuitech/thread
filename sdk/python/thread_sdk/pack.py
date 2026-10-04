@@ -121,6 +121,9 @@ class PackedBlobStore(BlobStore):
         self.key = key
         self.supports_ranges = inner.supports_ranges
         self.remote = inner.remote
+        self.inflight = inner.inflight
+        self.coalesce_bytes = inner.coalesce_bytes
+        self.span_bytes = inner.span_bytes
         h = inner.head(key)
         if h is None:
             raise ThreadError(f"no pack at {key}", 404)
@@ -128,6 +131,7 @@ class PackedBlobStore(BlobStore):
             raise ThreadError(f"{key} is too small to be a pack ({h.size} bytes)")
         #: Size and etag of the pack object.
         self.pack = h
+        self.warmup = inner.warmup  # type: ignore[method-assign]
         tail_len = min(h.size, PACK_TAIL_READ)
         tail = inner.get(key, BlobRange(h.size - tail_len, tail_len))
         if tail is None:
