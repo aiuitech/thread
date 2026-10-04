@@ -17,6 +17,7 @@ use thread_core::part::{span_sub_range, DirEntry, PartBuilder};
 use thread_core::pq::{Codebook, PqAccum, QueryTable};
 use thread_core::quant::{decode_residual_sq8, encode_residual_sq4, encode_residual_sq8};
 use thread_core::route::{CentroidTree, Router};
+use thread_core::routing::{decode_rows, encode_grouped, encode_rows, Elem, GroupedTable, PartialRouter};
 use thread_core::search::{rerank_records, scan_delta as scan_delta_core, scan_slab, scan_slab_pq, ScanStats};
 use thread_core::slab::{SlabHeader, SlabView, SlabWriter, SLAB_HEADER};
 use thread_core::tomb::Tombstones;
@@ -711,6 +712,175 @@ pub fn part_directory_len(k2: u32) -> u32 {
     thread_core::part::directory_len(k2 as usize) as u32
 }
 
+fn elem_arg(elem: &str) -> Result<Elem, JsValue> {
+    Elem::parse(elem).ok_or_else(|| js_err(format!("unknown routing table element type {elem:?} (f32, f16 or i8)")))
+}
+
+/// Encodes cell means (`k * dim` f32, e.g. `fine.f32`) as a compact routing
+/// table: `"f16"` (IEEE half, `fine.f16`), `"i8"` (`[scale f32][i8 * dim]` per
+/// row, `fine.i8`) or `"f32"` (the raw bytes).
+#[wasm_bindgen]
+pub fn routing_table_encode(means: &[f32], dim: u32, elem: &str) -> Result<Vec<u8>, JsValue> {
+    let elem = elem_arg(elem)?;
+    check_batch(means.len(), dim as usize)?;
+    Ok(encode_rows(means, dim as usize, elem))
+}
+
+/// Decodes a routing table of `elem` rows back to f32 means (what
+/// `Searcher.from_table` routes over).
+#[wasm_bindgen]
+pub fn routing_table_decode(table: &[u8], dim: u32, elem: &str) -> Result<Vec<f32>, JsValue> {
+    decode_rows(table, dim as usize, elem_arg(elem)?).map_err(js_err)
+}
+
+/// Bytes of one routing table row of `elem` at `dim`.
+#[wasm_bindgen]
+pub fn routing_row_bytes(dim: u32, elem: &str) -> Result<u32, JsValue> {
+    Ok(elem_arg(elem)?.row_bytes(dim as usize) as u32)
+}
+
+/// The means (`k * dim` f32) in the group order of a centroid tree built over
+/// them ("VIBG": header, directory, rows of `elem`), so a cold reader can
+/// range-read the rows of the groups a query needs (`ColdRouter`).
+#[wasm_bindgen]
+pub fn grouped_table_encode(means: &[f32], dim: u32, tree_bytes: &[u8], elem: &str) -> Result<Vec<u8>, JsValue> {
+    let elem = elem_arg(elem)?;
+    let k = check_batch(means.len(), dim as usize)?;
+    let tree = tree_arg(tree_bytes, dim as usize, k)?;
+    Ok(encode_grouped(means, dim as usize, &tree, elem))
+}
+
+/// Header of a grouped table (its first `data_off` bytes or the whole object):
+/// `[elem code (0 f32, 1 f16, 2 i8), dim, k, groups, n_rows, data_off, row_bytes, byte_len]`.
+#[wasm_bindgen]
+pub fn grouped_table_info(bytes: &[u8]) -> Result<Vec<u32>, JsValue> {
+    let t = GroupedTable::parse(bytes).map_err(js_err)?;
+    Ok(vec![t.elem.code(), t.dim as u32, t.k as u32, t.groups as u32, t.n_rows as u32, t.data_off as u32, t.row_bytes() as u32, t.byte_len() as u32])
+}
+
+/// Cold-start routing over a subset of the cell means: a centroid tree plus
+/// the rows of the groups loaded so far from a tree-grouped table
+/// (`fine.grouped.*`). `missing_groups(q, beam)` names the groups to read
+/// (`group_rows` gives their rows, so their byte range is `data_off + first *
+/// row_bytes`), `add_rows` / `add_group` installs them, `route_beam` then ranks
+/// the members of the best `beam` groups as `Searcher.route_beam` does over
+/// the full table. Cells not loaded are not candidates. `cell_dots_for` gives
+/// delta scans their base scores (load the delta cells' rows first:
+/// `missing_cells`, `cell_row`).
+#[wasm_bindgen]
+pub struct ColdRouter {
+    inner: PartialRouter,
+}
+
+#[wasm_bindgen]
+impl ColdRouter {
+    /// `tree_bytes`: the centroid tree the grouped table was written in the
+    /// order of; `elem`: its row type.
+    #[wasm_bindgen(constructor)]
+    pub fn new(tree_bytes: &[u8], elem: &str) -> Result<ColdRouter, JsValue> {
+        let elem = elem_arg(elem)?;
+        let tree = CentroidTree::from_bytes(tree_bytes).map_err(js_err)?;
+        Ok(ColdRouter { inner: PartialRouter::new(tree, elem) })
+    }
+
+    pub fn dim(&self) -> u32 {
+        self.inner.dim as u32
+    }
+
+    /// Cells (rows of the full table).
+    pub fn k(&self) -> u32 {
+        self.inner.k as u32
+    }
+
+    pub fn groups(&self) -> u32 {
+        self.inner.groups() as u32
+    }
+
+    pub fn row_bytes(&self) -> u32 {
+        self.inner.row_bytes() as u32
+    }
+
+    /// `[first row, row count]` of group `g` in the grouped table.
+    pub fn group_rows(&self, g: u32) -> Result<Vec<u32>, JsValue> {
+        if g as usize >= self.inner.groups() {
+            return Err(js_err(format!("group {g} >= {} groups", self.inner.groups())));
+        }
+        let (a, n) = self.inner.group_rows(g as usize);
+        Ok(vec![a as u32, n as u32])
+    }
+
+    /// Row of cell `c` in the grouped table, -1 if no group lists it.
+    pub fn cell_row(&self, c: u32) -> i32 {
+        self.inner.cell_row(c as usize).map_or(-1, |r| r as i32)
+    }
+
+    pub fn has_cell(&self, c: u32) -> bool {
+        self.inner.has_cell(c as usize)
+    }
+
+    /// The listed cells whose means are not loaded (in order, duplicates kept).
+    pub fn missing_cells(&self, cells: &[u32]) -> Vec<u32> {
+        cells.iter().copied().filter(|&c| !self.inner.has_cell(c as usize)).collect()
+    }
+
+    pub fn loaded_cells(&self) -> u32 {
+        self.inner.loaded_cells() as u32
+    }
+
+    pub fn loaded_groups(&self) -> u32 {
+        self.inner.loaded_groups() as u32
+    }
+
+    /// The `beam` best groups for unit query `q`, best first.
+    pub fn top_groups(&self, q: &[f32], beam: u32) -> Result<Vec<u32>, JsValue> {
+        self.check_q(q)?;
+        Ok(self.inner.top_groups(q, beam as usize).into_iter().map(|g| g as u32).collect())
+    }
+
+    /// The groups among the `beam` best for `q` that are not fully loaded, best first.
+    pub fn missing_groups(&self, q: &[f32], beam: u32) -> Result<Vec<u32>, JsValue> {
+        self.check_q(q)?;
+        Ok(self.inner.missing_groups(q, beam as usize).into_iter().map(|g| g as u32).collect())
+    }
+
+    /// Installs rows `first_row..` (a whole number of rows); returns the cells newly loaded.
+    pub fn add_rows(&mut self, first_row: u32, bytes: &[u8]) -> Result<u32, JsValue> {
+        Ok(self.inner.add_rows(first_row as usize, bytes).map_err(js_err)? as u32)
+    }
+
+    /// Installs the rows of group `g`; returns the cells newly loaded.
+    pub fn add_group(&mut self, g: u32, bytes: &[u8]) -> Result<u32, JsValue> {
+        Ok(self.inner.add_group(g as usize, bytes).map_err(js_err)? as u32)
+    }
+
+    /// Global ids of the `nprobe` best loaded cells among the members of the
+    /// best `beam` groups (cosine, descending).
+    pub fn route_beam(&self, q: &[f32], beam: u32, nprobe: u32) -> Result<Vec<u32>, JsValue> {
+        self.check_q(q)?;
+        Ok(self.inner.route_beam(q, beam as usize, nprobe as usize).into_iter().map(|(c, _)| c as u32).collect())
+    }
+
+    /// `q·mean[c]` for the listed cells (all loaded), in order.
+    pub fn cell_dots_for(&self, q: &[f32], cells: &[u32]) -> Result<Vec<f32>, JsValue> {
+        self.check_q(q)?;
+        self.inner.cell_dots_for(q, cells).map_err(js_err)
+    }
+
+    /// Bytes of decoded means held in wasm memory.
+    pub fn resident_bytes(&self) -> f64 {
+        self.inner.resident_bytes() as f64
+    }
+}
+
+impl ColdRouter {
+    fn check_q(&self, q: &[f32]) -> Result<(), JsValue> {
+        if q.len() != self.inner.dim {
+            return Err(js_err("query dim mismatch"));
+        }
+        Ok(())
+    }
+}
+
 /// Query-side: routing table plus slab scanning.
 #[wasm_bindgen]
 pub struct Searcher {
@@ -727,6 +897,22 @@ impl Searcher {
             return Err(js_err("centroid buffer size mismatch"));
         }
         Ok(Searcher { router: Router::new(dim, k1, k2, coarse_means, fine_means.to_vec()), tree: None })
+    }
+
+    /// A searcher over a compact routing table (`fine.f16` / `fine.i8`, or
+    /// `fine.f32` bytes with `"f32"`): the rows are decoded to f32 once, so
+    /// routing costs what it does over `fine.f32`, with the decoded means.
+    pub fn from_table(dim: u32, k1: u32, k2: u32, coarse_means: &[f32], table: &[u8], elem: &str) -> Result<Searcher, JsValue> {
+        let elem = elem_arg(elem)?;
+        let (d, k) = (dim as usize, (k1 * k2) as usize);
+        if table.len() != k * elem.row_bytes(d) {
+            return Err(js_err(format!("{} routing table is {} bytes, expected {k} rows of {} bytes", elem.name(), table.len(), elem.row_bytes(d))));
+        }
+        if coarse_means.len() != k1 as usize * d {
+            return Err(js_err("centroid buffer size mismatch"));
+        }
+        let fine = decode_rows(table, d, elem).map_err(js_err)?;
+        Ok(Searcher { router: Router::new(d, k1 as usize, k2 as usize, coarse_means, fine), tree: None })
     }
 
     pub fn dim(&self) -> u32 {

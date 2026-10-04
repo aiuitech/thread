@@ -11,7 +11,7 @@
 import type { BlobRange, BlobStore, BlobTrace } from "./store.js";
 import { newTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
-import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SegmentRef, type SlabRow, type TombState, type IndexFiles } from "./wire.js";
+import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SegmentRef, type SlabRow, type TombState, type IndexFiles, type RoutingElem } from "./wire.js";
 
 export interface QueryOptions {
 	/** Results to return (default 10). */
@@ -57,6 +57,8 @@ export interface QueryStats {
 	rev: number;
 	format: number;
 	routing: "flat" | "tree";
+	/** The routing table the probed cells were ranked with (`open({routing})`). */
+	routingTable: RoutingElem;
 	/** Probed cells, in routing order. */
 	cells: number[];
 	/** Entries scanned (slabs) and bytes of scan prefixes / of slab objects transferred. */
@@ -119,6 +121,8 @@ export interface Base {
 	key: string;
 	searcher: W.Searcher;
 	pq: W.PqCodebook | null;
+	/** The routing table the searcher was built from (f32 = `files.fine`). */
+	routing: RoutingElem;
 	/** Wasm instance epoch the objects were created in (they may be freed only in that epoch). */
 	epoch: number;
 }
@@ -483,6 +487,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			rev: rev.rev,
 			format,
 			routing: flat ? "flat" : "tree",
+			routingTable: base.routing,
 			cells,
 			scanned,
 			scanBytes,

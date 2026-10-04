@@ -12,6 +12,7 @@ from .wire import (
     BytesLike,
     ThreadError,
     build_tomb_state,
+    grouped_table_of,
     has_dense,
     keys,
     manifest_files,
@@ -19,6 +20,7 @@ from .wire import (
     parse_current,
     parse_manifest,
     parse_slabs_table,
+    routing_tables_of,
     slab_rev_of,
     u32_array,
 )
@@ -102,8 +104,15 @@ def snapshot_keys(rev: RevState) -> list[str]:
         for name, v in rev.files.items():
             if name == "slabs" and rev.slabs is None:
                 continue  # v1 generations without a slabs table
+            if name in ("base", "baseCold"):
+                continue  # base packs repeat objects listed here
             if isinstance(v, str) and v:
                 out.add(v)
+        # Compact routing tables made from the current means (fine.f16, fine.i8, the tree-grouped table).
+        r = routing_tables_of(m, rev.files) or {}
+        for t in (r.get("f16"), r.get("i8"), grouped_table_of(m, rev.files)):
+            if isinstance(t, dict) and isinstance(t.get("key"), str):
+                out.add(t["key"])
         for cell in range(m["k1"] * m["k2"]):
             out.add(keys.slab(rev.gen, cell, slab_rev_of(rev.slabs[cell]) if rev.slabs is not None else 0))
     # A centroid tree (written by the Worker's publish-rev --tree) is read by the Worker's beam routing.

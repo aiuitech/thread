@@ -13,7 +13,7 @@ import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, PrefixedBlobStore, R2BlobStore, type BlobStore, type BlobTrace, type CacheLike, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { compactSegments, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
-import { hasDense, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
+import { hasDense, resolveLexConfig, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef, chooseRouting } from "./wire.js";
 import { asF32, getRequired, loadRevState, resolveTarget } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchResult } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
@@ -23,6 +23,7 @@ export * from "./store.js";
 export * from "./s3.js";
 export * from "./lex.js";
 export * from "./fusion.js";
+export * from "./routing.js";
 export * from "./pack.js";
 export type { Base, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, RevState } from "./query.js";
 export { Limiter, QUERY_INFLIGHT, executeQuery } from "./query.js";
@@ -101,6 +102,13 @@ export interface OpenOptions {
 	deltaCacheBytes?: number;
 	/** Transient lexical bytes (buckets, posting lists, texts) each segment reader may hold (default 8 MB). */
 	lexTransientBytes?: number;
+	/**
+	 * Routing table to load (default `"f32"`, the 25 MB `fine.f32` at 4096 x 1536): `"f16"` (half the bytes) or
+	 * `"i8"` (a quarter), decoded to f32 on load, or `"auto"` for the smallest the revision has. A revision without
+	 * the table falls back to f32. The table only picks which cells to probe; slabs are scored with their own f32
+	 * means. See docs/query-path.md for the measured probe overlap and recall.
+	 */
+	routing?: RoutingOption;
 }
 
 /** One wasm instance per isolate. `Thread.init` once, then `open` indexes. */
@@ -583,7 +591,7 @@ export class ThreadIndex {
 		}
 		if (!this.basePromise) {
 			const rev = this.revState;
-			const p = loadBase(this.store, rev, this.thread.epoch).then((b) => {
+			const p = loadBase(this.store, rev, this.thread.epoch, this.opts.routing).then((b) => {
 				const slot: BaseSlot = { ...b, users: 0, dropped: false };
 				if (this.basePromise === p && !this.closed) this.base = slot;
 				else slot.dropped = true; // superseded while loading
@@ -623,10 +631,15 @@ export class ThreadIndex {
 
 export { asF32, headRevision, loadRevState, resolveTarget, snapshotKeys } from "./revision.js";
 
-/** Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. */
-export async function loadBase(store: BlobStore, rev: RevState, epoch: number): Promise<Base> {
+/**
+ * Loads the routing table (and PQ codebook) of a revision's generation into wasm memory. `routing` picks the table:
+ * `fine.f32` (default), the compact `fine.f16` / `fine.i8` copies (decoded to f32 on load) or `"auto"` (the smallest
+ * the revision has); a revision without the requested table falls back to `fine.f32`.
+ */
+export async function loadBase(store: BlobStore, rev: RevState, epoch: number, routing: RoutingOption = "f32"): Promise<Base> {
 	const { manifest, files } = rev;
-	const [c, f, p] = await Promise.all([getRequired(store, files.coarse), getRequired(store, files.fine), files.pq ? getRequired(store, files.pq) : Promise.resolve(null)]);
+	const table = chooseRouting(manifest, files, routing);
+	const [c, f, p] = await Promise.all([getRequired(store, files.coarse), getRequired(store, table.key), files.pq ? getRequired(store, files.pq) : Promise.resolve(null)]);
 	if (rev.format === 3 && !p) throw new ThreadError(`format 3 generation ${rev.gen} has no PQ codebook`);
 	let pq: W.PqCodebook | null = null;
 	if (p) {
@@ -638,8 +651,8 @@ export async function loadBase(store: BlobStore, rev: RevState, epoch: number): 
 		}
 	}
 	try {
-		const searcher = new W.Searcher(manifest.dim, manifest.k1, manifest.k2, asF32(c, files.coarse), asF32(f, files.fine));
-		return { key: rev.baseKey, searcher, pq, epoch };
+		const searcher = table.elem === "f32" ? new W.Searcher(manifest.dim, manifest.k1, manifest.k2, asF32(c, files.coarse), asF32(f, files.fine)) : W.Searcher.from_table(manifest.dim, manifest.k1, manifest.k2, asF32(c, files.coarse), f, table.elem);
+		return { key: rev.baseKey, searcher, pq, epoch, routing: table.elem };
 	} catch (e) {
 		if (pq) safeFree(pq);
 		throw e;

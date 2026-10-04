@@ -17,7 +17,16 @@ from .query import QUERY_INFLIGHT, Base, QueryContext, QueryResult, RevState, ex
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore
 from .pack import store_at
 from .revision import get_required, head_revision, load_rev_state, resolve_target
-from .wire import LEGACY_DEFAULTS, BytesLike, ResolvedLexConfig, ThreadError, has_dense, resolve_lex_config
+from .wire import (
+    LEGACY_DEFAULTS,
+    BytesLike,
+    ResolvedLexConfig,
+    ThreadError,
+    choose_routing,
+    has_dense,
+    resolve_lex_config,
+    routing_row_bytes,
+)
 from .write import (
     CompactSegmentsResult,
     ConfigureLexicalResult,
@@ -71,11 +80,14 @@ class SearchResult:
     stats: dict[str, Any]
 
 
-def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor) -> Base:
-    """Loads the routing table (and PQ codebook) of a revision's generation into native memory."""
+def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor, routing: str = "f32") -> Base:
+    """Loads the routing table (and PQ codebook) of a revision's generation into native memory. `routing` picks the
+    table: `fine.f32` (default), the compact `fine.f16` / `fine.i8` copies (decoded to f32 on load) or "auto" (the
+    smallest the revision has); a revision without the requested table falls back to `fine.f32`."""
     m, files = rev.manifest, rev.files
+    elem, table_key = choose_routing(m, files, routing)
     fc = io.submit(get_required, store, files["coarse"])
-    ff = io.submit(get_required, store, files["fine"])
+    ff = io.submit(get_required, store, table_key)
     fp = io.submit(get_required, store, files["pq"]) if files.get("pq") else None
     c, f, p = fc.result(), ff.result(), fp.result() if fp else None
     if rev.format == 3 and p is None:
@@ -85,11 +97,16 @@ def load_base(store: BlobStore, rev: RevState, io: ThreadPoolExecutor) -> Base:
         pq = _native.PqCodebook(p)
         if pq.dim != m["dim"] or (m.get("pq") and pq.m != m["pq"]["m"]):
             raise ThreadError(f"{files['pq']} is dim {pq.dim} m {pq.m}, manifest dim {m['dim']} pq {m.get('pq')}")
-    for name, b, n in (("coarse", c, m["k1"]), ("fine", f, m["k1"] * m["k2"])):
-        if len(b) != n * m["dim"] * 4:
-            raise ThreadError(f"{files[name]} is {len(b)} bytes, expected {n} x {m['dim']} f32")
-    searcher = _native.Searcher(m["dim"], m["k1"], m["k2"], c, f)
-    return Base(rev.base_key, searcher, pq)
+    k = m["k1"] * m["k2"]
+    if len(c) != m["k1"] * m["dim"] * 4:
+        raise ThreadError(f"{files['coarse']} is {len(c)} bytes, expected {m['k1']} x {m['dim']} f32")
+    if len(f) != k * routing_row_bytes(m["dim"], elem):
+        raise ThreadError(f"{table_key} is {len(f)} bytes, expected {k} {elem} rows of dim {m['dim']}")
+    if elem == "f32":
+        searcher = _native.Searcher(m["dim"], m["k1"], m["k2"], c, f)
+    else:
+        searcher = _native.Searcher.from_table(m["dim"], m["k1"], m["k2"], c, f, elem)
+    return Base(rev.base_key, searcher, pq, elem)
 
 
 class ThreadIndex:
@@ -97,7 +114,8 @@ class ThreadIndex:
     between threads; `query`, `search` and the write methods may run concurrently."""
 
     def __init__(self, store: BlobStore, rev: RevState, *, gen: str | None, pinned: bool, refresh_interval: float,
-                 delta_cache_bytes: int, lex_transient_bytes: int, io_workers: int, job_workers: int) -> None:
+                 delta_cache_bytes: int, lex_transient_bytes: int, io_workers: int, job_workers: int,
+                 routing: str = "f32") -> None:
         self.store = store
         self._rev = rev
         self._gen_opt = gen
@@ -105,6 +123,7 @@ class ThreadIndex:
         self._refresh_interval = refresh_interval
         self._delta_budget = delta_cache_bytes
         self._lex_transient = lex_transient_bytes
+        self._routing = routing
         self._io = ThreadPoolExecutor(max_workers=io_workers, thread_name_prefix="thread-io")
         self._jobs = ThreadPoolExecutor(max_workers=job_workers, thread_name_prefix="thread-job")
         self._lock = threading.RLock()
@@ -131,6 +150,7 @@ class ThreadIndex:
         lex_transient_bytes: int = 8 * 1024 * 1024,
         io_workers: int = 32,
         job_workers: int | None = None,
+        routing: str = "f32",
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
@@ -147,7 +167,7 @@ class ThreadIndex:
         state = load_rev_state(store, g, r)
         ix = cls(store, state, gen=gen, pinned=gen is not None and rev is not None, refresh_interval=refresh_interval,
                  delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
-                 job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)))
+                 job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), routing=routing)
         try:
             if has_dense(state.manifest):
                 ix._acquire_base(state)
@@ -263,7 +283,7 @@ class ThreadIndex:
         if not owner:
             return fut.result()
         try:
-            base = load_base(self.store, rev, self._io)
+            base = load_base(self.store, rev, self._io, self._routing)
         except BaseException as e:
             with self._lock:
                 if self._base is slot:
@@ -583,6 +603,7 @@ def open_index(
     lex_transient_bytes: int = 8 * 1024 * 1024,
     io_workers: int = 32,
     job_workers: int | None = None,
+    routing: str = "f32",
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -596,8 +617,11 @@ def open_index(
     - `delta_cache_bytes`: delta segments kept in memory across queries;
     - `lex_transient_bytes`: transient lexical bytes (buckets, posting lists, texts) each segment reader may hold;
     - `io_workers`: threads for reads (shared by concurrent queries; each query keeps at most `inflight` in flight);
-    - `job_workers`: threads for `query_many` and the lexical half of a hybrid search.
+    - `job_workers`: threads for `query_many` and the lexical half of a hybrid search;
+    - `routing`: the routing table to load: "f32" (default, `fine.f32`), "f16" / "i8" (the compact copies, half and a
+      quarter of the bytes, decoded to f32 on load) or "auto" (the smallest the revision has); a revision without the
+      table falls back to f32. It only picks which cells to probe: slabs are scored with their own f32 means.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
-                            io_workers=io_workers, job_workers=job_workers)
+                            io_workers=io_workers, job_workers=job_workers, routing=routing)

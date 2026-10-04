@@ -5,7 +5,7 @@
  */
 import type { BlobStore } from "./store.js";
 import type { RevState } from "./query.js";
-import { buildTombState, hasDense, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, slabRevOf, ThreadError, type CurrentPointer, type Manifest } from "./wire.js";
+import { buildTombState, groupedTableOf, hasDense, keys, manifestFiles, parseCurrent, parseManifest, parseSlabsTable, routingTablesOf, slabRevOf, ThreadError, type CurrentPointer, type Manifest } from "./wire.js";
 
 export async function getRequired(store: BlobStore, key: string): Promise<Uint8Array> {
 	const b = await store.get(key);
@@ -83,13 +83,17 @@ export function snapshotKeys(rev: RevState): string[] {
 	if (hasDense(manifest)) {
 		for (const [name, v] of Object.entries(files)) {
 			if (name === "slabs" && !rev.slabs) continue; // v1 generations without a slabs table
+			if (name === "base" || name === "baseCold") continue; // base packs repeat objects listed here
 			if (typeof v === "string" && v) out.add(v);
 		}
+		// Compact routing tables made from the current means (fine.f16, fine.i8, the tree-grouped table).
+		const r = routingTablesOf(manifest, files);
+		for (const t of [r?.f16, r?.i8, groupedTableOf(manifest, files)]) if (t) out.add(t.key);
 		const cells = manifest.k1 * manifest.k2;
 		for (let cell = 0; cell < cells; cell++) out.add(keys.slab(rev.gen, cell, rev.slabs ? slabRevOf(rev.slabs[cell]) : 0));
 	}
 	// A centroid tree (written by the Worker's publish-rev --tree) is read by the Worker's beam routing.
-	const tree = (manifest as Manifest & { tree?: { key?: unknown } }).tree;
+	const tree = manifest.tree as { key?: unknown } | undefined;
 	if (tree && typeof tree.key === "string") out.add(tree.key);
 	for (const d of rev.deltas) out.add(d.key);
 	for (const t of manifest.tombstones ?? []) out.add(t.key);

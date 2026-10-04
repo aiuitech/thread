@@ -84,6 +84,8 @@ class Base:
     key: str
     searcher: _native.Searcher
     pq: _native.PqCodebook | None
+    #: The routing table the searcher was built from ("f32" = `files.fine`).
+    routing: str = "f32"
 
 
 @dataclass
@@ -331,6 +333,7 @@ def execute_query(
             "rev": rev.rev,
             "format": fmt,
             "routing": "flat" if flat else "tree",
+            "routing_table": base.routing,
             "cells": cells,
             "scanned": rs["scanned"],
             "scan_bytes": rs["scan_bytes"],

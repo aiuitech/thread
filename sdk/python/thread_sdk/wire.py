@@ -36,6 +36,11 @@ __all__ = [
     "resolve_lex_config",
     "keys",
     "manifest_files",
+    "ROUTING_ELEMS",
+    "routing_row_bytes",
+    "routing_tables_of",
+    "choose_routing",
+    "grouped_table_of",
     "parse_current",
     "parse_manifest",
     "parse_slabs_table",
@@ -306,6 +311,72 @@ class keys:
     @staticmethod
     def segment_base(gen: str, rev: int) -> str:
         return f"idx/{gen}/seg/base.{rev}.thread"
+
+    @staticmethod
+    def base_pack(gen: str, rev: int) -> str:
+        """The base pack of a revision: every object a cold open reads, in one file."""
+        return f"idx/{gen}/base.{rev}.threadpack"
+
+    @staticmethod
+    def base_cold_pack(gen: str, rev: int) -> str:
+        """The cold base pack: the base pack without the full routing table (for `cold_routing="tree"`)."""
+        return f"idx/{gen}/base.cold.{rev}.threadpack"
+
+    @staticmethod
+    def routing_table(fine: str, elem: str) -> str:
+        """Compact routing tables derived from the f32 means at `fine` (`fine.105.f32` -> `fine.105.f16`)."""
+        return fine if elem == "f32" else re.sub(r"\.f32$", "", fine) + f".{elem}"
+
+    @staticmethod
+    def grouped_table(gen: str, rev: int, elem: str) -> str:
+        return f"idx/{gen}/fine.grouped.{rev}.{elem}"
+
+
+#: Element types of a routing table: the f32 means, IEEE half floats, int8 with one f32 scale per row.
+ROUTING_ELEMS = ("f32", "f16", "i8")
+
+
+def routing_row_bytes(dim: int, elem: str) -> int:
+    """Bytes of one routing table row."""
+    return 4 * dim if elem == "f32" else 2 * dim if elem == "f16" else 4 + dim
+
+
+def routing_tables_of(m: dict[str, Any], files: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """`manifest.routing` if it was made from the means `files.fine` names (else None: a compaction that split cells
+    wrote new means, and readers fall back to them)."""
+    files = files if files is not None else manifest_files(m)
+    r = m.get("routing")
+    if not isinstance(r, dict) or r.get("fine") != files.get("fine"):
+        return None
+    return r
+
+
+def choose_routing(m: dict[str, Any], files: dict[str, Any], opt: str = "f32") -> tuple[str, str]:
+    """(elem, key) of the routing table to load for `opt` (f32, f16, i8 or auto = the smallest available); a
+    revision without the requested table falls back to f32."""
+    if opt not in ("auto", *ROUTING_ELEMS):
+        raise ThreadError(f"routing must be one of f32, f16, i8, auto (got {opt!r})", 400)
+    r = routing_tables_of(m, files) or {}
+
+    def pick(e: str) -> tuple[str, str] | None:
+        if e == "f32":
+            return "f32", files["fine"]
+        t = r.get(e)
+        return (e, t["key"]) if isinstance(t, dict) and t.get("key") else None
+
+    if opt == "auto":
+        return pick("i8") or pick("f16") or pick("f32")  # type: ignore[return-value]
+    return pick(opt) or pick("f32")  # type: ignore[return-value]
+
+
+def grouped_table_of(m: dict[str, Any], files: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The tree-grouped routing table of a revision, if it follows its current tree and means."""
+    files = files if files is not None else manifest_files(m)
+    g = (routing_tables_of(m, files) or {}).get("grouped")
+    tree = m.get("tree")
+    if not isinstance(g, dict) or not isinstance(tree, dict) or g.get("tree") != tree.get("key") or m.get("k1") != 1:
+        return None
+    return g
 
 
 def manifest_files(m: dict[str, Any]) -> dict[str, str | None]:

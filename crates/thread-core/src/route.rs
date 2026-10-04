@@ -143,7 +143,7 @@ pub const TREE_HEADER: usize = 32;
 /// Inserts `(cell, score)` into `top` (score descending, ties: lower cell id
 /// first) if it ranks within the first `n` and is not already listed.
 #[inline]
-fn push_top_unique(top: &mut Vec<(usize, f32)>, n: usize, cell: usize, d: f32) {
+pub(crate) fn push_top_unique(top: &mut Vec<(usize, f32)>, n: usize, cell: usize, d: f32) {
     if n == 0 || d.is_nan() {
         return;
     }
@@ -346,6 +346,18 @@ impl CentroidTree {
 
     pub fn group_inv(&self) -> &[f32] {
         &self.group_inv
+    }
+
+    /// CSR offsets over [`CentroidTree::all_members`]: group `g` is
+    /// `all_members()[offsets[g]..offsets[g + 1]]` (`groups + 1` entries).
+    pub fn member_offsets(&self) -> &[u32] {
+        &self.offsets
+    }
+
+    /// Every group's member cell ids, group after group (the order a
+    /// tree-grouped routing table stores its rows in, `crate::routing`).
+    pub fn all_members(&self) -> &[u32] {
+        &self.members
     }
 
     /// Cell ids of group `g`.

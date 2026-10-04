@@ -280,6 +280,65 @@ export interface IndexFiles {
 	fine: string;
 	pq: string | null;
 	slabs: string | null;
+	/**
+	 * The newest base pack of the generation (`idx/{gen}/base.{rev}.threadpack`, written by publish / publish-rev
+	 * for that rev; later revisions inherit the name). For discoverability: a reader fetches the base pack of the
+	 * revision it opens by its conventional key (`keys.basePack`), and never needs this field.
+	 */
+	base?: string;
+	/** The newest cold base pack (`idx/{gen}/base.cold.{rev}.threadpack`), likewise. */
+	baseCold?: string;
+}
+
+/** Element type of a routing table: the f32 means, IEEE half floats, or int8 with one f32 scale per row. */
+export type RoutingElem = "f32" | "f16" | "i8";
+
+/** The routing table a reader loads: an element type, or `"auto"` for the smallest one the revision has. */
+export type RoutingOption = RoutingElem | "auto";
+
+/** Bytes of one routing table row. */
+export const routingRowBytes = (dim: number, elem: RoutingElem): number => (elem === "f32" ? 4 * dim : elem === "f16" ? 2 * dim : 4 + dim);
+
+export interface RoutingTableRef {
+	key: string;
+	bytes: number;
+}
+
+/**
+ * The fine means in centroid-tree group order (`fine.grouped.{rev}.{elem}`, "VIBG"): group g's rows are
+ * `[dataOff + offsets[g] * rowBytes, +count * rowBytes)` with the tree's CSR `offsets`, so a reader holding the tree
+ * range-reads just the groups a query needs.
+ */
+export interface GroupedRoutingRef {
+	key: string;
+	/** The centroid tree whose group order the rows follow (a reader checks it is `manifest.tree.key`). */
+	tree: string;
+	elem: RoutingElem;
+	groups: number;
+	rows: number;
+	dataOff: number;
+	rowBytes: number;
+	bytes: number;
+}
+
+/**
+ * Compact copies of the fine means (`manifest.routing`). They apply only while `files.fine` is the table they were
+ * made from (`fine`): a compaction that splits cells writes new means, and a reader then falls back to them.
+ */
+export interface RoutingTables {
+	fine: string;
+	f16?: RoutingTableRef;
+	i8?: RoutingTableRef;
+	grouped?: GroupedRoutingRef;
+}
+
+/** Centroid tree over the fine means (`manifest.tree`, written by the Worker's publish / publish-rev). */
+export interface TreeRef {
+	key: string;
+	groups: number;
+	beam: number;
+	bytes?: number;
+	[extra: string]: unknown;
 }
 
 export interface Manifest {
@@ -313,6 +372,10 @@ export interface Manifest {
 	lex?: LexConfig;
 	/** Lexical / docs segments, oldest first (a compaction's base first). */
 	segments?: SegmentRef[];
+	/** Compact routing tables (fine.f16, fine.i8, tree-grouped means). */
+	routing?: RoutingTables;
+	/** Centroid tree over the fine means. */
+	tree?: TreeRef;
 }
 
 /** `idx/current.json`: the generation and revision queries use by default. */
@@ -333,7 +396,40 @@ export const keys = {
 	delta: (gen: string, seq: number): string => `idx/${gen}/delta/${seq}.vibd`,
 	segment: (gen: string, seq: number): string => `idx/${gen}/seg/${seq}.thread`,
 	segmentBase: (gen: string, rev: number): string => `idx/${gen}/seg/base.${rev}.thread`,
+	/** The base pack of a revision: every object a cold open reads, in one file (`docs/query-path.md`). */
+	basePack: (gen: string, rev: number): string => `idx/${gen}/base.${rev}.threadpack`,
+	/** The cold base pack: the base pack without the full routing table (for `coldRouting: "tree"`). */
+	baseColdPack: (gen: string, rev: number): string => `idx/${gen}/base.cold.${rev}.threadpack`,
+	/** Compact routing tables derived from the f32 means at `fine` (`idx/g4/fine.105.f32` -> `idx/g4/fine.105.f16`). */
+	routingTable: (fine: string, elem: RoutingElem): string => (elem === "f32" ? fine : fine.replace(/\.f32$/, "") + `.${elem}`),
+	groupedTable: (gen: string, rev: number, elem: RoutingElem): string => `idx/${gen}/fine.grouped.${rev}.${elem}`,
 };
+
+/** The usable compact routing tables of a revision: those made from the means `files.fine` names. */
+export function routingTablesOf(m: Manifest, files: IndexFiles = manifestFiles(m)): RoutingTables | null {
+	const r = m.routing;
+	if (!r || r.fine !== files.fine) return null;
+	return r;
+}
+
+/** The routing table to load for `opt`: falls back to f32 when the revision has no such table. */
+export function chooseRouting(m: Manifest, files: IndexFiles, opt: RoutingOption = "f32"): { elem: RoutingElem; key: string } {
+	const r = routingTablesOf(m, files);
+	const pick = (e: RoutingElem): { elem: RoutingElem; key: string } | null => {
+		if (e === "f32") return { elem: "f32", key: files.fine };
+		const t = r?.[e];
+		return t ? { elem: e, key: t.key } : null;
+	};
+	if (opt === "auto") return pick("i8") ?? pick("f16") ?? pick("f32")!;
+	return pick(opt) ?? pick("f32")!;
+}
+
+/** The tree-grouped table of a revision, if it has one that follows its current tree and means. */
+export function groupedTableOf(m: Manifest, files: IndexFiles = manifestFiles(m)): GroupedRoutingRef | null {
+	const g = routingTablesOf(m, files)?.grouped;
+	if (!g || !m.tree || g.tree !== m.tree.key || m.k1 !== 1) return null;
+	return g;
+}
 
 export function manifestFiles(m: Manifest): IndexFiles {
 	if (m.files) return m.files;
