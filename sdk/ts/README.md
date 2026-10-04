@@ -273,6 +273,7 @@ concurrently: the two write the same objects but have not been cross-verified ye
 interface BlobStore {
 	get(key, range?: { offset; length }, opts?: { trace?; fill? }): Promise<Uint8Array | null>;   // null = missing
 	getRanges?(key, ranges, opts?): Promise<Uint8Array[] | null>;  // one request, several ranges; null = cannot (cache miss)
+	getTail?(key, length, opts?): Promise<{ bytes; size; etag? } | null>;  // last `length` bytes + size in one request (bytes=-N); packs open with it
 	head(key): Promise<{ size; etag } | null>;
 	put?(key, data, opts?: { ifAbsent?; ifMatch?; contentType? }): Promise<{ size; etag } | null>;  // null = condition failed
 	list?(prefix): Promise<string[]>;
