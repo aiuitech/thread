@@ -8,7 +8,13 @@
  * real. A query outside that set reads zeros and fails on the slab header: run warm_proxy.mjs for the set first.
  *
  *   node bench/cold/make_pack.mjs [--cache-dir data/cold/objects] [--out data/cold/overlay/packs/g4-cold.threadpack]
- *        [--proxy http://127.0.0.1:9555]
+ *        [--proxy http://127.0.0.1:9555] [--order key|tree]
+ *
+ * `--order tree` (default out `data/cold/open-overlay/packs/g4-cold-tree.threadpack`) writes the same objects but the
+ * slabs grouped by their centroid-tree group (`manifest.tree`, 128 groups on g4) and, inside a group, chained by
+ * nearest neighbour of their cell means (tree_order.mjs), so a query's probed slabs often sit next to each other
+ * (pack_adjacency.mjs measures it; `coalesceAcrossSlabs` merges their prefix reads). Everything else keeps
+ * packIndex's order.
  *
  * Objects other than slabs that are missing from the cache (e.g. the centroid tree, which the SDKs never read) are
  * fetched through the proxy (read-only, it caches them). Serve the pack with `fake_s3.mjs --overlay data/cold/overlay`.
@@ -16,10 +22,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { parseArgs, root } from "./lib.mjs";
+import { parseTree, treeOrder } from "./tree_order.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 const CACHE = path.resolve(root, args["cache-dir"] ?? "data/cold/objects");
-const OUT = path.resolve(root, args.out ?? "data/cold/overlay/packs/g4-cold.threadpack");
+const ORDER = args.order ?? "key";
+if (!["key", "tree"].includes(ORDER)) throw new Error(`--order must be key or tree, not ${ORDER}`);
+const OUT = path.resolve(root, args.out ?? (ORDER === "tree" ? "data/cold/open-overlay/packs/g4-cold-tree.threadpack" : "data/cold/overlay/packs/g4-cold.threadpack"));
 const PROXY = args.proxy ?? "http://127.0.0.1:9555";
 const dist = path.join(root, "sdk/ts/dist");
 const sdk = await import(path.join(dist, "index.js"));
@@ -28,11 +37,25 @@ const { FileBlobStore } = await import(path.join(dist, "node.js"));
 const cache = new FileBlobStore(CACHE);
 const t = await sdk.resolveTarget(cache);
 const rev = await sdk.loadRevState(cache, t.gen, t.rev);
-const keys = sdk.snapshotKeys(rev);
+const keyOrder = sdk.snapshotKeys(rev);
 const slabSize = new Map();
 for (let cell = 0; cell < rev.slabs.length; cell++) slabSize.set(sdk.keys.slab(rev.gen, cell, sdk.slabRevOf(rev.slabs[cell])), rev.slabs[cell][3]);
 
 const proxy = new sdk.S3BlobStore({ endpoint: PROXY, bucket: "vib-bench", accessKeyId: "fake", secretAccessKey: "fake" });
+const readAny = async (k) => (await cache.get(k)) ?? (await proxy.get(k));
+let keys = keyOrder;
+if (ORDER === "tree") {
+	// The slab block (contiguous in key order) is replaced by the slabs in tree order.
+	const treeKey = rev.manifest.tree?.key;
+	if (!treeKey) throw new Error(`${t.gen} rev ${t.rev} has no centroid tree`);
+	const tree = parseTree(await readAny(treeKey));
+	const k = rev.manifest.k1 * rev.manifest.k2;
+	const { order } = treeOrder(tree, sdk.asF32(await readAny(rev.files.fine), "fine"), k);
+	const first = keyOrder.findIndex((x) => slabSize.has(x));
+	const n = keyOrder.filter((x) => slabSize.has(x)).length;
+	if (n !== k || keyOrder.slice(first, first + n).some((x) => !slabSize.has(x))) throw new Error("slab keys are not one contiguous block in key order");
+	keys = [...keyOrder.slice(0, first), ...order.map((c) => sdk.keys.slab(rev.gen, c, sdk.slabRevOf(rev.slabs[c]))), ...keyOrder.slice(first + n)];
+}
 const holes = new WeakSet();
 let real = 0;
 let realBytes = 0;
@@ -75,7 +98,8 @@ fs.closeSync(fd);
 // Check: the pack opens, its directory is the one packIndex would write, and real entries read back identical.
 const ps = await sdk.PackedBlobStore.open(new FileBlobStore(path.dirname(OUT)), path.basename(OUT));
 const order = [...ps.directory.entries.keys()];
-if (order.join("\n") !== ["idx/current.json", ...keys].join("\n")) throw new Error("pack entry order differs from packIndex's");
+if (order.join("\n") !== ["idx/current.json", ...keys].join("\n")) throw new Error("pack entry order differs from the intended one");
+if (ORDER === "key" && order.join("\n") !== ["idx/current.json", ...keyOrder].join("\n")) throw new Error("pack entry order differs from packIndex's");
 for (const k of [rev.files.fine, rev.files.slabs, ...keys.filter((k) => slabSize.has(k) && !holeKeys.includes(k)).slice(0, 5)]) {
 	const a = await ps.get(k);
 	const b = await cache.get(k);
@@ -88,6 +112,7 @@ console.log(
 	JSON.stringify(
 		{
 			pack: path.relative(root, OUT),
+			order: ORDER,
 			gen: t.gen,
 			rev: t.rev,
 			entries: count,
