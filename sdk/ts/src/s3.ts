@@ -308,9 +308,11 @@ export class S3BlobStore implements BlobStore {
 	}
 
 	/**
-	 * A whole object as parallel range GETs: the first `chunkBytes` (whose Content-Range gives the size), then the
-	 * rest in chunks, `chunkConcurrency` at a time. One S3 stream is bandwidth-bound (~380 Mbps from R2 to one
-	 * client, 200 Mbps per response in the proxy model), and the 25 MB routing table is most of a cold open.
+	 * A whole object as parallel range GETs: the first `chunkBytes`, whose Content-Range gives the size, and the rest
+	 * in chunks, `chunkConcurrency` at a time beside the first. The rest starts as soon as the first response's HEADERS arrive,
+	 * while its body still streams, so splitting costs no extra round trip in the critical path: an object just above
+	 * `chunkBytes` (an 8.8 MB base pack) takes as long as one GET, a 25 MB routing table ~1/3 of it. One S3 stream is
+	 * bandwidth-bound (~380 Mbps from R2 to one client, 200 Mbps per response in the proxy model).
 	 */
 	private async getChunked(key: string, opts?: GetOptions): Promise<Uint8Array | null> {
 		const c = this.chunkBytes;
@@ -324,31 +326,47 @@ export class S3BlobStore implements BlobStore {
 			return this.getOne(key, undefined, opts);
 		}
 		if (!r.ok) return this.fail(r, `GET ${key}`);
-		const first = new Uint8Array(await r.arrayBuffer());
 		const count = (b: number) => {
 			if (opts?.trace) {
 				opts.trace.reads++;
 				opts.trace.bytes += b;
 			}
 		};
+		if (r.status !== 206) {
+			// Range ignored: the whole object in one response
+			const whole = new Uint8Array(await r.arrayBuffer());
+			count(whole.byteLength);
+			return whole;
+		}
+		const total = Number((r.headers.get("content-range") ?? "").match(/\/(\d+)$/)?.[1] ?? NaN);
+		if (!Number.isFinite(total)) {
+			await settle(r);
+			throw new ThreadError(`S3 GET ${key}: 206 without a usable Content-Range`);
+		}
+		const firstLen = Math.min(c, total);
+		const out = total > firstLen ? new Uint8Array(total) : null;
+		let rest: Promise<void> = Promise.resolve();
+		if (out) {
+			const todo: number[] = [];
+			for (let off = firstLen; off < total; off += c) todo.push(off);
+			const worker = async () => {
+				for (let off = todo.shift(); off !== undefined; off = todo.shift()) {
+					const len = Math.min(c, total - off);
+					const b = await this.getOne(key, { offset: off, length: len });
+					if (!b) throw new ThreadError(`${key} disappeared while being read`, 404);
+					count(b.byteLength);
+					out.set(b, off);
+				}
+			};
+			rest = Promise.all(Array.from({ length: Math.min(this.chunkConcurrency, todo.length) }, worker)).then(() => {});
+			rest.catch(() => {}); // awaited below; never an unhandled rejection meanwhile
+		}
+		const first = new Uint8Array(await r.arrayBuffer());
 		count(first.byteLength);
-		const total = r.status === 206 ? Number((r.headers.get("content-range") ?? "").match(/\/(\d+)$/)?.[1] ?? NaN) : first.byteLength;
-		if (!Number.isFinite(total)) throw new ThreadError(`S3 GET ${key}: 206 without a usable Content-Range`);
-		if (total <= first.byteLength) return first;
-		const out = new Uint8Array(total);
+		if (first.byteLength !== firstLen) throw new ThreadError(`${key} [0, +${firstLen}): got ${first.byteLength} bytes`);
+		if (!out) return first;
 		out.set(first, 0);
-		const todo: number[] = [];
-		for (let off = first.byteLength; off < total; off += c) todo.push(off);
-		const worker = async () => {
-			for (let off = todo.shift(); off !== undefined; off = todo.shift()) {
-				const len = Math.min(c, total - off);
-				const b = await this.getOne(key, { offset: off, length: len });
-				if (!b) throw new ThreadError(`${key} disappeared while being read`, 404);
-				count(b.byteLength);
-				out.set(b, off);
-			}
-		};
-		await Promise.all(Array.from({ length: Math.min(this.chunkConcurrency, todo.length) }, worker));
+		await rest;
 		return out;
 	}
 

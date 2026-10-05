@@ -11,6 +11,11 @@
 #   bench/cold/run_baseline.sh                       # TAG=baseline N=10
 #   TAG=after-prefetch N=10 R2S3=0 bench/cold/run_baseline.sh
 #   WARM=0 PROFILES="rtt25link500" R2S3=0 SDKS=ts bench/cold/run_baseline.sh   # a subset, cache already warm
+#   TAG=final-i8 WARM=0 R2S3=0 OVERLAY=data/cold/final-overlay PACK_KEY=packs/g4-base.threadpack ARGS="--routing i8" \
+#     bench/cold/run_baseline.sh                   # another overlay / pack, extra cold_bench flags on every run
+# OVERLAY (default data/cold/overlay), PACK_KEY (default packs/g4-cold.threadpack) and ARGS (extra cold_bench flags,
+# proxy and pack runs only: the new objects exist only in the overlay) pick what the proxy serves and how the
+# benches open it; R2S3_ARGS are the flags of the r2s3 runs.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 TAG=${TAG:-baseline}
@@ -21,12 +26,16 @@ SDKS=${SDKS:-ts py}
 PROFILES=${PROFILES:-rtt25 rtt60 rtt25link500}
 PORT=${PORT:-9555}
 PY=${PY:-sdk/python/.venv/bin/python}
+OVERLAY=${OVERLAY:-data/cold/overlay}
+PACK_KEY=${PACK_KEY:-packs/g4-cold.threadpack}
+ARGS=${ARGS:-}
+R2S3_ARGS=${R2S3_ARGS:-}
 PROXY_PID=
 stop_proxy() { if [ -n "$PROXY_PID" ]; then kill "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true; PROXY_PID=; fi; }
 trap stop_proxy EXIT
 start_proxy() { # name, proxy args...
 	local name=$1; shift
-	node bench/cold/fake_s3.mjs --port "$PORT" --overlay data/cold/overlay --log "data/cold/$TAG-proxy-$name.jsonl" "$@" &
+	node bench/cold/fake_s3.mjs --port "$PORT" --overlay "$OVERLAY" --log "data/cold/$TAG-proxy-$name.jsonl" "$@" &
 	PROXY_PID=$!
 	for _ in $(seq 50); do curl -sf "http://127.0.0.1:$PORT/__config" >/dev/null && return; sleep 0.1; done
 	echo "proxy did not start" >&2; exit 1
@@ -34,7 +43,8 @@ start_proxy() { # name, proxy args...
 bench() { # sdk store profile [args...]
 	local sdk=$1 store=$2 profile=$3; shift 3
 	local out="data/cold/$TAG-$sdk-$store${profile:+-$profile}"
-	[ "$store" = r2s3 ] || set -- --proxy "http://127.0.0.1:$PORT" "$@"
+	# shellcheck disable=SC2086
+	if [ "$store" = r2s3 ]; then set -- "$@" $R2S3_ARGS; else set -- --proxy "http://127.0.0.1:$PORT" --pack-key "$PACK_KEY" "$@" $ARGS; fi
 	if [ "$sdk" = ts ]; then node bench/cold/cold_bench.mjs --store "$store" --n "$N" --label "$TAG $profile" --out "$out.jsonl" "$@" | tee "$out.txt"
 	else "$PY" bench/cold/cold_bench.py --store "$store" --n "$N" --label "$TAG $profile" --out "$out.jsonl" "$@" | tee "$out.txt"; fi
 }

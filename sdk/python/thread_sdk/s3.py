@@ -21,7 +21,7 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
-from typing import Callable, Mapping
+from typing import Any, Callable, Mapping
 from urllib.parse import quote, urlsplit
 
 from .store import BlobHead, BlobRange, BlobStore, BlobTrace, _encode, _trace_read
@@ -255,7 +255,10 @@ class S3BlobStore(BlobStore):
             self._pool_cond.notify()
 
     def _send(self, method: str, key: str, headers: dict[str, str], body: bytes | None = None,
-              query: dict[str, str] | None = None) -> _Response:
+              query: dict[str, str] | None = None,
+              on_headers: Callable[[int, dict[str, str]], None] | None = None) -> _Response:
+        """One request (retried on connection errors and 5xx, except PUTs). `on_headers(status, headers)` runs once
+        the response headers are in, before the body is read (a chunked GET starts its other ranges there)."""
         host, path = self._target(key)
         payload_hash = hashlib.sha256(body).hexdigest() if body is not None else EMPTY_SHA256
         signed = sign_v4(method=method, path=path, query=query, headers=headers, payload_hash=payload_hash, host=host,
@@ -272,8 +275,10 @@ class S3BlobStore(BlobStore):
             try:
                 conn.request(method, path + qs, body=body, headers=signed)
                 r = conn.getresponse()
-                data = r.read()
                 hdrs = {k.lower(): v for k, v in r.getheaders()}
+                if on_headers is not None and r.status < 500:
+                    on_headers(r.status, hdrs)
+                data = r.read()
             except _RETRYABLE as e:
                 self._release(host, conn, False)
                 last = e
@@ -326,40 +331,63 @@ class S3BlobStore(BlobStore):
             return self._chunk_pool
 
     def _get_chunked(self, key: str, trace: BlobTrace | None) -> bytes | None:
-        """A whole object as parallel range GETs: the first `chunk_bytes` (whose Content-Range gives the size), then
-        the rest in chunks, `chunk_concurrency` at a time. One S3 stream is bandwidth-bound, and the 25 MB routing
-        table is most of a cold open."""
+        """A whole object as parallel range GETs: the first `chunk_bytes`, whose Content-Range gives the size, and the
+        rest in chunks, `chunk_concurrency` at a time beside the first. The rest starts as soon as the first response's HEADERS
+        arrive, while its body still streams, so splitting costs no extra round trip in the critical path: an object
+        just above `chunk_bytes` (an 8.8 MB base pack) takes as long as one GET, a 25 MB routing table ~1/3 of it.
+        One S3 stream is bandwidth-bound, and the routing table is most of a cold open."""
         c = self.chunk_bytes
-        r = self._send("GET", key, {"range": f"bytes=0-{c - 1}"})
-        if r.status == 404:
-            return None
-        if r.status == 416:  # an empty object: R2 refuses any range of it
-            return self._get_one(key, None, trace)
-        if not 200 <= r.status < 300:
-            raise self._fail(r, f"GET {key}")
-        first = r.body
-        _trace_read(trace, len(first))
-        if r.status != 206:
-            return first
-        m = re.search(r"/(\d+)$", r.headers.get("content-range", ""))
-        if not m:
-            raise ThreadError(f"S3 GET {key}: 206 without a usable Content-Range")
-        total = int(m.group(1))
-        if total <= len(first):
-            return first
-        out = bytearray(total)
-        out[: len(first)] = first
-        offs = list(builtins.range(len(first), total, c))
+        state: dict[str, Any] = {}
 
-        def one(off: int) -> None:
+        def one(out: bytearray, total: int, off: int) -> None:
             b = self._get_one(key, BlobRange(off, min(c, total - off)), trace)
             if b is None:
                 raise ThreadError(f"{key} disappeared while being read", 404)
             out[off : off + len(b)] = b
 
-        for f in [self._pool_for_chunks().submit(one, off) for off in offs]:
-            f.result()
-        return bytes(out)
+        def on_headers(status: int, headers: dict[str, str]) -> None:
+            if status != 206 or "out" in state:  # (a retried first request: the rest is already under way)
+                return
+            m = re.search(r"/(\d+)$", headers.get("content-range", ""))
+            if not m or int(m.group(1)) <= c:
+                return
+            total = int(m.group(1))
+            out = state["out"] = bytearray(total)
+            state["total"] = total
+            pool = self._pool_for_chunks()
+            state["futs"] = [pool.submit(one, out, total, off) for off in builtins.range(c, total, c)]
+
+        r = self._send("GET", key, {"range": f"bytes=0-{c - 1}"}, on_headers=on_headers)
+        futs = state.get("futs", [])
+        try:
+            if r.status == 404:
+                return None
+            if r.status == 416:  # an empty object: R2 refuses any range of it
+                return self._get_one(key, None, trace)
+            if not 200 <= r.status < 300:
+                raise self._fail(r, f"GET {key}")
+            first = r.body
+            _trace_read(trace, len(first))
+            if r.status != 206:
+                return first
+            m = re.search(r"/(\d+)$", r.headers.get("content-range", ""))
+            if not m:
+                raise ThreadError(f"S3 GET {key}: 206 without a usable Content-Range")
+            total = int(m.group(1))
+            if total <= len(first):
+                return first
+            if "out" not in state:  # (headers without a usable size first time round: read the rest now)
+                on_headers(206, r.headers)
+                futs = state.get("futs", [])
+            out = state["out"]
+            out[: len(first)] = first
+            for f in futs:
+                f.result()
+            futs = []
+            return bytes(out)
+        finally:
+            for f in futs:  # an error above: let the started ranges finish, never leak their exceptions
+                f.cancel()
 
     def _get_one(self, key: str, range: BlobRange | None, trace: BlobTrace | None) -> bytes | None:
         headers = {"range": f"bytes={range.offset}-{range.offset + range.length - 1}"} if range else {}
