@@ -389,6 +389,23 @@ export interface Manifest {
 export interface CurrentPointer {
 	gen: string;
 	rev: number;
+	/**
+	 * The manifest of (gen, rev) when `current.json` carries a copy of it (`"manifest"`, written by the SDK writers
+	 * when it is at most `INLINE_MANIFEST_MAX` bytes): an open then skips the manifest GET. Absent otherwise.
+	 */
+	manifest?: Manifest;
+}
+
+/** Largest manifest (serialized, UTF-8 bytes) the writers copy into `idx/current.json`; the pointer is re-read every 30 s. */
+export const INLINE_MANIFEST_MAX = 16 * 1024;
+
+/** The body of `idx/current.json` for (gen, rev): with an inline copy of `manifest` when it is small enough. */
+export function currentBody(gen: string, rev: number, manifest?: Manifest): string {
+	if (manifest) {
+		const m = JSON.stringify(manifest);
+		if (new TextEncoder().encode(m).byteLength <= INLINE_MANIFEST_MAX) return `{"gen":${JSON.stringify(gen)},"rev":${rev},"manifest":${m}}`;
+	}
+	return JSON.stringify({ gen, rev });
 }
 
 export const pad5 = (n: number): string => n.toString().padStart(5, "0");
@@ -449,10 +466,18 @@ export const decodeJson = <T>(b: Uint8Array): T => JSON.parse(utf8.decode(b)) as
 
 /** Parses `idx/current.json`; a pointer without `rev` (older publishes) means rev 0. */
 export function parseCurrent(b: Uint8Array): CurrentPointer {
-	const j = decodeJson<{ gen?: unknown; rev?: unknown }>(b);
+	const j = decodeJson<{ gen?: unknown; rev?: unknown; manifest?: unknown }>(b);
 	if (typeof j.gen !== "string" || !j.gen) throw new ThreadError("current.json has no gen");
 	const rev = j.rev === undefined ? 0 : Number(j.rev);
 	if (!Number.isInteger(rev) || rev < 0) throw new ThreadError(`current.json has a bad rev ${String(j.rev)}`);
+	// An inline manifest is an optimization: one that does not check out is ignored (the reader fetches the manifest).
+	if (j.manifest && typeof j.manifest === "object") {
+		try {
+			return { gen: j.gen, rev, manifest: checkManifest(j.manifest as Manifest, j.gen, rev) };
+		} catch {
+			/* fall through */
+		}
+	}
 	return { gen: j.gen, rev };
 }
 
@@ -461,7 +486,12 @@ export const hasDense = (m: Manifest): boolean => m.k2 > 0 && m.dim > 0;
 
 /** Parses a manifest and checks it is for `gen`; fills `rev` (absent in rev-0 manifests). */
 export function parseManifest(b: Uint8Array, gen: string, rev: number): Manifest {
-	const m = decodeJson<Manifest>(b);
+	return checkManifest(decodeJson<Manifest>(b), gen, rev);
+}
+
+/** Checks a parsed manifest is for (gen, rev); fills `rev` (absent in rev-0 manifests). */
+export function checkManifest(m: Manifest, gen: string, rev: number): Manifest {
+	if (!m || typeof m !== "object") throw new ThreadError(`manifest for ${gen} rev ${rev} is not an object`);
 	if (m.gen !== gen) throw new ThreadError(`manifest for ${gen} rev ${rev} is for generation ${m.gen}`);
 	for (const f of ["k1", "k2", "dim", "vectors"] as const) if (!Number.isInteger(m[f])) throw new ThreadError(`manifest ${gen} rev ${rev}: missing ${f}`);
 	if ((m.rev ?? 0) !== rev) throw new ThreadError(`manifest ${gen} rev ${rev} says rev ${m.rev}`);

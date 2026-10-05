@@ -24,6 +24,11 @@ Results, method and analysis: [docs/cold-start.md](../../docs/cold-start.md).
 | `routing_recall.mjs` | end-to-end recall@10 of the routing modes over R2 (range reads into a local SQLite range cache; slabs are never read whole) |
 | `run_base.sh` | the cold_bench runs of every open mode (routing table, cold tree routing, base packs) against a proxy serving `data/cold/base-overlay` |
 | `base_table.mjs` | the per-mode table of `run_base.sh` runs (docs/query-path.md, docs/cold-start.md) |
+| `hot_cells.mjs` | probe frequency of a query sample (routing only, no slab reads): coverage curve, held-out hot-set hit rate |
+| `make_warm_pack.mjs` | a warm pack (hot slab prefixes, `open({ warmPack })`) from `hot_cells.mjs`'s counts, sparse like `make_pack.mjs` |
+| `pack_adjacency.mjs` | how close a query's probed slabs sit in a pack, merged-read plans and a phase-1 latency model per layout |
+| `tree_order.mjs`, `route.mjs` | centroid-tree slab order (`make_pack.mjs --order tree`); routing without reading slabs |
+| `run_open.sh` | the cold/open experiments: an offline proxy on its own port/overlay, `TAG`, `ARGS`, `STORES`, `PROFILES` (adds `rtt5`, `rtt5g1`) |
 
 ```sh
 (cd sdk/ts && npm run build)                         # the benches and the proxy use sdk/ts/dist

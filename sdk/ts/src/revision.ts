@@ -65,14 +65,19 @@ export function resolveTarget(store: BlobStore, gen?: string, rev?: number, time
 			return { gen, rev: await headRevision(store, gen, trace) };
 		}
 		const c = parseCurrent(cur);
-		if (gen === undefined || gen === c.gen) return rev !== undefined ? { gen: c.gen, rev } : c;
+		if (gen === undefined || gen === c.gen) return rev !== undefined && rev !== c.rev ? { gen: c.gen, rev } : c;
 		return { gen, rev: await headRevision(store, gen, trace) };
 	});
 }
 
-/** Loads a revision: manifest (falling back to nothing else: rev 0 is `manifest.json`), slabs table, tombstone sets. */
-export async function loadRevState(store: BlobStore, gen: string, rev: number, timeline?: RevTimeline): Promise<RevState> {
+/**
+ * Loads a revision: manifest (falling back to nothing else: rev 0 is `manifest.json`), slabs table, tombstone sets.
+ * `inline`: the manifest when `idx/current.json` carried it (`CurrentPointer.manifest`); used instead of a GET when it
+ * is for (gen, rev).
+ */
+export async function loadRevState(store: BlobStore, gen: string, rev: number, timeline?: RevTimeline, inline?: Manifest): Promise<RevState> {
 	const manifest = await timed(timeline, "manifest", async (trace) => {
+		if (inline && inline.gen === gen && (inline.rev ?? 0) === rev) return inline;
 		const mb = await store.get(keys.manifest(gen, rev), undefined, trace ? { trace } : undefined);
 		if (!mb) throw new ThreadError(`no manifest ${keys.manifest(gen, rev)}`, 404);
 		return parseManifest(mb, gen, rev);

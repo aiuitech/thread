@@ -114,10 +114,11 @@ export interface BlobStore {
 	readonly coalesceBytes?: number;
 	readonly spanBytes?: number;
 	/**
-	 * Whether `key` can be read without an origin request (in a local cache, or a local store): `undefined` when the
-	 * store cannot tell. Used by the cold-path query policy. Optional.
+	 * Whether `key` (with `range`: that range of it) can be read without an origin request (in a local cache, a
+	 * seeded prefix, or a local store): `undefined` when the store cannot tell. Without a range it means the whole
+	 * object. Used by the cold-path query policy and by `index.warm`. Optional.
 	 */
-	contains?(key: string): boolean | undefined;
+	contains?(key: string, range?: BlobRange): boolean | undefined;
 	/** Opens `n` connections ahead of the first query (cheap HEADs); remote stores only. Optional. */
 	warmup?(n: number): Promise<void>;
 }
@@ -284,10 +285,19 @@ export interface BlobCache {
 	/** Ranges of a cached object (views are fine), or null when it is not cached. */
 	getRanges(key: string, ranges: BlobRange[]): Promise<Uint8Array[] | null>;
 	put(key: string, bytes: Uint8Array): Promise<unknown>;
-	/** Whether the object is cached (no I/O). */
+	/** Whether the whole object is cached (no I/O). */
 	has(key: string): boolean;
 	/** The miss policy a `CachedBlobStore` over this cache uses by default (`"range+warm"` when absent). */
 	readonly defaultMissPolicy?: MissPolicy;
+	/**
+	 * Optional prefix seeding (`PrefixSeed`, warm packs): hold the first `bytes.byteLength` bytes of `key` only.
+	 * `getRanges` then serves ranges inside a held prefix; `get`/`has` still mean the whole object.
+	 */
+	seedPrefix?(key: string, bytes: Uint8Array): void;
+	/** Whether `range` of `key` can be served (whole object or a held prefix). */
+	holds?(key: string, range: BlobRange): boolean;
+	/** Drops the held prefixes `keep` rejects (a revision switch). */
+	retainPrefixes?(keep: (key: string) => boolean): void;
 }
 
 const ownBuffer = (b: Uint8Array): Uint8Array => (b.byteOffset === 0 && b.buffer.byteLength === b.byteLength ? b : b.slice());
@@ -295,14 +305,42 @@ const ownBuffer = (b: Uint8Array): Uint8Array => (b.byteOffset === 0 && b.buffer
 /**
  * An LRU of whole objects in memory (default 256 MB; objects larger than a quarter of it are not kept). Hits are
  * views into the cached object, so a slab prefix served from it carries the slab's rerank records too.
+ *
+ * It also holds seeded PREFIXES (`seedPrefix`, a warm pack's slab scan prefixes): ranges inside one are served
+ * from it, the whole object is not (`get` / `has` miss), so a `CachedBlobStore` still fetches the whole slab in the
+ * background on a prefix hit (`"range+warm"`). Prefixes are views into the warm pack, are not counted in `held` and
+ * are not evicted by the LRU (they are bounded by the warm pack); one is dropped once its whole object is cached.
  */
 export class MemoryCache implements BlobCache {
 	held = 0;
 	private readonly items = new Map<string, Uint8Array>();
+	private readonly prefixes = new Map<string, Uint8Array>();
 	constructor(readonly maxBytes = 256 * 1024 * 1024) {}
 
 	has(key: string): boolean {
 		return this.items.has(key);
+	}
+
+	seedPrefix(key: string, bytes: Uint8Array): void {
+		if (this.items.has(key)) return;
+		const cur = this.prefixes.get(key);
+		if (!cur || cur.byteLength < bytes.byteLength) this.prefixes.set(key, bytes);
+	}
+
+	holds(key: string, range: BlobRange): boolean {
+		const b = this.items.get(key) ?? this.prefixes.get(key);
+		return !!b && range.offset >= 0 && range.length >= 0 && range.offset + range.length <= b.byteLength;
+	}
+
+	retainPrefixes(keep: (key: string) => boolean): void {
+		for (const k of [...this.prefixes.keys()]) if (!keep(k)) this.prefixes.delete(k);
+	}
+
+	/** Seeded prefixes held and their bytes. */
+	get prefixStats(): { prefixes: number; bytes: number } {
+		let bytes = 0;
+		for (const b of this.prefixes.values()) bytes += b.byteLength;
+		return { prefixes: this.prefixes.size, bytes };
 	}
 
 	private touch(key: string): Uint8Array | null {
@@ -319,7 +357,11 @@ export class MemoryCache implements BlobCache {
 
 	async getRanges(key: string, ranges: BlobRange[]): Promise<Uint8Array[] | null> {
 		const b = this.touch(key);
-		if (!b) return null;
+		if (!b) {
+			const p = this.prefixes.get(key);
+			if (!p || !ranges.length || !ranges.every((r) => r.offset >= 0 && r.length >= 0 && r.offset + r.length <= p.byteLength)) return null;
+			return ranges.map((r) => p.subarray(r.offset, r.offset + r.length));
+		}
 		return ranges.map((r) => {
 			if (r.offset < 0 || r.length < 0 || r.offset + r.length > b.byteLength) throw new ThreadError(`cached ${key} is ${b.byteLength} bytes, need [${r.offset}, +${r.length})`);
 			return b.subarray(r.offset, r.offset + r.length);
@@ -335,6 +377,7 @@ export class MemoryCache implements BlobCache {
 			this.items.delete(key);
 		}
 		this.items.set(key, own);
+		this.prefixes.delete(key);
 		this.held += own.byteLength;
 		for (const [k, v] of this.items) {
 			if (this.held <= this.maxBytes) break;
@@ -564,6 +607,29 @@ export class CachedBlobStore implements BlobStore {
 		return ranges.map((r) => full.subarray(r.offset, r.offset + r.length));
 	}
 
+	/**
+	 * Queues a background whole-object fetch of `key` into the cache (deduplicated, bounded, `waitUntil`), as the
+	 * `"range+warm"` policy does after a range miss. A warm-pack prefix layer in front of this store calls it.
+	 */
+	warmObject(key: string, trace?: BlobTrace): void {
+		if (this.cacheable(key)) this.warm(key, trace);
+	}
+
+	/** Whether the cache takes seeded prefixes (`MemoryCache`): `open({warmPack})` then seeds it instead of a layer. */
+	get seedsPrefixes(): boolean {
+		return typeof this.blobCache?.seedPrefix === "function";
+	}
+
+	seedPrefix(key: string, bytes: Uint8Array): void {
+		if (!this.blobCache?.seedPrefix) throw new ThreadError("this cache does not hold prefixes", 400);
+		this.blobCache.seedPrefix(key, bytes);
+	}
+
+	/** Drops seeded prefixes `keep` rejects. */
+	retain(keep: (key: string) => boolean): void {
+		this.blobCache?.retainPrefixes?.(keep);
+	}
+
 	/** Queues a background whole-object fetch of `key` (`"range+warm"`). */
 	private warm(key: string, trace?: BlobTrace): void {
 		if (this.warmConcurrency <= 0 || this.warming.has(key) || this.fills.has(key) || this.blobCache?.has(key)) return;
@@ -617,10 +683,10 @@ export class CachedBlobStore implements BlobStore {
 		while (this.warmActive || this.warmQ.length || this.fills.size) await new Promise<void>((r) => this.idleWaiters.push(r));
 	}
 
-	contains(key: string): boolean | undefined {
-		if (!this.cacheable(key)) return this.inner.contains?.(key);
-		if (this.blobCache) return this.blobCache.has(key) || this.inner.contains?.(key) || false;
-		return this.known.has(key) ? true : this.inner.contains?.(key);
+	contains(key: string, range?: BlobRange): boolean | undefined {
+		if (!this.cacheable(key)) return this.inner.contains?.(key, range);
+		if (this.blobCache) return this.blobCache.has(key) || (range !== undefined && !!this.blobCache.holds?.(key, range)) || this.inner.contains?.(key, range) || false;
+		return this.known.has(key) ? true : this.inner.contains?.(key, range);
 	}
 
 	warmup(n: number): Promise<void> {
@@ -650,6 +716,8 @@ export class CachedBlobStore implements BlobStore {
 					trace.bytes += got[0].byteLength;
 					if (range) trace.r206++;
 				}
+				// A seeded prefix served a fill read: fetch the whole slab in the background, as a miss would have.
+				if (range && opts?.fill && this.missPolicy !== "range" && !this.blobCache.has(key)) this.warm(key, trace);
 				return got[0];
 			}
 		} else {
@@ -690,6 +758,7 @@ export class CachedBlobStore implements BlobStore {
 					trace.r206++;
 					trace.bytes += got.reduce((a, b) => a + b.byteLength, 0);
 				}
+				if (opts?.fill && this.missPolicy !== "range" && !this.blobCache.has(key)) this.warm(key, trace);
 				return got;
 			}
 		} else {
@@ -766,8 +835,8 @@ export class PrefixedBlobStore implements BlobStore {
 	get(key: string, range?: BlobRange, opts?: GetOptions) {
 		return this.inner.get(this.prefix + key, range, opts);
 	}
-	contains(key: string) {
-		return this.inner.contains?.(this.prefix + key);
+	contains(key: string, range?: BlobRange) {
+		return this.inner.contains?.(this.prefix + key, range);
 	}
 	warmup(n: number) {
 		return this.inner.warmup?.(n) ?? Promise.resolve();

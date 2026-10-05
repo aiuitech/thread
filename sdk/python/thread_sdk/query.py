@@ -166,8 +166,10 @@ def coalesce_runs(idxs: list[int], rec_len: int, coalesce_bytes: int = MULTI_COA
 def slab_resident(store: BlobStore, rev: RevState, cell: int) -> bool:
     """Whether probed `cell`'s slab can be read without an origin request (see the cold-path policy): the store's
     `contains`, else True for a local store and False for a remote one."""
-    key = keys.slab(rev.gen, cell, slab_rev_of(rev.slabs[cell]) if rev.slabs is not None and cell < len(rev.slabs) and rev.slabs[cell] else 0)
-    r = store.contains(key)
+    meta = rev.slabs[cell] if rev.slabs is not None and cell < len(rev.slabs) and rev.slabs[cell] else None
+    key = keys.slab(rev.gen, cell, slab_rev_of(meta) if meta else 0)
+    # Its scan prefix is what phase 1 reads: a held prefix (a warm pack's) counts as resident.
+    r = store.contains(key, BlobRange(0, meta[0]) if meta else None)
     return (not store.remote) if r is None else r
 
 

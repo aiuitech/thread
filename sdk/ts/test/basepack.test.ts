@@ -39,7 +39,7 @@ async function packed(store: MemoryBlobStore, gen: string, rev: number, kind: "b
 }
 
 describe("base packs", () => {
-	it("a cold open is current.json + the base pack (+ the manifest, read alongside) and loads identical state", async () => {
+	it("a cold open is current.json + the base pack (+ the manifest, read alongside unless inlined) and loads identical state", async () => {
 		const b = await buildGen("bp", 3, { k2: 32, n: 900 });
 		await addRoutingRev(b.store, "bp", { tree: { groups: 4 } });
 		const writer = await thread.open({ store: b.store, cache: false });
@@ -58,13 +58,21 @@ describe("base packs", () => {
 		const fast = await thread.open({ store: c.store, cache: false, routing: "i8" });
 		expect(fast.openStats.prefetch.source).toBe("base-pack");
 		expect(fast.openStats.prefetch.key).toBe(key);
-		expect(c.reads.sort()).toEqual(["idx/bp/base.2.threadpack", "idx/bp/manifest.2.json", "idx/current.json"]);
+		// current.json carries the manifest (the SDK writer inlined it): no manifest GET alongside the pack
+		expect(c.reads.sort()).toEqual(["idx/bp/base.2.threadpack", "idx/current.json"]);
 		await sameAnswers(plain, fast, b.dim);
 		// the default routing (f32) is not what a base pack holds: the open reads the files (all requested at once)
 		const c2 = counting(b.store);
 		const f32 = await thread.open({ store: c2.store, cache: false });
 		expect(f32.openStats.prefetch.source).toBe("files");
-		expect(c2.reads.sort()).toEqual(["idx/bp/coarse.f32", "idx/bp/fine.f32", "idx/bp/manifest.2.json", "idx/bp/pq.bin", "idx/bp/slabs.json", "idx/bp/tombstones.2.u32", "idx/bp/tree.1.bin", "idx/current.json"]);
+		expect(c2.reads.sort()).toEqual(["idx/bp/coarse.f32", "idx/bp/fine.f32", "idx/bp/pq.bin", "idx/bp/slabs.json", "idx/bp/tombstones.2.u32", "idx/bp/tree.1.bin", "idx/current.json"]);
+		// a pointer without the copy (an older writer, the Worker's publish): the manifest is read alongside the pack
+		await b.store.put(keys.current(), JSON.stringify({ gen: "bp", rev: 2 }));
+		const c3 = counting(b.store);
+		const fast2 = await thread.open({ store: c3.store, cache: false, routing: "i8" });
+		expect(fast2.openStats.prefetch.source).toBe("base-pack");
+		expect(c3.reads.sort()).toEqual(["idx/bp/base.2.threadpack", "idx/bp/manifest.2.json", "idx/current.json"]);
+		fast2.close();
 		for (const ix of [plain, fast, f32]) ix.close();
 	});
 

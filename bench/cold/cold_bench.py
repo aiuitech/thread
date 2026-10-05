@@ -11,6 +11,7 @@ The same bench as bench/cold/cold_bench.mjs (TypeScript SDK): same CLI, same sce
         [--inflight N] [--coalesce BYTES] [--span BYTES] [--chunk BYTES] [--warmup N|false] [--cold-nprobe N] [--cold-rerank R]
         [--drain] (wait for background cache warms before the `warm` scenario)
         open options: [--routing f32|f16|i8|auto] [--cold-routing tree] [--cold-beam N] [--base-pack 0|1] [--gen G --rev R]
+        [--warm-pack KEY [--warm-wait slab|none]]
 
 The open options are open_index's (`routing`, `cold_routing`, `cold_beam`, `base_pack`, `gen`/`rev`), as in
 cold_bench.mjs.
@@ -21,6 +22,8 @@ Each trial t spawns a fresh interpreter (fresh connections, fresh native module 
   warm          query (offset + 2t + 1) again
 The index is opened with `open_index(store)` and no cache argument: what a Python user gets by default, a 256 MB
 MemoryCache in front of a remote store (so a phase-1 miss reads the whole slab once, and `warm` reads nothing).
+`--warm-pack KEY` opens with `warm_pack=KEY` and, with `--warm-wait slab` (default), waits for it to be seeded before
+the slab-cold scenario (see cold_bench.mjs).
 """
 
 from __future__ import annotations
@@ -68,6 +71,10 @@ PACK_KEY = ARGS.get("pack-key", "packs/g4-cold.threadpack")
 ENV_FILE = ARGS.get("env", "sdk/ts/examples/basic/.env.secrets")
 NPROBE = int(ARGS["nprobe"]) if "nprobe" in ARGS else None
 RERANK = int(ARGS["rerank"]) if "rerank" in ARGS else None
+WARM_PACK = ARGS.get("warm-pack")
+WARM_WAIT = ARGS.get("warm-wait", "slab")
+if WARM_WAIT not in ("slab", "none"):
+    raise SystemExit("--warm-wait must be slab or none")
 
 
 def _num(k: str) -> int | None:
@@ -204,6 +211,8 @@ def child() -> None:
         okw["warmup"] = CONFIG["warmup"]
     if CONFIG["coldPolicy"]:
         okw["cold_policy"] = CONFIG["coldPolicy"]
+    if WARM_PACK:
+        okw["warm_pack"] = WARM_PACK
     index = open_index(store, **okw, **open_opts())
     os_ = index.open_stats
     qopts: dict[str, Any] = {"top_k": 10}
@@ -217,6 +226,10 @@ def child() -> None:
         sys.stdout.flush()
 
     def run(scenario: str, qi: int, with_open: bool) -> None:
+        w = index.warm_stats
+        warm = {"state": w["state"], "target": w["target"], "entries": w["entries"], "seeded": w["seeded"], "seededBytes": w["seeded_bytes"],
+                "readyMs": w["ready_ms"], "fetchMs": (w["fetch"] or {}).get("ms"),
+                "fetchBytes": (w["fetch"] or {}).get("bytes")} if w else None
         t0 = time.perf_counter()
         res = index.query(ds.vector(qi), **qopts)
         wall = (time.perf_counter() - t0) * 1000
@@ -302,6 +315,7 @@ def child() -> None:
                 "query": st["io"]["bytes"],
             },
             "config": CONFIG,
+            "warm": warm,
             "stats": {"wholeSlabs": st["whole_slabs"], "warms": st["io"].get("warms", 0), "inflight": st["inflight"],
                       "coalesceBytes": st["coalesce_bytes"], "spanBytes": st["span_bytes"], "cold": st.get("cold"),
                       "scanned": st["scanned"], "scanBytes": st["scan_bytes"], "slabBytes": st["slab_bytes"],
@@ -314,6 +328,10 @@ def child() -> None:
 
     qa = OFFSET + 2 * trial
     run("process-cold", qa, True)
+    if WARM_PACK and WARM_WAIT == "slab":
+        index.warm_ready.result()
+        if use_proxy:
+            proxy_call("POST", "/__reset")  # the rest of the warm pack's GET is not slab-cold's
     run("slab-cold", qa + 1, False)
     if CONFIG["drain"] and hasattr(index.store, "drain"):
         index.store.drain(60)
@@ -382,6 +400,8 @@ METRICS = [
     ("MB phase2", _g("bytes", "phase2"), "mb"),
     ("MB query", _g("bytes", "query"), "mb"),
     ("cache hits (query)", _g("stats", "cacheHits"), "n"),
+    ("warm pack ready at query start (1/0)", lambda r: (1 if r["warm"]["state"] == "ready" else 0) if r.get("warm") else None, "n"),
+    ("ms warm pack seeded (since open start)", lambda r: (r.get("warm") or {}).get("readyMs"), "ms"),
     ("scan prefix MB", _g("stats", "scanBytes"), "mb"),
     ("slab MB transferred", _g("stats", "slabBytes"), "mb"),
     ("rerank reads", _g("stats", "rerankReads"), "n"),
@@ -493,6 +513,8 @@ def parent() -> None:
         "store": STORE,
         "endpoint": urlsplit(env["S3_ENDPOINT"]).netloc if STORE == "r2s3" else PROXY,
         "packKey": PACK_KEY if STORE == "pack" else None,
+        "warmPack": WARM_PACK,
+        "warmWait": WARM_WAIT if WARM_PACK else None,
         "proxyConfig": proxy_config,
         "cache": CONFIG["cache"],
         "config": CONFIG,

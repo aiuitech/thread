@@ -13,6 +13,7 @@
  *        [--keepalive MS] [--h2] [--drain] (wait for background cache warms before the `warm` scenario)
  *        [--early-warmup] (create the store with `warmup` before the wasm compiles)
  *        open options: [--routing f32|f16|i8|auto] [--cold-routing tree] [--cold-beam N] [--base-pack 0|1] [--gen G --rev R]
+ *        [--warm-pack KEY [--warm-wait slab|none]] [--coalesce-across-slabs GAP_BYTES]
  *
  * The open options are thread.open's: `--routing` (routing table), `--cold-routing tree` (+ `--cold-beam`: route the
  * first queries over the tree's groups while the full table loads), `--base-pack 0` (no base pack, no prefetch: the
@@ -26,6 +27,13 @@
  * Every query's recall@10 is checked against data/prep/groundtruth.u32. With --store proxy|pack the child resets
  * the proxy's counters before opening and reads them after each scenario, so `proxy` holds the exact requests and
  * bytes each scenario sent (the SDK's own counters are in `reqs` / `bytes`).
+ *
+ * `--warm-pack KEY` opens with `warmPack: KEY` (warm.ts; with `--store pack` the key is read from the S3 store next to
+ * the pack); `--warm-wait slab` (the default) waits for the warm pack to be seeded before the slab-cold scenario, so
+ * slab-cold and warm measure a loaded warm pack (process-cold never waits: it gets whatever has arrived). Each row
+ * records the warm pack's state when its query started (`warm`). `--coalesce-across-slabs GAP` passes
+ * `coalesceAcrossSlabs: GAP` to every query (`--store pack` only: phase-1 prefix reads of slabs within GAP bytes
+ * of each other in the pack become one range read).
  *
  * Output: a summary table (median / p90 per scenario) on stdout and, with --out, JSONL: one `kind: "meta"` row
  * then one `kind: "trial"` row per (trial, scenario). `node bench/cold/summarize.mjs a.jsonl b.jsonl` compares runs.
@@ -46,6 +54,10 @@ const PACK_KEY = args["pack-key"] ?? "packs/g4-cold.threadpack";
 const ENV_FILE = args.env ?? "sdk/ts/examples/basic/.env.secrets";
 const nprobe = args.nprobe !== undefined ? Number(args.nprobe) : undefined;
 const rerank = args.rerank !== undefined ? Number(args.rerank) : undefined;
+const WARM_PACK = args["warm-pack"] ?? null;
+const WARM_WAIT = args["warm-wait"] ?? "slab";
+if (!["slab", "none"].includes(WARM_WAIT)) throw new Error("--warm-wait must be slab or none");
+const COALESCE = args["coalesce-across-slabs"] !== undefined ? Number(args["coalesce-across-slabs"]) : undefined;
 const dist = path.join(root, "sdk/ts/dist");
 const num = (k) => (args[k] !== undefined ? Number(args[k]) : undefined);
 const LEGACY = args.legacy === "true";
@@ -142,11 +154,14 @@ async function child() {
 		...(config.warmup !== null ? { warmup: config.warmup } : {}),
 		...(config.coldPolicy ? { coldPolicy: config.coldPolicy } : {}),
 		...openOpts(),
+		...(WARM_PACK ? { warmPack: WARM_PACK } : {}),
 	});
 	const os = index.openStats;
-	const qopts = { topK: 10, ...(nprobe !== undefined ? { nprobe } : {}), ...(rerank !== undefined ? { rerank } : {}) };
+	const qopts = { topK: 10, ...(nprobe !== undefined ? { nprobe } : {}), ...(rerank !== undefined ? { rerank } : {}), ...(COALESCE !== undefined ? { coalesceAcrossSlabs: COALESCE } : {}) };
 	const emit = (row) => process.stdout.write("@@ROW " + JSON.stringify(row) + "\n");
 	const run = async (scenario, qi, withOpen) => {
+		const w = index.warmStats;
+		const warm = w ? { state: w.state, target: w.target, entries: w.entries, seeded: w.seeded, seededBytes: w.seededBytes, readyMs: w.readyMs, fetchMs: w.fetch?.ms ?? null, fetchBytes: w.fetch?.bytes ?? null } : null;
 		const t0 = nowMs();
 		const res = await index.query(ds.vector(qi), qopts);
 		const wall = nowMs() - t0;
@@ -224,13 +239,18 @@ async function child() {
 				query: st.io.bytes,
 			},
 			config,
-			stats: { wholeSlabs: st.wholeSlabs, warms: st.io.warms ?? 0, inflight: st.inflight, coalesceBytes: st.coalesceBytes, spanBytes: st.spanBytes, cold: st.cold ?? null, scanned: st.scanned, scanBytes: st.scanBytes, slabBytes: st.slabBytes, rerankSlabs: st.rerankSlabs, rerankReads: st.rerankReads, rerankBytes: st.rerankBytes, rerankLocal: st.rerankLocal, specRecords: st.specRecords, specUsed: st.specUsed, cacheHits: st.io.hits, cacheMisses: st.io.misses, baseFiles: withOpen ? os.base.files : null },
+			warm,
+			stats: { wholeSlabs: st.wholeSlabs, warms: st.io.warms ?? 0, inflight: st.inflight, coalesceBytes: st.coalesceBytes, spanBytes: st.spanBytes, cold: st.cold ?? null, scanned: st.scanned, scanBytes: st.scanBytes, slabBytes: st.slabBytes, rerankSlabs: st.rerankSlabs, rerankReads: st.rerankReads, rerankBytes: st.rerankBytes, rerankLocal: st.rerankLocal, specRecords: st.specRecords, specUsed: st.specUsed, cacheHits: st.io.hits, cacheMisses: st.io.misses, coalescedReads: st.coalesced?.reads ?? null, coalescedSlabs: st.coalesced?.slabs ?? null, coalescedBytes: st.coalesced?.bytes ?? null, baseFiles: withOpen ? os.base.files : null },
 			proxy,
 		});
 	};
 	const qa = OFFSET + 2 * trial;
 	const qb = qa + 1;
 	await run("process-cold", qa, true);
+	if (WARM_PACK && WARM_WAIT === "slab") {
+		await index.warmReady;
+		if (useProxy) await proxyCall("POST", "/__reset"); // the rest of the warm pack's GET is not slab-cold's
+	}
 	await run("slab-cold", qb, false);
 	if (config.drain && index.store.drain) {
 		await index.store.drain();
@@ -285,6 +305,9 @@ async function parent() {
 		store: STORE,
 		endpoint: STORE === "r2s3" ? new URL(env.S3_ENDPOINT).host : PROXY,
 		packKey: STORE === "pack" ? PACK_KEY : null,
+		warmPack: WARM_PACK,
+		warmWait: WARM_PACK ? WARM_WAIT : null,
+		coalesceAcrossSlabs: COALESCE ?? null,
 		proxyConfig,
 		cache: config.cache,
 		config,

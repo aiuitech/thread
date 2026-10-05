@@ -129,12 +129,14 @@ once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 | `coldRouting` | `"off"` | `"tree"`: the open waits only for the centroid tree and the codebook; until the full table has loaded (in the background) queries route over the tree's best `coldBeam` groups, range-reading just those groups' means from the tree-grouped table |
 | `coldBeam` | `defaults.beam`, else 16 | groups ranked per cold-routed query |
 | `basePack` | true | GET the revision's base pack (one object with everything the open reads) and, without one, start every read of the open as soon as the manifest is in; `false`: one read after another |
+| `warmPack` | - | key of a warm pack (hot slab prefixes in one object): fetched with one GET in the background at open; its prefixes go into the `MemoryCache` (else a prefix layer in front of the store, `index.warmLayer`) and are served from memory (`index.warmReady`, `index.warmStats`). Opt-in; measured no gain on our workload (docs/cold-start.md, "Warm packs") |
 
 `open` reads `current.json` (a pointer without `rev` means rev 0 = the legacy `idx/{gen}/manifest.json`), the
-manifest, the slabs table and the tombstone sets, and loads the routing table (`coarse.f32` + `fine.f32`, ~25 MB
+manifest (unless `current.json` carries an inline copy, which the SDK writers add when it is at most 16 KB), the slabs table and the tombstone sets, and loads the routing table (`coarse.f32` + `fine.f32`, ~25 MB
 in wasm at 4096 x 1536) and the PQ codebook (format 3). With a base pack (`idx/{gen}/base.{rev}.threadpack`,
 written by publish) that is two round trips: `current.json`, then the pack (the manifest is read alongside, in case
-there is none); without one, three: the base files are all requested as soon as the manifest is in. `routing: "i8"`
+there is none, unless `current.json` inlines it); without one, three, or two with an inline manifest: the base files
+are all requested as soon as the manifest is in. `routing: "i8"`
 (or `"auto"`) cuts the routing table to 6.3 MB and is the table a base pack holds by default, so the whole open is
 `current.json` + one 8.8 MB GET on g4; `coldRouting: "tree"` cuts it to the 2.5 MB cold base pack plus ~1 MB of
 group means read by the first query. Which mode suits which deployment, and the probe overlap and recall each
@@ -178,6 +180,7 @@ loaded, `"cold"` while queries route cold). `await index.whenFullRouting()` wait
 | `coalesceBytes` | the store's: 128 KB for `S3BlobStore`, else 4096 | phase 2: a slab's wanted rerank records are merged into one range while the range stays within this many bytes |
 | `spanBytes` | the store's, else 0 (off) | phase 2: read a slab's records as ONE range from the first to the last wanted record when that span is at most this |
 | `coldPolicy` | `OpenOptions.coldPolicy` | `{ nprobe?, rerank?, threshold? }`: when more than `threshold` (default 0.5) of the probed slabs are not cached, scan only the best `nprobe` of them and rerank `rerank` (each capped at the query's value); `false` disables it for this query |
+| `coalesceAcrossSlabs` | off | `PackedBlobStore` only: merge phase-1 prefix reads of slabs within this many bytes of each other in the pack into one range (`true` = 64 KiB). Measured: no gain on today's packs (docs/cold-start.md) |
 
 Manifests without `defaults` (g1, g2) use `nprobe 1, rerank 32, pc 0`; `params.source` says where each value
 came from (`query`, `manifest`, `legacy`); with a filter `params` also carries `filter: true` and the `maxNprobe` in

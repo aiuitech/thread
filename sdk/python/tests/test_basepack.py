@@ -60,15 +60,22 @@ def test_cold_open_is_current_plus_base_pack_and_state_is_identical():
             open_index(c, cache=False, routing="i8") as fast:
         assert plain.open_stats["prefetch"]["source"] == "none"
         assert fast.open_stats["prefetch"]["source"] == "base-pack"
-        assert sorted(c.reads) == ["idx/bp/base.2.threadpack", "idx/bp/manifest.2.json", "idx/current.json"]
+        # current.json carries the manifest (the SDK writer inlined it): no manifest GET alongside the pack
+        assert sorted(c.reads) == ["idx/bp/base.2.threadpack", "idx/current.json"]
         same_answers(plain, fast, b.dim)
     # the default routing (f32) is not what a base pack holds: the open reads the files (all requested at once)
     c2 = Counting(b.store)
     with open_index(c2, cache=False) as f32:
         assert f32.open_stats["prefetch"]["source"] == "files"
-        assert sorted(c2.reads) == ["idx/bp/coarse.f32", "idx/bp/fine.f32", "idx/bp/manifest.2.json", "idx/bp/pq.bin",
+        assert sorted(c2.reads) == ["idx/bp/coarse.f32", "idx/bp/fine.f32", "idx/bp/pq.bin",
                                     "idx/bp/slabs.json", "idx/bp/tombstones.2.u32", "idx/bp/tree.1.bin",
                                     "idx/current.json"]
+    # a pointer without the copy (an older writer, the Worker's publish): the manifest is read alongside the pack
+    b.store.put(keys.current(), '{"gen":"bp","rev":2}')
+    c3 = Counting(b.store)
+    with open_index(c3, cache=False, routing="i8") as fast2:
+        assert fast2.open_stats["prefetch"]["source"] == "base-pack"
+        assert sorted(c3.reads) == ["idx/bp/base.2.threadpack", "idx/bp/manifest.2.json", "idx/current.json"]
 
 
 def test_without_a_pack_reads_start_after_the_manifest_and_are_accounted():

@@ -14,6 +14,9 @@ import type { BlobRange, BlobStore, BlobTrace, PhaseStat } from "./store.js";
 import { newTrace, nowMs, phaseStat, roundMs, snapTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
 import type { ColdRouting, ColdStat } from "./cold.js";
+import { PackedBlobStore } from "./pack.js";
+import { WarmPrefixStore } from "./warm.js";
+import { CachedBlobStore } from "./store.js";
 import { concatBytes, deltaEntry, keys, NO_TOMBSTONES, parseDeltaHeader, tombForDelta, parseHits, parseSlabHeader, slabCentroid, slabEntry, slabRevOf, tombFor, ThreadError, type DeltaRef, type Manifest, type SegmentRef, type SlabRow, type TombState, type IndexFiles, type RoutingElem } from "./wire.js";
 
 export interface QueryOptions {
@@ -62,6 +65,14 @@ export interface QueryOptions {
 	 * centroid tree whose cells are ranked (default `open`'s `coldBeam`).
 	 */
 	beam?: number;
+	/**
+	 * Phase 1, `PackedBlobStore` only (also behind a warm-pack layer): merge the scan-prefix reads of probed slabs whose
+	 * prefixes lie within this many bytes of each other in the pack into ONE range read (`true` = 64 KiB; default off).
+	 * The bytes in between (the earlier slab's rerank tier and payload, unprobed slabs) are read and dropped, so this
+	 * pays only in a pack whose entries put a query's slabs next to each other (`bench/cold/make_pack.mjs --order
+	 * tree`, measured with `bench/cold/pack_adjacency.mjs`). Not the phase-2 record merging.
+	 */
+	coalesceAcrossSlabs?: boolean | number;
 }
 
 /**
@@ -76,6 +87,9 @@ export interface ColdPolicy {
 	rerank?: number;
 	threshold?: number;
 }
+
+/** `coalesceAcrossSlabs: true`. */
+export const CROSS_SLAB_GAP = 64 * 1024;
 
 export interface Hit {
 	id: number;
@@ -176,6 +190,8 @@ export interface QueryStats {
 	spanBytes: number;
 	/** Cold-path policy: probed slabs not cached / probed (before the policy), and whether it applied. */
 	cold?: { misses: number; probed: number; applied: boolean };
+	/** `coalesceAcrossSlabs`: merged prefix reads issued, the slabs they carried, and their bytes (prefixes + gaps). */
+	coalesced?: { reads: number; slabs: number; bytes: number };
 	/** Store accounting for this query (cache hits/misses, origin reads, bytes, warm fetches queued). */
 	io: BlobTrace;
 	limiterRetries: number;
@@ -287,8 +303,10 @@ export class Limiter {
 
 /** Whether probed `cell`'s slab can be read without an origin request (see `ColdPolicy`). */
 export function slabResident(store: BlobStore, rev: RevState, cell: number): boolean {
-	const key = keys.slab(rev.gen, cell, rev.slabs?.[cell] ? slabRevOf(rev.slabs[cell]) : 0);
-	return store.contains?.(key) ?? !store.remote;
+	const meta = rev.slabs?.[cell];
+	const key = keys.slab(rev.gen, cell, meta ? slabRevOf(meta) : 0);
+	// Its scan prefix is what phase 1 reads: a held prefix (a warm pack's) counts as resident.
+	return store.contains?.(key, meta ? { offset: 0, length: meta[0] } : undefined) ?? !store.remote;
 }
 
 export function safeFree(o: { free(): void }): void {
@@ -475,6 +493,24 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		}
 	};
 
+	// Cross-slab coalescing (phase 1, packs): groups of probed slabs whose prefixes lie close together in the pack,
+	// each read with one range of the pack the first time one of its members is needed (routing order).
+	const gap = o.coalesceAcrossSlabs === true ? CROSS_SLAB_GAP : typeof o.coalesceAcrossSlabs === "number" ? o.coalesceAcrossSlabs : -1;
+	const crossSlab = gap >= 0 && rev.slabs ? planCrossSlab(store, rev, gen, cells, gap) : null;
+	const coalesced = { reads: 0, slabs: 0, bytes: 0 };
+	const mergedRead = (g: CrossSlabGroup): Promise<Uint8Array> => {
+		if (!g.read) {
+			coalesced.reads++;
+			coalesced.slabs += g.members.size;
+			coalesced.bytes += g.range.length;
+			g.read = lim.read(() => g.pack.inner.get(g.pack.key, g.range, { trace })).then((b) => {
+				if (!b) throw new ThreadError(`pack ${g.pack.key} disappeared`, 404);
+				return b;
+			});
+		}
+		return g.read;
+	};
+
 	/** Phase 1 read: the scan prefix (v2/v3) against the cache, whole object on a miss; v1 slabs whole. */
 	const readSlab = async (cell: number): Promise<{ prefix: Uint8Array; full: Uint8Array | null; key: string; slabRev: number }> => {
 		if (!rev.slabs) {
@@ -488,6 +524,11 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		const slabRev = slabRevOf(meta);
 		const key = keys.slab(gen, cell, slabRev);
 		const scanLen = meta[0];
+		const g = crossSlab?.get(cell);
+		if (g) {
+			const at = g.members.get(cell)!;
+			return { prefix: (await mergedRead(g)).subarray(at, at + scanLen), full: null, key, slabRev };
+		}
 		const bytes = await lim.read(() => store.get(key, { offset: 0, length: scanLen }, { trace, fill: true }));
 		if (!bytes) throw new ThreadError(`missing slab ${key}`, 404);
 		// A store that fetched the whole object (cache miss, or a 200 to a Range request) returns a view into it.
@@ -699,6 +740,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			coalesceBytes: coalesce,
 			spanBytes,
 			...(cold ? { cold } : {}),
+			...(crossSlab ? { coalesced } : {}),
 			io: trace,
 			limiterRetries: lim.retries,
 			attempt,
@@ -726,6 +768,60 @@ export function coalesceRuns(idxs: number[], recLen: number, coalesceBytes: numb
 		} else runs.push({ a: i, b: i, members: [i] });
 	}
 	return runs;
+}
+
+interface CrossSlabGroup {
+	pack: PackedBlobStore;
+	/** The pack range read for the group. */
+	range: BlobRange;
+	/** Member cell -> offset of its prefix in the range. */
+	members: Map<number, number>;
+	read?: Promise<Uint8Array>;
+}
+
+/**
+ * Groups the probed slabs of a query whose scan prefixes lie within `gap` bytes of each other in the pack behind
+ * `store` (a `PackedBlobStore`, possibly behind a warm-pack layer and/or a cache, whose held prefixes are left out).
+ * Returns cell -> group for groups of two or more; null when the store is not a pack.
+ */
+export function planCrossSlab(store: BlobStore, rev: RevState, gen: string, cells: readonly number[], gap: number): Map<number, CrossSlabGroup> | null {
+	// Through a warm-pack layer and an in-process cache: prefixes either of them holds are read from there.
+	const front = store;
+	let base = store;
+	if (base instanceof WarmPrefixStore) base = base.inner;
+	if (base instanceof CachedBlobStore) base = base.inner;
+	if (!(base instanceof PackedBlobStore) || !rev.slabs) return null;
+	const pack = base;
+	const items: { cell: number; offset: number; length: number }[] = [];
+	for (const cell of cells) {
+		const meta = rev.slabs[cell];
+		if (!meta) continue;
+		const key = keys.slab(gen, cell, slabRevOf(meta));
+		const r = { offset: 0, length: meta[0] };
+		if (front !== pack && front.contains?.(key, r)) continue;
+		const at = pack.rangeOf(key, r);
+		if (at) items.push({ cell, ...at });
+	}
+	items.sort((a, b) => a.offset - b.offset);
+	const out = new Map<number, CrossSlabGroup>();
+	let run: typeof items = [];
+	const flush = () => {
+		if (run.length > 1) {
+			const start = run[0].offset;
+			const end = Math.max(...run.map((i) => i.offset + i.length));
+			const g: CrossSlabGroup = { pack, range: { offset: start, length: end - start }, members: new Map(run.map((i) => [i.cell, i.offset - start])) };
+			for (const i of run) out.set(i.cell, g);
+		}
+		run = [];
+	};
+	let end = -Infinity;
+	for (const it of items) {
+		if (run.length && it.offset - end > gap) flush();
+		run.push(it);
+		end = run.length === 1 ? it.offset + it.length : Math.max(end, it.offset + it.length);
+	}
+	flush();
+	return out;
 }
 
 /** Payloads of slab hits whose slab was not in memory: one (multi-)range read per slab. */

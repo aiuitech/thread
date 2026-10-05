@@ -135,6 +135,7 @@ up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whol
 | `warmup` | on for remote stores | open connections while opening: `True` = the store's `inflight` (32 for S3), an int, `False` |
 | `cold_policy` | None | `{"nprobe", "rerank", "threshold"}` for queries whose probed slabs are mostly not cached (see `query`) |
 | `prefetch_bytes` | 64 MB | slab prefixes / delta and lexical segments a revision switch prefetches into the cache |
+| `warm_pack` | - | key of a warm pack (hot slab prefixes in one object): fetched with one GET on a background thread at open; its prefixes go into the `MemoryCache` (else a prefix layer in front of the store) and are served from memory (`index.warm_ready`, `index.warm_stats`). Opt-in; measured no gain on our workload (docs/cold-start.md, "Warm packs") |
 
 `gen` without `rev` reads the generation's head (the current rev when `current.json` names that generation, else
 the newest `manifest.*.json` in the store). `ThreadIndex` is a context manager; `close()` releases its threads.

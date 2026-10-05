@@ -20,6 +20,7 @@ import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchOptions
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 import { ColdRouting } from "./cold.js";
 import { isPackHeader, PackedBlobStore, PrefetchStore } from "./pack.js";
+import { fetchWarmPack, revisionSlabKeys, seedWarmPack, WarmPrefixStore, type PrefixSeed, type WarmPackStats } from "./warm.js";
 
 export * from "./wire.js";
 export * from "./attrs.js";
@@ -30,9 +31,10 @@ export * from "./fusion.js";
 export * from "./routing.js";
 export type { ColdStat } from "./cold.js";
 export * from "./pack.js";
+export * from "./warm.js";
 export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
-export { FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, slabResident } from "./query.js";
+export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
 export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
 export { createLexicalGeneration } from "./write.js";
 
@@ -192,6 +194,18 @@ export interface OpenOptions {
 	 * a pack, the open starts every read as soon as the manifest is in. `false`: the reads one after another, as before.
 	 */
 	basePack?: boolean;
+	/**
+	 * Key of a warm pack (`meta.kind: "warm"`, see warm.ts): the scan prefixes of the most-probed slabs in one object.
+	 * `open` starts ONE GET of it right away and does not wait for it; once it is in, its prefixes (those of slabs the
+	 * open revision reads) are served from memory, so a query probing those cells skips their prefix reads. They go
+	 * into the in-process cache when it holds prefixes (`MemoryCache`: a prefix hit that asked for `fill` then warms
+	 * the whole slab in the background under the cache's miss policy, and counts as resident for `coldPolicy`), else
+	 * into a prefix layer in front of the store (`index.warmLayer`). Phase-2 reads of those slabs still go to the
+	 * store. The key is read from `store`/`bucket` (with `prefix`, around an in-process cache), or from the inner store
+	 * of a `PackedBlobStore`. `index.warmReady` resolves when it is seeded; `index.warmStats` says how it went.
+	 * Measured: no gain on the dbpedia workload (docs/cold-start.md, "Warm packs"); opt-in.
+	 */
+	warmPack?: string;
 }
 
 /** One wasm instance per isolate. `Thread.init` once, then `open` indexes. */
@@ -298,6 +312,17 @@ export class ThreadIndex {
 	private segLoading = new Map<string, Promise<LexSegment>>();
 	private lex: { rev: number; gen: string; index: LexIndex; epoch: number } | null = null;
 	private lexLoading: Promise<LexIndex> | null = null;
+	/**
+	 * The warm-pack prefix layer in front of the store (`OpenOptions.warmPack` without an in-process cache that holds
+	 * the prefixes itself), else null.
+	 */
+	readonly warmLayer: WarmPrefixStore | null = null;
+	/** Where the warm pack's prefixes went (the cache store or `warmLayer`). */
+	private warmTarget: (PrefixSeed & { retain(keep: (key: string) => boolean): void }) | null = null;
+	/** How loading the warm pack went (null without one); updated in place as it loads. */
+	warmStats: WarmPackStats | null = null;
+	/** Resolves once the warm pack is seeded (or failed: see `warmStats.error`); null without one. Never rejects. */
+	warmReady: Promise<WarmPackStats | null> = Promise.resolve(null);
 
 	private constructor(
 		readonly thread: Thread,
@@ -335,9 +360,25 @@ export class ThreadIndex {
 		if (!cache && opts.cache === undefined && store.remote && !inWorkers()) cache = new MemoryCache();
 		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
 		const t0 = nowMs();
+		// The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it. Its prefixes
+		// go into the in-process cache when it can hold prefixes (`MemoryCache`), else into a prefix layer in front of
+		// the store.
+		let warm: { target: PrefixSeed & { retain(keep: (key: string) => boolean): void }; layer: WarmPrefixStore | null; got: Promise<{ bytes: Uint8Array; stat: PhaseStat }> } | null = null;
+		if (opts.warmPack) {
+			// Read around an in-process cache (the pack is not an index object), through the Cache API (shared, worth it).
+			const source = opts.store instanceof PackedBlobStore ? opts.store.inner : store instanceof CachedBlobStore && store.blobCache ? store.inner : store;
+			const got = fetchWarmPack(source, opts.warmPack, t0);
+			got.catch(() => {});
+			if (store instanceof CachedBlobStore && store.seedsPrefixes) warm = { target: store, layer: null, got };
+			else {
+				const layer = new WarmPrefixStore(store);
+				warm = { target: layer, layer, got };
+				store = layer;
+			}
+		}
 		// Connection warm-up overlaps the open's own sequential reads (current.json, manifest, base files).
-		const warm = opts.warmup ?? (store.remote && !inWorkers());
-		const n = typeof warm === "number" ? warm : warm ? (store.inflight ?? 12) : 0;
+		const warmN = opts.warmup ?? (store.remote && !inWorkers());
+		const n = typeof warmN === "number" ? warmN : warmN ? (store.inflight ?? 12) : 0;
 		if (n > 0 && store.warmup) {
 			const p = store.warmup(n).catch(() => {});
 			opts.waitUntil?.(p);
@@ -345,13 +386,15 @@ export class ThreadIndex {
 		const tl: RevTimeline = {};
 		// The open's reads go through a prefetching view: a pack's base range, the base pack, or the files started
 		// together. A PackedBlobStore's base range (it starts with idx/current.json) is read before anything else.
+		// A manifest inlined in current.json saves its GET (and the base files start right after current.json).
 		const pre = new PrefetchStore(store);
 		const fromPack = await prefetchIndexPack(pre, opts);
 		const target = await resolveTarget(fromPack ? pre : store, opts.gen, opts.rev, tl);
-		const prefetch = fromPack && pre.has(keys.manifest(target.gen, target.rev)) ? fromPack : await prefetchOpen(store, pre, target.gen, target.rev, opts);
-		const rev = await loadRevState(pre, target.gen, target.rev, tl);
+		const prefetch = fromPack && (target.manifest || pre.has(keys.manifest(target.gen, target.rev))) ? fromPack : await prefetchOpen(store, pre, target.gen, target.rev, opts, target.manifest);
+		const rev = await loadRevState(pre, target.gen, target.rev, tl, target.manifest);
 		const ix = new ThreadIndex(thread, store, rev, opts);
 		ix.openStore = pre;
+		if (warm) ix.startWarm(warm.target, warm.layer, warm.got, opts.warmPack!, t0);
 		const loaded: { stat?: BaseStat } = {};
 		if (hasDense(rev.manifest)) {
 			if (ix.coldWanted(rev)) {
@@ -438,7 +481,7 @@ export class ThreadIndex {
 			const t = await resolveTarget(this.store, this.opts.gen, undefined);
 			this.lastCheck = Date.now();
 			if (t.gen === this.revState.gen && t.rev === this.revState.rev) return false;
-			await this.useRevision(t.gen, t.rev);
+			await this.useRevision(t.gen, t.rev, t.manifest);
 			return true;
 		})();
 		this.refreshing = p;
@@ -446,6 +489,30 @@ export class ThreadIndex {
 			if (this.refreshing === p) this.refreshing = null;
 		}).catch(() => {});
 		return p;
+	}
+
+	/** Seeds the warm-pack target once the warm pack's GET lands (only prefixes of slabs the current revision reads). */
+	private startWarm(target: PrefixSeed & { retain(keep: (key: string) => boolean): void }, layer: WarmPrefixStore | null, got: Promise<{ bytes: Uint8Array; stat: PhaseStat }>, key: string, t0: number): void {
+		(this as { warmLayer: WarmPrefixStore | null }).warmLayer = layer;
+		this.warmTarget = target;
+		const st: WarmPackStats = { key, state: "loading", target: layer ? "layer" : "cache", fetch: null, entries: 0, seeded: 0, skipped: 0, seededBytes: 0, readyMs: null };
+		this.warmStats = st;
+		this.warmReady = got
+			.then(({ bytes, stat }) => {
+				st.fetch = stat;
+				if (this.closed) throw new ThreadError("index closed while the warm pack loaded");
+				const current = revisionSlabKeys(this.revState);
+				const r = seedWarmPack(bytes, target, (k) => current.has(k));
+				Object.assign(st, { entries: r.entries, seeded: r.seeded, skipped: r.skipped, seededBytes: r.seededBytes, state: "ready", readyMs: roundMs(nowMs() - t0) });
+				return st;
+			})
+			.catch((e: unknown) => {
+				st.state = "failed";
+				st.error = e instanceof Error ? e.message : String(e);
+				console.error(`thread-sdk: warm pack ${key} not used: ${st.error}`);
+				return st;
+			});
+		this.opts.waitUntil?.(this.warmReady);
 	}
 
 	/** Starts a background refresh when `refreshInterval` has elapsed (queries never wait for it). */
@@ -460,11 +527,12 @@ export class ThreadIndex {
 	 * Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. Before switching it
 	 * loads what the first query on the new revision would otherwise wait for: the manifest, slabs table and
 	 * tombstones, the base files when they changed (routing table, PQ codebook) and the new delta segments; then it
-	 * warms the rest of the difference (`warm`) in the background.
+	 * warms the rest of the difference (`warm`) in the background. `manifest`: its manifest when already known (an
+	 * inline copy in `idx/current.json`), saving the GET.
 	 */
-	async useRevision(gen: string, rev: number): Promise<void> {
+	async useRevision(gen: string, rev: number, manifest?: Manifest): Promise<void> {
 		const prev = this.revState;
-		const next = await loadRevState(this.store, gen, rev);
+		const next = await loadRevState(this.store, gen, rev, undefined, manifest);
 		const epoch = this.thread.epoch;
 		let pre: BaseSlot | null = null;
 		const haveBase = (this.base && this.base.key === next.baseKey && !this.base.dropped) || (this.basePromise && !this.base && prev.baseKey === next.baseKey);
@@ -479,6 +547,10 @@ export class ThreadIndex {
 			return;
 		}
 		this.revState = next;
+		if (this.warmTarget) {
+			const current = revisionSlabKeys(next);
+			this.warmTarget.retain((k) => current.has(k));
+		}
 		const listed = new Set(next.deltas.map((d) => d.key));
 		for (const k of this.deltaCache.keys()) if (!listed.has(k)) this.deltaCache.delete(k);
 		const segs = new Set(next.segments.map((s) => s.key));
@@ -973,7 +1045,7 @@ async function prefetchIndexPack(pre: PrefetchStore, opts: OpenOptions): Promise
  * soon as the manifest is in (slabs table, tombstone sets, coarse, codebook, routing table or, for cold routing, the
  * tree). The loaders then read `pre`, which serves those objects from memory.
  */
-async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, rev: number, opts: OpenOptions): Promise<OpenStats["prefetch"]> {
+async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, rev: number, opts: OpenOptions, inline?: Manifest): Promise<OpenStats["prefetch"]> {
 	const t0 = nowMs();
 	const trace = newTrace();
 	const done = (source: OpenStats["prefetch"]["source"], key: string | null) => ({ ...phaseStat(nowMs() - t0, trace), source, key });
@@ -981,17 +1053,29 @@ async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, r
 	const cold = opts.coldRouting === "tree";
 	const routing = opts.routing ?? "f32";
 	const mkey = keys.manifest(gen, rev);
+	// A manifest inlined in current.json: nothing waits for the manifest GET (and none is issued).
+	const m0 = inline && inline.gen === gen && (inline.rev ?? 0) === rev ? inline : null;
+	const manifestOf = async (): Promise<Manifest | null> => {
+		if (m0) return m0;
+		const mb = await pre.peek(mkey).catch(() => null);
+		try {
+			return mb ? parseManifest(mb, gen, rev) : null;
+		} catch {
+			return null; // loadRevState reports it
+		}
+	};
 	// A base pack holds the smallest routing table (publish's default): worth its GET for cold routing and for
 	// routing "auto" / "i8"; an f32 / f16 open would download that table for nothing and reads the files instead.
+	// (A pack is looked up by its conventional key whatever `files.base` says: it may have been written after the
+	// manifest.)
+	const packKey = cold ? keys.baseColdPack(gen, rev) : keys.basePack(gen, rev);
 	if (!(opts.store instanceof PackedBlobStore) && (cold || routing === "auto" || routing === "i8")) {
-		const packKey = cold ? keys.baseColdPack(gen, rev) : keys.basePack(gen, rev);
-		pre.prefetch(mkey); // in case there is no pack
+		if (!m0) pre.prefetch(mkey); // in case there is no pack
 		if (!cold) {
 			// Should the pack hold another table than the one asked for (a generation without fine.i8), start that one
 			// as soon as the manifest is in rather than after the pack.
-			pre.peek(mkey)
-				.then((mb) => {
-					const m = mb ? parseManifest(mb, gen, rev) : null;
+			manifestOf()
+				.then((m) => {
 					if (!m || !hasDense(m)) return;
 					const files = manifestFiles(m);
 					const want = chooseRouting(m, files, routing).key;
@@ -1011,17 +1095,9 @@ async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, r
 	}
 	// No pack (or not worth one): every base object as soon as the manifest is in (each read is accounted where its
 	// bytes are used).
-	pre.prefetch(mkey);
-	const mb = await pre.peek(mkey).catch(() => null);
-	if (mb) {
-		let m: Manifest | null = null;
-		try {
-			m = parseManifest(mb, gen, rev);
-		} catch {
-			/* loadRevState reports it */
-		}
-		if (m) for (const k of baseKeysOf(m, gen, rev, cold ? "cold" : "base", routing)) pre.prefetch(k);
-	}
+	if (!m0) pre.prefetch(mkey);
+	const m = await manifestOf();
+	if (m) for (const k of baseKeysOf(m, gen, rev, cold ? "cold" : "base", routing)) if (!(m0 && k === mkey)) pre.prefetch(k);
 	return done("files", null);
 }
 

@@ -130,9 +130,10 @@ class BlobStore:
     coalesce_bytes: int | None = None
     span_bytes: int | None = None
 
-    def contains(self, key: str) -> bool | None:
-        """Whether `key` can be read without an origin request (in a local cache); None when the store cannot tell.
-        Used by the cold-path query policy."""
+    def contains(self, key: str, range: BlobRange | None = None) -> bool | None:
+        """Whether `key` (with `range`: that range of it) can be read without an origin request (in a local cache, a
+        seeded prefix); None when the store cannot tell. Without a range it means the whole object. Used by the
+        cold-path query policy and by `index.warm`."""
         return None
 
     def warmup(self, n: int, executor: ThreadPoolExecutor | None = None) -> list[Future]:
@@ -411,8 +412,8 @@ class PrefixedBlobStore(BlobStore):
         self.coalesce_bytes = inner.coalesce_bytes
         self.span_bytes = inner.span_bytes
 
-    def contains(self, key):
-        return self.inner.contains(self.prefix + key)
+    def contains(self, key, range=None):
+        return self.inner.contains(self.prefix + key, range)
 
     def warmup(self, n, executor=None):
         return self.inner.warmup(n, executor)
@@ -479,16 +480,78 @@ class BlobCache:
 
 class MemoryCache(BlobCache):
     """An LRU of whole objects in process memory (default 256 MB). Objects larger than `max_bytes / 4` are not
-    kept."""
+    kept.
+
+    It also holds seeded PREFIXES (`seed_prefix`, a warm pack's slab scan prefixes): ranges inside one are served from
+    it, the whole object is not (`get` / `contains` miss), so a `CachedBlobStore` still fetches the whole slab in the
+    background on a prefix hit ("range+warm"). Prefixes are not counted in `held` nor evicted by the LRU (the warm
+    pack bounds them); one is dropped once its whole object is cached."""
 
     def __init__(self, max_bytes: int = 256 * 1024 * 1024) -> None:
         self.max_bytes = max_bytes
         self.held = 0
         self._items: OrderedDict[str, bytes] = OrderedDict()
+        self._prefixes: dict[str, bytes] = {}
         self._lock = threading.Lock()
 
     def contains(self, key):
         return key in self._items
+
+    def seed_prefix(self, key: str, data: Bytes) -> None:
+        """Holds the first `len(data)` bytes of `key` only (own bytes: a view into the warm pack would look like a
+        whole object to the query's "is this the whole slab?" check)."""
+        b = bytes(data)
+        with self._lock:
+            if key in self._items:
+                return
+            cur = self._prefixes.get(key)
+            if cur is None or len(cur) < len(b):
+                self._prefixes[key] = b
+
+    def holds(self, key: str, r: BlobRange) -> bool:
+        """Whether range `r` of `key` can be served (whole object or a held prefix)."""
+        b = self._items.get(key)
+        if b is None:
+            b = self._prefixes.get(key)
+        return b is not None and r.offset >= 0 and r.length >= 0 and r.offset + r.length <= len(b)
+
+    def retain_prefixes(self, keep: Callable[[str], bool]) -> None:
+        """Drops the seeded prefixes `keep` rejects (a revision switch)."""
+        with self._lock:
+            for k in [k for k in self._prefixes if not keep(k)]:
+                del self._prefixes[k]
+
+    @property
+    def prefix_stats(self) -> tuple[int, int]:
+        """(seeded prefixes held, their bytes)."""
+        with self._lock:
+            return len(self._prefixes), sum(len(b) for b in self._prefixes.values())
+
+    def _prefix_ranges(self, key: str, ranges: Sequence[BlobRange]) -> list[Bytes] | None:
+        p = self._prefixes.get(key)
+        if p is None or not ranges or not all(r.offset >= 0 and r.length >= 0 and r.offset + r.length <= len(p)
+                                              for r in ranges):
+            return None
+        mv = memoryview(p)
+        return [mv[r.offset : r.offset + r.length] for r in ranges]
+
+    def get_range(self, key, offset, length):
+        b = self.get(key)
+        if b is None:
+            got = self._prefix_ranges(key, [BlobRange(offset, length)])
+            return None if got is None else got[0]
+        if offset + length > len(b):
+            raise ThreadError(f"cached {key} is {len(b)} bytes, need {offset + length}")
+        return memoryview(b)[offset : offset + length]
+
+    def get_ranges(self, key, ranges):
+        b = self.get(key)
+        if b is None:
+            return self._prefix_ranges(key, ranges)
+        for r in ranges:
+            _check_range(key, len(b), r)
+        mv = memoryview(b)
+        return [mv[r.offset : r.offset + r.length] for r in ranges]
 
     def get(self, key):
         with self._lock:
@@ -505,6 +568,7 @@ class MemoryCache(BlobCache):
             if old is not None:
                 self.held -= len(old)
             self._items[key] = data
+            self._prefixes.pop(key, None)
             self.held += len(data)
             while self.held > self.max_bytes and self._items:
                 _, ev = self._items.popitem(last=False)
@@ -550,7 +614,7 @@ class DiskCache(FileBlobStore, BlobCache):
             self._sizes[key] = [size, mtime]
         self.held = sum(int(v[0]) for v in self._sizes.values())
 
-    def contains(self, key):
+    def contains(self, key, range=None):
         return key in self._sizes
 
     def _touch(self, key: str, size: int | None) -> None:
@@ -687,10 +751,35 @@ class CachedBlobStore(BlobStore):
         self._idle = threading.Condition(self._lock)
         self._warm_pool: ThreadPoolExecutor | None = None
 
-    def contains(self, key):
+    def contains(self, key, range=None):
         if not self.cacheable(key):
-            return self.inner.contains(key)
-        return self.cache.contains(key) or bool(self.inner.contains(key))
+            return self.inner.contains(key, range)
+        holds = getattr(self.cache, "holds", None)
+        return (self.cache.contains(key) or (range is not None and holds is not None and holds(key, range))
+                or bool(self.inner.contains(key, range)))
+
+    @property
+    def seeds_prefixes(self) -> bool:
+        """Whether the cache takes seeded prefixes (`MemoryCache`): `open_index(warm_pack=)` then seeds it instead of
+        a prefix layer."""
+        return callable(getattr(self.cache, "seed_prefix", None))
+
+    def seed_prefix(self, key: str, data: Bytes) -> None:
+        if not self.seeds_prefixes:
+            raise ThreadError("this cache does not hold prefixes", 400)
+        self.cache.seed_prefix(key, data)  # type: ignore[attr-defined]
+
+    def retain(self, keep: Callable[[str], bool]) -> None:
+        """Drops seeded prefixes `keep` rejects."""
+        f = getattr(self.cache, "retain_prefixes", None)
+        if f is not None:
+            f(keep)
+
+    def warm_object(self, key: str, trace: BlobTrace | None = None) -> None:
+        """Queues a background whole-object fetch of `key` into the cache (deduplicated, bounded), as the
+        "range+warm" policy does after a range miss. A warm-pack prefix layer in front of this store calls it."""
+        if self.cacheable(key):
+            self._warm(key, trace)
 
     def warmup(self, n, executor=None):
         return self.inner.warmup(n, executor)
@@ -827,6 +916,9 @@ class CachedBlobStore(BlobStore):
         if b is not None:
             if trace is not None:
                 trace.add(hits=1, bytes=len(b), r206=1 if range is not None else 0)
+            # A seeded prefix served a fill read: fetch the whole slab in the background, as a miss would have.
+            if fill and range is not None and self.miss_policy != "range" and not self.cache.contains(key):
+                self._warm(key, trace)
             return b
         if trace is not None:
             trace.add(misses=1)
@@ -846,6 +938,8 @@ class CachedBlobStore(BlobStore):
         if parts is not None:
             if trace is not None:
                 trace.add(hits=1, r206=1, bytes=sum(len(p) for p in parts))
+            if fill and self.miss_policy != "range" and not self.cache.contains(key):
+                self._warm(key, trace)
             return parts
         if trace is not None:
             trace.add(misses=1)

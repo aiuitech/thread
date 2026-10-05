@@ -19,6 +19,7 @@ from .query import Base, QueryContext, QueryResult, RevState, execute_query
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
 from .pack import PackedBlobStore, PrefetchStore, is_pack_header, store_at
 from .revision import base_keys_of, get_required, head_revision, load_rev_state, resolve_target, snapshot_keys
+from .warm import WarmPrefixStore, WarmPackStats, fetch_warm_pack, revision_slab_keys, seed_warm_pack
 from .wire import (
     LEGACY_DEFAULTS,
     BytesLike,
@@ -148,10 +149,12 @@ def _prefetch_index_pack(pre: PrefetchStore, packed: PackedBlobStore | None, wit
 
 
 def _prefetch_open(store: BlobStore, pre: PrefetchStore, gen: str, rev: int, packed: bool,
-                   base_pack: bool, cold: bool, routing: str, io: ThreadPoolExecutor) -> dict[str, Any]:
+                   base_pack: bool, cold: bool, routing: str, io: ThreadPoolExecutor,
+                   inline: dict[str, Any] | None = None) -> dict[str, Any]:
     """Starts the reads of an open before the loaders ask for them: the revision's base pack (one GET, in parallel
     with the manifest in case there is none), a `PackedBlobStore`'s base range, or, without a pack, every base object
-    as soon as the manifest is in. The loaders then read `pre`, which serves those objects from memory. Returns
+    as soon as the manifest is in. The loaders then read `pre`, which serves those objects from memory. `inline`: the
+    manifest when `current.json` carried it (nothing waits for the manifest GET, and none is issued). Returns
     `open_stats["prefetch"]`."""
     t0 = time.perf_counter()
     trace = BlobTrace()
@@ -162,18 +165,31 @@ def _prefetch_open(store: BlobStore, pre: PrefetchStore, gen: str, rev: int, pac
     if not base_pack:
         return done("none", None)
     mkey = keys.manifest(gen, rev)
+    m0 = inline if inline is not None and inline.get("gen") == gen and inline.get("rev", 0) == rev else None
+
+    def manifest_of() -> dict[str, Any] | None:
+        if m0 is not None:
+            return m0
+        try:
+            mb = pre.peek(mkey)
+            return parse_manifest(mb, gen, rev) if mb is not None else None
+        except Exception:  # noqa: BLE001 - load_rev_state reports it
+            return None
+
     # A base pack holds the smallest routing table (publish's default): worth its GET for cold routing and for
     # routing "auto" / "i8"; an f32 / f16 open would download that table for nothing and reads the files instead.
+    # (A pack is looked up by its conventional key whatever `files.base` says: it may have been written after the
+    # manifest.)
+    pack_key = keys.base_cold_pack(gen, rev) if cold else keys.base_pack(gen, rev)
     if not packed and (cold or routing in ("auto", "i8")):
-        pack_key = keys.base_cold_pack(gen, rev) if cold else keys.base_pack(gen, rev)
-        pre.prefetch(mkey, io)  # in case there is no pack
+        if m0 is None:
+            pre.prefetch(mkey, io)  # in case there is no pack
         if not cold:
             # Should the pack hold another table than the one asked for (a generation without fine.i8), start that
             # one as soon as the manifest is in rather than after the pack.
             def other_table() -> None:
                 try:
-                    mb = pre.peek(mkey)
-                    m = parse_manifest(mb, gen, rev) if mb is not None else None
+                    m = manifest_of()
                     if m is None or not has_dense(m):
                         return
                     files = manifest_files(m)
@@ -197,15 +213,13 @@ def _prefetch_open(store: BlobStore, pre: PrefetchStore, gen: str, rev: int, pac
                 log.error("thread_sdk: ignoring the base pack %s: %s", pack_key, e)
     # No pack (or not worth one): every base object as soon as the manifest is in (each read is accounted where its
     # bytes are used).
-    pre.prefetch(mkey, io)
-    try:
-        mb = pre.peek(mkey)
-        m = parse_manifest(mb, gen, rev) if mb is not None else None
-    except Exception:  # noqa: BLE001 - load_rev_state reports it
-        m = None
+    if m0 is None:
+        pre.prefetch(mkey, io)
+    m = manifest_of()
     if m is not None:
         for k in base_keys_of(m, gen, rev, "cold" if cold else "base", "f32" if cold else routing):
-            pre.prefetch(k, io)
+            if not (m0 is not None and k == mkey):
+                pre.prefetch(k, io)
     return done("files", None)
 
 
@@ -296,6 +310,13 @@ class ThreadIndex:
         self._closed = False
         #: Where `open` spent its time and reads: `{total, current, manifest, slabs, base}` (see `open_index`).
         self.open_stats: dict[str, Any] = {}
+        #: The warm-pack layer (`warm_pack=`), None without one.
+        self.warm_layer: WarmPrefixStore | None = None
+        #: Where the warm pack's prefixes went (the cache store or `warm_layer`), None without one.
+        self._warm_target: Any = None
+        self._warm_stats: WarmPackStats | None = None
+        #: Resolves (with `warm_stats`) once the warm pack is seeded or failed; None without one. Never raises.
+        self.warm_ready: Future | None = None
 
     @classmethod
     def open(
@@ -320,12 +341,14 @@ class ThreadIndex:
         cold_routing: str = "off",
         cold_beam: int | None = None,
         base_pack: bool = True,
+        warm_pack: str | None = None,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
             store = store_at(store)
-        pack = store.open_stats if isinstance(store, PackedBlobStore) else None
-        packed = store if isinstance(store, PackedBlobStore) and not prefix else None
+        pack_store = store if isinstance(store, PackedBlobStore) else None
+        pack = pack_store.open_stats if pack_store is not None else None
+        packed = pack_store if not prefix else None
         if prefix:
             store = PrefixedBlobStore(store, prefix)
         if cache is None:
@@ -336,6 +359,28 @@ class ThreadIndex:
             store = CachedBlobStore(store, cache, miss_policy=miss_policy,  # type: ignore[arg-type]
                                     warm_concurrency=warm_concurrency)
         t0 = time.perf_counter()
+        warm: tuple[Any, WarmPrefixStore | None, Future] | None = None
+        if warm_pack:
+            # The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it. Its
+            # prefixes go into the in-process cache when it holds prefixes (`MemoryCache`), else into a prefix layer
+            # in front of the store. It is read around an in-process cache (it is not an index object).
+            source = pack_store.inner if pack_store is not None else \
+                store.inner if isinstance(store, CachedBlobStore) else store
+            got: Future = Future()
+
+            def fetch() -> None:
+                try:
+                    got.set_result(fetch_warm_pack(source, warm_pack, t0))
+                except BaseException as e:  # noqa: BLE001 - reported through warm_stats
+                    got.set_exception(e)
+
+            threading.Thread(target=fetch, name="thread-warm", daemon=True).start()
+            if isinstance(store, CachedBlobStore) and store.seeds_prefixes:
+                warm = (store, None, got)
+            else:
+                layer = WarmPrefixStore(store)
+                warm = (layer, layer, got)
+                store = layer
         timeline: dict[str, Any] = {}
         ix = cls(store, None, gen=gen, pinned=gen is not None and rev is not None,  # type: ignore[arg-type]
                  refresh_interval=refresh_interval, delta_cache_bytes=delta_cache_bytes,
@@ -360,18 +405,23 @@ class ThreadIndex:
                 ".f16") else "f32"
             from_pack = _prefetch_index_pack(pre, packed, cold_routing == "tree" or routing in ("auto", in_range)) \
                 if base_pack else None
-            g, r = resolve_target(pre if from_pack else store, gen, rev, timeline)
-            if from_pack is not None and pre.has(keys.manifest(g, r)):
+            # A manifest inlined in current.json saves its GET (and the base files start right after current.json).
+            inline: dict[str, Any] = {}
+            g, r = resolve_target(pre if from_pack else store, gen, rev, timeline, inline)
+            m0 = inline.get("manifest")
+            if from_pack is not None and (m0 is not None or pre.has(keys.manifest(g, r))):
                 prefetch = from_pack
             else:
                 prefetch = _prefetch_open(store, pre, g, r, packed is not None, base_pack, cold_routing == "tree",
-                                          routing, ix._io)
-            state = load_rev_state(pre, g, r, timeline)
+                                          routing, ix._io, m0)
+            state = load_rev_state(pre, g, r, timeline, m0)
         except BaseException:
             ix.close()
             raise
         ix._rev = state
         ix._open_store = pre
+        if warm is not None:
+            ix._start_warm(warm[0], warm[1], warm[2], warm_pack, t0)  # type: ignore[arg-type]
         loaded: dict[str, Any] = {}
         try:
             if has_dense(state.manifest):
@@ -464,6 +514,44 @@ class ThreadIndex:
         """Compiles a filter expression against the schema into the words `query(filter=...)` takes."""
         return compile_filter(self.attr_schema, filter)
 
+    # ---- warm pack ----
+
+    @property
+    def warm_stats(self) -> dict[str, Any] | None:
+        """How loading the warm pack went (`{key, state: loading|ready|failed, target: cache|layer, fetch, entries,
+        seeded, skipped, seeded_bytes, ready_ms, error?}`), None without one."""
+        return self._warm_stats.as_dict() if self._warm_stats is not None else None
+
+    def _start_warm(self, target: Any, layer: WarmPrefixStore | None, got: Future, key: str, t0: float) -> None:
+        """Seeds the warm-pack target (the cache store or `warm_layer`) once the warm pack's GET lands (only prefixes
+        of slabs the current revision reads)."""
+        self.warm_layer = layer
+        self._warm_target = target
+        st = self._warm_stats = WarmPackStats(key, target="layer" if layer is not None else "cache")
+        ready: Future = Future()
+        self.warm_ready = ready
+
+        def done(f: Future) -> None:
+            try:
+                data, stat = f.result()
+                st.fetch = stat
+                if self._closed:
+                    raise ThreadError("index closed while the warm pack loaded")
+                with self._lock:
+                    current = revision_slab_keys(self._rev)
+                r = seed_warm_pack(data, target, current.__contains__)
+                st.entries, st.seeded, st.skipped, st.seeded_bytes = r["entries"], r["seeded"], r["skipped"], \
+                    r["seeded_bytes"]
+                st.ready_ms = round((time.perf_counter() - t0) * 1000, 3)
+                st.state = "ready"
+            except BaseException as e:  # noqa: BLE001 - a warm pack never fails the index
+                st.state = "failed"
+                st.error = str(e)
+                log.error("thread_sdk: warm pack %s not used: %s", key, e)
+            ready.set_result(st.as_dict())
+
+        got.add_done_callback(done)
+
     # ---- revisions ----
 
     def _check_open(self) -> None:
@@ -478,11 +566,12 @@ class ThreadIndex:
         if self._pinned:
             return False
         with self._refresh_lock:
-            g, r = resolve_target(self.store, self._gen_opt, None)
+            inline: dict[str, Any] = {}
+            g, r = resolve_target(self.store, self._gen_opt, None, None, inline)
             self._last_check = time.monotonic()
             if g == self._rev.gen and r == self._rev.rev:
                 return False
-            self.use_revision(g, r)
+            self.use_revision(g, r, inline.get("manifest"))
             return True
 
     def _maybe_refresh(self) -> None:
@@ -510,13 +599,14 @@ class ThreadIndex:
             with self._lock:
                 self._refreshing = False
 
-    def use_revision(self, gen: str, rev: int) -> None:
+    def use_revision(self, gen: str, rev: int, manifest: dict[str, Any] | None = None) -> None:
         """Switches to (gen, rev); drops delta and lexical segments the new revision no longer lists. Before switching
         it loads what the first query on the new revision would otherwise wait for: the manifest, slabs table and
         tombstones, the base files when they changed (routing table, PQ codebook) and the new delta segments; then it
-        warms the rest of the difference (`warm`) in the background."""
+        warms the rest of the difference (`warm`) in the background. `manifest`: its manifest when already known (an
+        inline copy in `idx/current.json`), saving the GET."""
         prev = self._rev
-        nxt = load_rev_state(self.store, gen, rev)
+        nxt = load_rev_state(self.store, gen, rev, None, manifest)
         if has_dense(nxt.manifest):
             self._acquire_base(nxt, install=False)
         if sum(d.get("bytes", 0) for d in nxt.deltas) <= self._delta_budget:
@@ -525,6 +615,9 @@ class ThreadIndex:
                 f.exception()
         with self._lock:
             self._rev = nxt
+            if self._warm_target is not None:
+                current = revision_slab_keys(nxt)
+                self._warm_target.retain(current.__contains__)
             listed = {d["key"] for d in nxt.deltas}
             for k in [k for k in self._delta_cache if k not in listed]:
                 del self._delta_cache[k]
@@ -1097,6 +1190,7 @@ def open_index(
     cold_routing: str = "off",
     cold_beam: int | None = None,
     base_pack: bool = True,
+    warm_pack: str | None = None,
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -1128,11 +1222,20 @@ def open_index(
     - `base_pack`: (default True) a cold open first GETs the revision's base pack (`idx/{gen}/base.{rev}.threadpack`,
       `base.cold.{rev}` with `cold_routing="tree"`), every object the open reads in one object, in parallel with the
       manifest; from a `PackedBlobStore` it reads the pack's recorded base range. Without a pack, the open starts
-      every read as soon as the manifest is in. False: the reads one after another, as before.
+      every read as soon as the manifest is in. False: the reads one after another, as before;
+    - `warm_pack`: key of a warm pack (`meta.kind: "warm"`, see warm.py): the scan prefixes of the most-probed slabs in
+      one object. `open` starts ONE GET of it on a background thread and does not wait for it; once it is in, its
+      prefixes (those of slabs the open revision reads) are served from memory, so a query probing those cells skips
+      their prefix reads (phase-2 reads of those slabs still go to the store). They go into the in-process cache when
+      it holds prefixes (`MemoryCache`: a prefix hit of a fill read then warms the whole slab in the background under
+      the cache's miss policy, and counts as resident for `cold_policy`), else into a prefix layer in front of the
+      store (`index.warm_layer`). Read from `store` (with `prefix`, around an in-process cache), or from the inner
+      store of a `PackedBlobStore`. `index.warm_ready` (a Future) resolves once it is seeded; `index.warm_stats` says
+      how it went. Measured: no gain on the dbpedia workload (docs/cold-start.md, "Warm packs"); opt-in.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
                             io_workers=io_workers, job_workers=job_workers, miss_policy=miss_policy,
                             warm_concurrency=warm_concurrency, warmup=warmup, cold_policy=cold_policy,
                             prefetch_bytes=prefetch_bytes, routing=routing, cold_routing=cold_routing,
-                            cold_beam=cold_beam, base_pack=base_pack)
+                            cold_beam=cold_beam, base_pack=base_pack, warm_pack=warm_pack)

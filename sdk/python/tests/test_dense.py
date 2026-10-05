@@ -117,7 +117,10 @@ def test_upsert_delete_replace_refresh():
     assert up.current_updated
     assert a.rev == 1
     assert len(a.manifest["deltas"]) == 1 and len(a.manifest["tombstones"]) == 1
-    assert json.loads(b.store.get(keys.current())) == {"gen": "gu", "rev": 1}
+    cur = json.loads(b.store.get(keys.current()))
+    assert {k: cur[k] for k in ("gen", "rev")} == {"gen": "gu", "rev": 1}
+    # the pointer carries a copy of the manifest it names
+    assert cur["manifest"] == json.loads(b.store.get(keys.manifest("gu", 1)))
     q1 = a.query(row(fresh, 0, 16), top_k=3, return_payload=True)
     h0 = q1.hits[0]
     assert (h0.id, h0.source, h0.attrs, h0.payload) == (1000, "delta", 5, b"p-1000")
@@ -259,7 +262,8 @@ def test_file_store_round_trip(tmp_path):
             assert [(h.id, h.score) for h in a.query(q).hits] == [(h.id, h.score) for h in f.query(q).hits]
         up = f.upsert([4242], row(mem.vectors, 11, 16))
         assert (tmp_path / "bucket" / "idx" / "gf" / "delta" / "1.vibd").exists()
-        assert json.loads((tmp_path / "bucket" / "idx" / "current.json").read_text()) == {"gen": "gf", "rev": up.rev}
+        cur = json.loads((tmp_path / "bucket" / "idx" / "current.json").read_text())
+        assert (cur["gen"], cur["rev"]) == ("gf", up.rev) and cur["manifest"]["rev"] == up.rev
         assert {h.id for h in f.query(row(mem.vectors, 11, 16), top_k=2).hits} == {11, 4242}
     assert fs.list("idx/gf/manifest.") == ["idx/gf/manifest.1.json", "idx/gf/manifest.json"]
 

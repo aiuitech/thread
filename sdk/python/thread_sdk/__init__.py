@@ -33,6 +33,7 @@ from .store import (
     MemoryCache,
     PrefixedBlobStore,
 )
+from .warm import WarmPrefixStore, build_warm_pack, parse_warm_pack, seed_warm_pack, write_warm_pack
 from .wire import ResolvedLexConfig, ThreadError, keys
 from .write import (
     MAX_UPSERT,
@@ -89,6 +90,11 @@ __all__ = [
     "pack_to_bytes",
     "copy_objects",
     "store_at",
+    "WarmPrefixStore",
+    "build_warm_pack",
+    "write_warm_pack",
+    "parse_warm_pack",
+    "seed_warm_pack",
     "snapshot_keys",
     "CachedBlobStore",
     "BlobCache",
