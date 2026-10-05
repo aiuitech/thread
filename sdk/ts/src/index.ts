@@ -100,11 +100,14 @@ export interface OpenStats {
 	wasmInit: number;
 	/** `idx/current.json` (or listing the generation's manifests); zero work for a pinned (gen, rev). */
 	current: PhaseStat;
-	/** The manifest revision. */
+	/** The manifest revision (no read when `current.json` carries an inline copy, or a pack / base pack served it). */
 	manifest: PhaseStat;
 	/** The slabs table and the tombstone sets (read concurrently). */
 	slabs: PhaseStat;
-	/** The routing table and PQ codebook (`coarse.f32`, `fine.f32`, `pq.bin`) read and loaded into wasm; null without a dense index. */
+	/**
+	 * The routing table and PQ codebook (`coarse.f32`, the `routing` table, `pq.bin`) read and loaded into wasm; with
+	 * `coldRouting: "tree"` the cold base instead (centroid tree as `files.fine`, codebook). Null without a dense index.
+	 */
 	base: BaseStat | null;
 	/**
 	 * How the open's objects were fetched up front (`basePack`): from the revision's base pack (`"base-pack"`), from
@@ -114,8 +117,9 @@ export interface OpenStats {
 	 */
 	prefetch: PhaseStat & { source: "base-pack" | "index-pack" | "files" | "none"; key: string | null };
 	/**
-	 * When the store is a `PackedBlobStore`: its own open (head, tail and directory reads, `PackedBlobStore.openStats`).
-	 * It happened before `open` (when the pack store was created), so it is not part of `total`.
+	 * When the store is a `PackedBlobStore`: its own open (one suffix read of footer + directory, `getTail`; a HEAD and
+	 * a directory read on stores without it; `PackedBlobStore.openStats`). It happened before `open` (when the pack
+	 * store was created), so it is not part of `total`.
 	 */
 	pack?: PhaseStat;
 }

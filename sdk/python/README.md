@@ -107,7 +107,8 @@ thread (33). `open_index` warms `inflight` of them with HEADs of `idx/current.js
 (`SigningKeyCache`; ~5 us instead of ~9 us per request). `S3BlobStore(..., inflight=32, coalesce_bytes=128 << 10,
 chunk_bytes=8 << 20, chunk_concurrency=4, max_connections=inflight, warmup=0)`: rerank records are read as runs of
 up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whole-object GET larger than
-`chunk_bytes` becomes parallel range GETs (one S3 stream is bandwidth-bound; the routing table is 25 MB on g4).
+`chunk_bytes` becomes parallel range GETs (one S3 stream is bandwidth-bound; the routing table is 25 MB on g4); the
+rest starts as soon as the first response's headers give the size, so the split costs no extra round trip.
 
 ## API
 
@@ -121,7 +122,7 @@ up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whol
 | `prefix` | `""` | key prefix in front of `idx/` (several indexes in one bucket) |
 | `gen`, `rev` | `idx/current.json` | read a specific generation / revision; with both, the index is pinned and never refreshes |
 | `cache` | `MemoryCache()` for remote stores, none for local ones | a `MemoryCache` / `DiskCache`; `True` = default cache, `False` = none |
-| `refresh_interval` | 30.0 s | a query older than this re-reads `current.json` first (0 = only `refresh()`) |
+| `refresh_interval` | 30.0 s | how often a query checks `current.json` for a new revision, in the background (0 = only `refresh()`) |
 | `delta_cache_bytes` | 40 MB | delta segments kept in memory across queries |
 | `lex_transient_bytes` | 8 MB | transient lexical bytes (buckets, posting lists, texts) each segment reader may hold |
 | `io_workers` | 32 | threads for reads, shared by concurrent queries |
@@ -141,7 +142,9 @@ up to 128 KB (half the requests of a cold query for ~45% more bytes), and a whol
 the newest `manifest.*.json` in the store). `ThreadIndex` is a context manager; `close()` releases its threads.
 
 With a base pack (`idx/{gen}/base.{rev}.threadpack`, written by publish) a cold open is two round trips:
-`current.json`, then the pack (the manifest is read alongside, in case there is none); without one, three. With
+`current.json`, then the pack (the manifest is read alongside, in case there is none, unless `current.json` carries
+an inline copy, which the SDK writers and the Worker's publish add when it is at most 16 KB); without one, three
+(two with an inline manifest: the base files start right after `current.json`). With
 `routing="i8"` (or `"auto"`, the table a base pack holds by default) that is `current.json` + one 8.8 MB GET on g4;
 `cold_routing="tree"` reads the 2.5 MB cold base pack and ~1 MB of group means with the first query. The trade-offs
 and measured numbers: [docs/query-path.md](../../docs/query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs).

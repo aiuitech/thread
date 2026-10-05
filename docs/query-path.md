@@ -98,8 +98,11 @@ GET) each record run is one request, so the store's knobs matter: `inflight` (re
 Cache API, 32 against S3 from Node or Python, 6 against S3 inside a Worker), `coalesceBytes` (records of one slab
 merged into runs of up to this many bytes: 128 KB for `S3BlobStore`, 4 KB elsewhere) and `spanBytes` (one range
 from a slab's first to last wanted record when the span is at most this; off by default). `S3BlobStore` also splits
-whole-object GETs above 8 MiB into 4 parallel range GETs (the 25 MB routing table), caches its SigV4 signing key per
-day, and `open` warms its connections. An opt-in `coldPolicy: {nprobe, rerank, threshold}` lowers nprobe/rerank for
+whole-object GETs above 8 MiB into parallel 8 MiB range GETs (4 at a time beside the first; they start as soon as the
+first response's headers give the size, so the 25 MB routing table costs one round), caches its SigV4 signing key
+per day, and `open` warms its connections. A warm pack's slab prefixes (`open({warmPack})`, opt-in) are seeded into
+the `MemoryCache` itself: a range inside a seeded prefix is a hit, counts as resident for the cold-path policy, and a
+fill read of it queues the whole slab on the same `range+warm` queue. An opt-in `coldPolicy: {nprobe, rerank, threshold}` lowers nprobe/rerank for
 a query whose probed slabs are mostly not cached. When `refresh()` (or the periodic `current.json` check, which now
 runs in the background) sees a new revision, it loads the new manifest, slabs table, tombstones, base files (if they
 changed) and delta segments before switching, then warms the rest of `snapshotKeys(new) - snapshotKeys(old)` into the
@@ -177,9 +180,12 @@ independent levers cut what a cold open must read, all opt-in on the reader and 
 3. **Base packs** (`basePack`, default on): `idx/{gen}/base.{rev}.threadpack` is a pack of everything a cold open
    reads (manifest, slabs table, tombstone sets, coarse, codebook, tree, `fine.i8`; 8.8 MB on g4), found by its
    conventional key from `current.json`'s (gen, rev): the open is `current.json` + one GET (the manifest is read
-   alongside in case there is no pack). `base.cold.{rev}.threadpack` (2.5 MB) leaves the routing table out, for cold
-   routing. An open with `routing` f32 / f16 does not fetch a pack (it would download `fine.i8` for nothing); every
-   open without a pack requests all base objects as soon as the manifest is in (3 round trips instead of 4). An index
+   alongside in case there is no pack, unless `current.json` carries an inline copy: the SDK writers and the
+   Worker's publish add one when the manifest is at most 16 KB, and an open then issues no manifest GET at all).
+   `base.cold.{rev}.threadpack` (2.5 MB) leaves the routing table out, for cold routing. An open with `routing` f32 /
+   f16 (f32 is the default) does not fetch a pack (it would download `fine.i8` for nothing); every open without a
+   pack requests all base objects as soon as the manifest is in (3 round trips instead of 4; 2 with an inline
+   manifest, the default open of the merged SDKs). An index
    pack (`packIndex`) now stores these base objects first and records their range, so an open on a `PackedBlobStore`
    reads it with one range read, after a single suffix-range read for the footer and directory (`getTail`).
 
@@ -225,7 +231,8 @@ row precision, decides cold routing's agreement: beam 8 misses ~3 of 34 cells, b
 
 ### Bytes and time before the first query (g4 rev 180, fake S3 proxy)
 
-`bench/cold/run_base.sh` (TypeScript SDK, Node, no cache; `cold_bench.mjs` process-cold scenario: spawn, wasm, open,
+`bench/cold/run_base.sh` (measured on the `cold/base` branch, before the store-level defaults: TypeScript SDK, Node,
+no cache, inflight 12, whole GETs unsplit; `cold_bench.mjs` process-cold scenario: spawn, wasm, open,
 one query; n = 10, queries 0..19, medians). The objects of `make_routing.mjs` / `make_base_pack.mjs` are served from
 a local overlay over the proxy's R2 cache; nothing was written to R2. Modes: `-seq` = `basePack: false` (the open's
 reads one after another, as before this change); without the suffix the default `basePack: true` (a base pack for i8

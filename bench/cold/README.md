@@ -13,7 +13,8 @@ Results, method and analysis: [docs/cold-start.md](../../docs/cold-start.md).
 | `cold_bench.mjs` / `cold_bench.py` | the bench, TypeScript / Python SDK: same CLI, same JSONL (`thread-cold/1`), same table |
 | `summarize.mjs` | summary of saved runs; with several files, medians side by side (before/after) |
 | `slab_bytes.mjs` | per-slab byte accounting: scan prefix vs rerank tier vs whole slab |
-| `run_baseline.sh` | the whole baseline: warm-up, pack, 3 network profiles x {proxy, pack} x {ts, py}, then r2s3 (`TAG`, `N`, `PROFILES`, `SDKS`, `WARM`, `R2S3`) |
+| `run_baseline.sh` | the whole baseline: warm-up, pack, 3 network profiles x {proxy, pack} x {ts, py}, then r2s3 (`TAG`, `N`, `PROFILES`, `SDKS`, `WARM`, `R2S3`; `OVERLAY`, `PACK_KEY`, `ARGS`, `R2S3_ARGS` for another overlay / pack / mode, e.g. the final runs on `data/cold/final-overlay`) |
+| `final_table.mjs` | the summary table of docs/cold-start.md: baseline -> final defaults -> i8 + base pack -> cold tree beam 16, per SDK, profile and store |
 | `run_store.sh` | the store-option matrix (miss policy, inflight, coalescing, span, chunking, warm-up, cold policy, disk cache) for both SDKs on the proxy profiles and R2; `--legacy` and the other `cold_bench` flags it uses |
 | `store_table.mjs` | markdown tables of the matrix, with the baseline row; `--tag TAG` compares a `run_baseline.sh` run with the baseline |
 | `refresh_bench.mjs` / `refresh_bench.py` | what a revision switch costs the query that notices it (blocking refresh vs the background prefetch), via a proxy `--overlay` holding a second revision |

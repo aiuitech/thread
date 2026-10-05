@@ -19,8 +19,8 @@ __all__ = ["ColdRouting", "new_cold_stat"]
 
 
 def new_cold_stat(beam: int) -> dict[str, int]:
-    """What a cold query had to read (`stats["cold_routing"]`): the beam, the groups and delta cells whose means it read, the
-    requests and bytes of those reads, and the groups / cells loaded so far."""
+    """What a cold query had to read (`stats["cold_routing"]`): the beam, the groups and delta cells whose means it
+    read, the requests and bytes of those reads, and the groups / cells loaded so far."""
     return {"beam": beam, "groups": 0, "cells": 0, "reads": 0, "bytes": 0, "loaded_groups": 0, "loaded_cells": 0}
 
 

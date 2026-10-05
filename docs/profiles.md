@@ -59,7 +59,8 @@ on g4; `base.cold.{rev}.threadpack` without the routing table, 2.5 MB). The mani
 | `basePack: {routing, cold}` | `{}` (the smallest table, and the cold pack when there is a grouped table) | `base.{rev}.threadpack`, `base.cold.{rev}.threadpack` after the commit; `false` = none |
 
 To add them to a generation that has none: `POST /build/publish-rev {"gen": "g4", "routing": {}}` (the base packs
-come with it). Readers choose with `open({routing, coldRouting, basePack})`; what each mode costs and saves, measured
+come with it). Readers choose with `open({routing, coldRouting, basePack})` (defaults: `routing: "f32"`, cold routing
+off, `basePack` on, which fetches a base pack only for `"i8"` / `"auto"` / cold opens); what each mode costs and saves, measured
 on g4: [query-path.md](query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs). The query defaults are
 not involved: these objects only change how fast a cold reader gets its routing table.
 

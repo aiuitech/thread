@@ -358,8 +358,8 @@ interface BlobStore {
   one SHA-256 and one HMAC (26 us in Node instead of 130 us). `inflight` defaults to 32 (Node: no connection cap)
   or 6 inside a Worker; `coalesceBytes` to 128 KB (rerank records read as runs of up to 128 KB: half the requests
   of a cold query for ~45% more bytes). A whole-object GET of an object larger than `chunkBytes` (8 MiB) is split
-  into parallel range GETs (`chunkConcurrency` 4), since one S3 stream is bandwidth-bound and the routing table is
-  25 MB on g4. `store.warmup(n)` opens `n` connections with one-byte GETs of `idx/current.json` (not HEADs: Node's `fetch` closes a connection after a HEAD answer with a Content-Length); `new S3BlobStore({ ..., warmup: 32 })` starts that at construction, so creating the store before `Thread.init` overlaps the handshakes (and Node's lazy `fetch` globals) with the wasm compile.
+  into parallel range GETs (`chunkConcurrency` 4 beside the first, started as soon as the first response's headers
+  give the size), since one S3 stream is bandwidth-bound and the routing table is 25 MB on g4. `store.warmup(n)` opens `n` connections with one-byte GETs of `idx/current.json` (not HEADs: Node's `fetch` closes a connection after a HEAD answer with a Content-Length); `new S3BlobStore({ ..., warmup: 32 })` starts that at construction, so creating the store before `Thread.init` overlaps the handshakes (and Node's lazy `fetch` globals) with the wasm compile.
 - `CachedBlobStore(inner, cache, { origin, waitUntil, cacheable, missPolicy, warmConcurrency, warmQueue })`: a cache
   in front of any store, either the Workers Cache API or an in-process `BlobCache`. Objects under `idx/` are
   immutable, so they are cached whole (Cache API: for a year under `${origin}${key}`; `current.json` is never
@@ -404,7 +404,10 @@ What each runtime gets by default:
 | Node, `S3BlobStore` | `MemoryCache` 256 MB | `"range+warm"` | 32 | `inflight` connections |
 | Node, `FileBlobStore` / pack file | none | - | 12 | - |
 
-Before this, Node put no cache in front of S3 (`caches` does not exist there), so every query was cold.
+Before this, Node put no cache in front of S3 (`caches` does not exist there), so every query was cold. Everywhere,
+`open` loads the f32 routing table by default (`routing: "i8"` is the opt-in that cuts it 4x and fetches the base
+pack), starts every base read as soon as the manifest is known, and skips the manifest GET when `current.json`
+carries an inline copy. Measured end to end: [docs/cold-start.md](../../docs/cold-start.md#summary).
 
 **Disk cache.** `new DiskCache(dir)` keeps whole objects as files in the bucket layout (`{dir}/idx/g4/slab/00123`),
 the same layout Python's `DiskCache` uses (the two SDKs can share a directory), evicting least recently used

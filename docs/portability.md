@@ -150,7 +150,10 @@ index: `idx/{gen}/base.{rev}.threadpack` holds the manifest, slabs table, tombst
 the centroid tree and one routing table (default the smallest, `fine.i8`); `idx/{gen}/base.cold.{rev}.threadpack`
 leaves the routing table out, for `coldRouting: "tree"`. Directory metadata `{gen, rev, kind: "base" | "base-cold",
 routing}`. The SDKs know its key from `idx/current.json`, so a cold open is two round trips: `current.json`, then
-one whole GET of the pack (with the manifest read alongside in case there is none). Its objects are byte-identical
+one whole GET of the pack (with the manifest read alongside in case there is none, unless `current.json` carries an
+inline copy of it, which every writer now adds when the manifest is at most 16 KB). The SDKs fetch one for
+`routing: "i8"` / `"auto"` and `coldRouting: "tree"` opens; the default `routing: "f32"` reads the separate files
+(all requested together once the manifest is known). Its objects are byte-identical
 copies of the separate files and keyed by them, so loading from a pack gives the same state as loading the files.
 `buildBasePack` / `build_base_pack` write the same bytes in both SDKs (the interop test checks). Details and
 numbers: [query-path.md](query-path.md#cold-opens-compact-routing-cold-tree-routing-base-packs).

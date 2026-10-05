@@ -3,8 +3,117 @@
 What the first query costs when nothing is warm: a new process, a new index handle, empty caches, against a plain
 S3 endpoint (R2's S3 API here, AWS S3 in spirit), for both SDKs. This page describes the measurement harness in
 `bench/cold/`, the SDK timeline it reads, the baseline it recorded (g4 rev 179, 2026-10-04) and where the time
-goes. Later optimizations re-run the same harness on the same query set and network profiles and compare medians
-(`bench/cold/summarize.mjs`).
+goes, then three rounds of work measured on the same harness, query set and network profiles (store-level options,
+the routing base and base packs, the open chain and hot sets) and options outside the SDK. The Summary below gives
+the end result of all of them merged, and a verdict per idea.
+
+## Summary
+
+**Method.** The merged code (branch `cold-start`) against the baseline, with the harness below: queries 0..19,
+n = 10 trials per scenario, medians, the fake S3 proxy at three network profiles (`rtt25`: 25 ms, 200 Mbps per
+response; `rtt60`: 60 ms, 100 Mbps; `rtt25link500`: `rtt25` with every response sharing one 500 Mbps link), per-object
+store and pack, both SDKs, plus real R2. The merged runs serve rev 180 (rev 179 plus the routing tables, grouped
+tables and base packs that publish now writes; same slabs, same answers) from `data/cold/final-overlay`, whose
+`idx/current.json` carries the inline manifest every writer now writes, and the base-first pack
+`packs/g4-base.threadpack`. Real R2 holds only rev 179 and was only read (`--store r2s3`: GET / HEAD / List), so it
+measures the new defaults without the new objects or the inline manifest. Commands:
+`TAG=final WARM=0 R2S3=1 OVERLAY=data/cold/final-overlay PACK_KEY=packs/g4-base.threadpack bench/cold/run_baseline.sh`,
+the same with `TAG=final-i8 R2S3=0 ARGS="--routing i8"` and `TAG=final-cold16 R2S3=0 ARGS="--routing i8 --cold-routing
+tree --cold-beam 16"`; tables from `node bench/cold/final_table.mjs` (all profiles and stores in
+[Final runs](#final-runs-all-profiles-and-stores) at the end). Every proxy row read 0 objects upstream (one cold-tree
+run that touched slabs outside the warmed set was repeated with the cache warm).
+
+**Process-cold e2e** (spawn, import, open, first query; per-object store; ms):
+
+| SDK | profile | baseline | merged defaults | + `routing: "i8"` (base pack) | + `coldRouting: "tree"`, beam 16 |
+|---|---|---:|---:|---:|---:|
+| TS (Node) | rtt25 | 1925 | 752 (-61%) | 743 | 527 |
+| TS | rtt60 | 3786 | 1417 (-63%) | 1318 | 951 |
+| TS | rtt25link500 | 1955 | 913 (-53%) | 814 | 606 |
+| TS | real R2 | 2319 | 1084 (-53%) | - | - |
+| Python | rtt25 | 1813 | 798 (-56%) | 714 | 513 |
+| Python | rtt60 | 3605 | 1495 (-59%) | 1390 | 983 |
+| Python | rtt25link500 | 2215 | 927 (-58%) | 796 | 609 |
+| Python | real R2 | 1609 | 1147 (-29%) | - | - |
+
+**Per query and per process** (rtt25, per-object store, baseline -> merged defaults; R2 in brackets):
+
+| | TS | Python |
+|---|---|---|
+| open ms | 1292 -> 545 (897 -> 683) | 1255 -> 573 (779 -> 678) |
+| process-cold query ms | 576 -> 134 (1305 -> 416) | 476 -> 151 (678 -> 436) |
+| slab-cold query ms | 564 -> 140 (1293 -> 363) | 307 -> 150 (599 -> 446) |
+| warm query ms (the same query right away) | 536 -> 142 (1175 -> 369) | 13 -> 151 (12 -> 453) |
+| requests per cold process (open + query) | 181 -> 96 | 40 -> 96 |
+| MB per cold process (open + query) | 32.1 -> 34.3 | 76.5 -> 34.3 |
+| recall@10 (the 20 cold queries) | 91.5% -> 91.5% | 91.5% -> 91.5% |
+
+With `routing: "i8"` a cold process reads 16.9 MB instead of 34.3 MB; with cold tree routing 11.7 MB, at 91.0%
+recall@10 on these 20 queries (one neighbour lost; -0.18 points over 2000 queries, below). Where the merged default
+open goes now (TS, rtt25): `current.json` 111 ms (first request: TCP + TLS + Node's `fetch` setup, beside the 32
+warm-up handshakes), slabs table 31 ms, routing table 400 ms (25.2 MB as three parallel 8 MiB ranges), manifest 0
+(inline); the query is 95 ms of phase 1 (34 prefixes) and 39 ms of phase 2 (~22 record runs). The routing table is
+still 73% of the open and the largest single cost: `routing: "i8"` and cold routing are the levers left.
+
+**Verdicts, idea by idea.**
+
+- **In-process cache for Node, `range+warm` misses** (default). Node had no cache at all, so every query was cold;
+  Python's cache read whole slabs (8x the bytes). Now both put a 256 MB `MemoryCache` in front of a remote store and
+  read only the prefix and records on a miss, warming the whole slab in the background. Gain: TS repeat queries are
+  cached (14 ms once the warms land), Python cold queries move 9 MB instead of 48 MB (slab-cold 829 -> 244 ms on the
+  shared link). Trade-off: in Python a query repeated right after a cold one takes ~150 ms instead of 13 ms until the
+  background warms land (~1-2 s); `missPolicy: "whole"` restores the old trade where bandwidth is plentiful.
+- **`inflight` 32 and `coalesceBytes` 128 KB on `S3BlobStore`** (default). The largest query win: TS phase 2 was
+  ~140 single-record GETs at 12 in flight; slab-cold 564 -> 140 ms at rtt25, 1293 -> 363 ms against R2, requests
+  177 -> 95 per query, for 9 MB instead of 6.2 MB. 512 KB runs and `spanBytes` were measured and are not better.
+- **Connection warm-up during `open`** (default outside Workers): -44 ms TS / -37 ms Python of process-cold query at
+  rtt25; the price is ~15 ms on `open.current`, which shares the start with 32 handshakes.
+- **Chunked whole-object GETs** (`chunkBytes` 8 MiB, default), finished in the merge: the rest of the object now
+  starts at the first response's headers instead of after its body. The f32 routing table loads in 400 ms instead of
+  1133 ms (baseline) and 757 ms (two-round chunking) at rtt25, and an 8.8 MB base pack is no slower than one GET
+  (513 vs 524 ms open, TS; before: 563 ms).
+- **SigV4 signing-key cache** (default): 135 -> 24 us per request in Node; not visible in latency.
+- **`DiskCache`** (opt-in): a restarted process over a filled disk cache answers process-cold in 472 ms e2e (TS) /
+  396 ms (Python) at rtt25, 0 requests in the query, instead of a cold start; it costs disk, and both SDKs can share
+  one directory.
+- **Cold-path policy** (`coldPolicy`, opt-in, off): `{nprobe 20, rerank 100}` on cold queries saves 10-25% of a cold
+  query for 5 points of recall@10 (91.5 -> 86.5%). Rejected as a default for that recall cost.
+- **Prefetch on refresh, background `current.json` check** (default): the query that notices a new revision answers
+  in 19 ms instead of 117 ms (TS) while the switch completes in the background; the new revision's delta segments and
+  base are loaded before the switch.
+- **Exact `Limiter`** (bug fix): the TS limiter oversubscribed (24 reads in flight under a limit of 12 on the pack
+  path); fixed, so pack and per-object paths measure alike.
+- **Compact routing tables** (`routing: "i8"` / `"f16"`, opt-in; the default stays `"f32"`). `fine.i8` is 6.3 MB
+  instead of 25.2 MB, with 99.82% probe overlap and the same recall@10 over 2000 queries (95.11%, same top 10 for
+  99.6% of queries). Merged gain in process e2e: -1% / -7% / -11% (TS) and -11% / -7% / -14% (Python) at rtt25 /
+  rtt60 / shared link per object, -14% to -23% through a pack, and half the bytes per cold process. It stays opt-in because the merged chunked GET already took
+  most of its time win on a per-response-bandwidth network (f32 open 545 ms vs i8 511 ms at rtt25), it needs tables
+  written by publish (older revisions fall back to f32), and it changes the probe set of ~6% of queries; turn it on
+  where cold opens are frequent and bandwidth is shared or slow.
+- **Cold tree routing** (`coldRouting: "tree"`, opt-in): the open waits only for the tree and the codebook (2.5 MB
+  cold base pack), the first queries rank the cells of the tree's best 16 groups. The fastest cold process measured:
+  527 ms TS / 513 ms Python e2e at rtt25 (-30% / -36% vs the merged defaults), 951 / 983 ms at rtt60. Trade-off: the
+  first queries pay a round trip for their group rows (+40 to +125 ms per query until the full table is in, after
+  the first one or two) and route a little worse (-0.5 points on these 20 queries, -0.18 over 2000; beam 32
+  costs none). Through a pack it gains nothing over i8 (the pack's base range is one read either way).
+- **Base packs and the "files" prefetch** (default on; a pack is fetched for `routing: "i8"` / `"auto"` and cold
+  opens): `current.json` + one GET for the whole open, or, for an f32 open, every base object requested as soon as the
+  manifest is known. Saves round trips, not bytes; with the inline manifest an f32 open is two serial steps.
+- **Index packs open with one suffix read and one base range** (default): a `PackedBlobStore` open went from HEAD +
+  tail + directory (218 ms TS at rtt25) to one `getTail` (110 ms), and the base objects are one range.
+- **Inline manifest in `current.json`** (default, every writer including the Worker's publish): -1 round trip per
+  open and per revision switch (~30 / ~65 / ~87 ms at rtt25 / rtt60 / R2), ~1 KB more per 30 s `current.json` poll.
+- **Warm packs** (`warmPack`, opt-in, rejected for this workload): the hot set of dbpedia queries is mild (top 512
+  cells: 33% of probes), a 35-122 MB pack arrives 1.5-5 s after the open, so it never helps the first query, and
+  later it removes 2-10 of 34 prefix reads (0-22 ms of a 500 ms query, TS). It would pay with a much more skewed query
+  log or a small pack. Since the merge the prefixes live in the `MemoryCache` itself.
+- **Tree-ordered packs + `coalesceAcrossSlabs`** (opt-in option, rejected): ordering a pack by centroid-tree group
+  puts a query's slabs next to each other, but not their prefixes (each slab's rerank tier lies between), so merging
+  reads trades a round trip for ~1 MB; measured no faster at any gap (4 MiB: 868 ms phase 1 vs 134).
+- **Outside the SDK** (documented, not tested against a live account): a CDN in front of the bucket, S3 Express
+  One Zone (modelled with the proxy at 5 ms first byte: TS cold start ~2.0 -> ~0.54 s with in-AZ bandwidth) and
+  routing offloaded to a warm Durable Object / service; see [Options outside the SDK](#options-outside-the-sdk).
+
 
 ## What is measured
 
@@ -23,7 +132,8 @@ The fixed set warmed into the proxy and packed is queries **0..29** (30 x 34 pro
 none of the 30 has a near-duplicate twin inside the set (`data/prep/query-twins.json`), so no trial pre-warms
 another's slabs beyond ordinary cell overlap. Parameters are the manifest defaults: nprobe 34, rerank 150, top 10.
 
-Defaults matter here, because the two SDKs differ in what sits in front of the store:
+Defaults matter here, because at the baseline the two SDKs differed in what sat in front of the store (both now put
+a 256 MB `MemoryCache` with `range+warm` misses in front of a remote store: see the Summary):
 
 - **TypeScript in Node: no cache at all.** `thread.open` puts a `CachedBlobStore` in front of the store only when
   the Workers Cache API exists (`caches.default`); Node has none, and the SDK has no in-memory equivalent of Python's
@@ -58,19 +168,45 @@ What a "request" is in the tables:
 
 ### SDK timeline
 
-Both SDKs now expose where a cold start goes, with the same field names (TS camelCase where both differ already:
-`openStats` vs `open_stats`). A phase stat is `{ms, reads, hits, misses, r206, r200, bytes}`.
+Both SDKs expose where a cold start goes, with the same fields (TS camelCase, Python snake_case: `openStats` /
+`open_stats`, `routingTable` / `routing_table`, ...). A phase stat is `{ms, reads, hits, misses, r206, r200, bytes}`
+plus `warms` (background whole-object fetches queued, `range+warm`): `reads` are requests that reached the store,
+`hits` / `misses` cache lookups, `bytes` what was delivered (cache hits included).
 
-- `index.openStats` / `index.open_stats`: `total`, `current` (current.json), `manifest`, `slabs` (slabs table and
-  tombstone sets), `base` (`coarse.f32`, `fine.f32`, `pq.bin` read and loaded; plus `fetch` / `build` ms and
-  per-file bytes), `pack` (a `PackedBlobStore`'s own HEAD + tail + directory reads; it happens when the pack store is
-  created, so it is not in `total`), and in TS `wasmInit` (`thread.initMs`).
-- `stats.timeline` per query: `route`, `phase1`, `phase2`, `payload` (trace snapshots at the phase boundaries: a
-  speculative rerank read issued in phase 1 that lands in phase 2 counts in phase 2), and `base` when that query
-  reloaded the routing table.
+**`index.openStats` / `index.open_stats`** (the open, one object per index):
 
-The instrumentation lives in `revision.ts` / `revision.py` (`resolveTarget` / `loadRevState` take an optional
-timeline), `loadBase` and `PackedBlobStore`.
+| field | what |
+|---|---|
+| `total` | wall time of `open` (ms) |
+| `wasmInit` | TS only: `Thread.init` (`thread.initMs`), not part of `total` |
+| `current` | `idx/current.json` (or listing a generation's manifests) |
+| `prefetch` | how the open's objects were fetched up front, plus `source` (`"base-pack"`, `"index-pack"`, `"files"`, `"none"`) and `key` (the pack tried): the work of a pack read counts here; objects whose reads merely started early count in the step that uses them |
+| `manifest` | the manifest; 0 reads when `current.json` carried an inline copy or a pack served it |
+| `slabs` | slabs table and tombstone sets |
+| `base` | the routing table (`routing`) and PQ codebook read and built, plus `fetch` / `build` ms and `files: {coarse, fine, pq}` bytes; with `coldRouting: "tree"` the cold base (`files.fine` = the centroid tree) |
+| `pack` | for a `PackedBlobStore`: its own open (one suffix read, `getTail`); it happened when the pack store was created, so it is not in `total` |
+
+**`index.warmStats` / `index.warm_stats`** (only with a warm pack): `{key, state: loading | ready | failed, target: cache |
+layer, fetch, entries, seeded, skipped, seededBytes, readyMs, error?}`. `CachedBlobStore.warmStats` (TS) /
+`warm_stats` (Python) count the cache's background warms: `{queued, fetched, bytes, failed, dropped}`.
+
+**`stats` of a query** (the fields cold-start work added or uses):
+
+| field | what |
+|---|---|
+| `timeline` | `route`, `phase1`, `phase2`, `payload`: phase stats from trace snapshots at the phase boundaries (a speculative read issued in phase 1 that lands in phase 2 counts in phase 2); `base` when this query (re)loaded the routing table |
+| `io` | the query's whole trace (a phase stat without `ms`, with `warms`) |
+| `routing`, `routingTable` | `"flat"`, `"tree"` or `"cold"` (ranked over the tree's best groups while the full table loads); the table the cells were ranked with (`"f32"`, `"f16"`, `"i8"`) |
+| `coldRouting` | cold routing only: `{beam, groups, cells, reads, bytes, loadedGroups, loadedCells}` (the group / delta-cell means this query read) |
+| `cold` | with a cold-path policy only: `{misses, probed, applied}` (probed slabs not resident, of the first `nprobe`) |
+| `wholeSlabs`, `inflight`, `coalesceBytes`, `spanBytes` | slabs whose whole object was in memory (records local); the I/O knobs in effect |
+| `coalesced` | TS, `coalesceAcrossSlabs` only: `{reads, slabs, bytes}` of merged prefix reads |
+| `cells`, `filterDropped`, `candidates` | cells scanned (beyond `nprobe` when a filter widened), entries the attribute filter dropped, distinct scan-tier candidates |
+
+`cold` (the policy) and `coldRouting` (the routing) were both called `cold` on their branches; the merge kept `cold`
+for the policy (it existed first in the store-level work and is what `--cold-nprobe` runs read) and renamed the
+routing stat. The instrumentation lives in `revision.ts` / `revision.py` (`resolveTarget` / `loadRevState` take an
+optional timeline), the open (`prefetchOpen`, `loadBase`, `loadColdBase`), `PackedBlobStore` and the query.
 
 ## Commands
 
@@ -508,9 +644,9 @@ concurrency.
 **What did not change.** The open is still dominated by the routing table (25 MB, now ~800 ms at `rtt25` instead of
 ~1.1 s) and its serial chain (current -> manifest -> slabs); `warmup` connections start with the open, so
 `open.current` pays ~20 ms more while 32 handshakes run beside it (starting them after `current.json` would avoid
-that; not done). A per-object whole GET learns the object's size from its first 8 MiB range and fetches the rest
-after it (two rounds); a pack range or a size hint from the manifest (`fine.f32` is `k1 * k2 * dim * 4` bytes) would
-allow one round, as the pack's 422 ms `open.base` shows (not done). `range+warm` makes the query right after a cold query slower than Python's old whole-slab default
+that; not done). A per-object whole GET learned the object's size from its first 8 MiB range and fetched the rest
+after it (two rounds); since the merge the rest starts as soon as that first response's headers give the size, while
+its body streams (one round in the critical path: TS `open.base` 757 -> 404 ms for f32 at `rtt25`, see the Summary). `range+warm` makes the query right after a cold query slower than Python's old whole-slab default
 (137 vs 13 ms) for the ~1-2 s the background warms take; `missPolicy: "whole"` brings it back where bandwidth is
 plentiful.
 
@@ -862,6 +998,15 @@ counter per cell in a Durable Object or Analytics Engine), and `publish` / `publ
 names, and could record its key in the manifest so `open` finds it without an option. The Worker's publish is not
 changed here.
 
+**After the merge with the store-level work.** The prefixes no longer need a layer of their own in front of the
+default cache: `MemoryCache` takes them (`seedPrefix` / `seed_prefix`, kept prefix-only: `get` / `has` still mean the
+whole object, and a prefix is dropped once its whole object is cached), a range inside one is a cache hit, counts as
+resident for the cold-path policy (`contains(key, range)`), and a fill read of it queues the whole slab on the
+cache's own `range+warm` queue (`warmObject` / `warm_object`) instead of the layer's former pool. `WarmPrefixStore`
+remains for caches that cannot hold prefixes (the Workers Cache API, `DiskCache`, `cache: false`), and delegates its
+background fill to that same queue. `index.warmStats.target` says which one took the prefixes. The measurements
+above were taken before the merge; the verdict does not depend on where the prefixes live.
+
 ### Pack order by centroid-tree group, and cross-slab coalescing
 
 **Adjacency in the baseline pack** (`bench/cold/pack_adjacency.mjs`, queries 0..29, routing only): the pack lists
@@ -915,7 +1060,8 @@ implemented; worth revisiting only for a 6-connection client.
 `current.json` as `{"gen", "rev", "manifest": {...}}` when the manifest serializes to at most 16 KB
 (`currentBody` / `current_body`, the same bytes in both SDKs; g4 rev 179's pointer grows from 22 B to 1,058 B).
 Readers use a copy that checks out for (gen, rev), at open and on refresh, and otherwise fetch the manifest as before;
-older readers ignore the field. The Worker's publish is unchanged, so pointers it writes carry no copy.
+older readers ignore the field. Since the merge the Worker's publish, publish-rev and commits write the same
+pointer (`currentBody`), so every writer inlines the manifest.
 
 Measured with the copy in an overlay `idx/current.json` (`data/cold/open-overlay-inline`), process-cold:
 
@@ -1013,3 +1159,133 @@ process holding it (a Durable Object, or a Worker reached through a service bind
 - **Cost:** DO requests ($0.15 per million) plus duration while active; a service binding call is billed as a request
   to the routing Worker. Pair it with `cold/base`'s smaller tables (f16/int8) and tree-grouped cold routing, which
   shrink B instead of moving it.
+
+## Final runs, all profiles and stores
+
+`node bench/cold/final_table.mjs` over the runs of the Summary (n = 10, medians; `req / MB` are the SDK's own
+counters: requests that reached the store and bytes delivered, open + query for process-cold). Packs: the baseline
+read `packs/g4-cold.threadpack` (rev 179, key order); the merged runs `packs/g4-base.threadpack` (rev 180, base
+objects first; its own `idx/current.json` carries no inline manifest, so the pack's base range serves the manifest).
+Real R2 has only the defaults row (the new objects exist only in the overlay).
+
+### TypeScript (Node), rtt25, per-object store
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 1925 | 1292 | 576 | 564 | 536 | 181 / 32.1 | 177 / 6.2 | 91.5% |
+| final defaults | 752 | 545 | 134 | 140 | 142 | 96 / 34.3 | 95 / 9.0 | 91.5% |
+| i8 + base pack | 743 | 511 | 146 | 155 | 144 | 91 / 16.9 | 94 / 9.3 | 91.5% |
+| cold tree, beam 16 | 527 | 252 | 196 | 191 | 134 | 103 / 11.7 | 99 / 9.9 | 91.0% |
+
+### TypeScript (Node), rtt25, pack
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 2012 | 1447 | 508 | 482 | 471 | 184 / 32.3 | 178 / 6.2 | 91.5% |
+| final defaults | 950 | 729 | 141 | 133 | 139 | 96 / 35.4 | 94 / 9.5 | 91.5% |
+| i8 + base pack | 811 | 583 | 154 | 142 | 160 | 90 / 17.4 | 89 / 9.0 | 91.5% |
+| cold tree, beam 16 | 854 | 570 | 205 | 133 | 136 | 104 / 18.5 | 93 / 9.0 | 91.0% |
+
+### TypeScript (Node), rtt60, per-object store
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 3786 | 2587 | 1141 | 1091 | 1122 | 181 / 32.1 | 178 / 6.2 | 91.5% |
+| final defaults | 1417 | 1066 | 266 | 268 | 257 | 96 / 34.1 | 91 / 9.0 | 91.5% |
+| i8 + base pack | 1318 | 983 | 267 | 271 | 262 | 91 / 16.9 | 90 / 8.9 | 91.5% |
+| cold tree, beam 16 | 951 | 488 | 390 | 360 | 257 | 105 / 12.0 | 99 / 10.1 | 91.0% |
+
+### TypeScript (Node), rtt60, pack
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 4011 | 2942 | 1005 | 957 | 978 | 184 / 32.3 | 179 / 6.2 | 91.5% |
+| final defaults | 1762 | 1436 | 255 | 280 | 255 | 94 / 35.4 | 93 / 9.0 | 91.5% |
+| i8 + base pack | 1514 | 1171 | 265 | 275 | 255 | 90 / 17.4 | 88 / 9.2 | 91.5% |
+| cold tree, beam 16 | 1605 | 1158 | 375 | 273 | 259 | 103 / 18.3 | 86 / 9.1 | 91.0% |
+
+### TypeScript (Node), rtt25link500, per-object store
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 1955 | 1294 | 603 | 564 | 548 | 181 / 32.1 | 179 / 6.2 | 91.5% |
+| final defaults | 913 | 620 | 223 | 219 | 221 | 98 / 34.2 | 85 / 8.9 | 91.5% |
+| i8 + base pack | 814 | 513 | 232 | 218 | 221 | 93 / 17.0 | 85 / 8.9 | 91.5% |
+| cold tree, beam 16 | 606 | 253 | 285 | 286 | 227 | 105 / 12.0 | 98 / 9.6 | 91.0% |
+
+### TypeScript (Node), rtt25link500, pack
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 2033 | 1450 | 522 | 456 | 470 | 184 / 32.3 | 179 / 6.2 | 91.5% |
+| final defaults | 1094 | 791 | 233 | 222 | 221 | 97 / 35.4 | 85 / 8.9 | 91.5% |
+| i8 + base pack | 883 | 587 | 226 | 223 | 224 | 93 / 17.5 | 85 / 8.9 | 91.5% |
+| cold tree, beam 16 | 929 | 571 | 291 | 215 | 221 | 105 / 18.5 | 85 / 8.9 | 91.0% |
+
+### TypeScript (Node), real R2 (S3 API)
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 2319 | 897 | 1305 | 1293 | 1175 | 180 / 32.1 | 180 / 6.2 | 91.5% |
+| final defaults | 1084 | 683 | 416 | 363 | 369 | 102 / 34.5 | 89 / 9.0 | 91.5% |
+
+### Python, rtt25, per-object store
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 1813 | 1255 | 476 | 307 | 13 | 40 / 76.5 | 34 / 47.8 | 91.5% |
+| final defaults | 798 | 573 | 151 | 150 | 151 | 96 / 34.3 | 87 / 9.2 | 91.5% |
+| i8 + base pack | 714 | 497 | 147 | 148 | 150 | 95 / 17.0 | 85 / 8.9 | 91.5% |
+| cold tree, beam 16 | 513 | 241 | 194 | 188 | 148 | 105 / 11.9 | 100 / 9.6 | 91.0% |
+
+### Python, rtt25, pack
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 1892 | 1345 | 471 | 306 | 12 | 43 / 76.7 | 34 / 47.8 | 91.5% |
+| final defaults | 929 | 704 | 151 | 153 | 153 | 95 / 35.6 | 92 / 9.0 | 91.5% |
+| i8 + base pack | 767 | 535 | 154 | 152 | 149 | 91 / 17.7 | 86 / 8.9 | 91.5% |
+| cold tree, beam 16 | 792 | 523 | 193 | 149 | 153 | 106 / 18.6 | 87 / 9.0 | 91.0% |
+
+### Python, rtt60, per-object store
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 3605 | 2525 | 1010 | 612 | 5 | 40 / 76.5 | 34 / 47.8 | 91.5% |
+| final defaults | 1495 | 1118 | 301 | 301 | 303 | 96 / 34.2 | 85 / 8.9 | 91.5% |
+| i8 + base pack | 1390 | 1008 | 307 | 314 | 307 | 91 / 17.1 | 91 / 9.5 | 91.5% |
+| cold tree, beam 16 | 983 | 518 | 386 | 382 | 305 | 104 / 12.0 | 99 / 9.7 | 91.0% |
+
+### Python, rtt60, pack
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 3863 | 2725 | 1031 | 635 | 5 | 43 / 76.7 | 34 / 47.8 | 91.5% |
+| final defaults | 1731 | 1369 | 298 | 312 | 308 | 94 / 35.6 | 94 / 9.4 | 91.5% |
+| i8 + base pack | 1446 | 1083 | 293 | 306 | 308 | 91 / 17.6 | 86 / 9.0 | 91.5% |
+| cold tree, beam 16 | 1544 | 1073 | 390 | 304 | 308 | 103 / 18.3 | 86 / 9.0 | 91.0% |
+
+### Python, rtt25link500, per-object store
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 2215 | 1252 | 891 | 829 | 11 | 40 / 76.5 | 34 / 47.8 | 91.5% |
+| final defaults | 927 | 626 | 232 | 244 | 241 | 96 / 34.2 | 91 / 9.0 | 91.5% |
+| i8 + base pack | 796 | 495 | 230 | 240 | 240 | 92 / 17.0 | 90 / 9.0 | 91.5% |
+| cold tree, beam 16 | 609 | 243 | 294 | 285 | 242 | 103 / 12.0 | 99 / 9.6 | 91.0% |
+
+### Python, rtt25link500, pack
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 2302 | 1330 | 886 | 855 | 9 | 43 / 76.7 | 34 / 47.8 | 91.5% |
+| final defaults | 1078 | 766 | 227 | 238 | 236 | 95 / 35.4 | 86 / 8.9 | 91.5% |
+| i8 + base pack | 833 | 532 | 221 | 240 | 240 | 90 / 17.5 | 88 / 8.9 | 91.5% |
+| cold tree, beam 16 | 877 | 522 | 283 | 235 | 237 | 103 / 18.6 | 89 / 8.9 | 91.0% |
+
+### Python, real R2 (S3 API)
+
+| mode | process-cold e2e ms | open ms | process-cold query ms | slab-cold query ms | warm query ms | process-cold req / MB | slab-cold req / MB | recall@10 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| baseline | 1609 | 779 | 678 | 599 | 12 | 40 / 76.5 | 34 / 47.8 | 91.5% |
+| final defaults | 1147 | 678 | 436 | 446 | 453 | 99 / 34.3 | 88 / 9.0 | 91.5% |
