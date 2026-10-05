@@ -52,7 +52,7 @@ import { buildRoutingObjects } from "../../../sdk/ts/src/routing.ts";
 import { buildBasePack } from "../../../sdk/ts/src/pack.ts";
 import { loadRevState as sdkLoadRevState } from "../../../sdk/ts/src/revision.ts";
 import { R2BlobStore } from "../../../sdk/ts/src/store.ts";
-import { groupedTableOf, keys as sdkKeys, type Manifest as SdkManifest, type RoutingElem, type RoutingOption, type RoutingTables } from "../../../sdk/ts/src/wire.ts";
+import { currentBody, groupedTableOf, keys as sdkKeys, type Manifest as SdkManifest, type RoutingElem, type RoutingOption, type RoutingTables } from "../../../sdk/ts/src/wire.ts";
 
 interface Env {
 	BUCKET: R2Bucket;
@@ -1284,7 +1284,8 @@ async function stagePublish(env: Env, body: PublishReq) {
 	const manifest = { gen, ...rest, format, tiers, ...(format === 3 ? { pq: { m: pqM } } : {}), ...(tree ? { tree } : {}), ...(routing ? { routing } : {}), ...(files ? { files } : {}), rev: 0, createdAt: new Date().toISOString() };
 	await putBytes(env.BUCKET, manifestKey(gen, 0), JSON.stringify(manifest));
 	const basePacks = slabTable ? await writeBasePacks(env, gen, 0, basePackReq) : [];
-	if (setCurrent !== false) await putBytes(env.BUCKET, CURRENT_KEY, JSON.stringify({ gen, rev: 0 }));
+	// current.json carries a copy of the manifest when it is small (<= 16 KB): an SDK open skips the manifest GET.
+	if (setCurrent !== false) await putBytes(env.BUCKET, CURRENT_KEY, currentBody(gen, 0, manifest as unknown as SdkManifest));
 	return { ...manifest, basePacks, current: setCurrent !== false };
 }
 
@@ -3061,19 +3062,24 @@ async function putUnique(env: Env, key: string, data: ArrayBuffer | ArrayBufferV
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/** Moves idx/current.json forward to (gen, rev) with a CAS loop; leaves it alone if it points at another generation or a newer rev. */
-async function advanceCurrent(env: Env, gen: string, rev: number, setIfOtherGen = false, hint: { cur: Current; etag: string } | null = null): Promise<{ updated: boolean; conflicts: number; current: Current | null }> {
+/**
+ * Moves idx/current.json forward to (gen, rev) with a CAS loop; leaves it alone if it points at another generation or a
+ * newer rev. With `manifest` (that revision's), the pointer carries a copy of it when small (the SDKs' `currentBody`),
+ * so an SDK open skips the manifest GET.
+ */
+async function advanceCurrent(env: Env, gen: string, rev: number, setIfOtherGen = false, hint: { cur: Current; etag: string } | null = null, manifest?: Manifest): Promise<{ updated: boolean; conflicts: number; current: Current | null }> {
 	let conflicts = 0;
+	const pointer = currentBody(gen, rev, manifest as unknown as SdkManifest | undefined);
 	for (let attempt = 0; attempt < 10; attempt++) {
 		// The first CAS uses the copy read when the commit started (usually still current), saving a round trip.
 		const r = attempt === 0 && hint ? hint : await readCurrent(env);
 		if (!r) {
-			if (await putIfAbsent(env, CURRENT_KEY, JSON.stringify({ gen, rev }))) return { updated: true, conflicts, current: { gen, rev } };
+			if (await putIfAbsent(env, CURRENT_KEY, pointer)) return { updated: true, conflicts, current: { gen, rev } };
 			conflicts++;
 			continue;
 		}
 		if ((r.cur.gen !== gen && !setIfOtherGen) || (r.cur.gen === gen && r.cur.rev >= rev)) return { updated: false, conflicts, current: r.cur };
-		const ok = await env.BUCKET.put(CURRENT_KEY, JSON.stringify({ gen, rev }), { onlyIf: { etagMatches: r.etag } });
+		const ok = await env.BUCKET.put(CURRENT_KEY, pointer, { onlyIf: { etagMatches: r.etag } });
 		if (ok) {
 			currentPtr = { cur: { gen, rev }, at: Date.now() };
 			return { updated: true, conflicts, current: { gen, rev } };
@@ -3119,7 +3125,7 @@ async function commitRev(env: Env, genArg: string | null, make: (head: { gen: st
 		const body = JSON.stringify(manifest);
 		if (await putIfAbsent(env, manifestKey(gen, rev), body)) {
 			genHeads.set(gen, { rev, at: Date.now() });
-			const c = await advanceCurrent(env, gen, rev, false, cur);
+			const c = await advanceCurrent(env, gen, rev, false, cur, manifest);
 			return { gen, rev, parentRev: head, manifest, conflicts, casConflicts: c.conflicts, currentUpdated: c.updated, manifestBytes: body.length };
 		}
 		conflicts++;
@@ -3240,7 +3246,7 @@ async function stagePublishRev(env: Env, body: PublishRevReq) {
 	// The packs hold the committed manifest, so they are written after the commit (a reader that sees the revision
 	// first finds no pack and reads the separate files).
 	const basePacks = c.manifest.files?.base ? await writeBasePacks(env, gen, c.rev, body.basePack) : [];
-	const cur = body.setCurrent ? await advanceCurrent(env, gen, c.rev, true) : null;
+	const cur = body.setCurrent ? await advanceCurrent(env, gen, c.rev, true, null, c.manifest) : null;
 	return { gen, rev: c.rev, parentRev: c.parentRev, defaults: c.manifest.defaults, tree: c.manifest.tree ?? null, routing: c.manifest.routing ?? null, basePacks, compaction: c.manifest.compaction ?? null, conflicts: c.conflicts, currentUpdated: c.currentUpdated || !!cur?.updated };
 }
 
