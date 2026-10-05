@@ -16,6 +16,7 @@ use thread_core::docs::DocEntry;
 use thread_core::error::Error;
 use thread_core::excerpts::{self, DocLines, Term};
 use thread_core::fusion::{rrf, RrfList};
+use thread_core::keys::KeyPage;
 use thread_core::lex::{Lengths, LexParams, QueryTerm, Stats, TermInfo};
 use thread_core::rerank;
 use thread_core::segment::{self, Segment, SegmentBuilder, SegmentOptions};
@@ -160,6 +161,8 @@ fn segment_options(
     docs: bool,
     text: bool,
     bucket_docs: u32,
+    keys: bool,
+    bucket_keys: u32,
 ) -> Result<SegmentOptions, JsValue> {
     let lengths = Lengths::from_name(lengths).ok_or_else(|| {
         arg_error(format!(
@@ -189,6 +192,12 @@ fn segment_options(
             SegmentOptions::default().bucket_docs
         } else {
             bucket_docs
+        },
+        keys,
+        bucket_keys: if bucket_keys == 0 {
+            SegmentOptions::default().bucket_keys
+        } else {
+            bucket_keys
         },
     })
 }
@@ -235,10 +244,11 @@ pub fn tokenizer_config_json(config_json: Option<String>) -> Result<String, JsVa
 
 // ---- segment builder ------------------------------------------------------------------------------
 
-/// Builds one segment (the lexical index and/or the docs entries of a batch of documents).
-/// `tokenizer_json` is the tokenizer config (`"{}"` = the default config); null or empty = **no
-/// lexical index** (a docs-only segment). `lengths` `"exact"` | `"byte"`; `bucket_terms` /
-/// `bucket_docs` 0 = defaults.
+/// Builds one segment (the lexical index, the docs entries and/or the keys of a batch of
+/// documents). `tokenizer_json` is the tokenizer config (`"{}"` = the default config); null or
+/// empty = **no lexical index** (a docs-only segment). `lengths` `"exact"` | `"byte"`;
+/// `bucket_terms` / `bucket_docs` / `bucket_keys` 0 = defaults; `keys` writes a `keys` section
+/// (unique string keys -> ids) from the keys passed to `add`.
 #[wasm_bindgen]
 pub struct SegmentJob {
     b: SegmentBuilder,
@@ -257,6 +267,8 @@ impl SegmentJob {
         docs: bool,
         text: bool,
         bucket_docs: u32,
+        keys: bool,
+        bucket_keys: u32,
     ) -> Result<SegmentJob, JsValue> {
         let opts = segment_options(
             tokenizer_json,
@@ -267,6 +279,8 @@ impl SegmentJob {
             docs,
             text,
             bucket_docs,
+            keys,
+            bucket_keys,
         )?;
         Ok(SegmentJob {
             b: SegmentBuilder::new(&opts).map_err(|e| index_error(&e))?,
@@ -274,17 +288,25 @@ impl SegmentJob {
     }
 
     /// Adds a document (`text` indexed and, when the segment stores texts, kept; `meta` and
-    /// `attrs`, the document's attribute word (default 0), stored in `docs`). Returns the tokens
-    /// indexed. Errors on a duplicate id (nothing added).
+    /// `attrs`, the document's attribute word (default 0), stored in `docs`; `key`, its unique
+    /// string key, stored in `keys` when the job writes that section). Returns the tokens
+    /// indexed. Errors on a duplicate id or key (nothing added).
     pub fn add(
         &mut self,
         id: u32,
         text: Option<String>,
         meta: Option<String>,
         attrs: Option<u32>,
+        key: Option<String>,
     ) -> Result<u32, JsValue> {
         self.b
-            .add(id, text.as_deref(), meta.as_deref(), attrs.unwrap_or(0))
+            .add_keyed(
+                id,
+                key.as_deref(),
+                text.as_deref(),
+                meta.as_deref(),
+                attrs.unwrap_or(0),
+            )
             .map(|n| n as u32)
             .map_err(|e| index_error(&e))
     }
@@ -322,7 +344,8 @@ pub fn segment_meta(bytes: &[u8]) -> Result<String, JsValue> {
 /// first**) into one, leaving out each segment's tombstoned ids (`tombs` = the sets' `u32` LE
 /// buffers back to back, `tomb_lens` their byte lengths, one per segment; 0 = none). The lexical
 /// index is rebuilt with the given parameters (`tokenizer_json` null = keep the inputs'),
-/// `docs` / `text` say what the merged segment keeps.
+/// `docs` / `text` say what the merged segment keeps; a `keys` section is written when `keys` is
+/// set or any input has one.
 #[wasm_bindgen]
 #[allow(clippy::too_many_arguments)]
 pub fn merge_segments(
@@ -338,6 +361,8 @@ pub fn merge_segments(
     docs: bool,
     text: bool,
     bucket_docs: u32,
+    keys: bool,
+    bucket_keys: u32,
 ) -> Result<Vec<u8>, JsValue> {
     let opts = segment_options(
         tokenizer_json,
@@ -348,6 +373,8 @@ pub fn merge_segments(
         docs,
         text,
         bucket_docs,
+        keys,
+        bucket_keys,
     )?;
     if tomb_lens.len() != lens.len() {
         return Err(arg_error(format!(
@@ -400,8 +427,8 @@ pub fn merge_segments(
 /// One segment object under demand paging. `feed` the ranges a call reports as `MissingRanges`
 /// and call again. Opening: `plan_open()` (the container header + table, one range), `open()`,
 /// then `plan_headers()` and `plan_directories()` are the small ranges a host keeps resident so
-/// that a search is two rounds (`lookup`: the terms' buckets; `search`: their posting lists) and
-/// a docs lookup one or two (`docs_get`: buckets, then texts).
+/// that a search is two rounds (`lookup`: the terms' buckets; `search`: their posting lists), a
+/// docs lookup one or two (`docs_get`: buckets, then texts) and a key lookup one (`keys_get`).
 #[wasm_bindgen]
 pub struct SegmentReader {
     source: Prefetched,
@@ -487,6 +514,28 @@ impl SegmentReader {
             f(&d).map_err(Error::Source)
         })
     }
+
+    fn with_keys<T>(
+        &mut self,
+        f: impl FnOnce(&thread_core::keys::Keys<Sub<'_>>) -> Result<T, SourceError>,
+    ) -> Result<T, JsValue> {
+        self.with_section(container::SEC_KEYS, |sub| {
+            let k = thread_core::keys::Keys::open(sub)?;
+            f(&k).map_err(Error::Source)
+        })
+    }
+}
+
+fn key_page_json(page: &KeyPage) -> String {
+    let mut s = String::from(r#"{"entries":["#);
+    for (i, (k, id)) in page.entries.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("[{},{}]", json_str(k), id));
+    }
+    s.push_str(&format!(r#"],"more":{}}}"#, page.more));
+    s
 }
 
 fn infos_from_flat(flat: &[f64]) -> Result<Vec<Option<TermInfo>>, JsValue> {
@@ -608,17 +657,18 @@ impl SegmentReader {
         ranges_value(&clipped)
     }
 
-    /// Opens the container and reads `meta`. Returns `{hasLex, hasDocs, tokenizer: json|null,
-    /// meta: json, sections: [{name, offset, len}]}`.
+    /// Opens the container and reads `meta`. Returns `{hasLex, hasDocs, hasKeys, tokenizer:
+    /// json|null, meta: json, sections: [{name, offset, len}]}`.
     pub fn open(&mut self) -> Result<JsValue, JsValue> {
         let seg = match Segment::open(&self.source) {
             Ok(s) => s,
             Err(e) => return Err(self.fail_index(e)),
         };
         let mut s = format!(
-            r#"{{"hasLex":{},"hasDocs":{},"tokenizer":{},"meta":{},"sections":["#,
+            r#"{{"hasLex":{},"hasDocs":{},"hasKeys":{},"tokenizer":{},"meta":{},"sections":["#,
             seg.has_lex(),
             seg.has_docs(),
+            seg.has_keys(),
             seg.tokenizer()
                 .map(|c| c.to_json())
                 .unwrap_or_else(|| "null".into()),
@@ -640,7 +690,7 @@ impl SegmentReader {
         Ok(json_parse(&s))
     }
 
-    /// The section headers (first bytes of `terms`, `postings`, `docs`): fetch once, keep.
+    /// The section headers (first bytes of `terms`, `postings`, `docs`, `keys`): fetch once, keep.
     pub fn plan_headers(&self) -> Result<JsValue, JsValue> {
         let seg = self.seg()?;
         let mut plan = Plan::new();
@@ -651,6 +701,7 @@ impl SegmentReader {
                 thread_core::lex::POSTINGS_HEADER_LEN,
             ),
             (container::SEC_DOCS, thread_core::docs::HEADER_LEN),
+            (container::SEC_KEYS, thread_core::keys::HEADER_LEN),
         ] {
             if let Some(r) = seg.section(name) {
                 plan.push(Range::new(r.offset, head.min(r.len)));
@@ -663,10 +714,12 @@ impl SegmentReader {
     /// The segment's counts, from the section headers (`MissingRanges` until `plan_headers` is
     /// held): `{numDocs, totalLen, numTerms, numPostings, k1, b, lengths, bucketTerms,
     /// termsDirectoryBytes, termsBytes, postingsBytes, docs: {n, hasText, bucketDocs,
-    /// directoryBytes, textBytes} | null}`; `numDocs` etc. are 0 without a lexical index.
+    /// directoryBytes, textBytes} | null, keys: {n, bucketKeys, directoryBytes, nbytes} | null}`;
+    /// `numDocs` etc. are 0 without a lexical index.
     pub fn info(&mut self) -> Result<JsValue, JsValue> {
         let has_lex = self.seg()?.has_lex();
         let has_docs = self.seg()?.has_docs();
+        let has_keys = self.seg()?.has_keys();
         let mut acc: Vec<Range> = Vec::new();
         let mut lex_json = String::from(
             r#""numDocs":0,"totalLen":0,"numTerms":0,"numPostings":0,"k1":0,"b":0,"lengths":null,"bucketTerms":0,"termsDirectoryBytes":0,"termsBytes":0,"postingsBytes":0"#,
@@ -720,24 +773,50 @@ impl SegmentReader {
                 }
             }
         }
+        let mut keys_json = String::from("null");
+        if has_keys {
+            match self.with_keys(|k| {
+                Ok(format!(
+                    r#"{{"n":{},"bucketKeys":{},"directoryBytes":{},"nbytes":{}}}"#,
+                    k.n(),
+                    k.bucket_keys(),
+                    k.directory_nbytes(),
+                    k.nbytes()
+                ))
+            }) {
+                Ok(j) => keys_json = j,
+                Err(e) => {
+                    if self.last_missing.is_empty() {
+                        return Err(e);
+                    }
+                    acc.append(&mut self.last_missing);
+                }
+            }
+        }
         if !acc.is_empty() {
             let mut p = Plan::from(acc);
             p.coalesce(thread_core::lex::PLAN_GAP);
             return Err(self.fail(SourceError::Missing(p.into_ranges())));
         }
-        Ok(json_parse(&format!("{{{lex_json},\"docs\":{docs_json}}}")))
+        Ok(json_parse(&format!(
+            "{{{lex_json},\"docs\":{docs_json},\"keys\":{keys_json}}}"
+        )))
     }
 
-    /// The terms and docs directories (needs the headers): fetch once, keep.
+    /// The terms, docs and keys directories (needs the headers): fetch once, keep.
     pub fn plan_directories(&mut self) -> Result<JsValue, JsValue> {
         let has_lex = self.seg()?.has_lex();
         let has_docs = self.seg()?.has_docs();
+        let has_keys = self.seg()?.has_keys();
         let mut plan = Plan::new();
         if has_lex {
             plan.append(self.with_terms(|t| Ok(t.plan_directory()))?);
         }
         if has_docs {
             plan.append(self.with_docs(|d| Ok(d.plan_directory()))?);
+        }
+        if has_keys {
+            plan.append(self.with_keys(|k| Ok(k.plan_directory()))?);
         }
         plan.coalesce(thread_core::lex::PLAN_GAP);
         Ok(ranges_value(plan.ranges()))
@@ -896,6 +975,53 @@ impl SegmentReader {
         }
         s.push(']');
         Ok(json_parse(&s))
+    }
+
+    /// The bucket ranges `keys_get(keys)` reads.
+    pub fn plan_keys_lookup(&mut self, keys: Vec<String>) -> Result<JsValue, JsValue> {
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let plan = self.with_keys(|k| k.plan_lookup(&refs))?;
+        Ok(ranges_value(plan.ranges()))
+    }
+
+    /// The id of each key through the `keys` section, `-1` when the segment lacks the key (or
+    /// has no keys section). One round cold after the directory.
+    pub fn keys_get(&mut self, keys: Vec<String>) -> Result<Vec<f64>, JsValue> {
+        if !self.seg()?.has_keys() {
+            return Ok(vec![-1.0; keys.len()]);
+        }
+        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let ids = self.with_keys(|k| k.lookup(&refs))?;
+        Ok(ids
+            .into_iter()
+            .map(|i| i.map_or(-1.0, |id| id as f64))
+            .collect())
+    }
+
+    /// The bucket ranges `keys_list(prefix, after, limit)` reads first.
+    pub fn plan_keys_list(
+        &mut self,
+        prefix: &str,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<JsValue, JsValue> {
+        let plan = self.with_keys(|k| k.plan_list(prefix, after.as_deref(), limit as usize))?;
+        Ok(ranges_value(plan.ranges()))
+    }
+
+    /// Up to `limit` keys starting with `prefix` (those `> after` when given), in key order:
+    /// `{entries: [[key, id], ..], more}`; empty without a keys section.
+    pub fn keys_list(
+        &mut self,
+        prefix: &str,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<JsValue, JsValue> {
+        if !self.seg()?.has_keys() {
+            return Ok(json_parse(&key_page_json(&KeyPage::default())));
+        }
+        let page = self.with_keys(|k| k.list(prefix, after.as_deref(), limit as usize))?;
+        Ok(json_parse(&key_page_json(&page)))
     }
 }
 

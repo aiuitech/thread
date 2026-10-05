@@ -57,6 +57,12 @@ def answer(index, req: dict):
         return {"tokens": r.tokens, "hits": [[h.id, h.score] for h in r.hits], "numDocs": r.stats["num_docs"]}
     if req["kind"] == "compile":
         return list(index.compile_filter(req["filter"]))
+    if req["kind"] == "get":
+        r = index.get(req["keys"], text=True)
+        return [[k, r[k].id, r[k].meta, r[k].text, r[k].attrs] if k in r else None for k in req["keys"]]
+    if req["kind"] == "listKeys":
+        p = index.list_keys(req["prefix"], after=req.get("after"), limit=req["limit"])
+        return {"entries": [list(e) for e in p.entries], "more": p.more, "next": p.next}
     raise AssertionError(req["kind"])
 
 
@@ -84,7 +90,9 @@ def test_typescript_and_python_agree(tmp_path):
     # 1. Python reads what TypeScript wrote and answers exactly the same.
     with open_index(store) as index:
         assert (index.gen, index.rev) == (ts["gen"], ts["rev"])
-        assert len(index.manifest["deltas"]) == 3 and len(index.segments) == 4 and len(index.manifest["tombstones"]) == 5
+        assert len(index.manifest["deltas"]) == 4 and len(index.segments) == 6 and len(index.manifest["tombstones"]) == 8
+        n = 20003  # the counter sits past the explicit ids TypeScript wrote
+        assert index.manifest["nextId"] == n + 5 and index.resolve_keys(["k/a", "k/c"]) == {"k/a": n}
         assert [f["name"] for f in index.attr_schema["fields"]] == ["kind", "public", "team"]
         for req, want in zip(ts["requests"], ts["results"]):
             got = json.loads(json.dumps(answer(index, req)))
@@ -106,8 +114,13 @@ def test_typescript_and_python_agree(tmp_path):
         index.upsert([40001], texts=["memo from python"], metas=["py-memo"], attrs=[{"kind": "note", "year": 2024}])
         index.delete([30001, 10004])
         c = index.compact_segments()
-        assert c.merged == 7
+        assert c.merged == 9
         index.upsert([40000], texts=["text only from python galaxy"], metas=["py-text"])
+        # keyed writes from Python on top of the TypeScript ones: a known key keeps its id, new keys continue
+        kp = index.upsert(keys=["k/a", "k/f", "k/c"], texts=["keyed alpha from python", "keyed foxtrot", "keyed charlie back"],
+                          metas=["ka-py", "kf", "kc-py"], attrs=[{"kind": "ticket"}, 0, {"year": 2021}])
+        assert kp.ids == [n, 40002, 40003] and kp.allocated == 2  # k/c was deleted: a new id, past the explicit 4000x ids
+        assert index.delete_keys(["k/d"]).count == 1
         requests = []
         qr = rng(77)
         for i in range(8):
@@ -121,6 +134,11 @@ def test_typescript_and_python_agree(tmp_path):
         requests.append({"kind": "search", "text": "python item2", "vector": list(fresh[64:96]), "topK": 8,
                          "nprobe": 5})
         requests.append({"kind": "search", "text": "galaxy", "vector": None, "topK": 6, "nprobe": 4})
+        requests.append({"kind": "get", "keys": ["k/a", "k/b", "k/c", "k/d", "k/e", "k/f", "k/none"]})
+        requests.append({"kind": "listKeys", "prefix": "k/", "limit": 10, "after": None})
+        requests.append({"kind": "listKeys", "prefix": "k/", "limit": 3, "after": None})
+        requests.append({"kind": "listKeys", "prefix": "k/", "limit": 3, "after": "k/c"})
+        requests.append({"kind": "lexical", "text": "keyed", "topK": 10})
         for i, f in enumerate([{"kind": "ticket"}, {"public": True, "team": {"$in": [0, 3, 6]}}, {"kind": "note", "year": 2024},
                                {"year": {"$gte": 2020}}, {"kind": {"$nin": ["doc"]}, "team": {"$lt": 4}}]):
             requests.append({"kind": "query", "vector": list(fresh[i * 32 : (i + 1) * 32]), "topK": 6, "nprobe": 2,

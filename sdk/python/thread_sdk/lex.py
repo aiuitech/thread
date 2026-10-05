@@ -5,9 +5,9 @@ BM25 index over a batch of documents and/or their `docs` entries) read on demand
 Every native call either succeeds or raises `MissingRanges` naming every blob-absolute range its current round still
 needs; `LexSegment.run` fetches them from the store (one multi-range request where the store can, else one range per
 request), feeds them and calls again. The resident parts (container table, `meta`, section headers, the terms and
-docs directories) are fetched once per segment; after that a search is two rounds per segment (the query terms'
-buckets, then their posting lists), run for every segment concurrently, and a docs lookup one or two (buckets, then
-texts). Scores use corpus-wide statistics (N, average length, per-term df summed over the segments), so the
+docs and keys directories) are fetched once per segment; after that a search is two rounds per segment (the query
+terms' buckets, then their posting lists), run for every segment concurrently, a docs lookup one or two (buckets,
+then texts) and a key lookup one (the keys' buckets, newest segment first). Scores use corpus-wide statistics (N, average length, per-term df summed over the segments), so the
 segments together score exactly like one index over all documents.
 """
 
@@ -28,12 +28,15 @@ from .attrs import filter_matches
 from .store import BlobRange, BlobStore, BlobTrace
 from .wire import ResolvedLexConfig, TombState, ThreadError, parse_hits, tomb_for_segment, tomb_hides
 
-__all__ = ["LexIo", "LexSegment", "LexIndex", "LexHit", "LexSearchResult", "DocRecord", "coalesce", "PLAN_GAP"]
+__all__ = ["LexIo", "LexSegment", "LexIndex", "LexHit", "LexSearchResult", "DocRecord", "KeyPage", "coalesce",
+           "PLAN_GAP", "MAX_LIST_KEYS"]
 
 T = TypeVar("T")
 
 #: Ranges closer than this are fetched as one (the core's `PLAN_GAP`).
 PLAN_GAP = 4096
+#: Largest page `list_keys` returns.
+MAX_LIST_KEYS = 10_000
 
 
 def coalesce(ranges: Iterable[tuple[int, int]], max_gap: int = PLAN_GAP) -> list[tuple[int, int]]:
@@ -81,6 +84,7 @@ class LexSegment:
         self.info: dict[str, Any] | None = None
         self.has_lex = False
         self.has_docs = False
+        self.has_keys = False
         #: The tokenizer config recorded in the segment's `meta` (JSON) or None.
         self.tokenizer: str | None = None
         self.transient_budget = transient_budget
@@ -106,6 +110,7 @@ class LexSegment:
         o = seg.run(seg.reader.open, io, trace, True)
         seg.has_lex = o["has_lex"]
         seg.has_docs = o["has_docs"]
+        seg.has_keys = o["has_keys"]
         seg.tokenizer = o["tokenizer"]
         seg._fetch(seg.run(seg.reader.plan_headers, io, trace, True), io, trace, True)
         seg.info = seg.run(seg.reader.info, io, trace, True)
@@ -193,6 +198,16 @@ class LexSearchResult:
 
 
 @dataclass
+class KeyPage:
+    """One page of a key listing: `(key, id)` entries in key order; `more` says whether keys with the prefix may
+    follow, continue with `after=next`."""
+
+    entries: list[tuple[str, int]]
+    more: bool
+    next: str | None = None
+
+
+@dataclass
 class DocRecord:
     """A resolved document: its metadata string, when stored and requested its text, and its attribute word."""
 
@@ -220,6 +235,10 @@ class LexIndex:
     @property
     def has_docs(self) -> bool:
         return any(s.has_docs for s in self.segments)
+
+    @property
+    def has_keys(self) -> bool:
+        return any(s.has_keys for s in self.segments)
 
     def stats(self) -> tuple[int, int]:
         """Corpus-wide `(num_docs, total_len)` over the lexical segments."""
@@ -319,6 +338,69 @@ class LexIndex:
                         best[h.id] = h.score
         hits = sorted((LexHit(i, s) for i, s in best.items()), key=lambda h: (-h.score, h.id))[:k]
         return result(hits, found, df_record)
+
+    def resolve_keys(self, keys: Iterable[str], trace: BlobTrace | None = None) -> tuple[dict[str, int], LexIo]:
+        """Resolves string keys to ids through the `keys` sections, newest segment first (a key's live entry is the
+        newest one whose id a later tombstone set does not hide). Keys with no live document are absent."""
+        io = LexIo()
+        out: dict[str, int] = {}
+        pending = list(dict.fromkeys(keys))
+        for seg in reversed(self.segments):
+            if not pending:
+                break
+            if not seg.has_keys:
+                continue
+            got = seg.run(functools.partial(seg.reader.keys_get, pending), io, trace)
+            added = seg.ref["addedRev"]
+            resolved = set()
+            for key, id in zip(pending, got):
+                if id is None:
+                    continue
+                # The newest copy decides: a hidden one means the key was deleted.
+                resolved.add(key)
+                if not tomb_hides(self.tomb, id, added):
+                    out[key] = id
+            pending = [k for k in pending if k not in resolved]
+        return out, io
+
+    def list_keys(self, prefix: str = "", after: str | None = None, limit: int = 100,
+                  trace: BlobTrace | None = None) -> tuple[KeyPage, LexIo]:
+        """Keys with a prefix, in key order, over every segment (the newest copy of a key decides whether it is
+        live), paged: continue with `after=page.next` while `page.more`."""
+        io = LexIo()
+        limit = min(MAX_LIST_KEYS, max(0, int(limit)))
+        segs = [s for s in self.segments if s.has_keys]
+        if not limit or not segs:
+            return KeyPage([], False), io
+        pages = self._each(segs, lambda s: s.run(functools.partial(s.reader.keys_list, prefix, after, limit), io, trace))
+        # Newest segment first: the first copy of a key decides. A segment page that stops early bounds what is
+        # known (keys past its last entry may have a newer copy there), so the merged page stops at the smallest
+        # such cursor and the caller continues from it.
+        decided: set[str] = set()
+        live: dict[str, int] = {}
+        cursor: str | None = None
+        for seg, page in reversed(list(zip(segs, pages))):
+            if page["more"] and page["entries"]:
+                last = page["entries"][-1][0]
+                if cursor is None or last < cursor:
+                    cursor = last
+            added = seg.ref["addedRev"]
+            for key, id in page["entries"]:
+                if key in decided:
+                    continue
+                decided.add(key)
+                if not tomb_hides(self.tomb, id, added):
+                    live[key] = id
+        entries = sorted(live.items())
+        more = False
+        nxt: str | None = None
+        if cursor is not None:
+            entries = [e for e in entries if e[0] <= cursor]
+            more, nxt = True, cursor
+        if len(entries) > limit:
+            entries = entries[:limit]
+            more, nxt = True, entries[-1][0]
+        return KeyPage(entries, more, nxt if more else None), io
 
     def docs(self, ids: Iterable[int], *, text: bool = False, trace: BlobTrace | None = None) -> tuple[dict[int, DocRecord], LexIo]:
         """Resolves ids through the `docs` sections, newest segment first (the live copy of a replaced id is the

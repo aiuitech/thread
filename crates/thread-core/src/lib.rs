@@ -52,6 +52,7 @@ pub mod excerpts;
 pub mod filter;
 pub mod fusion;
 pub mod lex;
+pub mod keys;
 pub mod kmeans;
 pub mod math;
 pub mod part;

@@ -6,9 +6,10 @@
  * still needs; `LexSegment.run` fetches them from the store (one multi-range request where the store can, else one
  * range per request), feeds them and calls again. The resident parts (container table, `meta`, section headers,
  * the terms and docs directories) are fetched once per segment per isolate; after that a search is two rounds per
- * segment (the query terms' buckets, then their posting lists), run for every segment concurrently, and a docs
- * lookup one or two (buckets, then texts). Scores use corpus-wide statistics (N, average length, per-term df
- * summed over the segments), so the segments together score exactly like one index over all documents.
+ * segment (the query terms' buckets, then their posting lists), run for every segment concurrently, a docs
+ * lookup one or two (buckets, then texts) and a key lookup one (the keys' buckets, newest segment first). Scores
+ * use corpus-wide statistics (N, average length, per-term df summed over the segments), so the segments together
+ * score exactly like one index over all documents.
  */
 import type { BlobRange, BlobStore, BlobTrace } from "./store.js";
 import type * as W from "./wasm/thread.js";
@@ -69,6 +70,7 @@ export interface LexSegmentInfo {
 	termsBytes: number;
 	postingsBytes: number;
 	docs: { n: number; hasText: boolean; bucketDocs: number; directoryBytes: number; textBytes: number; nbytes: number } | null;
+	keys: { n: number; bucketKeys: number; directoryBytes: number; nbytes: number } | null;
 }
 
 export interface LexSegmentOptions {
@@ -90,6 +92,7 @@ export class LexSegment {
 	info: LexSegmentInfo | null = null;
 	hasLex = false;
 	hasDocs = false;
+	hasKeys = false;
 	/** The tokenizer config recorded in the segment's `meta` (JSON) or null. */
 	tokenizer: string | null = null;
 	readonly transientBudget: number;
@@ -125,9 +128,10 @@ export class LexSegment {
 		const seg = new LexSegment(w, store, ref, epoch, size, opts);
 		try {
 			await seg.fetch(seg.reader.plan_open() as Range[], io, trace, true);
-			const o = (await seg.run(() => seg.reader.open(), io, trace, true)) as { hasLex: boolean; hasDocs: boolean; tokenizer: Record<string, unknown> | null };
+			const o = (await seg.run(() => seg.reader.open(), io, trace, true)) as { hasLex: boolean; hasDocs: boolean; hasKeys: boolean; tokenizer: Record<string, unknown> | null };
 			seg.hasLex = o.hasLex;
 			seg.hasDocs = o.hasDocs;
+			seg.hasKeys = o.hasKeys;
 			seg.tokenizer = o.tokenizer ? JSON.stringify(o.tokenizer) : null;
 			await seg.fetch(seg.reader.plan_headers() as Range[], io, trace, true);
 			seg.info = (await seg.run(() => seg.reader.info(), io, trace, true)) as LexSegmentInfo;
@@ -258,6 +262,27 @@ export interface LexSearchResult {
 	};
 }
 
+/** One page of a key listing. */
+export interface KeyPage {
+	/** `{key, id}` in key order. */
+	entries: { key: string; id: number }[];
+	/** Whether more keys with the prefix may follow: continue with `after: next`. */
+	more: boolean;
+	/** The cursor for the next page (the last key examined; set when `more`). */
+	next?: string;
+}
+
+export interface ListKeysOptions {
+	/** Keys starting with this (default: every key). */
+	prefix?: string;
+	/** Only keys after this one (the last key of the previous page). */
+	after?: string;
+	/** Page size (default 100, at most 10,000). */
+	limit?: number;
+}
+
+export const MAX_LIST_KEYS = 10_000;
+
 /** A resolved document. */
 export interface DocRecord {
 	id: number;
@@ -289,6 +314,9 @@ export class LexIndex {
 	}
 	get hasDocs(): boolean {
 		return this.segments.some((s) => s.seg.hasDocs);
+	}
+	get hasKeys(): boolean {
+		return this.segments.some((s) => s.seg.hasKeys);
 	}
 
 	/** Corpus-wide statistics over the lexical segments. */
@@ -409,6 +437,77 @@ export class LexIndex {
 			pending = pending.filter((id) => !resolved.has(id));
 		}
 		return { docs: out, io };
+	}
+
+	/**
+	 * Resolves string keys to ids through the `keys` sections, newest segment first (a key's live entry is the
+	 * newest one whose id a later tombstone set does not hide). Keys with no live entry are absent.
+	 */
+	async resolveKeys(keys: readonly string[], opts: { trace?: BlobTrace } = {}): Promise<{ ids: Map<string, number>; io: LexIo }> {
+		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
+		const out = new Map<string, number>();
+		let pending = [...new Set(keys)];
+		for (let i = this.segments.length - 1; i >= 0 && pending.length; i--) {
+			const { ref, seg } = this.segments[i];
+			if (!seg.hasKeys) continue;
+			const got = (await seg.run(() => seg.reader.keys_get(pending), io, opts.trace)) as Float64Array;
+			const resolved = new Set<string>();
+			pending.forEach((key, j) => {
+				const id = got[j];
+				if (id < 0) return;
+				// The newest copy decides: a hidden one means the key was deleted (or its id replaced under another key).
+				resolved.add(key);
+				if (!tombHides(this.tomb, id, ref.addedRev)) out.set(key, id);
+			});
+			pending = pending.filter((k) => !resolved.has(k));
+		}
+		return { ids: out, io };
+	}
+
+	/**
+	 * Keys with a prefix, in key order, over every segment (the newest copy of a key decides whether it is live),
+	 * paged with `after` / `more`.
+	 */
+	async listKeys(opts: ListKeysOptions & { trace?: BlobTrace } = {}): Promise<KeyPage & { io: LexIo }> {
+		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
+		const prefix = opts.prefix ?? "";
+		const limit = Math.min(MAX_LIST_KEYS, Math.max(0, Math.floor(opts.limit ?? 100)));
+		const after = opts.after;
+		const segs = this.segments.filter((s) => s.seg.hasKeys);
+		if (!limit || !segs.length) return { entries: [], more: false, io };
+		const pages = await Promise.all(segs.map(({ seg }) => seg.run(() => seg.reader.keys_list(prefix, after, limit), io, opts.trace) as Promise<{ entries: [string, number][]; more: boolean }>));
+		// Newest segment first: the first copy of a key decides whether it is live. A segment page that stops early
+		// bounds what is known: keys past its last entry may have a newer copy there, so the merged page stops at the
+		// smallest such cursor and the caller continues from it.
+		const decided = new Set<string>();
+		const live = new Map<string, number>();
+		let cursor: string | null = null;
+		for (let i = segs.length - 1; i >= 0; i--) {
+			const page = pages[i];
+			if (page.more && page.entries.length) {
+				const last = page.entries[page.entries.length - 1][0];
+				if (cursor === null || last < cursor) cursor = last;
+			}
+			for (const [key, id] of page.entries) {
+				if (decided.has(key)) continue;
+				decided.add(key);
+				if (!tombHides(this.tomb, id, segs[i].ref.addedRev)) live.set(key, id);
+			}
+		}
+		let entries = [...live].map(([key, id]) => ({ key, id })).sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+		let more = false;
+		let next: string | undefined;
+		if (cursor !== null) {
+			entries = entries.filter((e) => e.key <= cursor!);
+			more = true;
+			next = cursor;
+		}
+		if (entries.length > limit) {
+			entries.length = limit;
+			more = true;
+			next = entries[limit - 1].key;
+		}
+		return { entries, more, ...(more ? { next } : {}), io };
 	}
 
 	free(): void {

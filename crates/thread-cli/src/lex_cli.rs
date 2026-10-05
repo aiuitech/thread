@@ -113,6 +113,8 @@ fn segment_options(a: &Args) -> Result<SegmentOptions, String> {
         docs,
         text: docs && a.flag("text"),
         bucket_docs: a.num("bucket-docs", SegmentOptions::default().bucket_docs)?,
+        keys: a.flag("keys"),
+        bucket_keys: a.num("bucket-keys", SegmentOptions::default().bucket_keys)?,
     })
 }
 
@@ -145,10 +147,11 @@ pub fn build(a: &Args) -> Result<Value, String> {
     let t0 = Instant::now();
     let out = a.get("out").ok_or("--out <file.thread> is required")?;
     let docs_path = a.get("docs").ok_or("--docs <docs.jsonl> is required")?;
-    let (id_f, text_f, meta_f) = (
+    let (id_f, text_f, meta_f, key_f) = (
         a.get("id-field").unwrap_or("id"),
         a.get("text-field").unwrap_or("text"),
         a.get("meta-field").unwrap_or("meta"),
+        a.get("key-field").unwrap_or("key"),
     );
     let opts = segment_options(a)?;
     let mut b = SegmentBuilder::new(&opts).map_err(|e| e.to_string())?;
@@ -185,7 +188,12 @@ pub fn build(a: &Args) -> Result<Value, String> {
                     )
                 })? as u32,
         };
-        b.add(id, text.as_deref(), meta.as_deref(), attrs)
+        let key = match v.get(key_f) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(k)) => Some(k.clone()),
+            Some(_) => return err(format!("{docs_path}:{}: {key_f:?} must be a string", i + 1)),
+        };
+        b.add_keyed(id, key.as_deref(), text.as_deref(), meta.as_deref(), attrs)
             .map_err(|e| format!("{docs_path}:{}: {e}", i + 1))?;
         rows += 1;
     }
@@ -223,6 +231,100 @@ pub fn inspect(a: &Args) -> Result<Value, String> {
         let d = d.map_err(|e| e.to_string())?;
         o.insert("docs".into(), json!({"n": d.n(), "text": d.has_text(), "buckets": d.bucket_count(), "bucket_docs": d.bucket_docs(), "directory_bytes": d.directory_nbytes(), "text_bytes": d.text_nbytes()}));
     }
+    if let Some(k) = seg.keys(&bytes) {
+        let k = k.map_err(|e| e.to_string())?;
+        o.insert("keys".into(), json!({"n": k.n(), "buckets": k.bucket_count(), "bucket_keys": k.bucket_keys(), "directory_bytes": k.directory_nbytes()}));
+    }
+    Ok(Value::Object(o))
+}
+
+/// Resolves keys (`--get a,b`) and/or lists a prefix (`--prefix p [--after k] [--limit n]`) over one
+/// or more segments given oldest first, newest copy of a key winning, `--tombstones` applying per
+/// segment as in `seg search`.
+pub fn keys(a: &Args) -> Result<Value, String> {
+    let t0 = Instant::now();
+    let segs = open_all(&a.positional)?;
+    let tombs = read_tombstones(a.get("tombstones"))?;
+    if !tombs.is_empty() && tombs.len() != segs.len() {
+        return err(format!(
+            "{} tombstone sets for {} segments",
+            tombs.len(),
+            segs.len()
+        ));
+    }
+    let hidden = |i: usize, id: u32| {
+        tombs
+            .get(i)
+            .and_then(|t| t.as_ref())
+            .is_some_and(|t| t.contains(id))
+    };
+    let mut readers = Vec::new();
+    for (i, s) in segs.iter().enumerate() {
+        if let Some(k) = s.seg.keys(&s.bytes) {
+            readers.push((i, k.map_err(|e| format!("{}: {e}", s.path))?));
+        }
+    }
+    if readers.is_empty() {
+        return err("none of the segments has a keys section");
+    }
+    let mut o = Map::new();
+    if let Some(list) = a.get("get") {
+        let wanted: Vec<&str> = list.split(',').filter(|k| !k.is_empty()).collect();
+        let mut found: Vec<Option<u32>> = vec![None; wanted.len()];
+        for (i, k) in readers.iter().rev() {
+            let pending: Vec<usize> = (0..wanted.len()).filter(|&j| found[j].is_none()).collect();
+            if pending.is_empty() {
+                break;
+            }
+            let ask: Vec<&str> = pending.iter().map(|&j| wanted[j]).collect();
+            let ids = k.lookup(&ask).map_err(|e| e.to_string())?;
+            for (j, id) in pending.into_iter().zip(ids) {
+                if let Some(id) = id.filter(|&id| !hidden(*i, id)) {
+                    found[j] = Some(id);
+                }
+            }
+        }
+        let got: Map<String, Value> = wanted
+            .iter()
+            .zip(found)
+            .map(|(k, id)| (k.to_string(), id.map_or(Value::Null, Value::from)))
+            .collect();
+        o.insert("ids".into(), Value::Object(got));
+    }
+    if let Some(prefix) = a.get("prefix") {
+        let limit: usize = a.num("limit", 100)?;
+        let after = a.get("after");
+        // newest segment first: the first copy of a key seen decides (live, or hidden = dead)
+        let mut decided: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut live: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        let mut more = false;
+        for (i, k) in readers.iter().rev() {
+            let page = k.list(prefix, after, limit).map_err(|e| e.to_string())?;
+            more |= page.more;
+            for (key, id) in page.entries {
+                if decided.insert(key.clone()) && !hidden(*i, id) {
+                    live.insert(key, id);
+                }
+            }
+        }
+        let mut entries: Vec<Value> = Vec::new();
+        for (key, id) in live {
+            if entries.len() == limit {
+                more = true;
+                break;
+            }
+            entries.push(json!({"key": key, "id": id}));
+        }
+        o.insert("entries".into(), Value::Array(entries));
+        o.insert("more".into(), json!(more));
+    }
+    if !o.contains_key("ids") && !o.contains_key("entries") {
+        return err("--get <k1,k2,..> and/or --prefix <p> is required");
+    }
+    o.insert(
+        "elapsed_ms".into(),
+        json!(t0.elapsed().as_secs_f64() * 1000.0),
+    );
     Ok(Value::Object(o))
 }
 
@@ -420,6 +522,7 @@ pub const USAGE: &str = "  thread seg build   --out seg.thread --docs docs.jsonl
   thread seg inspect seg.thread                                       sections, meta and per-section counts
   thread seg search  --text \"query\" [--k 10] [--with-docs] [--tombstones a.u32,-] seg.thread [more ...]
   thread seg merge   --out base.thread [--tombstones ...] seg.thread [more ...]   compact segments into one
+  thread seg keys    [--get k1,k2] [--prefix p --after k --limit n] [--tombstones ...] seg.thread [more ...]
   thread tokenize    [--tokenizer json|file] \"text\" [\"text\" ...]      the index's tokenizer
   (every command prints one JSON object on stdout; `thread <command> --help` lists its options)";
 
@@ -436,7 +539,10 @@ const BUILD_OPTIONS: &str = "options shared by `seg build` and `seg merge`:
                            larger = smaller resident directory (16 B + the first term per bucket)
   --bucket-docs <n>        documents per `docs` bucket (default 128): the same trade for resolving hits
   --no-docs                write no `docs` section (ids only)
-  --text                   store the documents' texts in `docs` (for excerpts and reading)";
+  --text                   store the documents' texts in `docs` (for excerpts and reading)
+  --keys                   write a `keys` section: each document's unique string key -> its id (build: from the
+                           key field; merge: written anyway when an input has one)
+  --bucket-keys <n>        keys per `keys` bucket (default 128)";
 
 const HELP_BUILD: &str = "thread seg build --out <seg.thread> --docs <docs.jsonl> [options]
 
@@ -450,6 +556,7 @@ THREADIX container an upsert writes to idx/{gen}/seg/{seq}.thread. Prints {path,
   --id-field <name>        the id field (default `id`)
   --text-field <name>      the text field (default `text`)
   --meta-field <name>      the metadata field (default `meta`)
+  --key-field <name>       the key field (default `key`; a string, stored with --keys)
 ";
 
 const HELP_INSPECT: &str = "thread seg inspect <seg.thread>
@@ -483,6 +590,13 @@ documents. Prints {path, bytes, merged, meta}. Texts are kept when any input sto
   --tombstones <list>      as in `seg search`
 ";
 
+const HELP_KEYS: &str = "thread seg keys [--get k1,k2,..] [--prefix p] [--after k] [--limit 100] [--tombstones a.u32,-] <seg.thread> [more.thread ...]
+
+Point lookups and prefix listings over the `keys` sections of one or more segments (oldest first; the newest
+copy of a key wins, --tombstones hide ids per segment as in `seg search`). Prints {ids: {key: id|null}} for
+--get and {entries: [{key, id}], more} for --prefix.
+";
+
 const HELP_TOKENIZE: &str = "thread tokenize [--tokenizer <json|file>] <text> [<text> ...]
 
 Prints {tokenizer, tokens: [[...], ...]}: the tokens of each text under the config (default: bm25s's).
@@ -496,7 +610,8 @@ fn help_for(cmd: &str, sub: Option<&str>) -> Option<String> {
         ("seg", Some("inspect")) => HELP_INSPECT.to_string(),
         ("seg", Some("search")) => HELP_SEARCH.to_string(),
         ("seg", Some("merge")) => format!("{HELP_MERGE}\n{BUILD_OPTIONS}\n"),
-        ("seg", _) => format!("thread seg <build|inspect|search|merge> ...\n\n{USAGE}\n"),
+        ("seg", Some("keys")) => HELP_KEYS.to_string(),
+        ("seg", _) => format!("thread seg <build|inspect|search|merge|keys> ...\n\n{USAGE}\n"),
         _ => return None,
     })
 }
@@ -533,7 +648,7 @@ fn run_json(cmd: &str, rest: &[String]) -> Result<Value, String> {
         "tokenize" => tokenize(&Args::parse(rest)?),
         "seg" => {
             let sub = rest.first().map(String::as_str).ok_or(
-                "seg needs a subcommand: build | search | inspect | merge (try `thread seg --help`)",
+                "seg needs a subcommand: build | search | inspect | merge | keys (try `thread seg --help`)",
             )?;
             let a = Args::parse(&rest[1..])?;
             match sub {
@@ -541,6 +656,7 @@ fn run_json(cmd: &str, rest: &[String]) -> Result<Value, String> {
                 "search" => search(&a),
                 "inspect" => inspect(&a),
                 "merge" => merge(&a),
+                "keys" => keys(&a),
                 other => err(format!(
                     "unknown seg subcommand {other:?} (try `thread seg --help`)"
                 )),

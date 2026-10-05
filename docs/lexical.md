@@ -28,24 +28,27 @@ idx/{gen}/seg/{seq}.thread        one per upsert that carried texts or metadata 
 idx/{gen}/seg/base.{rev}.thread   written by a segment compaction that read manifest rev - 1
 ```
 
-A segment holds up to four sections (`container.rs`; 64-byte header, 32-byte table entries, 8-byte aligned):
+A segment holds up to five sections (`container.rs`; 64-byte header, 32-byte table entries, 8-byte aligned):
 
 | section | content |
 |---|---|
-| `meta` | JSON: `format: "thread-seg"`, `version`, the `tokenizer` object, a `lex` summary, a `docs` summary |
+| `meta` | JSON: `format: "thread-seg"`, `version`, the `tokenizer` object, a `lex` summary, a `docs` summary, a `keys` summary |
 | `terms` | the segment's terms sorted by bytes, in buckets behind a directory; each entry carries the term's `df` and the byte range of its posting list |
 | `postings` | the posting lists, back to back |
 | `docs` | document id -> metadata string (+ optional text), bucketed by id behind a directory |
+| `keys` | unique string key -> document id, sorted by key bytes in buckets behind a directory ([keys.md](keys.md)) |
 
 A segment may hold `terms` + `postings` only (a lexical index for documents named elsewhere), `docs` only (a document
-store for a dense-only index), or both. The manifest lists them oldest first:
+store for a dense-only index), `keys` only, or any combination; an upsert that passed keys writes a `keys` section
+(`segments[].keys: true`). The manifest lists them oldest first:
 
 ```json
 "lex": {"tokenizer": {...}, "k1": 1.2, "b": 0.75, "lengths": "exact", "bucketTerms": 256, "docs": true, "text": false,
-        "bucketDocs": 128, "defaults": {"rrfK": 60, "recallK": 50, "weights": {"dense": 1, "lexical": 1}}},
+        "bucketDocs": 128, "bucketKeys": 128, "defaults": {"rrfK": 60, "recallK": 50, "weights": {"dense": 1, "lexical": 1}}},
 "segments": [{"seq": 0, "key": "idx/g4/seg/base.12.thread", "addedRev": 12, "count": 975000, "bytes": 61234567,
               "lex": true, "docs": true, "text": false, "base": true},
-             {"seq": 7, "key": "idx/g4/seg/7.thread", "addedRev": 14, "count": 250, "bytes": 31744, "lex": true, "docs": true, "text": false}]
+             {"seq": 7, "key": "idx/g4/seg/7.thread", "addedRev": 14, "count": 250, "bytes": 31744, "lex": true, "docs": true, "text": false, "keys": true}],
+"nextId": 975250
 ```
 
 `manifest.lex` is the configuration every segment of the generation is built with (`index.configureLexical` writes
@@ -105,16 +108,34 @@ dense hits and lexical hits resolve through the same section. (The dense slabs s
 and `payload`; `docs` is the recommended place for anything larger than a few bytes, since slab payloads are
 duplicated `m` times.)
 
+### `keys` (`keys.rs`, magic `THRDKEYS`, version 1)
+
+```
+0   magic "THRDKEYS"   8 version u32 = 1   12 n u32   16 bucket count B u32   20 bucket_keys u32   24 flags u32 = 0
+32  dir_off u64 (= 64)   40 dir_len u64   48 buckets_off u64   56 buckets_len u64
+directory: B x 16 bytes (bucket offset u64, bucket len u32, first-key offset u32 relative to the directory), then every
+  bucket's first key back to back (full keys: a binary search over the directory names exactly one bucket)
+bucket entry: key len varint, key (UTF-8), id varint
+```
+
+The `terms` directory with an id in place of a posting range. Keys are unique within a section (non-empty, at most
+4096 bytes); across segments the newest live entry of a key wins, so a re-put of a key under the same id replaces its
+document and a deleted id hides its key, through the one tombstone rule. A lookup is one bucket read per key
+(coalesced) after the directory; a prefix listing is a binary search to the first bucket and a forward scan over
+contiguous buckets (one range). The design, the id counter (`manifest.nextId`) and the key-value use case:
+[keys.md](keys.md).
+
 ### Container and `meta`
 
-Sections are written `meta`, `terms`, `postings`, `docs`. `meta` records the tokenizer config (the core parses only
-that key back) and a summary of each section:
+Sections are written `meta`, `terms`, `postings`, `docs`, `keys`. `meta` records the tokenizer config (the core
+parses only that key back) and a summary of each section:
 
 ```json
 {"format":"thread-seg","version":1,
  "tokenizer":{"lowercase":true,"token_pattern":"\\w\\w+","stopwords":"en","stemmer":"english"},
  "lex":{"version":1,"num_docs":20000,"terms":29999,"num_postings":2353244,"total_len":3994184,"k1":1.2,"b":0.75,"lengths":"exact","bucket_terms":256,"terms_nbytes":383492,"postings_nbytes":8545861},
- "docs":{"version":1,"n":20000,"text":false,"bucket_docs":128,"nbytes":368168}}
+ "docs":{"version":1,"n":20000,"text":false,"bucket_docs":128,"nbytes":368168},
+ "keys":{"version":1,"n":20000,"bucket_keys":128,"nbytes":1364120}}
 ```
 
 ## Query
@@ -139,9 +160,10 @@ the Cache API, or one request per range on a miss):
 | lookup | one bucket per distinct query term (~3-5 KB each at 256 terms per bucket) | transient |
 | search | one posting list per query term that exists | transient |
 | docs | one bucket per hit id (coalesced), then one text range per text shown | transient |
+| keys | one bucket per key looked up (coalesced); a listing one contiguous range | transient |
 
-So a warm isolate answers a text query in **two rounds per segment**, all segments concurrently, and resolves docs
-in one or two more. Transient bytes are evicted from the wasm reader once they exceed a budget (8 MB by default);
+So a warm isolate answers a text query in **two rounds per segment**, all segments concurrently, resolves docs
+in one or two more, and a `get(key)` in two (keys bucket, docs bucket). Transient bytes are evicted from the wasm reader once they exceed a budget (8 MB by default);
 the resident parts are a few KB per segment (20k documents: 2.5 KB terms directory + 2.5 KB docs directory).
 
 The dense query and the lexical query run concurrently at depth `recallK`; the two id lists are fused with
@@ -158,15 +180,18 @@ newest segment first, skipping hidden copies.
 
 ## Updates and compaction
 
-`index.upsert({ids, vectors?, texts?, metas?, attrs?})` writes, in one manifest revision: a dense delta segment for the
-vectors (as before), a lexical/docs segment for the texts, metadata and attribute words (`SegmentJob`: tokenize,
-build `terms` + `postings` + `docs`), and the tombstone set. Vectors are optional when the generation has a lexical configuration
+`index.upsert({ids?, keys?, vectors?, texts?, metas?, attrs?})` writes, in one manifest revision: a dense delta segment for
+the vectors (as before), a lexical/docs/keys segment for the texts, metadata, attribute words and keys (`SegmentJob`:
+tokenize, build `terms` + `postings` + `docs` + `keys`), and the tombstone set. With `keys` and no `ids`, the keys are
+resolved through the head revision: known keys keep their ids, new keys take the next ones from `manifest.nextId`
+([keys.md](keys.md#ids-allocation-and-the-counter)). Vectors are optional when the generation has a lexical configuration
 (text-only documents are found by text alone), texts/metas are optional (dense-only upserts are unchanged). The
 delta and the segment share the `seq`. `index.delete(ids)` is one tombstone set, as before, and hides both sides.
 
 `index.compactSegments()` reads every segment of the head whole, merges them (`segment::merge`: posting lists
 concatenated per term with tombstoned documents dropped and documents re-sorted, docs with the newest copy of each
-id, texts kept when configured) into `seg/base.{rev}.thread` and commits a revision listing only it. The merged
+id, texts kept when configured, keys with the newest copy of each key) into `seg/base.{rev}.thread` and commits a
+revision listing only it. The merged
 `terms`/`postings` are byte-identical to a fresh build over the live documents (checked); a document with no tokens
 leaves the lexical count then (it stays in `docs`). Tombstone sets are not dropped here; the dense compaction's
 rule now also keeps a set while any segment predates it (`tombDroppable` in the Worker), and the Worker's GC keeps
@@ -183,6 +208,7 @@ built with in their headers.
 | `lengths` | `exact` | `byte`: one length byte per posting (-0.9 B/posting below; scores within a few percent) | `exact`: exact BM25 scores |
 | `bucketTerms` | 256 | larger buckets: a smaller resident directory (22 B per bucket) | smaller buckets: fewer bytes per query term (an entry is ~12 B) |
 | `bucketDocs` | 128 | larger buckets: a smaller resident docs directory (16 B per bucket) | smaller buckets: fewer bytes per resolved hit |
+| `bucketKeys` | 128 | larger buckets: a smaller resident keys directory (16 B + one key per bucket) | smaller buckets: fewer bytes per key lookup |
 | `docs` | true | false: no document store (ids only) | |
 | `text` | false | false: texts stay outside the index | true: texts available for excerpts and reading, one range read each |
 | `tokenizer` | bm25s defaults | `stopwords: "en"` drops 33 words; `stemmer: "english"` merges inflections (fewer terms) | `identifiers: "both"` indexes `INC-12345` as the exact token and its parts |
@@ -243,6 +269,10 @@ const r = await index.search({ text: "deploy failed", vector: q, topK: 10, docs:
 r.hits[0]                       // { id, score, dense?: {rank, score}, lexical?: {rank, score}, doc?: {id, meta, text} }
 await index.lexicalSearch("deploy failed", 20);                       // BM25 only: { hits, tokens, found, stats }
 await index.docs([1, 2, 3], { text: true });                          // Map<id, {id, meta, text}>
+await index.upsert({ keys: ["s3://b/a", "s3://b/c"], metas, texts });  // keyed documents: ids resolved or allocated
+await index.get(["s3://b/a"]);                                        // Map<key, {key, id, meta, attrs, text?}>
+await index.listKeys({ prefix: "s3://b/", limit: 100 });              // {entries: [{key, id}], more, next}
+await index.deleteKeys(["s3://b/c"]);
 await index.compactSegments();                                        // merge the segments into one base
 await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only index
 ```
@@ -250,15 +280,16 @@ await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   /
 CLI (`cargo build --release -p thread-cli`, `target/release/thread`):
 
 ```sh
-thread seg build --out seg.thread --docs docs.jsonl [--tokenizer '{"stemmer":null}'] [--lengths byte] [--bucket-terms 256] [--text]
+thread seg build --out seg.thread --docs docs.jsonl [--tokenizer '{"stemmer":null}'] [--lengths byte] [--bucket-terms 256] [--text] [--keys]
 thread seg inspect seg.thread
 thread seg search --text "deploy failed" --k 10 --with-docs [--tombstones dead.u32,-] seg.thread older.thread
+thread seg keys --get "s3://b/a,s3://b/c" --prefix "s3://b/" [--after k] [--limit 100] seg1.thread seg2.thread
 thread seg merge --out base.thread [--tombstones a.u32,b.u32] seg1.thread seg2.thread
 thread tokenize [--tokenizer '{"identifiers":"both"}'] "INC-12345 failed"
 ```
 
-`docs.jsonl` is one object per line with an integer `id`, a `text`, an optional `attrs` (the u32 attribute word)
-and an optional `meta` (a string, or any JSON value stored as its text). A segment file built here is byte-for-byte what an upsert writes, so a corpus can be
+`docs.jsonl` is one object per line with an integer `id`, a `text`, an optional `attrs` (the u32 attribute word),
+an optional `meta` (a string, or any JSON value stored as its text) and, with `--keys`, a string `key`. A segment file built here is byte-for-byte what an upsert writes, so a corpus can be
 indexed locally and uploaded as `idx/{gen}/seg/base.0.thread` with a matching `segments` entry in rev 0.
 
 ## Not done
@@ -270,3 +301,4 @@ indexed locally and uploaded as `idx/{gen}/seg/base.0.thread` with a matching `s
 - Wiper's `search_range` sharding over Durable Objects, its SQLite/D1 byte sources and the ICU/charabia
   segmenters were not carried over.
 - Fusion is RRF only; the judge-based reranker is exposed as arithmetic, not wired to a model.
+- Keys: no reverse lookup (id -> key), no Bloom filter for negative lookups ([keys.md](keys.md#not-done)).

@@ -17,6 +17,7 @@ use std::sync::{Mutex, MutexGuard};
 use thread_core::container::{self, Container};
 use thread_core::docs::DocEntry;
 use thread_core::error::Error;
+use thread_core::keys::KeyPage;
 use thread_core::lex::{Lengths, LexParams, QueryTerm, Stats, TermInfo};
 use thread_core::segment::{self, Segment, SegmentBuilder, SegmentOptions};
 use thread_core::source::{ByteSource, Plan, Prefetched, Range, SourceError};
@@ -102,6 +103,8 @@ fn segment_options(
     docs: bool,
     text: bool,
     bucket_docs: u32,
+    keys: bool,
+    bucket_keys: u32,
 ) -> Result<SegmentOptions, LexErr> {
     let lengths = Lengths::from_name(lengths).ok_or_else(|| {
         LexErr::Arg(format!(
@@ -131,6 +134,12 @@ fn segment_options(
             SegmentOptions::default().bucket_docs
         } else {
             bucket_docs
+        },
+        keys,
+        bucket_keys: if bucket_keys == 0 {
+            SegmentOptions::default().bucket_keys
+        } else {
+            bucket_keys
         },
     })
 }
@@ -190,8 +199,9 @@ fn tokenizer_config_json(py: Python<'_>, config_json: Option<&str>) -> PyResult<
 
 // ---- segment builder ----------------------------------------------------------------------------
 
-/// Builds one segment (the BM25 index and/or the docs entries of a batch of documents).
-/// `tokenizer_json` `"{}"` is the default tokenizer; None or empty = no lexical index (docs only).
+/// Builds one segment (the BM25 index, the docs entries and/or the keys of a batch of documents).
+/// `tokenizer_json` `"{}"` is the default tokenizer; None or empty = no lexical index (docs only);
+/// `keys` writes a `keys` section (unique string keys -> ids) from the keys passed to `add`.
 #[pyclass(module = "thread_sdk._native")]
 pub struct SegmentJob {
     b: Option<SegmentBuilder>,
@@ -209,6 +219,7 @@ impl SegmentJob {
 impl SegmentJob {
     #[new]
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (tokenizer_json, k1, b, lengths, bucket_terms, docs, text, bucket_docs, keys = false, bucket_keys = 0))]
     fn new(
         py: Python<'_>,
         tokenizer_json: Option<&str>,
@@ -219,6 +230,8 @@ impl SegmentJob {
         docs: bool,
         text: bool,
         bucket_docs: u32,
+        keys: bool,
+        bucket_keys: u32,
     ) -> PyResult<Self> {
         let opts = segment_options(
             tokenizer_json,
@@ -229,6 +242,8 @@ impl SegmentJob {
             docs,
             text,
             bucket_docs,
+            keys,
+            bucket_keys,
         )
         .map_err(|e| e.into_py(py))?;
         Ok(SegmentJob {
@@ -236,9 +251,10 @@ impl SegmentJob {
         })
     }
 
-    /// Adds a document (`attrs`: its attribute word, stored in `docs`). Returns the tokens indexed. Errors on a
-    /// duplicate id (nothing added).
-    #[pyo3(signature = (id, text = None, meta = None, attrs = 0))]
+    /// Adds a document (`attrs`: its attribute word, stored in `docs`; `key`: its unique string key, stored in
+    /// `keys` when the job writes that section). Returns the tokens indexed. Errors on a duplicate id or key
+    /// (nothing added).
+    #[pyo3(signature = (id, text = None, meta = None, attrs = 0, key = None))]
     fn add(
         &mut self,
         py: Python<'_>,
@@ -246,8 +262,9 @@ impl SegmentJob {
         text: Option<&str>,
         meta: Option<&str>,
         attrs: u32,
+        key: Option<&str>,
     ) -> PyResult<u32> {
-        let r = self.builder()?.add(id, text, meta, attrs);
+        let r = self.builder()?.add_keyed(id, key, text, meta, attrs);
         r.map(|n| n as u32).map_err(|e| LexErr::from(e).into_py(py))
     }
 
@@ -284,9 +301,10 @@ fn segment_meta(py: Python<'_>, segment: Buf) -> PyResult<String> {
 
 /// Merges whole segments (**oldest first**) into one, leaving out each segment's tombstoned ids
 /// (`tombstones[i]`: `u32` LE ids hidden in segment `i`, or None). The lexical index is rebuilt with
-/// the given parameters.
+/// the given parameters; a `keys` section is written when `keys` is set or any input has one.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (segments, tombstones, tokenizer_json, k1, b, lengths, bucket_terms, docs, text, bucket_docs, keys = false, bucket_keys = 0))]
 fn merge_segments<'py>(
     py: Python<'py>,
     segments: Vec<Buf>,
@@ -299,6 +317,8 @@ fn merge_segments<'py>(
     docs: bool,
     text: bool,
     bucket_docs: u32,
+    keys: bool,
+    bucket_keys: u32,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let opts = segment_options(
         tokenizer_json,
@@ -309,6 +329,8 @@ fn merge_segments<'py>(
         docs,
         text,
         bucket_docs,
+        keys,
+        bucket_keys,
     )
     .map_err(|e| e.into_py(py))?;
     if tombstones.len() != segments.len() {
@@ -401,6 +423,16 @@ impl ReaderState {
             f(&d).map_err(Error::Source)
         })
     }
+
+    fn with_keys<T>(
+        &self,
+        f: impl FnOnce(&thread_core::keys::Keys<Sub<'_>>) -> Result<T, SourceError>,
+    ) -> Result<T, LexErr> {
+        self.with_section(container::SEC_KEYS, |sub| {
+            let k = thread_core::keys::Keys::open(sub)?;
+            f(&k).map_err(Error::Source)
+        })
+    }
 }
 
 /// Segment counts from the section headers (see `SegmentReader.info`).
@@ -408,11 +440,13 @@ struct Info {
     lex: Option<[f64; 11]>,
     lengths: Option<&'static str>,
     docs: Option<(u64, bool, u64, u64, u64, u64)>,
+    keys: Option<(u64, u64, u64, u64)>,
 }
 
 /// One segment object under demand paging. Opening: fetch `plan_open()`, call `open()`, then fetch
 /// `plan_headers()` and `plan_directories()` and keep them resident, so that a search is two rounds
-/// (`lookup`: the terms' buckets; `search`: their posting lists) and a docs lookup one or two.
+/// (`lookup`: the terms' buckets; `search`: their posting lists), a docs lookup one or two and a
+/// key lookup one (`keys_get`).
 #[pyclass(frozen, module = "thread_sdk._native")]
 pub struct SegmentReader {
     st: Mutex<ReaderState>,
@@ -499,15 +533,23 @@ impl SegmentReader {
             .collect()
     }
 
-    /// Opens the container and reads `meta`. Returns `{has_lex, has_docs, tokenizer: json | None,
+    /// Opens the container and reads `meta`. Returns `{has_lex, has_docs, has_keys, tokenizer: json | None,
     /// meta: json, sections: [(name, offset, len)]}`.
     fn open<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        type Opened = (bool, bool, Option<String>, String, Vec<(String, u64, u64)>);
-        let (has_lex, has_docs, tok, meta, sections): Opened = self.run(py, |st| {
+        type Opened = (
+            bool,
+            bool,
+            bool,
+            Option<String>,
+            String,
+            Vec<(String, u64, u64)>,
+        );
+        let (has_lex, has_docs, has_keys, tok, meta, sections): Opened = self.run(py, |st| {
             let seg = Segment::open(&st.source)?;
             let out = (
                 seg.has_lex(),
                 seg.has_docs(),
+                seg.has_keys(),
                 seg.tokenizer().map(|c| c.to_json()),
                 seg.meta().to_string(),
                 seg.container()
@@ -522,13 +564,14 @@ impl SegmentReader {
         let d = PyDict::new(py);
         d.set_item("has_lex", has_lex)?;
         d.set_item("has_docs", has_docs)?;
+        d.set_item("has_keys", has_keys)?;
         d.set_item("tokenizer", tok)?;
         d.set_item("meta", meta)?;
         d.set_item("sections", sections)?;
         Ok(d)
     }
 
-    /// The section headers (first bytes of `terms`, `postings`, `docs`): fetch once, keep.
+    /// The section headers (first bytes of `terms`, `postings`, `docs`, `keys`): fetch once, keep.
     fn plan_headers(&self, py: Python<'_>) -> PyResult<Vec<(u64, u64)>> {
         self.run(py, |st| {
             let seg = st.seg()?;
@@ -540,6 +583,7 @@ impl SegmentReader {
                     thread_core::lex::POSTINGS_HEADER_LEN,
                 ),
                 (container::SEC_DOCS, thread_core::docs::HEADER_LEN),
+                (container::SEC_KEYS, thread_core::keys::HEADER_LEN),
             ] {
                 if let Some(r) = seg.section(name) {
                     plan.push(Range::new(r.offset, head.min(r.len)));
@@ -553,15 +597,21 @@ impl SegmentReader {
     /// The segment's counts from the section headers (`MissingRanges` until `plan_headers` is held):
     /// `{num_docs, total_len, num_terms, num_postings, k1, b, lengths, bucket_terms,
     /// terms_directory_bytes, terms_bytes, postings_bytes, docs: {n, has_text, bucket_docs,
-    /// directory_bytes, text_bytes, nbytes} | None}`; the counts are 0 without a lexical index.
+    /// directory_bytes, text_bytes, nbytes} | None, keys: {n, bucket_keys, directory_bytes, nbytes} | None}`;
+    /// the counts are 0 without a lexical index.
     fn info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let info = self.run(py, |st| {
-            let (has_lex, has_docs) = (st.seg()?.has_lex(), st.seg()?.has_docs());
+            let (has_lex, has_docs, has_keys) = (
+                st.seg()?.has_lex(),
+                st.seg()?.has_docs(),
+                st.seg()?.has_keys(),
+            );
             let mut acc: Vec<Range> = Vec::new();
             let mut out = Info {
                 lex: None,
                 lengths: None,
                 docs: None,
+                keys: None,
             };
             if has_lex {
                 let postings_len = st.section(container::SEC_POSTINGS)?.len;
@@ -603,6 +653,20 @@ impl SegmentReader {
                     ))
                 }) {
                     Ok(v) => out.docs = Some(v),
+                    Err(LexErr::Missing(mut r)) => acc.append(&mut r),
+                    Err(e) => return Err(e),
+                }
+            }
+            if has_keys {
+                match st.with_keys(|k| {
+                    Ok((
+                        k.n() as u64,
+                        k.bucket_keys() as u64,
+                        k.directory_nbytes(),
+                        k.nbytes(),
+                    ))
+                }) {
+                    Ok(v) => out.keys = Some(v),
                     Err(LexErr::Missing(mut r)) => acc.append(&mut r),
                     Err(e) => return Err(e),
                 }
@@ -649,19 +713,37 @@ impl SegmentReader {
                 d.set_item("docs", dd)?;
             }
         }
+        match info.keys {
+            None => d.set_item("keys", py.None())?,
+            Some((n, bucket_keys, dir, nbytes)) => {
+                let kd = PyDict::new(py);
+                kd.set_item("n", n)?;
+                kd.set_item("bucket_keys", bucket_keys)?;
+                kd.set_item("directory_bytes", dir)?;
+                kd.set_item("nbytes", nbytes)?;
+                d.set_item("keys", kd)?;
+            }
+        }
         Ok(d)
     }
 
-    /// The terms and docs directories (needs the headers): fetch once, keep.
+    /// The terms, docs and keys directories (needs the headers): fetch once, keep.
     fn plan_directories(&self, py: Python<'_>) -> PyResult<Vec<(u64, u64)>> {
         self.run(py, |st| {
-            let (has_lex, has_docs) = (st.seg()?.has_lex(), st.seg()?.has_docs());
+            let (has_lex, has_docs, has_keys) = (
+                st.seg()?.has_lex(),
+                st.seg()?.has_docs(),
+                st.seg()?.has_keys(),
+            );
             let mut plan = Plan::new();
             if has_lex {
                 plan.append(st.with_terms(|t| Ok(t.plan_directory()))?);
             }
             if has_docs {
                 plan.append(st.with_docs(|d| Ok(d.plan_directory()))?);
+            }
+            if has_keys {
+                plan.append(st.with_keys(|k| Ok(k.plan_directory()))?);
             }
             plan.coalesce(thread_core::lex::PLAN_GAP);
             Ok(ranges_out(plan.ranges()))
@@ -787,6 +869,40 @@ impl SegmentReader {
             }
         }
         Ok(out)
+    }
+
+    /// The id of each key through the `keys` section (None when the segment lacks the key or has no
+    /// keys section). One round cold after the directory.
+    fn keys_get(&self, py: Python<'_>, keys: Vec<String>) -> PyResult<Vec<Option<u32>>> {
+        self.run(py, |st| {
+            if !st.seg()?.has_keys() {
+                return Ok(vec![None; keys.len()]);
+            }
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            st.with_keys(|k| k.lookup(&refs))
+        })
+    }
+
+    /// Up to `limit` keys starting with `prefix` (those `> after` when given), in key order:
+    /// `{entries: [(key, id), ..], more}`; empty without a keys section.
+    #[pyo3(signature = (prefix, after = None, limit = 100))]
+    fn keys_list<'py>(
+        &self,
+        py: Python<'py>,
+        prefix: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let page: KeyPage = self.run(py, |st| {
+            if !st.seg()?.has_keys() {
+                return Ok(KeyPage::default());
+            }
+            st.with_keys(|k| k.list(prefix, after, limit))
+        })?;
+        let d = PyDict::new(py);
+        d.set_item("entries", page.entries)?;
+        d.set_item("more", page.more)?;
+        Ok(d)
     }
 }
 

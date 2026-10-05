@@ -251,6 +251,7 @@ class ResolvedLexConfig:
     docs: bool
     text: bool
     bucket_docs: int
+    bucket_keys: int
     rrf_k: float
     recall_k: int | None
     weights: dict[str, float]
@@ -272,6 +273,7 @@ def resolve_lex_config(m: dict[str, Any]) -> ResolvedLexConfig | None:
         docs=c.get("docs", True),
         text=c.get("text", False),
         bucket_docs=c.get("bucketDocs", 128),
+        bucket_keys=c.get("bucketKeys", 128),
         rrf_k=d.get("rrfK", 60),
         recall_k=d.get("recallK"),
         weights={"dense": w.get("dense", 1), "lexical": w.get("lexical", 1)},

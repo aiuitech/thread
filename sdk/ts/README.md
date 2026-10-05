@@ -319,13 +319,21 @@ const r = await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: 
 // { gen, rev, seq, count, cells, distinctCells, keys: { delta, segment, tombstones, manifest }, bytes, conflicts, casConflicts, currentUpdated, ms }
 await index.upsert({ ids: [1002], texts: ["text-only document"], metas: ["C"] });   // no vector: found by text alone
 await index.delete([1000]);           // { gen, rev, count, key, conflicts, ... } (hides the vector, the text and the doc)
+// by key (needs manifest.lex): known keys keep their id, new keys are allocated from manifest.nextId; r.ids lists them
+const k = await index.upsert({ keys: ["s3://b/a.bin", "s3://b/c.bin"], metas: ["A", "C"], texts: ["host:cdn-1", "host:cdn-2"] });
+const { records } = await index.get(["s3://b/a.bin"], { text: true });   // Map<key, { key, id, meta, attrs, text? }>
+const { ids } = await index.resolveKeys(["s3://b/a.bin"]);              // Map<key, id>
+const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });   // { entries: [{ key, id }], more, next }; continue with { after: page.next }
+await index.deleteKeys(["s3://b/c.bin"]);                                // { count, missing, ... }
 await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
 await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only generation (no dense index)
 ```
 
 `manifest.lex` (`LexConfig`): `tokenizer` (frozen once a segment exists), `k1`, `b`, `lengths: "exact" | "byte"`,
-`bucketTerms`, `docs`, `text`, `bucketDocs`, `defaults: {rrfK, recallK, weights}`; see docs/lexical.md for what
-each one trades.
+`bucketTerms`, `docs`, `text`, `bucketDocs`, `bucketKeys`, `defaults: {rrfK, recallK, weights}`; see docs/lexical.md
+for what each one trades. Keys (non-empty strings of at most 4096 bytes, unique per batch) are stored in the
+segment's `keys` section and resolved newest segment first; the design and the key-value index case are in
+[docs/keys.md](../../docs/keys.md).
 
 Implemented against [docs/update-path.md](../../docs/update-path.md): an upsert encodes one delta segment
 (`DeltaJob`: primary cell + residual codes, PQ codes with the generation's codebook) and, unless

@@ -290,12 +290,20 @@ r = index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["Tit
 # UpsertResult(gen, rev, seq, count, cells, distinct_cells, keys, bytes, conflicts, cas_conflicts, current_updated, ms)
 index.upsert([1002], texts=["text-only document"], metas=["C"])        # no vector: found by text alone
 index.delete([1000])                    # hides the vector, the text and the doc
+k = index.upsert(keys=["s3://b/a.bin", "s3://b/c.bin"], metas=["A", "C"], texts=["host:cdn-1", "host:cdn-2"])
+# by key (needs manifest.lex): known keys keep their id, new keys are allocated from manifest.nextId; k.ids lists them
+index.get(["s3://b/a.bin"], text=True)  # {key: KeyRecord(id, meta, text, attrs, key)}
+index.resolve_keys(["s3://b/a.bin"])    # {key: id}
+page = index.list_keys("s3://b/", limit=100)   # KeyPage(entries=[(key, id)], more, next); continue with after=page.next
+index.delete_keys(["s3://b/c.bin"])     # DeleteResult with .missing
 index.compact_segments()                # merge the lexical/docs segments into one base segment
 create_lexical_generation(store, "docs1", {"text": True})               # a text-only generation (no dense index)
 ```
 
 `vectors` may be `n * dim` floats, one row per id, an `(n, dim)` numpy array or raw f32 bytes. Up to 4096 ids per
-call. `replace=False` skips the tombstone set when the ids are known to be new. `configure_lexical` takes the
+call. `replace=False` skips the tombstone set when the ids are known to be new. Keys (non-empty strings of at most
+4096 bytes, unique per batch) go to the segment's `keys` section and resolve newest segment first; see
+[docs/keys.md](../../docs/keys.md). `configure_lexical` takes the
 wire-format dict (`{"bucketTerms": 64}`) or snake_case keyword arguments; the tokenizer of a generation with
 segments is frozen.
 

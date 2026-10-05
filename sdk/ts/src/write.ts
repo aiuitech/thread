@@ -14,7 +14,15 @@ import { defineAttrs, packAttrs, schemaExtends, validateSchema, type AttrFieldSp
 import { buildTombState, currentBody, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
 
 export interface UpsertInput {
-	ids: ArrayLike<number>;
+	/** The documents' u32 ids. Optional with `keys`: the ids of known keys are reused, new keys get fresh ones. */
+	ids?: ArrayLike<number>;
+	/**
+	 * One unique string key per document (an external address, a path, a primary key; at most 4096 bytes), stored
+	 * in the segment's `keys` section so `get(key)` / `resolveKeys` find the document. Needs `manifest.lex`. Without
+	 * `ids`, each key is resolved through the head revision: a known key keeps its id (so the put replaces the
+	 * document), a new key is allocated the next id from `manifest.nextId`.
+	 */
+	keys?: readonly string[];
 	/**
 	 * `n * dim` floats (flat) or one array per vector; any norm (normalized here). Optional when the generation has
 	 * a lexical configuration: documents without a vector are only found by text.
@@ -46,6 +54,10 @@ export interface UpsertResult {
 	rev: number;
 	seq: number;
 	count: number;
+	/** The ids written, in input order (the given ones, or those resolved / allocated for `keys`). */
+	ids: number[];
+	/** Ids allocated to new keys. */
+	allocated: number;
 	/** Primary cell of each vector (empty without vectors). */
 	cells: number[];
 	distinctCells: number;
@@ -66,6 +78,8 @@ export interface DeleteResult {
 	rev: number;
 	count: number;
 	key: string;
+	/** `deleteKeys`: the keys that had no live document (nothing was written if every key was missing). */
+	missing?: string[];
 	conflicts: number;
 	casConflicts: number;
 	currentUpdated: boolean;
@@ -79,6 +93,8 @@ export interface WriterContext {
 	gen: string;
 	/** The index's loaded PqCodebook for these base files (if any), to avoid re-parsing 1.5 MB. */
 	borrowPq: (baseKey: string) => W.PqCodebook | null;
+	/** Resolves keys to ids through the `keys` sections of the given (head) revision. */
+	resolveKeys: (manifest: Manifest, keys: readonly string[]) => Promise<Map<string, number>>;
 }
 
 export interface ConfigureLexicalResult {
@@ -122,6 +138,8 @@ export interface CreateLexicalOptions {
 }
 
 export const MAX_UPSERT = 4096;
+/** Longest key (UTF-8 bytes). */
+export const MAX_KEY_BYTES = 4096;
 const COMMIT_ATTEMPTS = 12;
 /** Vectors passed to DeltaJob.add per call (bounds the batch copy in wasm memory). */
 const DELTA_ADD_CHUNK = 256;
@@ -243,7 +261,11 @@ function u32(a: ArrayLike<number>, name: string): Uint32Array {
 }
 
 interface Batch {
+	/** The ids (resolved / allocated per attempt for a keyed batch without ids). */
 	ids: Uint32Array;
+	/** Whether the caller gave the ids (else they come from the keys). */
+	givenIds: boolean;
+	keys: string[] | null;
 	/** Unit-normalized vectors (a copy), or null for a text-only batch. */
 	vectors: Float32Array | null;
 	attrs: Uint32Array | null;
@@ -252,14 +274,29 @@ interface Batch {
 	metas: (string | null)[] | null;
 }
 
+const utf8Len = (s: string): number => new TextEncoder().encode(s).byteLength;
+
 /** Validates the batch and returns ids and unit-normalized vectors (a copy). */
 function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | null, schema: AttrSchema | null): Batch {
-	const ids = u32(input.ids, "ids");
+	const keys = input.keys ? Array.from(input.keys) : null;
+	if (keys) {
+		if (!lex) throw new ThreadError("keys need a lexical configuration (index.configureLexical)", 400);
+		if (keys.length > MAX_UPSERT) throw new ThreadError(`at most ${MAX_UPSERT} documents per upsert`, 400);
+		if (new Set(keys).size !== keys.length) throw new ThreadError("duplicate keys in the batch", 400);
+		keys.forEach((k, i) => {
+			if (typeof k !== "string" || k.length === 0) throw new ThreadError(`keys[${i}] is not a non-empty string`, 400);
+			if (k.length > MAX_KEY_BYTES || utf8Len(k) > MAX_KEY_BYTES) throw new ThreadError(`keys[${i}] is longer than ${MAX_KEY_BYTES} bytes`, 400);
+		});
+	}
+	if (input.ids === undefined && !keys) throw new ThreadError("an upsert needs ids or keys", 400);
+	const givenIds = input.ids !== undefined;
+	const ids = givenIds ? u32(input.ids!, "ids") : new Uint32Array(keys!.length);
 	const n = ids.length;
 	if (n === 0) throw new ThreadError("empty batch", 400);
 	if (n > MAX_UPSERT) throw new ThreadError(`at most ${MAX_UPSERT} documents per upsert`, 400);
-	if (new Set(ids).size !== n) throw new ThreadError("duplicate ids in the batch", 400);
+	if (givenIds && new Set(ids).size !== n) throw new ThreadError("duplicate ids in the batch", 400);
 	if (ids.some((id) => id === 0xffffffff)) throw new ThreadError("id 4294967295 is reserved", 400);
+	if (keys && keys.length !== n) throw new ThreadError(`${keys.length} keys for ${n} ids`, 400);
 	const texts = input.texts ?? null;
 	const metas = input.metas ?? null;
 	if (texts && texts.length !== n) throw new ThreadError(`${texts.length} texts for ${n} ids`, 400);
@@ -268,9 +305,9 @@ function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | 
 	if (input.attrs && input.attrs.length !== n) throw new ThreadError(`${input.attrs.length} attrs for ${n} ids`, 400);
 	const attrs = input.attrs ? Uint32Array.from({ length: n }, (_, i) => packAttrs(schema, input.attrs![i])) : null;
 	if (input.vectors === undefined) {
-		if (!texts && !metas) throw new ThreadError("an upsert needs vectors, texts or metas", 400);
+		if (!texts && !metas && !keys) throw new ThreadError("an upsert needs vectors, texts, metas or keys", 400);
 		if (input.payloads) throw new ThreadError("payloads belong to vectors", 400);
-		return { ids, vectors: null, attrs, payloads: null, texts, metas };
+		return { ids, givenIds, keys, vectors: null, attrs, payloads: null, texts, metas };
 	}
 	if (dim === 0) throw new ThreadError("this generation has no dense index: upsert texts/metas only", 400);
 	const v = input.vectors;
@@ -297,7 +334,28 @@ function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | 
 	const enc = new TextEncoder();
 	const payloads = input.payloads ? input.payloads.map((p) => (typeof p === "string" ? enc.encode(p) : p)) : null;
 	if (payloads && payloads.length !== n) throw new ThreadError(`${payloads.length} payloads for ${n} vectors`, 400);
-	return { ids, vectors, attrs, payloads, texts, metas };
+	return { ids, givenIds, keys, vectors, attrs, payloads, texts, metas };
+}
+
+/**
+ * The ids of a keyed batch against the head revision: known keys keep their id, new keys take the next ids from
+ * `manifest.nextId` (`vectors` when absent). Returns the ids and the number allocated.
+ */
+async function assignIds(ctx: WriterContext, manifest: Manifest, keys: readonly string[]): Promise<{ ids: Uint32Array; allocated: number }> {
+	const found = await ctx.resolveKeys(manifest, keys);
+	let nextId = manifest.nextId ?? manifest.vectors ?? 0;
+	let allocated = 0;
+	const ids = new Uint32Array(keys.length);
+	keys.forEach((k, i) => {
+		const id = found.get(k);
+		if (id !== undefined) ids[i] = id;
+		else {
+			if (nextId >= 0xffffffff) throw new ThreadError("the id space is exhausted", 400);
+			ids[i] = nextId++;
+			allocated++;
+		}
+	});
+	return { ids, allocated };
 }
 
 /** The first free seq >= `from` for both the delta and the segment key (a crashed writer's objects are skipped). */
@@ -314,16 +372,16 @@ interface EncodedSegment {
 	ref: Omit<SegmentRef, "addedRev">;
 }
 
-/** Tokenizes and writes one lexical/docs segment for the batch under the generation's `lex` configuration. */
+/** Tokenizes and writes one lexical/docs/keys segment for the batch under the generation's `lex` configuration. */
 async function encodeSegment(ctx: WriterContext, seq: number, lex: ResolvedLexConfig, b: Batch): Promise<EncodedSegment> {
 	const { w, store, gen } = ctx;
 	// `{}` is the default tokenizer; a null tokenizer would mean a docs-only segment without a lexical index.
-	const job = new w.SegmentJob(JSON.stringify(lex.tokenizer ?? {}), lex.k1, lex.b, lex.lengths, lex.bucketTerms, lex.docs, lex.text, lex.bucketDocs);
+	const job = new w.SegmentJob(JSON.stringify(lex.tokenizer ?? {}), lex.k1, lex.b, lex.lengths, lex.bucketTerms, lex.docs, lex.text, lex.bucketDocs, b.keys !== null, lex.bucketKeys);
 	let bytes: Uint8Array;
 	let finished = false;
 	const epoch = ctx.thread.epoch;
 	try {
-		for (let i = 0; i < b.ids.length; i++) job.add(b.ids[i], b.texts?.[i] ?? undefined, b.metas?.[i] ?? undefined, b.attrs?.[i] ?? 0);
+		for (let i = 0; i < b.ids.length; i++) job.add(b.ids[i], b.texts?.[i] ?? undefined, b.metas?.[i] ?? undefined, b.attrs?.[i] ?? 0, b.keys?.[i]);
 		finished = true;
 		bytes = job.finish();
 	} finally {
@@ -331,7 +389,7 @@ async function encodeSegment(ctx: WriterContext, seq: number, lex: ResolvedLexCo
 	}
 	const tokens = 0; // reported from the job before finish would need a second pass; the meta carries the count
 	const key = await putUnique(store, keys.segment(gen, seq), bytes);
-	return { key, bytes: bytes.byteLength, tokens, ref: { seq, key, count: b.ids.length, bytes: bytes.byteLength, lex: true, docs: lex.docs, text: lex.docs && lex.text } };
+	return { key, bytes: bytes.byteLength, tokens, ref: { seq, key, count: b.ids.length, bytes: bytes.byteLength, lex: true, docs: lex.docs, text: lex.docs && lex.text, ...(b.keys ? { keys: true } : {}) } };
 }
 
 interface EncodedDelta {
@@ -409,17 +467,37 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 	writable(store);
 	const replace = input.replace ?? true;
 	return ctx.thread.withRecovery("upsert", async () => {
-		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0 };
+		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number; idsKey: string; idsRev: number; allocated: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0, idsKey: "", idsRev: -1, allocated: 0 };
 		const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
 			const lex = resolveLexConfig(manifest);
 			const batch = (st.batch ??= prepareBatch(input, hasDense(manifest) ? manifest.dim : 0, lex, manifest.attrs ? validateSchema(manifest.attrs) : null));
-			const wantSeg = lex !== null && (batch.texts !== null || batch.metas !== null);
+			const wantSeg = lex !== null && (batch.texts !== null || batch.metas !== null || batch.keys !== null);
 			const next = inherit(manifest);
 			const newRev = rev + 1;
 			const filesKey = `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}`;
 			if (!st.seq) st.seq = await allocSeq(store, gen, manifest.nextSeq ?? 1);
-			// The delta and the segment are reused across retries (unless the means/codebook changed under us);
-			// the tombstone set is keyed by the rev, so it is rewritten for every attempt.
+			// Ids: given, or resolved through the head's keys (re-resolved when a lost race moved the head, since
+			// another writer may have allocated ids or written the same keys meanwhile).
+			const baseNext = manifest.nextId ?? manifest.vectors ?? 0;
+			let nextId = baseNext;
+			if (!batch.givenIds) {
+				if (st.idsRev !== rev) {
+					const a = await assignIds(ctx, manifest, batch.keys!);
+					batch.ids = a.ids;
+					st.allocated = a.allocated;
+					st.idsRev = rev;
+				}
+				nextId = baseNext + st.allocated; // the allocation took the next ids of this head
+			} else for (const id of batch.ids) if (id >= nextId) nextId = id + 1;
+			if (nextId !== baseNext || manifest.nextId !== undefined) next.nextId = nextId;
+			const idsKey = batch.ids.join(",");
+			if (idsKey !== st.idsKey) {
+				st.idsKey = idsKey;
+				st.delta = null;
+				st.seg = null;
+			}
+			// The delta and the segment are reused across retries (unless the means/codebook or the ids changed
+			// under us); the tombstone set is keyed by the rev, so it is rewritten for every attempt.
 			const tb = replace ? tombBytes(w, batch.ids) : null;
 			const [delta, seg, tombKey] = await Promise.all([
 				batch.vectors ? (st.delta && st.delta.filesKey === filesKey ? st.delta : encodeDelta(ctx, manifest, files, batch, st.seq)) : Promise.resolve(null),
@@ -436,7 +514,7 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 			if (delta) next.deltas!.push({ seq: delta.seq, key: delta.key, count: batch.ids.length, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
 			if (seg) next.segments = [...(next.segments ?? []), { ...seg.ref, addedRev: newRev }];
 			next.nextSeq = Math.max(next.nextSeq ?? 1, st.seq + 1);
-			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, dense: !!delta, lexical: !!seg, writer: "thread-sdk" } };
+			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, dense: !!delta, lexical: !!seg, ...(batch.keys ? { keys: batch.keys.length, allocated: st.allocated } : {}), writer: "thread-sdk" } };
 		});
 		const d = st.delta;
 		return {
@@ -444,6 +522,8 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 			rev: c.rev,
 			seq: st.seq,
 			count: st.batch!.ids.length,
+			ids: Array.from(st.batch!.ids),
+			allocated: st.allocated,
 			cells: d ? Array.from(d.cells) : [],
 			distinctCells: d?.nCells ?? 0,
 			keys: { delta: d?.key ?? null, segment: st.seg?.key ?? null, tombstones: st.tombKey, manifest: c.manifestKey },
@@ -509,7 +589,7 @@ export async function compactSegments(ctx: WriterContext): Promise<CompactSegmen
 	let count = 0;
 	let bytes = 0;
 	let readBytes = 0;
-	let built: { forKeys: string; key: string; bytes: number; count: number } | null = null;
+	let built: { forKeys: string; key: string; bytes: number; count: number; keys: boolean } | null = null;
 	const c = await commitRev(ctx, async ({ rev, manifest }) => {
 		const lex = resolveLexConfig(manifest);
 		if (!lex) throw new ThreadError("this generation has no lexical configuration", 400);
@@ -543,16 +623,16 @@ export async function compactSegments(ctx: WriterContext): Promise<CompactSegmen
 				tombs.set(t, o);
 				o += t.byteLength;
 			}
-			const out = w.merge_segments(concat, Float64Array.from(parts, (p) => p.byteLength), tombs, Uint32Array.from(tombBufs, (t) => t.byteLength), JSON.stringify(lex.tokenizer ?? {}), lex.k1, lex.b, lex.lengths, lex.bucketTerms, lex.docs, lex.text, lex.bucketDocs);
-			const meta = JSON.parse(w.segment_meta(out)) as { lex?: { num_docs: number }; docs?: { n: number } };
+			const out = w.merge_segments(concat, Float64Array.from(parts, (p) => p.byteLength), tombs, Uint32Array.from(tombBufs, (t) => t.byteLength), JSON.stringify(lex.tokenizer ?? {}), lex.k1, lex.b, lex.lengths, lex.bucketTerms, lex.docs, lex.text, lex.bucketDocs, false, lex.bucketKeys);
+			const meta = JSON.parse(w.segment_meta(out)) as { lex?: { num_docs: number }; docs?: { n: number }; keys?: { n: number } };
 			const k = await putUnique(store, keys.segmentBase(gen, rev + 1), out);
-			built = { forKeys, key: k, bytes: out.byteLength, count: meta.docs?.n ?? meta.lex?.num_docs ?? 0 };
+			built = { forKeys, key: k, bytes: out.byteLength, count: meta.docs?.n ?? meta.lex?.num_docs ?? 0, keys: meta.keys !== undefined };
 		}
 		merged = segs.length;
 		key = built.key;
 		bytes = built.bytes;
 		count = built.count;
-		const ref: SegmentRef = { seq: 0, key: built.key, addedRev: rev + 1, count, bytes, lex: true, docs: lex.docs, text: lex.docs && lex.text, base: true };
+		const ref: SegmentRef = { seq: 0, key: built.key, addedRev: rev + 1, count, bytes, lex: true, docs: lex.docs, text: lex.docs && lex.text, ...(built.keys ? { keys: true } : {}), base: true };
 		return { ...inherit(manifest), segments: [ref], change: { op: "compact-segments", merged, count, writer: "thread-sdk" } };
 	});
 	return { gen, rev: c.rev, merged, key, count, bytes, readBytes, conflicts: c.conflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
@@ -575,6 +655,34 @@ export async function createLexicalGeneration(opts: CreateLexicalOptions): Promi
 		else await writable(store).put(keys.current(), body, { ifMatch: cur.etag, contentType: "application/json" });
 	}
 	return { gen, rev: 0, manifest };
+}
+
+/**
+ * Deletes documents by key: the keys are resolved through the head revision's `keys` sections and the ids found
+ * are tombstoned (one set, rev + 1). Nothing is written when no key has a live document.
+ */
+export async function deleteKeys(ctx: WriterContext, keysIn: readonly string[]): Promise<DeleteResult> {
+	const t0 = Date.now();
+	const { store, gen, w } = ctx;
+	writable(store);
+	const wanted = [...new Set(keysIn)];
+	if (!wanted.length) throw new ThreadError("no keys", 400);
+	let key = "";
+	let ids = new Uint32Array(0);
+	let missing: string[] = [];
+	const c = await commitRev(ctx, async ({ rev, manifest }) => {
+		if (!resolveLexConfig(manifest)) throw new ThreadError("this generation has no lexical configuration (no keys)", 400);
+		const found = await ctx.resolveKeys(manifest, wanted);
+		missing = wanted.filter((k) => !found.has(k));
+		ids = Uint32Array.from(new Set(found.values()));
+		if (!ids.length) return null;
+		const tb = tombBytes(w, ids);
+		const next = inherit(manifest);
+		key = await putUnique(store, keys.tombstones(gen, rev + 1), tb);
+		next.tombstones!.push({ rev: rev + 1, key, count: ids.length });
+		return { ...next, change: { op: "delete", count: ids.length, keys: wanted.length, writer: "thread-sdk" } };
+	});
+	return { gen, rev: c.rev, count: ids.length, key, missing, conflicts: c.conflicts, casConflicts: c.casConflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
 }
 
 export async function deleteIds(ctx: WriterContext, idsIn: ArrayLike<number>): Promise<DeleteResult> {

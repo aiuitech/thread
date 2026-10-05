@@ -14,7 +14,7 @@ import re
 import time
 from array import array
 from concurrent.futures import Executor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -72,6 +72,10 @@ class UpsertResult:
     #: Whether current.json now points at this revision (False if another generation is current).
     current_updated: bool
     ms: float
+    #: The ids written, in input order (the given ones, or those resolved / allocated for `keys`).
+    ids: list[int] = field(default_factory=list)
+    #: Ids allocated to new keys.
+    allocated: int = 0
 
 
 @dataclass
@@ -84,6 +88,8 @@ class DeleteResult:
     cas_conflicts: int
     current_updated: bool
     ms: float
+    #: `delete_keys`: the keys that had no live document (nothing was written if every key was missing).
+    missing: list[str] | None = None
 
 
 @dataclass
@@ -127,6 +133,8 @@ class WriterContext:
     io: Executor
     #: The index's loaded PqCodebook for these base files (if any), to avoid re-parsing 1.5 MB.
     borrow_pq: Callable[[str], Any]
+    #: Resolves keys to ids through the `keys` sections of the given (head) revision's manifest.
+    resolve_keys: Callable[[dict[str, Any], Sequence[str]], dict[str, int]] = lambda m, k: {}
 
 
 def _now_iso() -> str:
@@ -273,8 +281,13 @@ def _is_buffer(v: Any) -> bool:
         return False
 
 
+#: Longest key (UTF-8 bytes).
+MAX_KEY_BYTES = 4096
+
+
 @dataclass
 class _Batch:
+    #: The ids (resolved / allocated per attempt for a keyed batch without ids).
     ids: array
     #: Unit-normalized vectors (f32 LE bytes), or None for a text-only batch.
     vectors: bytes | None
@@ -282,21 +295,43 @@ class _Batch:
     payloads: list[bytes] | None
     texts: list[str | None] | None
     metas: list[str | None] | None
+    keys: list[str] | None = None
+    #: Whether the caller gave the ids (else they come from the keys).
+    given_ids: bool = True
 
 
-def _prepare_batch(ids_in: Iterable[int], vectors: Any, attrs: Iterable[Any] | None, payloads: Sequence[bytes | str] | None,
+def _prepare_batch(ids_in: Iterable[int] | None, vectors: Any, attrs: Iterable[Any] | None, payloads: Sequence[bytes | str] | None,
                    texts: Sequence[str | None] | None, metas: Sequence[str | None] | None, dim: int,
-                   lex: ResolvedLexConfig | None, schema: AttrSchema | None) -> _Batch:
-    ids = _u32(ids_in, "ids")
+                   lex: ResolvedLexConfig | None, schema: AttrSchema | None,
+                   keys_in: Sequence[str] | None = None) -> _Batch:
+    keys_l = list(keys_in) if keys_in is not None else None
+    if keys_l is not None:
+        if lex is None:
+            raise ThreadError("keys need a lexical configuration (index.configure_lexical)", 400)
+        if len(keys_l) > MAX_UPSERT:
+            raise ThreadError(f"at most {MAX_UPSERT} documents per upsert", 400)
+        if len(set(keys_l)) != len(keys_l):
+            raise ThreadError("duplicate keys in the batch", 400)
+        for i, k in enumerate(keys_l):
+            if not isinstance(k, str) or not k:
+                raise ThreadError(f"keys[{i}] is not a non-empty string", 400)
+            if len(k.encode("utf-8")) > MAX_KEY_BYTES:
+                raise ThreadError(f"keys[{i}] is longer than {MAX_KEY_BYTES} bytes", 400)
+    if ids_in is None and keys_l is None:
+        raise ThreadError("an upsert needs ids or keys", 400)
+    given_ids = ids_in is not None
+    ids = _u32(ids_in, "ids") if ids_in is not None else array("I", [0] * len(keys_l or []))
     n = len(ids)
     if n == 0:
         raise ThreadError("empty batch", 400)
     if n > MAX_UPSERT:
         raise ThreadError(f"at most {MAX_UPSERT} documents per upsert", 400)
-    if len(set(ids)) != n:
+    if given_ids and len(set(ids)) != n:
         raise ThreadError("duplicate ids in the batch", 400)
     if 0xFFFFFFFF in ids:
         raise ThreadError("id 4294967295 is reserved", 400)
+    if keys_l is not None and len(keys_l) != n:
+        raise ThreadError(f"{len(keys_l)} keys for {n} ids", 400)
     texts_l = list(texts) if texts is not None else None
     metas_l = list(metas) if metas is not None else None
     if texts_l is not None and len(texts_l) != n:
@@ -310,11 +345,11 @@ def _prepare_batch(ids_in: Iterable[int], vectors: Any, attrs: Iterable[Any] | N
     if attrs_a is not None and len(attrs_a) != n:
         raise ThreadError(f"{len(attrs_a)} attrs for {n} ids", 400)
     if vectors is None:
-        if texts_l is None and metas_l is None:
-            raise ThreadError("an upsert needs vectors, texts or metas", 400)
+        if texts_l is None and metas_l is None and keys_l is None:
+            raise ThreadError("an upsert needs vectors, texts, metas or keys", 400)
         if payloads is not None:
             raise ThreadError("payloads belong to vectors", 400)
-        return _Batch(ids, None, attrs_a, None, texts_l, metas_l)
+        return _Batch(ids, None, attrs_a, None, texts_l, metas_l, keys_l, given_ids)
     if dim == 0:
         raise ThreadError("this generation has no dense index: upsert texts/metas only", 400)
     # A buffer (numpy array of shape (n, dim) or (n * dim,), array('f'), raw f32 bytes) goes to the native side as
@@ -345,7 +380,26 @@ def _prepare_batch(ids_in: Iterable[int], vectors: Any, attrs: Iterable[Any] | N
     payloads_l = [p.encode("utf-8") if isinstance(p, str) else bytes(p) for p in payloads] if payloads is not None else None
     if payloads_l is not None and len(payloads_l) != n:
         raise ThreadError(f"{len(payloads_l)} payloads for {n} vectors", 400)
-    return _Batch(ids, unit, attrs_a, payloads_l, texts_l, metas_l)
+    return _Batch(ids, unit, attrs_a, payloads_l, texts_l, metas_l, keys_l, given_ids)
+
+
+def _assign_ids(ctx: WriterContext, manifest: dict[str, Any], keys_l: Sequence[str]) -> tuple[array, int]:
+    """The ids of a keyed batch against the head revision: known keys keep their id, new keys take the next ids from
+    `manifest.nextId` (`vectors` when absent). Returns the ids and the number allocated."""
+    found = ctx.resolve_keys(manifest, keys_l)
+    next_id = manifest.get("nextId")
+    if next_id is None:
+        next_id = manifest.get("vectors") or 0
+    allocated = 0
+    ids = array("I")
+    for k in keys_l:
+        id = found.get(k)
+        if id is None:
+            if next_id >= 0xFFFFFFFF:
+                raise ThreadError("the id space is exhausted", 400)
+            id, next_id, allocated = next_id, next_id + 1, allocated + 1
+        ids.append(id)
+    return ids, allocated
 
 
 def _alloc_seq(store: BlobStore, gen: str, start: int) -> int:
@@ -370,13 +424,17 @@ def _encode_segment(ctx: WriterContext, seq: int, lex: ResolvedLexConfig, b: _Ba
     """Tokenizes and writes one lexical/docs segment for the batch under the generation's `lex` configuration."""
     # `{}` is the default tokenizer; a None tokenizer would mean a docs-only segment without a lexical index.
     job = _native.SegmentJob(dumps(lex.tokenizer or {}), lex.k1, lex.b, lex.lengths, lex.bucket_terms, lex.docs,
-                             lex.text, lex.bucket_docs)
+                             lex.text, lex.bucket_docs, b.keys is not None, lex.bucket_keys)
     for i, id in enumerate(b.ids):
-        job.add(id, b.texts[i] if b.texts else None, b.metas[i] if b.metas else None, b.attrs[i] if b.attrs is not None else 0)
+        job.add(id, b.texts[i] if b.texts else None, b.metas[i] if b.metas else None,
+                b.attrs[i] if b.attrs is not None else 0, b.keys[i] if b.keys is not None else None)
     data = job.finish()
     key = _put_unique(ctx.store, keys.segment(ctx.gen, seq), data)
-    return _EncodedSegment(key, len(data), {"seq": seq, "key": key, "count": len(b.ids), "bytes": len(data),
-                                            "lex": True, "docs": lex.docs, "text": lex.docs and lex.text})
+    ref = {"seq": seq, "key": key, "count": len(b.ids), "bytes": len(data), "lex": True, "docs": lex.docs,
+           "text": lex.docs and lex.text}
+    if b.keys is not None:
+        ref["keys"] = True
+    return _EncodedSegment(key, len(data), ref)
 
 
 @dataclass
@@ -436,29 +494,50 @@ def _tomb_bytes(ids: array) -> bytes:
     return _native.tombstones_merge(b"", ids) if len(ids) else b""
 
 
-def upsert(ctx: WriterContext, ids: Iterable[int], vectors: Any = None, *, attrs: Iterable[Any] | None = None,
+def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *, attrs: Iterable[Any] | None = None,
            payloads: Sequence[bytes | str] | None = None, texts: Sequence[str | None] | None = None,
-           metas: Sequence[str | None] | None = None, replace: bool = True) -> UpsertResult:
+           metas: Sequence[str | None] | None = None, keys_: Sequence[str] | None = None,
+           replace: bool = True) -> UpsertResult:
     t0 = time.perf_counter()
     store, gen = ctx.store, ctx.gen
     _writable(store)
-    st: dict[str, Any] = {"batch": None, "delta": None, "seg": None, "seq": 0, "tomb_key": None, "tomb_bytes": 0}
+    st: dict[str, Any] = {"batch": None, "delta": None, "seg": None, "seq": 0, "tomb_key": None, "tomb_bytes": 0,
+                          "ids_key": None, "ids_rev": -1, "allocated": 0}
 
     def make(rev: int, manifest: dict[str, Any], files: dict[str, Any]) -> dict[str, Any]:
         lex = resolve_lex_config(manifest)
         if st["batch"] is None:
             schema = validate_schema(manifest["attrs"]) if manifest.get("attrs") else None
             st["batch"] = _prepare_batch(ids, vectors, attrs, payloads, texts, metas,
-                                         manifest["dim"] if has_dense(manifest) else 0, lex, schema)
+                                         manifest["dim"] if has_dense(manifest) else 0, lex, schema, keys_)
         batch: _Batch = st["batch"]
-        want_seg = lex is not None and (batch.texts is not None or batch.metas is not None)
+        want_seg = lex is not None and (batch.texts is not None or batch.metas is not None or batch.keys is not None)
         nxt = _inherit(manifest)
         new_rev = rev + 1
         if not st["seq"]:
             st["seq"] = _alloc_seq(store, gen, manifest.get("nextSeq") or 1)
         seq = st["seq"]
-        # The delta and the segment are reused across retries (unless the means/codebook changed under us); the
-        # tombstone set is keyed by the rev, so it is rewritten for every attempt.
+        # Ids: given, or resolved through the head's keys (re-resolved when a lost race moved the head, since another
+        # writer may have allocated ids or written the same keys meanwhile).
+        base_next = manifest.get("nextId")
+        if base_next is None:
+            base_next = manifest.get("vectors") or 0
+        next_id = base_next
+        if not batch.given_ids:
+            if st["ids_rev"] != rev:
+                assert batch.keys is not None
+                batch.ids, st["allocated"] = _assign_ids(ctx, manifest, batch.keys)
+                st["ids_rev"] = rev
+            next_id = base_next + st["allocated"]  # the allocation took the next ids of this head
+        else:
+            next_id = max(next_id, max(batch.ids) + 1)
+        if next_id != base_next or manifest.get("nextId") is not None:
+            nxt["nextId"] = next_id
+        ids_key = batch.ids.tobytes()
+        if ids_key != st["ids_key"]:
+            st["ids_key"], st["delta"], st["seg"] = ids_key, None, None
+        # The delta and the segment are reused across retries (unless the means/codebook or the ids changed under
+        # us); the tombstone set is keyed by the rev, so it is rewritten for every attempt.
         tb = _tomb_bytes(batch.ids) if replace else None
         delta_f = seg_f = tomb_f = None
         if batch.vectors is not None:
@@ -488,6 +567,8 @@ def upsert(ctx: WriterContext, ids: Iterable[int], vectors: Any = None, *, attrs
         nxt["nextSeq"] = max(nxt.get("nextSeq") or 1, seq + 1)
         nxt["change"] = {"op": "upsert", "seq": seq, "count": len(batch.ids), "replace": replace,
                          "dense": delta is not None, "lexical": seg is not None, "writer": "thread-sdk-python"}
+        if batch.keys is not None:
+            nxt["change"].update(keys=len(batch.keys), allocated=st["allocated"])
         return nxt
 
     c = _commit_rev(ctx, make)
@@ -507,7 +588,40 @@ def upsert(ctx: WriterContext, ids: Iterable[int], vectors: Any = None, *, attrs
         cas_conflicts=c.cas_conflicts,
         current_updated=c.current_updated,
         ms=round((time.perf_counter() - t0) * 1000, 3),
+        ids=list(batch.ids),
+        allocated=st["allocated"],
     )
+
+
+def delete_keys(ctx: WriterContext, keys_in: Iterable[str]) -> DeleteResult:
+    """Deletes documents by key: the keys are resolved through the head revision's `keys` sections and the ids found
+    are tombstoned (one set, rev + 1). Nothing is written when no key has a live document."""
+    t0 = time.perf_counter()
+    store, gen = ctx.store, ctx.gen
+    _writable(store)
+    wanted = list(dict.fromkeys(keys_in))
+    if not wanted:
+        raise ThreadError("no keys", 400)
+    st: dict[str, Any] = {"key": "", "ids": array("I"), "missing": []}
+
+    def make(rev: int, manifest: dict[str, Any], files: dict[str, Any]) -> dict[str, Any] | None:
+        if resolve_lex_config(manifest) is None:
+            raise ThreadError("this generation has no lexical configuration (no keys)", 400)
+        found = ctx.resolve_keys(manifest, wanted)
+        st["missing"] = [k for k in wanted if k not in found]
+        st["ids"] = array("I", sorted(set(found.values())))
+        if not st["ids"]:
+            return None
+        tb = _tomb_bytes(st["ids"])
+        nxt = _inherit(manifest)
+        st["key"] = _put_unique(store, keys.tombstones(gen, rev + 1), tb)
+        nxt["tombstones"].append({"rev": rev + 1, "key": st["key"], "count": len(st["ids"])})
+        nxt["change"] = {"op": "delete", "count": len(st["ids"]), "keys": len(wanted), "writer": "thread-sdk-python"}
+        return nxt
+
+    c = _commit_rev(ctx, make)
+    return DeleteResult(gen, c.rev, len(st["ids"]), st["key"], c.conflicts, c.cas_conflicts, c.current_updated,
+                        round((time.perf_counter() - t0) * 1000, 3), st["missing"])
 
 
 def delete_ids(ctx: WriterContext, ids_in: Iterable[int]) -> DeleteResult:
@@ -618,14 +732,17 @@ def compact_segments(ctx: WriterContext) -> CompactSegmentsResult:
             tomb = build_tomb_state(tomb_sets) if tomb_sets else None
             tombs = [tomb_for_segment(tomb, s["addedRev"]) if tomb else None for s in segs]
             out = _native.merge_segments(parts, tombs, dumps(lex.tokenizer or {}), lex.k1, lex.b, lex.lengths,
-                                         lex.bucket_terms, lex.docs, lex.text, lex.bucket_docs)
+                                         lex.bucket_terms, lex.docs, lex.text, lex.bucket_docs, False, lex.bucket_keys)
             meta = json.loads(_native.segment_meta(out))
             key = _put_unique(store, keys.segment_base(gen, rev + 1), out)
             count = (meta.get("docs") or {}).get("n") or (meta.get("lex") or {}).get("num_docs") or 0
-            built = st["built"] = {"for_keys": for_keys, "key": key, "bytes": len(out), "count": count}
+            built = st["built"] = {"for_keys": for_keys, "key": key, "bytes": len(out), "count": count,
+                                   "keys": meta.get("keys") is not None}
         st.update(merged=len(segs), key=built["key"], bytes=built["bytes"], count=built["count"])
         ref = {"seq": 0, "key": built["key"], "addedRev": rev + 1, "count": built["count"], "bytes": built["bytes"],
                "lex": True, "docs": lex.docs, "text": lex.docs and lex.text, "base": True}
+        if built["keys"]:
+            ref["keys"] = True
         return {**_inherit(manifest), "segments": [ref],
                 "change": {"op": "compact-segments", "merged": len(segs), "count": built["count"],
                            "writer": "thread-sdk-python"}}
@@ -666,7 +783,8 @@ def create_lexical_generation(store: BlobStore, gen: str, lex: dict[str, Any] | 
 def lex_config_from_kwargs(config: dict[str, Any] | None, kwargs: dict[str, Any]) -> dict[str, Any]:
     """`manifest.lex` from a wire-format dict and/or snake_case keyword arguments (`bucket_terms=64`,
     `defaults={"rrf_k": 10}`)."""
-    names = {"bucket_terms": "bucketTerms", "bucket_docs": "bucketDocs", "rrf_k": "rrfK", "recall_k": "recallK"}
+    names = {"bucket_terms": "bucketTerms", "bucket_docs": "bucketDocs", "bucket_keys": "bucketKeys", "rrf_k": "rrfK",
+             "recall_k": "recallK"}
     out = dict(config or {})
     for k, v in kwargs.items():
         if k == "defaults" and isinstance(v, dict):

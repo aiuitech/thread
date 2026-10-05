@@ -1365,6 +1365,8 @@ interface Manifest {
 	tombstones?: TombRef[];
 	/** Next delta sequence number. */
 	nextSeq?: number;
+	/** The next id a keyed upsert allocates (SDK writers); absent = `vectors`. */
+	nextId?: number;
 	/** Automatic compaction thresholds and the cell split cap (absent: no automatic compaction, no splits). */
 	compaction?: CompactionPolicy;
 	/** Compact routing tables (fine.f16 / fine.i8) made from the means `routing.fine`; ignored by readers once files.fine differs. */
@@ -4428,6 +4430,9 @@ async function stageRollback(env: Env, body: { gen: string; toRev: number; force
 		if (lost.length && !body.force) throw new HttpError(409, `head rev ${rev} lists ${lost.length} deltas/tombstone sets that rev ${toRev} does not (pass force to drop them)`);
 		const next = inherit(target);
 		next.nextSeq = Math.max(manifest.nextSeq ?? 1, target.nextSeq ?? 1);
+		// Ids allocated to keys since toRev must stay allocated: a rollback never reuses an id.
+		const nextId = Math.max(manifest.nextId ?? 0, target.nextId ?? 0);
+		if (nextId > 0) next.nextId = nextId;
 		return { ...next, change: { op: "rollback", toRev, fromRev: rev } };
 	});
 	return { gen, rev: c.rev, toRev, k: c.manifest.k1 * c.manifest.k2, files: c.manifest.files, currentUpdated: c.currentUpdated };

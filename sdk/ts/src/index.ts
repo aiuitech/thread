@@ -12,11 +12,11 @@
 import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
-import { compactSegments, configureAttrs, configureLexical, createLexicalGeneration, deleteIds, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
+import { compactSegments, configureAttrs, configureLexical, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
 import { chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseManifest, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
 import { asF32, baseKeysOf, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
-import { LexIndex, LexSegment, type DocRecord, type LexIo, type LexSearchOptions, type LexSearchResult } from "./lex.js";
+import { LexIndex, LexSegment, type DocRecord, type KeyPage, type LexIo, type LexSearchOptions, type LexSearchResult, type ListKeysOptions } from "./lex.js";
 import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 import { ColdRouting } from "./cold.js";
 import { isPackHeader, PackedBlobStore, PrefetchStore } from "./pack.js";
@@ -37,6 +37,11 @@ export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
 export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
 export { createLexicalGeneration } from "./write.js";
+
+/** A document fetched by key: its id and `docs` entry. */
+export interface KeyRecord extends DocRecord {
+	key: string;
+}
 
 /** A unified search: text, vector or both. */
 export interface SearchRequest {
@@ -748,6 +753,82 @@ export class ThreadIndex {
 		return this.thread.withRecovery("docs", async () => (await this.lexIndex()).docs(ids, opts));
 	}
 
+	// ---- keys ----
+
+	/**
+	 * Resolves string keys (`upsert({keys})`) to ids through the `keys` sections, newest segment first; keys with
+	 * no live document are absent.
+	 */
+	async resolveKeys(keys: readonly string[]): Promise<{ ids: Map<string, number>; io: LexIo }> {
+		if (this.closed) throw new ThreadError("index is closed", 400);
+		if (!this.lexConfig) return { ids: new Map(), io: { rounds: 0, ranges: 0, bytes: 0 } };
+		return this.thread.withRecovery("resolveKeys", async () => (await this.lexIndex()).resolveKeys(keys));
+	}
+
+	/**
+	 * Fetches documents by key: each key's id (`resolveKeys`) and its `docs` entry (`docs`), two rounds against
+	 * cached objects. Keys with no live document are absent; with `text`, the stored text comes along.
+	 */
+	async get(keys: readonly string[], opts: { text?: boolean } = {}): Promise<{ records: Map<string, KeyRecord>; io: LexIo }> {
+		if (this.closed) throw new ThreadError("index is closed", 400);
+		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
+		const records = new Map<string, KeyRecord>();
+		if (!this.lexConfig) return { records, io };
+		return this.thread.withRecovery("get", async () => {
+			const lex = await this.lexIndex();
+			const r = await lex.resolveKeys(keys);
+			const add = (x: LexIo) => {
+				io.rounds += x.rounds;
+				io.ranges += x.ranges;
+				io.bytes += x.bytes;
+			};
+			add(r.io);
+			if (!r.ids.size) return { records, io };
+			const d = await lex.docs([...r.ids.values()], opts);
+			add(d.io);
+			for (const [key, id] of r.ids) {
+				const doc = d.docs.get(id);
+				records.set(key, doc ? { ...doc, key } : { key, id, meta: "", attrs: 0 });
+			}
+			return { records, io };
+		});
+	}
+
+	/** Lists keys with a prefix in key order, paged: continue with `after: page.next` while `page.more`. */
+	async listKeys(opts: ListKeysOptions = {}): Promise<KeyPage & { io: LexIo }> {
+		if (this.closed) throw new ThreadError("index is closed", 400);
+		if (!this.lexConfig) return { entries: [], more: false, io: { rounds: 0, ranges: 0, bytes: 0 } };
+		return this.thread.withRecovery("listKeys", async () => (await this.lexIndex()).listKeys(opts));
+	}
+
+	/** @experimental Deletes documents by key (their vectors, texts, docs entries and keys): one tombstone set. */
+	async deleteKeys(keys: readonly string[]): Promise<DeleteResult> {
+		const r = await deleteKeys(this.writer(), keys);
+		if (r.key) await this.useRevision(r.gen, r.rev);
+		return r;
+	}
+
+	/** A lexical index over another revision's segments (the head a writer reads), sharing the segment cache. */
+	private async lexIndexFor(manifest: Manifest): Promise<LexIndex> {
+		const rev = this.revState;
+		if (manifest.gen === rev.gen && (manifest.rev ?? 0) === rev.rev) return this.lexIndex();
+		const cfg = resolveLexConfig(manifest);
+		if (!cfg) throw new ThreadError("this generation has no lexical index (index.configureLexical first)", 400);
+		const state = await loadRevState(this.store, manifest.gen, manifest.rev ?? 0, undefined, manifest);
+		const epoch = this.thread.epoch;
+		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
+		const segs = await Promise.all(
+			state.segments.map(async (ref) => {
+				const cached = this.segCache.get(ref.key);
+				if (cached && cached.epoch === epoch) return { ref, seg: cached.seg };
+				const seg = await LexSegment.open(W, this.store, ref, epoch, io, undefined, { transientBudget: this.opts.lexTransientBytes });
+				if (epoch === this.thread.epoch && !this.closed) this.segCache.set(ref.key, { seg, epoch });
+				return { ref, seg };
+			}),
+		);
+		return new LexIndex(W, cfg, segs, state.tomb);
+	}
+
 	/**
 	 * @experimental Gives the generation a lexical index / docs store (or changes its configuration for future
 	 * segments): a manifest revision with `lex`. Existing documents are not indexed retroactively: upsert them
@@ -861,9 +942,11 @@ export class ThreadIndex {
 	}
 
 	/**
-	 * @experimental Adds or replaces vectors: one delta segment plus (with `replace`, the default) a tombstone set
-	 * for the ids, committed as a new manifest revision; the index then reads that revision. Needs a store with
-	 * `put`/`head` (R2 binding or S3). See README "Write path".
+	 * @experimental Adds or replaces documents: one delta segment for the vectors, one lexical/docs/keys segment
+	 * for texts, metas and keys, plus (with `replace`, the default) a tombstone set for the ids, committed as a
+	 * new manifest revision; the index then reads that revision. With `keys` and no `ids`, known keys keep their
+	 * ids and new ones are allocated (`manifest.nextId`); the result lists the ids. Needs a store with `put`/`head`
+	 * (R2 binding or S3). See README "Write path".
 	 */
 	async upsert(input: UpsertInput): Promise<UpsertResult> {
 		const r = await upsert(this.writer(), input);
@@ -896,7 +979,14 @@ export class ThreadIndex {
 
 	private writer(): WriterContext {
 		if (this.closed) throw new ThreadError("index is closed", 400);
-		return { thread: this.thread, w: W, store: this.store, gen: this.revState.gen, borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.thread.epoch ? this.base.pq : null) };
+		return {
+			thread: this.thread,
+			w: W,
+			store: this.store,
+			gen: this.revState.gen,
+			borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.thread.epoch ? this.base.pq : null),
+			resolveKeys: async (manifest, keys) => (await (await this.lexIndexFor(manifest)).resolveKeys(keys)).ids,
+		};
 	}
 
 	private async getDelta(ref: DeltaRef, trace: BlobTrace, rev: RevState = this.revState): Promise<Uint8Array> {

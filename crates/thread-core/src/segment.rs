@@ -1,18 +1,20 @@
 //! A segment: one immutable object holding, for a batch of documents, its `meta`, a lexical
-//! index over them (`terms` + `postings`, see [`crate::lex`]) and/or their `docs` entries (see
-//! [`crate::docs`]), as a [`Container`]. An upsert writes one segment next to its dense delta
+//! index over them (`terms` + `postings`, see [`crate::lex`]), their `docs` entries (see
+//! [`crate::docs`]) and/or their `keys` (unique string keys -> ids, see [`crate::keys`]), as a
+//! [`Container`]. An upsert writes one segment next to its dense delta
 //! segment; a compaction merges every segment of a generation into one base segment. The dense
 //! slabs, the segments and the tombstone sets share the index's u32 ids, so a hit from either
 //! side resolves through the same `docs` and a replaced or deleted id is hidden everywhere by
 //! the one tombstone rule (a segment added at manifest rev `a` is filtered by the sets with
 //! `rev > a`).
 //!
-//! `meta` is JSON: `{"format":"thread-seg","version":1,"tokenizer":{..},"lex":{..},"docs":{..}}`;
+//! `meta` is JSON: `{"format":"thread-seg","version":1,"tokenizer":{..},"lex":{..},"docs":{..},"keys":{..}}`;
 //! the core reads only `tokenizer` back (to tokenize queries exactly like the documents).
 
 use crate::container::{self, Container, ContainerWriter};
 use crate::docs::{self, Docs, DocsBuilder};
 use crate::error::Error;
+use crate::keys::{self, Keys, KeysBuilder};
 use crate::lex::{self, LexBuilder, LexParams, Postings, Terms};
 use crate::source::{ByteSource, Range, SubSource};
 use crate::tokenize::{Tokenizer, TokenizerConfig};
@@ -32,6 +34,10 @@ pub struct SegmentOptions {
     /// Store the texts in `docs` (needs `docs`).
     pub text: bool,
     pub bucket_docs: u32,
+    /// Write a `keys` section (the documents' unique string keys -> ids). A merge writes one
+    /// whenever an input has one.
+    pub keys: bool,
+    pub bucket_keys: u32,
 }
 
 impl Default for SegmentOptions {
@@ -42,6 +48,8 @@ impl Default for SegmentOptions {
             docs: true,
             text: false,
             bucket_docs: docs::DEFAULT_BUCKET_DOCS,
+            keys: false,
+            bucket_keys: keys::DEFAULT_BUCKET_KEYS,
         }
     }
 }
@@ -52,6 +60,7 @@ pub struct SegmentBuilder {
     tokenizer: Option<Tokenizer>,
     lex: Option<LexBuilder>,
     docs: Option<DocsBuilder>,
+    keys: Option<KeysBuilder>,
     tokens: u64,
 }
 
@@ -62,9 +71,9 @@ impl SegmentBuilder {
                 "segment: storing texts needs the docs section".into(),
             ));
         }
-        if opts.tokenizer.is_none() && !opts.docs {
+        if opts.tokenizer.is_none() && !opts.docs && !opts.keys {
             return Err(Error::Format(
-                "segment: nothing to build (no tokenizer, no docs)".into(),
+                "segment: nothing to build (no tokenizer, no docs, no keys)".into(),
             ));
         }
         let tokenizer = match &opts.tokenizer {
@@ -80,6 +89,9 @@ impl SegmentBuilder {
                     .bucket_docs(opts.bucket_docs)
                     .with_text(opts.text)
             }),
+            keys: opts
+                .keys
+                .then(|| KeysBuilder::new().bucket_keys(opts.bucket_keys)),
             tokens: 0,
         })
     }
@@ -90,11 +102,15 @@ impl SegmentBuilder {
     pub fn has_docs(&self) -> bool {
         self.docs.is_some()
     }
+    pub fn has_keys(&self) -> bool {
+        self.keys.is_some()
+    }
     pub fn len(&self) -> u32 {
         self.lex
             .as_ref()
             .map(|l| l.num_docs())
             .or_else(|| self.docs.as_ref().map(|d| d.len()))
+            .or_else(|| self.keys.as_ref().map(|k| k.len()))
             .unwrap_or(0)
     }
     pub fn is_empty(&self) -> bool {
@@ -120,6 +136,25 @@ impl SegmentBuilder {
         meta: Option<&str>,
         attrs: u32,
     ) -> Result<usize, Error> {
+        self.add_keyed(id, None, text, meta, attrs)
+    }
+
+    /// [`add`](Self::add) with the document's unique string `key`, stored in `keys` when the
+    /// segment has that section (a segment without one ignores it; a document may have no key).
+    /// Fails on a duplicate id or key (nothing is added then).
+    pub fn add_keyed(
+        &mut self,
+        id: u32,
+        key: Option<&str>,
+        text: Option<&str>,
+        meta: Option<&str>,
+        attrs: u32,
+    ) -> Result<usize, Error> {
+        if let (Some(k), Some(key)) = (&self.keys, key) {
+            if k.contains(key) {
+                return Err(Error::Format(format!("duplicate key {key:?}")));
+            }
+        }
         let mut n = 0;
         if let (Some(tok), Some(lex)) = (&mut self.tokenizer, &mut self.lex) {
             let tokens = tok.tokenize(text.unwrap_or(""));
@@ -129,6 +164,9 @@ impl SegmentBuilder {
         if let Some(d) = &mut self.docs {
             // a duplicate id is caught above when there is a lexical index, here otherwise
             d.add_attrs(id, meta.unwrap_or(""), text, attrs)?;
+        }
+        if let (Some(k), Some(key)) = (&mut self.keys, key) {
+            k.add(key, id)?;
         }
         self.tokens += n as u64;
         Ok(n)
@@ -163,7 +201,11 @@ impl SegmentBuilder {
             Some(d) => Some(d.finish()?),
             None => None,
         };
-        write_container(self.cfg.as_ref(), lex, docs)
+        let keys = match &self.keys {
+            Some(k) => Some(k.finish()?),
+            None => None,
+        };
+        write_container(self.cfg.as_ref(), lex, docs, keys)
     }
 }
 
@@ -172,6 +214,7 @@ pub fn write_container(
     tokenizer: Option<&TokenizerConfig>,
     lex: Option<lex::LexBytes>,
     docs: Option<Vec<u8>>,
+    keys: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, Error> {
     let mut meta = format!(r#"{{"format":"{FORMAT}","version":{VERSION}"#);
     if let Some(cfg) = tokenizer {
@@ -188,6 +231,11 @@ pub fn write_container(
         meta.push_str(",\"docs\":");
         meta.push_str(&r.meta_json());
     }
+    if let Some(k) = &keys {
+        let r = Keys::open(k.as_slice())?;
+        meta.push_str(",\"keys\":");
+        meta.push_str(&r.meta_json());
+    }
     meta.push('}');
     let mut w = ContainerWriter::new();
     w.add(container::SEC_META, meta)?;
@@ -197,6 +245,9 @@ pub fn write_container(
     }
     if let Some(d) = docs {
         w.add(container::SEC_DOCS, d)?;
+    }
+    if let Some(k) = keys {
+        w.add(container::SEC_KEYS, k)?;
     }
     Ok(w.finish())
 }
@@ -244,6 +295,9 @@ impl Segment {
     pub fn has_docs(&self) -> bool {
         self.container.section(container::SEC_DOCS).is_some()
     }
+    pub fn has_keys(&self) -> bool {
+        self.container.section(container::SEC_KEYS).is_some()
+    }
     pub fn section(&self, name: &str) -> Option<Range> {
         self.container.section(name)
     }
@@ -280,15 +334,25 @@ impl Segment {
         self.sub(source, container::SEC_DOCS)
             .map(|s| Docs::open(s?))
     }
+    /// The `keys` reader (`None` without a keys section).
+    pub fn keys<'a, S: ByteSource + ?Sized>(
+        &self,
+        source: &'a S,
+    ) -> Option<Result<Keys<SubSource<'a, S>>, Error>> {
+        self.sub(source, container::SEC_KEYS)
+            .map(|s| Keys::open(s?))
+    }
 }
 
 type DocsInput<'a> = (&'a Docs<SubSource<'a, [u8]>>, Option<&'a Tombstones>);
+type KeysInput<'a> = (&'a Keys<SubSource<'a, [u8]>>, Option<&'a Tombstones>);
 
 /// Merges segments (given **oldest first**, each with the tombstones that apply to it) into one:
 /// the lexical indexes through [`lex::merge`] with `lex` as the new parameters, the docs through
 /// [`docs::merge`] (newest copy of an id wins). The tokenizer config is taken from the first
 /// segment that has one (every lexical segment of an index shares it). `text` stores texts when
-/// the inputs have them; `docs` false drops the docs section.
+/// the inputs have them; `docs` false drops the docs section. A `keys` section (newest copy of a
+/// key wins, [`keys::merge`]) is written when `keys` is set or any input has one.
 pub fn merge(
     inputs: &[(&[u8], Option<&Tombstones>)],
     opts: &SegmentOptions,
@@ -330,7 +394,18 @@ pub fn merge(
         let ins: Vec<DocsInput<'_>> = readers.iter().map(|(d, s)| (d, *s)).collect();
         docs_out = Some(docs::merge(&ins, opts.bucket_docs, opts.text)?.finish()?);
     }
-    write_container(tokenizer.as_ref(), lex_out, docs_out)
+    let mut keys_out = None;
+    if opts.keys || segs.iter().any(|(s, _, _)| s.has_keys()) {
+        let mut readers = Vec::new();
+        for (s, bytes, skip) in &segs {
+            if let Some(k) = s.keys(*bytes) {
+                readers.push((k?, *skip));
+            }
+        }
+        let ins: Vec<KeysInput<'_>> = readers.iter().map(|(k, s)| (k, *s)).collect();
+        keys_out = Some(keys::merge(&ins, opts.bucket_keys)?.finish()?);
+    }
+    write_container(tokenizer.as_ref(), lex_out, docs_out, keys_out)
 }
 
 #[cfg(test)]
@@ -351,7 +426,9 @@ mod tests {
     fn build(opts: &SegmentOptions, rows: &[(u32, &str, &str)]) -> Vec<u8> {
         let mut b = SegmentBuilder::new(opts).unwrap();
         for (id, text, meta) in rows {
-            b.add(*id, Some(text), Some(meta), *id % 3).unwrap();
+            let key = format!("doc/{id}");
+            b.add_keyed(*id, Some(&key), Some(text), Some(meta), *id % 3)
+                .unwrap();
         }
         assert_eq!(b.len() as usize, rows.len());
         b.finish().unwrap()
@@ -365,7 +442,8 @@ mod tests {
         };
         let bytes = build(&opts, &DOCS);
         let seg = Segment::open(&bytes).unwrap();
-        assert!(seg.has_lex() && seg.has_docs());
+        assert!(seg.has_lex() && seg.has_docs() && !seg.has_keys());
+        assert!(seg.keys(&bytes).is_none());
         assert_eq!(seg.tokenizer(), Some(&TokenizerConfig::bm25s_default()));
         assert!(
             seg.meta().contains(r#""format":"thread-seg""#)
@@ -437,6 +515,92 @@ mod tests {
         let mut b = SegmentBuilder::new(&SegmentOptions::default()).unwrap();
         b.add(1, Some("x y"), None, 0).unwrap();
         assert!(b.add(1, Some("z"), None, 0).is_err());
+    }
+
+    #[test]
+    fn keys_section_and_keys_only_segments() {
+        let opts = SegmentOptions {
+            keys: true,
+            bucket_keys: 2,
+            ..SegmentOptions::default()
+        };
+        let bytes = build(&opts, &DOCS);
+        let seg = Segment::open(&bytes).unwrap();
+        assert!(seg.has_lex() && seg.has_docs() && seg.has_keys());
+        assert!(seg
+            .meta()
+            .contains(r#""keys":{"version":1,"n":6,"bucket_keys":2"#));
+        let k = seg.keys(&bytes).unwrap().unwrap();
+        assert_eq!(k.n(), 6);
+        assert_eq!(
+            k.lookup(&["doc/3", "doc/1000", "doc/4"]).unwrap(),
+            vec![Some(3), Some(1000), None]
+        );
+        let page = k.list("doc/1", None, 10).unwrap();
+        assert_eq!(
+            page.entries,
+            vec![("doc/10".into(), 10), ("doc/1000".into(), 1000)]
+        );
+        // a duplicate key is refused before anything is added
+        let mut b = SegmentBuilder::new(&opts).unwrap();
+        b.add_keyed(1, Some("k"), Some("x"), None, 0).unwrap();
+        assert!(b.add_keyed(2, Some("k"), Some("y"), None, 0).is_err());
+        assert_eq!(b.len(), 1);
+        // a document without a key, and a segment without a keys section ignoring keys
+        b.add_keyed(2, None, Some("y"), None, 0).unwrap();
+        let bytes = b.finish().unwrap();
+        let s = Segment::open(&bytes).unwrap();
+        let k = s.keys(&bytes).unwrap().unwrap();
+        assert_eq!(k.entries().unwrap(), vec![("k".into(), 1)]);
+        let mut b = SegmentBuilder::new(&SegmentOptions::default()).unwrap();
+        b.add_keyed(1, Some("k"), Some("x"), None, 0).unwrap();
+        assert!(!Segment::open(&b.finish().unwrap()).unwrap().has_keys());
+        // keys only: no tokenizer, no docs
+        let only = SegmentOptions {
+            tokenizer: None,
+            docs: false,
+            keys: true,
+            ..SegmentOptions::default()
+        };
+        let mut b = SegmentBuilder::new(&only).unwrap();
+        b.add_keyed(7, Some("seven"), None, None, 0).unwrap();
+        assert_eq!(b.len(), 1);
+        let bytes = b.finish().unwrap();
+        let s = Segment::open(&bytes).unwrap();
+        assert!(!s.has_lex() && !s.has_docs() && s.has_keys());
+        assert_eq!(
+            s.keys(&bytes).unwrap().unwrap().lookup(&["seven"]).unwrap(),
+            vec![Some(7)]
+        );
+        // merge: the newest copy of a key wins, tombstoned ids drop their keys, inputs without
+        // keys are fine, and the section appears whenever one input has it
+        let a = build(&opts, &DOCS[..3]);
+        let plain = build(&SegmentOptions::default(), &DOCS[3..5]);
+        let mut cb = SegmentBuilder::new(&opts).unwrap();
+        cb.add_keyed(99, Some("doc/99-renamed"), Some("Nothing"), Some("t99"), 0)
+            .unwrap();
+        cb.add_keyed(3, Some("doc/3"), Some("Retry"), Some("t3-v2"), 0)
+            .unwrap();
+        let c = cb.finish().unwrap();
+        let dead_a = Tombstones::from_ids(&[3, 10]);
+        let merged = merge(
+            &[(&a, Some(&dead_a)), (&plain, None), (&c, None)],
+            &SegmentOptions::default(),
+        )
+        .unwrap();
+        let s = Segment::open(&merged).unwrap();
+        assert!(s.has_keys());
+        let k = s.keys(&merged).unwrap().unwrap();
+        assert_eq!(
+            k.entries().unwrap(),
+            vec![
+                ("doc/1000".into(), 1000),
+                ("doc/3".into(), 3),
+                ("doc/99-renamed".into(), 99)
+            ]
+        );
+        let d = s.docs(&merged).unwrap().unwrap();
+        assert_eq!(d.n(), 5);
     }
 
     #[test]

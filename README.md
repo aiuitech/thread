@@ -31,6 +31,9 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
   copy, a query takes about a millisecond.
 - **Vectors and text, one id space.** BM25 search over the same documents, fused with the vector results by rank.
   One upsert adds a vector, its text and its metadata; one delete hides all three.
+- **Lookups by key.** Documents can be named by a unique string key (an address, a path, a primary key): `get(key)`
+  is two range reads, keyed upserts need no ids, and keys list by prefix. A text-only generation with keys, a JSON
+  meta and facet tokens is a small key-value index with equality filters ([docs/keys.md](docs/keys.md)).
 - **Filters that cost nothing extra.** Every document carries a 32-bit attribute word (named fields: a tenant, a
   language, flags, a date) that lives inside the bytes a query reads anyway. A filter is applied inside the scan,
   before candidates are chosen, and a selective filter widens its probes instead of returning less.
@@ -69,6 +72,11 @@ const f = await index.search({ text: "deploy failed", vector: embedding, topK: 1
 // write
 await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: ["...", "..."], metas: ["A", "B"], attrs: [{ tenant: 42, lang: "en" }, { tenant: 7 }] });
 await index.delete([1000]);
+
+// by key: ids are allocated for new keys and reused for known ones (a re-put replaces the document)
+await index.upsert({ keys: ["s3://b/a.bin"], metas: [JSON.stringify({ host: "cdn-1", size: 4096 })], texts: ["host:cdn-1"] });
+const { records } = await index.get(["s3://b/a.bin"]);                 // Map<key, { key, id, meta, attrs }>
+const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });  // { entries: [{ key, id }], more, next }
 ```
 
 The full API, the stores (R2 binding, S3, memory) and a mapping from Vectorize's calls are in
@@ -85,6 +93,8 @@ with open_index(store) as index:
     index.configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr", "de"]}, public="bool")   # once
     r = index.search(text="deploy failed", vector=embedding, top_k=10, docs=True, filter={"tenant": 42})
     index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["A", "B"], attrs=[{"tenant": 42}, {"tenant": 7}])
+    index.upsert(keys=["s3://b/a.bin"], metas=['{"host": "cdn-1"}'])          # by key; r.ids holds the allocated ids
+    index.get(["s3://b/a.bin"])                                                # {key: KeyRecord(id, meta, text, attrs, key)}
 ```
 
 Python reads the same bucket the Worker serves from, a local directory holding a copy of it, or a pack
@@ -141,7 +151,7 @@ All the arithmetic is Rust (`crates/thread-core`), compiled to wasm for Workers 
 for Python. The SDKs and the Worker only do I/O. [docs/architecture.md](docs/architecture.md) has the whole
 picture; [docs/query-path.md](docs/query-path.md), [docs/update-path.md](docs/update-path.md) and
 [docs/lexical.md](docs/lexical.md) have the details; [docs/filtering.md](docs/filtering.md) covers attribute
-filters.
+filters and [docs/keys.md](docs/keys.md) string keys.
 
 ## What is in the repo
 

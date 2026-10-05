@@ -341,7 +341,7 @@ describe("hybrid search on a dense generation", () => {
 describe("LexSegment paging", () => {
 	it("opens with a handful of fetches and searches in two rounds per call; MissingRanges is structured", async () => {
 		const store = new MemoryBlobStore();
-		const job = new w.SegmentJob("{}", 1.2, 0.75, "exact", 4, true, true, 4);
+		const job = new w.SegmentJob("{}", 1.2, 0.75, "exact", 4, true, true, 4, false, 0);
 		const rows: string[] = [];
 		// a wide vocabulary, so the buckets and lists of one query are a small part of the sections
 		for (let i = 0; i < 3000; i++) {

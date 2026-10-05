@@ -117,6 +117,14 @@ async function answer(index, req) {
 	if (req.kind === "compile") {
 		return Array.from(index.compileFilter(req.filter));
 	}
+	if (req.kind === "get") {
+		const r = await index.get(req.keys, { text: true });
+		return req.keys.map((k) => (r.records.has(k) ? [k, r.records.get(k).id, r.records.get(k).meta, r.records.get(k).text ?? null, r.records.get(k).attrs] : null));
+	}
+	if (req.kind === "listKeys") {
+		const r = await index.listKeys({ prefix: req.prefix, after: req.after ?? undefined, limit: req.limit });
+		return { entries: r.entries.map((e) => [e.key, e.id]), more: r.more, next: r.next ?? null };
+	}
 	throw new Error(`unknown request ${req.kind}`);
 }
 
@@ -137,6 +145,15 @@ if (cmd === "build") {
 	await index.upsert({ ids: [20000, 20001, 20002], texts: ["galaxy budget review", "galaxy galaxy", "deployments failed"], metas: ["g0", "g1", "g2"], attrs: [{ kind: "note", public: true }, { kind: "ticket" }, { team: 3 }] });
 	await index.upsert({ ids: [5, 10001], vectors: fresh.subarray(50 * DIM, 52 * DIM), texts: ["replaced five", "replaced 10001 galaxy"], metas: ["r5", "r10001"] });
 	await index.delete([7, 10002, 20001]);
+	// keyed documents: ids allocated from manifest.nextId (past the explicit ids above), a re-put keeps its id, a
+	// delete by key
+	const B = 20003;
+	const keyed = await index.upsert({ keys: ["k/a", "k/b", "k/c", "k/d"], texts: ["keyed alpha galaxy", "keyed bravo", "keyed charlie budget", "keyed delta"], metas: ["ka", "kb", "kc", "kd"], attrs: [{ kind: "note" }, { team: 2 }, {}, { public: true }] });
+	if (keyed.ids.join() !== `${B},${B + 1},${B + 2},${B + 3}` || keyed.allocated !== 4) throw new Error(`keyed ids ${keyed.ids}`);
+	const re = await index.upsert({ keys: ["k/b", "k/e"], vectors: fresh.subarray(52 * DIM, 54 * DIM), texts: ["keyed bravo again galaxy", "keyed echo"], metas: ["kb2", "ke"] });
+	if (re.ids.join() !== `${B + 1},${B + 4}` || re.allocated !== 1) throw new Error(`re-put ids ${re.ids}`);
+	const dk = await index.deleteKeys(["k/c", "k/none"]);
+	if (dk.count !== 1 || dk.missing.join() !== "k/none") throw new Error(`deleteKeys ${JSON.stringify(dk)}`);
 	const requests = [];
 	const qr = rng(11);
 	for (let i = 0; i < 12; i++) requests.push({ kind: "query", vector: Array.from(unitRows(1, DIM, qr)), topK: 10, nprobe: 4 + (i % 5), rerank: 40 });
@@ -145,6 +162,12 @@ if (cmd === "build") {
 	for (const t of ["galaxy budget", "deployment review", "alpha kilo item3", "replaced", "nothing-here"]) requests.push({ kind: "lexical", text: t, topK: 10 });
 	for (const [t, i] of [["alpha bravo", 0], ["galaxy", 51], ["budget item7", 9]]) requests.push({ kind: "search", text: t, vector: Array.from(fresh.subarray(i * DIM, (i + 1) * DIM)), topK: 8, nprobe: 6 });
 	requests.push({ kind: "search", text: "deployments failed", vector: null, topK: 5, nprobe: 4 });
+	requests.push({ kind: "get", keys: ["k/a", "k/b", "k/c", "k/e", "k/none"] });
+	requests.push({ kind: "listKeys", prefix: "k/", limit: 10, after: null });
+	requests.push({ kind: "listKeys", prefix: "k/", limit: 2, after: null });
+	requests.push({ kind: "listKeys", prefix: "k/", limit: 2, after: "k/b" });
+	requests.push({ kind: "search", text: "keyed galaxy", vector: null, topK: 5, nprobe: 4 });
+	requests.push({ kind: "query", vector: Array.from(fresh.subarray(52 * DIM, 53 * DIM)), topK: 3, nprobe: 4, rerank: 40 });
 	// filtered: field conditions on the schema (dense, with widening; lexical; hybrid) and the compiled words themselves
 	const filters = [{ kind: "doc" }, { public: true, team: { $gte: 2 } }, { kind: { $in: ["note", "ticket"] }, public: false }, { team: { $gt: 1, $lt: 4 } }, { kind: { $ne: "doc" } }];
 	for (const [i, f] of filters.entries()) {

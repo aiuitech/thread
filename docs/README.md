@@ -13,7 +13,8 @@ if you want to use it.
 | [profiles.md](profiles.md) | the `edge` and `local` layouts, what each knob trades, manifest query defaults and how to change them |
 | [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual and automatic), cell splitting, GC |
 | [portability.md](portability.md) | moving an index: copying between stores, snapshotting one revision, packs (one file, queried in place) and their format, base packs, warm packs |
-| [lexical.md](lexical.md) | BM25 segments, the `docs` store, the tokenizer, fusion, size-vs-speed tuning, the native CLI |
+| [lexical.md](lexical.md) | BM25 segments, the `docs` store, the `keys` section, the tokenizer, fusion, size-vs-speed tuning, the native CLI |
+| [keys.md](keys.md) | string keys: `get(key)` in two reads, keyed upserts and id allocation (`manifest.nextId`), prefix listings, delete by key, the key-value index case (keys + JSON meta + facet tokens) |
 | [filtering.md](filtering.md) | attribute filters: the 32-bit word and its schema, filter expressions and their compiled clauses, pre-filtering inside the scan with probe widening, post-filtering of text queries |
 | [build-pipeline.md](build-pipeline.md) | the build stages, build slots (Worker Loader), PQ codebook training, incremental k-means, finalize |
 | [build-flags.md](build-flags.md) | every `bench/driver.mjs` flag, and the commands that built g1 and g2 |

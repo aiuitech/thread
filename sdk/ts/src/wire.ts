@@ -193,8 +193,9 @@ export interface DeltaRef {
 
 /**
  * A lexical/docs segment listed in a manifest (`idx/{gen}/seg/{seq}.thread`, or the base `seg/base.{rev}.thread` a
- * compaction wrote): a `THREADIX` container with `meta`, optionally `terms` + `postings` (BM25 over its documents)
- * and `docs` (id -> metadata, optionally the text). Filtered like a delta: sets with rev > addedRev hide its entries.
+ * compaction wrote): a `THREADIX` container with `meta`, optionally `terms` + `postings` (BM25 over its documents),
+ * `docs` (id -> metadata, optionally the text) and `keys` (unique string keys -> ids). Filtered like a delta: sets
+ * with rev > addedRev hide its entries.
  */
 export interface SegmentRef {
 	/** The delta seq of the upsert that wrote it (0 for a compaction's base segment). */
@@ -209,6 +210,8 @@ export interface SegmentRef {
 	lex: boolean;
 	docs: boolean;
 	text: boolean;
+	/** Holds a `keys` section (string keys -> ids); absent = no. */
+	keys?: boolean;
 	/** Written by a compaction (holds every live document of the segments it replaced). */
 	base?: boolean;
 }
@@ -232,6 +235,8 @@ export interface LexConfig {
 	text?: boolean;
 	/** Documents per `docs` bucket (default 128). */
 	bucketDocs?: number;
+	/** Keys per `keys` bucket (default 128): fewer = smaller reads per key lookup, more = smaller resident directory. */
+	bucketKeys?: number;
 	/** Query defaults for `search`: RRF constant (60), per-list depth (max(topK, 50)) and list weights (1 / 1). */
 	defaults?: { rrfK?: number; recallK?: number; weights?: { dense?: number; lexical?: number } };
 }
@@ -245,6 +250,7 @@ export interface ResolvedLexConfig {
 	docs: boolean;
 	text: boolean;
 	bucketDocs: number;
+	bucketKeys: number;
 	rrfK: number;
 	recallK: number | null;
 	weights: { dense: number; lexical: number };
@@ -263,6 +269,7 @@ export function resolveLexConfig(m: Manifest): ResolvedLexConfig | null {
 		docs: c.docs ?? true,
 		text: c.text ?? false,
 		bucketDocs: c.bucketDocs ?? 128,
+		bucketKeys: c.bucketKeys ?? 128,
 		rrfK: c.defaults?.rrfK ?? 60,
 		recallK: c.defaults?.recallK ?? null,
 		weights: { dense: c.defaults?.weights?.dense ?? 1, lexical: c.defaults?.weights?.lexical ?? 1 },
@@ -373,6 +380,11 @@ export interface Manifest {
 	tombstones?: TombRef[];
 	/** Next delta sequence number. */
 	nextSeq?: number;
+	/**
+	 * The next id a keyed upsert (`upsert({keys})`) allocates to a new key; absent = `vectors` (a built base holds
+	 * ids `[0, vectors)`). Explicit-id upserts move it past their largest id.
+	 */
+	nextId?: number;
 	/** Lexical / docs configuration (absent: the generation has no lexical index and no docs store). */
 	lex?: LexConfig;
 	/** Attribute schema: named fields packed into each document's 32-bit `attrs` word (absent: the raw word). */

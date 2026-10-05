@@ -14,7 +14,7 @@ from . import _native
 from .attrs import AttrFilterExpr, AttrSchema, compile_filter, pack_attrs, unpack_attrs, validate_schema
 from .cold import ColdRouting
 from .fusion import DEFAULT_RRF_K, rrf
-from .lex import DocRecord, LexIndex, LexIo, LexSearchResult, LexSegment
+from .lex import DocRecord, KeyPage, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import Base, QueryContext, QueryResult, RevState, execute_query
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
 from .pack import PackedBlobStore, PrefetchStore, is_pack_header, store_at
@@ -46,6 +46,7 @@ from .write import (
     configure_attrs,
     configure_lexical,
     delete_ids,
+    delete_keys,
     lex_config_from_kwargs,
     upsert,
 )
@@ -77,6 +78,13 @@ class SearchHit:
     lexical: Rank | None = None
     #: With `docs`: the document's metadata (and text); None when the id has no docs entry or docs were not asked.
     doc: DocRecord | None = None
+
+
+@dataclass
+class KeyRecord(DocRecord):
+    """A document fetched by key: its key, id and `docs` entry."""
+
+    key: str = ""
 
 
 @dataclass
@@ -978,6 +986,77 @@ class ThreadIndex:
             return {}, LexIo()
         return self._lex_index().docs(ids, text=text)
 
+    # ---- keys ----
+
+    def resolve_keys(self, keys_: Iterable[str]) -> dict[str, int]:
+        """Resolves string keys (`upsert(keys=...)`) to ids through the `keys` sections, newest segment first; keys
+        with no live document are absent."""
+        self._check_open()
+        if self.lex_config is None:
+            return {}
+        return self._lex_index().resolve_keys(keys_)[0]
+
+    def get(self, keys_: Iterable[str], *, text: bool = False) -> dict[str, KeyRecord]:
+        """Fetches documents by key: each key's id (`resolve_keys`) and its `docs` entry (`docs`), two rounds against
+        cached objects. Keys with no live document are absent; with `text`, the stored text comes along."""
+        self._check_open()
+        if self.lex_config is None:
+            return {}
+        lex = self._lex_index()
+        ids, _ = lex.resolve_keys(keys_)
+        if not ids:
+            return {}
+        docs, _ = lex.docs(ids.values(), text=text)
+        out: dict[str, KeyRecord] = {}
+        for key, id in ids.items():
+            d = docs.get(id)
+            out[key] = KeyRecord(id, d.meta, d.text, d.attrs, key) if d is not None else KeyRecord(id, "", None, 0, key)
+        return out
+
+    def list_keys(self, prefix: str = "", *, after: str | None = None, limit: int = 100) -> KeyPage:
+        """Lists keys with a prefix in key order, paged: continue with `after=page.next` while `page.more`."""
+        self._check_open()
+        if self.lex_config is None:
+            return KeyPage([], False)
+        return self._lex_index().list_keys(prefix, after, limit)[0]
+
+    def delete_keys(self, keys_: Iterable[str]) -> DeleteResult:
+        """Deletes documents by key (their vectors, texts, docs entries and keys): one tombstone set in a new manifest
+        revision (none when no key has a live document)."""
+        r = delete_keys(self._writer(), keys_)
+        if r.key:
+            self.use_revision(r.gen, r.rev)
+        return r
+
+    def _lex_index_for(self, manifest: dict[str, Any]) -> LexIndex:
+        """A lexical index over another revision's segments (the head a writer reads), sharing the segment cache."""
+        rev = self._rev
+        if manifest.get("gen") == rev.gen and (manifest.get("rev") or 0) == rev.rev:
+            return self._lex_index()
+        cfg = resolve_lex_config(manifest)
+        if cfg is None:
+            raise ThreadError("this generation has no lexical index (index.configure_lexical first)", 400)
+        state = load_rev_state(self.store, manifest["gen"], manifest.get("rev") or 0, None, manifest)
+        io = LexIo()
+        seg_futs = []
+        with self._lock:
+            for ref in state.segments:
+                f = self._seg_cache.get(ref["key"])
+                if f is None:
+                    f = self._io.submit(LexSegment.open, self.store, ref, io, None, transient_budget=self._lex_transient)
+                    self._seg_cache[ref["key"]] = f
+                seg_futs.append(f)
+        segs = []
+        for ref, f in zip(state.segments, seg_futs):
+            try:
+                segs.append(f.result())
+            except BaseException:
+                with self._lock:
+                    if self._seg_cache.get(ref["key"]) is f:
+                        del self._seg_cache[ref["key"]]
+                raise
+        return LexIndex(cfg, segs, state.tomb, self._io)
+
     # ---- unified search ----
 
     def search(
@@ -1086,27 +1165,33 @@ class ThreadIndex:
                 return slot[1].result().pq
             return None
 
-        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq)
+        def resolve_keys(manifest: dict[str, Any], keys_: Sequence[str]) -> dict[str, int]:
+            return self._lex_index_for(manifest).resolve_keys(keys_)[0]
+
+        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq, resolve_keys)
 
     def upsert(
         self,
-        ids: Iterable[int],
+        ids: Iterable[int] | None = None,
         vectors: Any = None,
         *,
         attrs: Iterable[Any] | None = None,
         payloads: Sequence[bytes | str] | None = None,
         texts: Sequence[str | None] | None = None,
         metas: Sequence[str | None] | None = None,
+        keys: Sequence[str] | None = None,
         replace: bool = True,
     ) -> UpsertResult:
         """Adds or replaces documents: one delta segment (vectors: `n * dim` floats flat, one row per id, or an
-        `(n, dim)` numpy array; any norm), one lexical/docs segment (`texts` indexed by BM25, `metas` stored in the
-        docs store; needs `configure_lexical`) and, with `replace` (default), a tombstone set hiding older copies of
-        the ids, committed as a new manifest revision; the index then reads that revision. `attrs`: one attribute
-        word per document, as field values under the schema (`{"tenant": 5, "lang": "en"}`) or a raw u32; stored
-        with the vector and in the docs store, and what `filter` tests. Up to 4096 per call."""
+        `(n, dim)` numpy array; any norm), one lexical/docs/keys segment (`texts` indexed by BM25, `metas` stored in
+        the docs store, `keys` unique string keys; needs `configure_lexical`) and, with `replace` (default), a
+        tombstone set hiding older copies of the ids, committed as a new manifest revision; the index then reads
+        that revision. With `keys` and no `ids`, a known key keeps its id and a new one is allocated the next id
+        (`manifest.nextId`); the result lists the ids. `attrs`: one attribute word per document, as field values
+        under the schema (`{"tenant": 5, "lang": "en"}`) or a raw u32; stored with the vector and in the docs store,
+        and what `filter` tests. Up to 4096 per call."""
         r = upsert(self._writer(), ids, vectors, attrs=attrs, payloads=payloads, texts=texts, metas=metas,
-                   replace=replace)
+                   keys_=keys, replace=replace)
         self.use_revision(r.gen, r.rev)
         return r
 

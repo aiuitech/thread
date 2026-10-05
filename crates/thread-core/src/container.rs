@@ -46,6 +46,8 @@ pub const SEC_TERMS: &str = "terms";
 pub const SEC_POSTINGS: &str = "postings";
 /// Document ids -> metadata (+ optional text), bucketed by id (`docs.rs`).
 pub const SEC_DOCS: &str = "docs";
+/// Unique string keys -> document ids, bucketed by key (`keys.rs`).
+pub const SEC_KEYS: &str = "keys";
 
 #[inline]
 fn align8(x: u64) -> u64 {

@@ -4,8 +4,9 @@ thread is a search index that lives in object storage and is queried by range re
 one sitting: what the objects are, how a query reads them, how updates avoid rewriting anything, and where the
 code lives. The other pages go deeper: [query-path.md](query-path.md) (slab formats, the two-phase query, caching,
 routing), [build-pipeline.md](build-pipeline.md) (how an index is built), [profiles.md](profiles.md) (the layout
-knobs), [update-path.md](update-path.md) (revisions, deltas, tombstones, compaction) and [lexical.md](lexical.md)
-(BM25 segments, the document store, fusion) and [filtering.md](filtering.md) (attribute filters).
+knobs), [update-path.md](update-path.md) (revisions, deltas, tombstones, compaction), [lexical.md](lexical.md)
+(BM25 segments, the document store, fusion), [keys.md](keys.md) (string keys, `get(key)`, the key-value case) and
+[filtering.md](filtering.md) (attribute filters).
 
 ## The dense index in one paragraph
 
@@ -27,7 +28,9 @@ Text lives in **segments** next to the slabs: immutable `THREADIX` containers ho
 term table carrying each term's `df` and posting range, lists of `gap/tf/length` varints) and a `docs` store
 (id -> metadata, optionally the text), read by range requests in two rounds per query. Segments share the slabs'
 u32 ids and tombstone sets, so one upsert adds a vector, its text and its metadata, and one delete hides all of
-them; a compaction merges segments into one base. A query can be a vector, a text or both (Reciprocal Rank
+them; a compaction merges segments into one base. A segment can also carry the documents' unique string **keys**
+(sorted, bucketed, key -> id), so `get(key)` is two range reads and a keyed upsert needs no ids
+([keys.md](keys.md)). A query can be a vector, a text or both (Reciprocal Rank
 Fusion), and hits resolve through the one `docs` store. The lexical side was ported from Wiper's `thread` engine
 (demand-paged byte sources, the `THREADIX` container, a bm25s-compatible tokenizer with Snowball English, CJK
 bigrams and technical identifiers, RRF, excerpts) and reshaped for blob storage with sparse ids: no term ids or
@@ -66,7 +69,7 @@ such host that also runs the build.
 
 - `crates/thread-core`   format, quantization, k-means accumulators, router, scan, `filter` (attribute clauses
                       the scans apply before top-k insertion); lexical side: `source`
-                      (demand paging), `container`, `tokenize`, `lex` (terms/postings), `docs`, `segment`,
+                      (demand paging), `container`, `tokenize`, `lex` (terms/postings), `docs`, `keys`, `segment`,
                       `fusion`, `excerpts`, `rerank`
 - `crates/thread-wasm`   wasm-bindgen jobs: FlatKmeansJob, TreeKmeansJob, IncKmeansJob, Reducer, AssignJob, SlabJob,
                       Searcher, cell_neighbors; PQ: residuals_for, pq_init_codebook, PqTrainJob, PqReducer,
