@@ -5,7 +5,8 @@
 thread is a vector + full-text search index stored as plain, immutable files in object storage (Cloudflare R2,
 S3, or a directory on disk) and queried straight from a Cloudflare Worker, a Node process or Python. There is no
 database to run and nothing to keep in RAM beyond a small routing table. On the standard 1M-vector benchmark it
-matches Cloudflare Vectorize's recall, beats its tail latency and throughput, and costs 10-20x less.
+comes within 0.3 points of Cloudflare Vectorize's recall, halves its p95 latency at 7-8x its throughput (its median
+latency is about 3x Vectorize's), and costs a few percent as much.
 
 ```ts
 const index = await thread.open({ bucket: env.BUCKET });
@@ -21,12 +22,13 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
 - **It runs where you already are.** The same index is read by a Worker (wasm, inside a 128 MB isolate), by Node,
   and by Python (a native extension). The TypeScript and Python SDKs share one wire format and give identical
   answers, down to the id order.
-- **It is cheap.** A query reads about 6 MB of ranges from cache and does a little arithmetic. At 1M vectors and
-  1M queries a month that is about $1-2 on Workers + R2, against about $21 for Vectorize. At 10M queries it is about
-  $10 against $111.
-- **It is fast enough to serve from.** 95% recall@10 with p50 around 80 ms and over 2000 requests per second from
-  a single Worker deployment at concurrency 300. From a laptop against a local copy, a query takes about a
-  millisecond.
+- **It is cheap.** A query reads about 6 MB of ranges from cache and spends about 33 ms of CPU. At 1M vectors and
+  1M queries a month that is about $0.10 on Workers + R2 beyond the Workers Paid plan both need, against about $31
+  for Vectorize. At 10M queries it is about $6 against $169. Both figures assume a warm edge cache: every cache miss is an
+  R2 read ([costs](docs/benchmarks.md#cost)).
+- **It is fast enough to serve from.** 95% recall@10 with p50 around 90 ms and about 2500 requests per second from
+  a single Worker deployment at concurrency 300 (p50 around 75 ms at concurrency 50). From a laptop against a local
+  copy, a query takes about a millisecond.
 - **Vectors and text, one id space.** BM25 search over the same documents, fused with the vector results by rank.
   One upsert adds a vector, its text and its metadata; one delete hides all three.
 - **Filters that cost nothing extra.** Every document carries a 32-bit attribute word (named fields: a tenant, a
@@ -100,17 +102,19 @@ exists, vectors are added with ordinary upserts from any SDK.
 ## How it compares
 
 Measured on dbpedia-openai-1M (975k vectors, 1536 dims, cosine, top-10) against Cloudflare's published Vectorize
-numbers for the same dataset. thread was served by one Worker reading R2 through the edge cache. Full tables and
-methodology: [docs/benchmarks.md](docs/benchmarks.md).
+numbers for the same dataset. thread was served by one Worker (main `610501f`, g4 rev 179) reading R2 through a
+warm edge cache, measured 2026-10-05 from near Montreal, three runs each (recall over all 5000 test queries at
+concurrency 300, over the first 1000 at 50). Full tables, the runs, a cold-cache figure and methodology:
+[docs/benchmarks.md](docs/benchmarks.md).
 
 | | Vectorize | thread (concurrency 300) | thread (concurrency 50) |
 |---|---:|---:|---:|
-| recall@10 | 95.4% | 95.1% | 95.1% |
-| p50 latency | 31 ms | 83 ms | 71 ms |
-| p95 latency | 380 ms | 176-223 ms | 116-128 ms |
-| throughput | 343 RPS | 2000-2650 RPS | ~600 RPS |
-| cost, 1M vectors + 1M queries/month | ~$21 | ~$1-2 | |
-| cost, 1M vectors + 10M queries/month | ~$111 | ~$10 | |
+| recall@10 | 95.4% | 95.1% | 94.9% |
+| p50 latency | 31 ms | 88-90 ms | 69-78 ms |
+| p95 latency | 380 ms | 176-193 ms | 120-133 ms |
+| throughput | 343 RPS | 2495-2785 RPS | 578-608 RPS |
+| cost, 1M vectors + 1M queries/month | ~$31 | ~$0.10 | |
+| cost, 1M vectors + 10M queries/month | ~$169 | ~$6 | |
 | index size | managed | 5.1 GB in R2 | |
 | upsert of 2000 vectors | | 3.3 s, visible within 30 s | |
 | metadata filtering | indexed properties | fields packed into a 32-bit word, tested inside the scan; selective filters widen the probes | |
