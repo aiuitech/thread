@@ -325,6 +325,10 @@ const { records } = await index.get(["s3://b/a.bin"], { text: true });   // Map<
 const { ids } = await index.resolveKeys(["s3://b/a.bin"]);              // Map<key, id>
 const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });   // { entries: [{ key, id }], more, next }; continue with { after: page.next }
 await index.deleteKeys(["s3://b/c.bin"]);                                // { count, missing, ... }
+// long texts: chunked into windows of `words` words (default 200) sharing `overlap` (default 0), one document per chunk keyed `k#i`
+// with the parent's meta/attrs; `embed` is called once with the chunk texts and returns their vectors (r.chunks = { documents, count, stale })
+await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk: { words: 200, overlap: 20 }, embed: async (texts) => embedAll(texts) });
+chunkText(longText, { words: 200, overlap: 20 });                       // [{ index, text, start, end, words }, ...], the same windows
 await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
 await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only generation (no dense index)
 ```
@@ -333,7 +337,9 @@ await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   /
 `bucketTerms`, `docs`, `text`, `bucketDocs`, `bucketKeys`, `defaults: {rrfK, recallK, weights}`; see docs/lexical.md
 for what each one trades. Keys (non-empty strings of at most 4096 bytes, unique per batch) are stored in the
 segment's `keys` section and resolved newest segment first; the design and the key-value index case are in
-[docs/keys.md](../../docs/keys.md).
+[docs/keys.md](../../docs/keys.md). `chunk` splits each text into flat word windows before writing (needs `keys`
+and `texts`; vectors come from `embed`; chunk keys the parent no longer produces are tombstoned in the same
+revision); the rule, the key scheme and the limits are in [docs/chunking.md](../../docs/chunking.md).
 
 Implemented against [docs/update-path.md](../../docs/update-path.md): an upsert encodes one delta segment
 (`DeltaJob`: primary cell + residual codes, PQ codes with the generation's codebook) and, unless

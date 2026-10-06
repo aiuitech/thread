@@ -12,6 +12,8 @@ kernels are the same Rust code (`thread-core`) the Worker and the TypeScript SDK
 
 from . import _native
 from .attrs import compile_filter, define_attrs, filter_matches, pack_attrs, unpack_attrs, validate_schema
+from .chunk import (CHUNK_KEY_SEPARATOR, DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_WORDS, Chunk, ChunkOptions, chunk_index_of,
+                    chunk_key, chunk_text, resolve_chunk_options)
 from .index import KeyRecord, Rank, SearchHit, SearchResult, ThreadIndex, head_revision, load_rev_state, open_index, resolve_target
 from .lex import DocRecord, KeyPage, LexHit, LexIndex, LexSearchResult, LexSegment
 from .pack import PackedBlobStore, PackResult, PackWriter, copy_objects, pack_index, pack_to_bytes, store_at
@@ -75,6 +77,15 @@ __all__ = [
     "compile_filter",
     "filter_matches",
     "MAX_UPSERT",
+    "Chunk",
+    "ChunkOptions",
+    "chunk_text",
+    "chunk_key",
+    "chunk_index_of",
+    "resolve_chunk_options",
+    "DEFAULT_CHUNK_WORDS",
+    "DEFAULT_CHUNK_OVERLAP",
+    "CHUNK_KEY_SEPARATOR",
     "QUERY_INFLIGHT",
     "BlobStore",
     "BlobRange",

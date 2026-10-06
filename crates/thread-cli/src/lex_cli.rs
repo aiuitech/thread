@@ -10,6 +10,7 @@
 //! thread seg inspect seg.thread
 //! thread seg merge --out base.thread [--tombstones a.u32,b.u32,...] [build options] seg.thread [more.thread ...]
 //! thread tokenize [--tokenizer <json|file>] "text" ["text" ...]
+//! thread chunk [--words 200] [--overlap 0] [--file path] ["text" ...]   (chunk.rs)
 //! ```
 //!
 //! `docs.jsonl`: one JSON object per line with an integer `id` (u32), a `text`, optionally an `attrs` (u32, the
@@ -31,7 +32,7 @@ use thread_core::Error;
 
 pub struct Args {
     flags: HashMap<String, String>,
-    positional: Vec<String>,
+    pub positional: Vec<String>,
 }
 
 impl Args {
@@ -61,13 +62,13 @@ impl Args {
         }
         Ok(Args { flags, positional })
     }
-    fn get(&self, k: &str) -> Option<&str> {
+    pub fn get(&self, k: &str) -> Option<&str> {
         self.flags.get(k).map(String::as_str)
     }
-    fn flag(&self, k: &str) -> bool {
+    pub fn flag(&self, k: &str) -> bool {
         self.get(k).is_some()
     }
-    fn num<T: std::str::FromStr>(&self, k: &str, default: T) -> Result<T, String> {
+    pub fn num<T: std::str::FromStr>(&self, k: &str, default: T) -> Result<T, String> {
         match self.get(k) {
             None => Ok(default),
             Some(v) => v.parse().map_err(|_| format!("--{k}: bad value {v:?}")),
@@ -154,9 +155,21 @@ pub fn build(a: &Args) -> Result<Value, String> {
         a.get("key-field").unwrap_or("key"),
     );
     let opts = segment_options(a)?;
+    // --chunk-words / --chunk-overlap: every document's text is split into flat word windows (chunk.rs) and each
+    // chunk is a document of its own, keyed `key#i`, with ids running from --first-id (the id field is not used).
+    let chunking = a.get("chunk-words").is_some() || a.get("chunk-overlap").is_some();
+    let (chunk_words, chunk_overlap) = (
+        a.num("chunk-words", crate::chunk::DEFAULT_WORDS)?,
+        a.num("chunk-overlap", crate::chunk::DEFAULT_OVERLAP)?,
+    );
+    if chunking {
+        crate::chunk::check(chunk_words, chunk_overlap)?;
+    }
+    let mut next_id: u32 = a.num("first-id", 0u32)?;
     let mut b = SegmentBuilder::new(&opts).map_err(|e| e.to_string())?;
     let file = std::fs::File::open(docs_path).map_err(|e| format!("{docs_path}: {e}"))?;
     let mut rows = 0usize;
+    let mut chunks = 0usize;
     for (i, line) in BufReader::with_capacity(1 << 20, file).lines().enumerate() {
         let line = line.map_err(|e| format!("{docs_path}: {e}"))?;
         if line.trim().is_empty() {
@@ -164,16 +177,19 @@ pub fn build(a: &Args) -> Result<Value, String> {
         }
         let v: Value =
             serde_json::from_str(&line).map_err(|e| format!("{docs_path}:{}: {e}", i + 1))?;
-        let id = v
-            .get(id_f)
-            .and_then(Value::as_u64)
-            .filter(|&x| x < u32::MAX as u64)
-            .ok_or_else(|| {
-                format!(
-                    "{docs_path}:{}: {id_f:?} must be an integer in [0, 2^32 - 1)",
-                    i + 1
-                )
-            })? as u32;
+        let id = if chunking {
+            0
+        } else {
+            v.get(id_f)
+                .and_then(Value::as_u64)
+                .filter(|&x| x < u32::MAX as u64)
+                .ok_or_else(|| {
+                    format!(
+                        "{docs_path}:{}: {id_f:?} must be an integer in [0, 2^32 - 1)",
+                        i + 1
+                    )
+                })? as u32
+        };
         let text = v.get(text_f).map(meta_string);
         let meta = v.get(meta_f).map(meta_string);
         let attrs = match v.get("attrs") {
@@ -193,16 +209,33 @@ pub fn build(a: &Args) -> Result<Value, String> {
             Some(Value::String(k)) => Some(k.clone()),
             Some(_) => return err(format!("{docs_path}:{}: {key_f:?} must be a string", i + 1)),
         };
-        b.add_keyed(id, key.as_deref(), text.as_deref(), meta.as_deref(), attrs)
-            .map_err(|e| format!("{docs_path}:{}: {e}", i + 1))?;
+        if chunking {
+            let whole = text.unwrap_or_default();
+            for c in crate::chunk::chunk_text(&whole, chunk_words, chunk_overlap)? {
+                if next_id == u32::MAX {
+                    return err(format!("{docs_path}:{}: the id space is exhausted", i + 1));
+                }
+                let ck = key.as_deref().map(|k| crate::chunk::chunk_key(k, c.index));
+                b.add_keyed(next_id, ck.as_deref(), Some(c.text), meta.as_deref(), attrs)
+                    .map_err(|e| format!("{docs_path}:{}: {e}", i + 1))?;
+                next_id += 1;
+                chunks += 1;
+            }
+        } else {
+            b.add_keyed(id, key.as_deref(), text.as_deref(), meta.as_deref(), attrs)
+                .map_err(|e| format!("{docs_path}:{}: {e}", i + 1))?;
+        }
         rows += 1;
     }
     let bytes = b.finish().map_err(|e| e.to_string())?;
     std::fs::write(out, &bytes).map_err(|e| format!("{out}: {e}"))?;
     let seg = Segment::open(&bytes).map_err(|e| e.to_string())?;
-    Ok(
-        json!({"path": out, "bytes": bytes.len(), "docs": rows, "tokens": b.tokens(), "meta": serde_json::from_str::<Value>(seg.meta()).unwrap_or(Value::Null), "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0}),
-    )
+    let mut o = json!({"path": out, "bytes": bytes.len(), "docs": if chunking { chunks } else { rows }, "tokens": b.tokens(), "meta": serde_json::from_str::<Value>(seg.meta()).unwrap_or(Value::Null), "elapsed_ms": t0.elapsed().as_secs_f64() * 1000.0});
+    if chunking {
+        o["documents"] = json!(rows);
+        o["chunk"] = json!({"words": chunk_words, "overlap": chunk_overlap, "firstId": a.num("first-id", 0u32)?, "nextId": next_id});
+    }
+    Ok(o)
 }
 
 pub fn inspect(a: &Args) -> Result<Value, String> {
@@ -524,6 +557,7 @@ pub const USAGE: &str = "  thread seg build   --out seg.thread --docs docs.jsonl
   thread seg merge   --out base.thread [--tombstones ...] seg.thread [more ...]   compact segments into one
   thread seg keys    [--get k1,k2] [--prefix p --after k --limit n] [--tombstones ...] seg.thread [more ...]
   thread tokenize    [--tokenizer json|file] \"text\" [\"text\" ...]      the index's tokenizer
+  thread chunk       [--words 200] [--overlap 0] [--file path] [\"text\" ...]  flat word-window chunks of a text
   (every command prints one JSON object on stdout; `thread <command> --help` lists its options)";
 
 const BUILD_OPTIONS: &str = "options shared by `seg build` and `seg merge`:
@@ -557,6 +591,13 @@ THREADIX container an upsert writes to idx/{gen}/seg/{seq}.thread. Prints {path,
   --text-field <name>      the text field (default `text`)
   --meta-field <name>      the metadata field (default `meta`)
   --key-field <name>       the key field (default `key`; a string, stored with --keys)
+  --chunk-words <n>        split every text into flat windows of n words (default 200 when only --chunk-overlap is
+                           given) and index each chunk as a document of its own, as the SDKs' `upsert({chunk})`
+                           does: chunk i of the document keyed k is keyed `k#i` and carries the document's meta
+                           and attrs; ids run from --first-id in file order (the id field is not used). Prints
+                           `documents` (input rows) next to `docs` (chunks written). See `thread chunk --help`.
+  --chunk-overlap <n>      words shared with the previous chunk (default 0; < --chunk-words)
+  --first-id <n>           the first chunk id (default 0)
 ";
 
 const HELP_INSPECT: &str = "thread seg inspect <seg.thread>
@@ -606,6 +647,7 @@ See `thread seg build --help` for the tokenizer keys.
 fn help_for(cmd: &str, sub: Option<&str>) -> Option<String> {
     Some(match (cmd, sub) {
         ("tokenize", _) => HELP_TOKENIZE.to_string(),
+        ("chunk", _) => crate::chunk::HELP.to_string(),
         ("seg", Some("build")) => format!("{HELP_BUILD}\n{BUILD_OPTIONS}\n"),
         ("seg", Some("inspect")) => HELP_INSPECT.to_string(),
         ("seg", Some("search")) => HELP_SEARCH.to_string(),
@@ -646,6 +688,7 @@ pub fn run(cmd: &str, rest: &[String]) -> Result<Output, String> {
 fn run_json(cmd: &str, rest: &[String]) -> Result<Value, String> {
     match cmd {
         "tokenize" => tokenize(&Args::parse(rest)?),
+        "chunk" => crate::chunk::run(&Args::parse(rest)?),
         "seg" => {
             let sub = rest.first().map(String::as_str).ok_or(
                 "seg needs a subcommand: build | search | inspect | merge | keys (try `thread seg --help`)",

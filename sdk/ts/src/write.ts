@@ -11,6 +11,7 @@ import { safeFree } from "./query.js";
 import type { BlobStore } from "./store.js";
 import type * as W from "./wasm/thread.js";
 import { defineAttrs, packAttrs, schemaExtends, validateSchema, type AttrFieldSpec, type AttrSchema, type AttrValues } from "./attrs.js";
+import { chunkIndexOf, chunkKey, chunkText, resolveChunkOptions, type ChunkOptions } from "./chunk.js";
 import { buildTombState, currentBody, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
 
 export interface UpsertInput {
@@ -47,7 +48,25 @@ export interface UpsertInput {
 	 * ids are known to be new: no tombstones to filter on every later query.
 	 */
 	replace?: boolean;
+	/**
+	 * Split each text into flat word windows (`chunkText`: `words` per chunk, default 200, sharing `overlap` words
+	 * with the previous one, default 0; `true` = the defaults) and write one document per chunk: chunk `i` of the
+	 * document keyed `k` is stored under the key `k#i` (`chunkKey`) with the parent's meta and attrs, and its
+	 * vector comes from `embed`. Needs `keys` (not `ids`) and `texts`; `vectors` cannot be given. Chunk keys of
+	 * the parent that this put no longer writes (a shorter text) are tombstoned in the same revision. At most
+	 * 4096 chunks per call.
+	 */
+	chunk?: ChunkOptions | boolean;
+	/**
+	 * Produces the vectors: called once with the texts to index (the chunks when chunking, else `texts`) and
+	 * returns one vector per text, as `vectors` takes them (`n * dim` floats flat or one array per text). The SDK
+	 * does no embedding itself; this is where an embedding API call goes.
+	 */
+	embed?: Embedder;
 }
+
+/** `upsert({ embed })`: the texts to embed, in order -> their vectors (`n * dim` flat or one row per text). */
+export type Embedder = (texts: string[]) => Promise<Float32Array | number[] | (Float32Array | number[])[]> | Float32Array | number[] | (Float32Array | number[])[];
 
 export interface UpsertResult {
 	gen: string;
@@ -58,6 +77,8 @@ export interface UpsertResult {
 	ids: number[];
 	/** Ids allocated to new keys. */
 	allocated: number;
+	/** With `chunk`: the input documents, the chunks written (= `count`) and the stale chunk keys tombstoned. */
+	chunks?: { documents: number; count: number; stale: number };
 	/** Primary cell of each vector (empty without vectors). */
 	cells: number[];
 	distinctCells: number;
@@ -95,6 +116,8 @@ export interface WriterContext {
 	borrowPq: (baseKey: string) => W.PqCodebook | null;
 	/** Resolves keys to ids through the `keys` sections of the given (head) revision. */
 	resolveKeys: (manifest: Manifest, keys: readonly string[]) => Promise<Map<string, number>>;
+	/** Every live key with the prefix in the given (head) revision, in key order. */
+	listKeys: (manifest: Manifest, prefix: string) => Promise<string[]>;
 }
 
 export interface ConfigureLexicalResult {
@@ -461,13 +484,88 @@ async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b
 /** Sorted unique ids as a tombstone buffer (`tombstones_merge` of the empty set and `ids`). */
 const tombBytes = (w: typeof W, ids: Uint32Array): Uint8Array => (ids.length ? w.tombstones_merge(new Uint8Array(0), ids) : idUnion([]));
 
-export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<UpsertResult> {
+/** A chunked upsert's expansion: the parent keys and the chunking recorded in the manifest's `change`. */
+interface Chunked {
+	parents: string[];
+	words: number;
+	overlap: number;
+}
+
+/**
+ * Applies `chunk` and `embed`: the input with one document per chunk (keyed `chunkKey(parent, i)`, the parent's meta
+ * and attrs) and the vectors `embed` returns for the texts to index. Validation of the result is left to
+ * `prepareBatch`, which sees an ordinary batch.
+ */
+async function expandInput(input: UpsertInput): Promise<{ input: UpsertInput; chunked: Chunked | null }> {
+	if (input.embed && input.vectors !== undefined) throw new ThreadError("vectors and embed together: pass one or the other", 400);
+	let out = input;
+	let chunked: Chunked | null = null;
+	if (input.chunk !== undefined && input.chunk !== false) {
+		let opts: { words: number; overlap: number };
+		try {
+			opts = resolveChunkOptions(input.chunk);
+		} catch (e) {
+			throw new ThreadError(String((e as Error).message ?? e), 400);
+		}
+		if (input.ids !== undefined || !input.keys) throw new ThreadError("chunked upserts name documents by key: pass keys, not ids", 400);
+		if (!input.texts) throw new ThreadError("chunk needs texts (one per key)", 400);
+		if (input.vectors !== undefined || input.payloads) throw new ThreadError("with chunk, vectors come from embed (one per chunk)", 400);
+		const parents = Array.from(input.keys);
+		const n = parents.length;
+		if (input.texts.length !== n) throw new ThreadError(`${input.texts.length} texts for ${n} keys`, 400);
+		if (input.metas && input.metas.length !== n) throw new ThreadError(`${input.metas.length} metas for ${n} keys`, 400);
+		if (input.attrs && input.attrs.length !== n) throw new ThreadError(`${input.attrs.length} attrs for ${n} keys`, 400);
+		const keys: string[] = [];
+		const texts: string[] = [];
+		const metas: (string | null)[] = [];
+		const attrs: AttrValues[] = [];
+		parents.forEach((parent, i) => {
+			for (const c of chunkText(input.texts![i] ?? "", opts)) {
+				keys.push(chunkKey(parent, c.index));
+				texts.push(c.text);
+				if (input.metas) metas.push(input.metas[i]);
+				if (input.attrs) attrs.push(input.attrs[i]);
+			}
+		});
+		if (keys.length > MAX_UPSERT) throw new ThreadError(`chunk produced ${keys.length} documents, at most ${MAX_UPSERT} per upsert: pass fewer texts`, 400);
+		const { chunk: _c, ids: _i, ...rest } = input;
+		out = { ...rest, keys, texts, ...(input.metas ? { metas } : {}), ...(input.attrs ? { attrs } : {}) };
+		chunked = { parents, ...opts };
+	}
+	if (out.embed) {
+		const texts = (out.texts ?? []).map((t) => t ?? "");
+		if (!texts.length) throw new ThreadError("embed needs texts", 400);
+		const vectors = await out.embed(texts);
+		const rows = Array.isArray(vectors) && vectors.length && typeof vectors[0] !== "number" ? vectors.length : null;
+		if (rows !== null && rows !== texts.length) throw new ThreadError(`embed returned ${rows} vectors for ${texts.length} texts`, 400);
+		if (rows === null && vectors.length === 0) throw new ThreadError(`embed returned 0 vectors for ${texts.length} texts`, 400);
+		const { embed: _e, ...rest } = out;
+		out = { ...rest, vectors };
+	}
+	return { input: out, chunked };
+}
+
+/** The ids of the parents' chunk keys the batch no longer writes (`parent#<i>` for an `i` not in the batch). */
+async function staleChunkIds(ctx: WriterContext, manifest: Manifest, chunked: Chunked, written: readonly string[]): Promise<{ keys: string[]; ids: Uint32Array }> {
+	const have = new Set(written);
+	const stale: string[] = [];
+	const lists = await Promise.all(chunked.parents.map((p) => ctx.listKeys(manifest, p + "#")));
+	chunked.parents.forEach((p, i) => {
+		for (const k of lists[i]) if (!have.has(k) && chunkIndexOf(k, p) !== null) stale.push(k);
+	});
+	if (!stale.length) return { keys: stale, ids: new Uint32Array(0) };
+	const found = await ctx.resolveKeys(manifest, stale);
+	return { keys: stale, ids: Uint32Array.from(new Set(found.values())) };
+}
+
+export async function upsert(ctx: WriterContext, inputIn: UpsertInput): Promise<UpsertResult> {
 	const t0 = Date.now();
 	const { store, gen, w } = ctx;
 	writable(store);
-	const replace = input.replace ?? true;
+	const replace = inputIn.replace ?? true;
 	return ctx.thread.withRecovery("upsert", async () => {
-		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number; idsKey: string; idsRev: number; allocated: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0, idsKey: "", idsRev: -1, allocated: 0 };
+		const { input, chunked } = await expandInput(inputIn);
+		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number; idsKey: string; idsRev: number; allocated: number; stale: Uint32Array; staleRev: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0, idsKey: "", idsRev: -1, allocated: 0, stale: new Uint32Array(0), staleRev: -1 };
 		const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
 			const lex = resolveLexConfig(manifest);
 			const batch = (st.batch ??= prepareBatch(input, hasDense(manifest) ? manifest.dim : 0, lex, manifest.attrs ? validateSchema(manifest.attrs) : null));
@@ -476,6 +574,12 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 			const newRev = rev + 1;
 			const filesKey = `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}`;
 			if (!st.seq) st.seq = await allocSeq(store, gen, manifest.nextSeq ?? 1);
+			// Chunk keys of the parents that this put no longer writes are tombstoned with the batch (per head, like
+			// the id resolution: another writer may have changed the parents meanwhile).
+			if (chunked && st.staleRev !== rev) {
+				st.stale = (await staleChunkIds(ctx, manifest, chunked, batch.keys!)).ids;
+				st.staleRev = rev;
+			}
 			// Ids: given, or resolved through the head's keys (re-resolved when a lost race moved the head, since
 			// another writer may have allocated ids or written the same keys meanwhile).
 			const baseNext = manifest.nextId ?? manifest.vectors ?? 0;
@@ -498,7 +602,8 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 			}
 			// The delta and the segment are reused across retries (unless the means/codebook or the ids changed
 			// under us); the tombstone set is keyed by the rev, so it is rewritten for every attempt.
-			const tb = replace ? tombBytes(w, batch.ids) : null;
+			const tombIds = replace ? (st.stale.length ? Uint32Array.from(new Set([...batch.ids, ...st.stale])) : batch.ids) : st.stale;
+			const tb = tombIds.length ? tombBytes(w, tombIds) : null;
 			const [delta, seg, tombKey] = await Promise.all([
 				batch.vectors ? (st.delta && st.delta.filesKey === filesKey ? st.delta : encodeDelta(ctx, manifest, files, batch, st.seq)) : Promise.resolve(null),
 				wantSeg ? (st.seg ?? encodeSegment(ctx, st.seq, lex!, batch)) : Promise.resolve(null),
@@ -514,7 +619,7 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 			if (delta) next.deltas!.push({ seq: delta.seq, key: delta.key, count: batch.ids.length, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
 			if (seg) next.segments = [...(next.segments ?? []), { ...seg.ref, addedRev: newRev }];
 			next.nextSeq = Math.max(next.nextSeq ?? 1, st.seq + 1);
-			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, dense: !!delta, lexical: !!seg, ...(batch.keys ? { keys: batch.keys.length, allocated: st.allocated } : {}), writer: "thread-sdk" } };
+			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, dense: !!delta, lexical: !!seg, ...(batch.keys ? { keys: batch.keys.length, allocated: st.allocated } : {}), ...(chunked ? { chunk: { words: chunked.words, overlap: chunked.overlap, documents: chunked.parents.length, stale: st.stale.length } } : {}), writer: "thread-sdk" } };
 		});
 		const d = st.delta;
 		return {
@@ -524,6 +629,7 @@ export async function upsert(ctx: WriterContext, input: UpsertInput): Promise<Up
 			count: st.batch!.ids.length,
 			ids: Array.from(st.batch!.ids),
 			allocated: st.allocated,
+			...(chunked ? { chunks: { documents: chunked.parents.length, count: st.batch!.ids.length, stale: st.stale.length } } : {}),
 			cells: d ? Array.from(d.cells) : [],
 			distinctCells: d?.nCells ?? 0,
 			keys: { delta: d?.key ?? null, segment: st.seg?.key ?? null, tombstones: st.tombKey, manifest: c.manifestKey },

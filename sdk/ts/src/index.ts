@@ -16,7 +16,7 @@ import { compactSegments, configureAttrs, configureLexical, createLexicalGenerat
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
 import { chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseManifest, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
 import { asF32, baseKeysOf, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
-import { LexIndex, LexSegment, type DocRecord, type KeyPage, type LexIo, type LexSearchOptions, type LexSearchResult, type ListKeysOptions } from "./lex.js";
+import { LexIndex, LexSegment, MAX_LIST_KEYS, type DocRecord, type KeyPage, type LexIo, type LexSearchOptions, type LexSearchResult, type ListKeysOptions } from "./lex.js";
 import { ColdRouting } from "./cold.js";
 import { isPackHeader, PackedBlobStore, PrefetchStore } from "./pack.js";
 import { fetchWarmPack, revisionSlabKeys, seedWarmPack, WarmPrefixStore, type PrefixSeed, type WarmPackStats } from "./warm.js";
@@ -27,13 +27,14 @@ export * from "./store.js";
 export * from "./s3.js";
 export * from "./lex.js";
 export * from "./routing.js";
+export * from "./chunk.js";
 export type { ColdStat } from "./cold.js";
 export * from "./pack.js";
 export * from "./warm.js";
 export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
-export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, UpsertInput, UpsertResult } from "./write.js";
+export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, Embedder, UpsertInput, UpsertResult } from "./write.js";
 export { createLexicalGeneration } from "./write.js";
 
 /** A document fetched by key: its id and `docs` entry. */
@@ -979,6 +980,16 @@ export class ThreadIndex {
 			gen: this.revState.gen,
 			borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.thread.epoch ? this.base.pq : null),
 			resolveKeys: async (manifest, keys) => (await (await this.lexIndexFor(manifest)).resolveKeys(keys)).ids,
+			listKeys: async (manifest, prefix) => {
+				const lex = await this.lexIndexFor(manifest);
+				const out: string[] = [];
+				for (let after: string | undefined; ; ) {
+					const page = await lex.listKeys({ prefix, after, limit: MAX_LIST_KEYS });
+					for (const e of page.entries) out.push(e.key);
+					if (!page.more) return out;
+					after = page.next;
+				}
+			},
 		};
 	}
 

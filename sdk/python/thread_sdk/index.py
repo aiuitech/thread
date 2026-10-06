@@ -8,12 +8,13 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from . import _native
 from .attrs import AttrFilterExpr, AttrSchema, compile_filter, pack_attrs, unpack_attrs, validate_schema
 from .cold import ColdRouting
-from .lex import DocRecord, KeyPage, LexIndex, LexIo, LexSearchResult, LexSegment
+from .chunk import ChunkOptions
+from .lex import MAX_LIST_KEYS, DocRecord, KeyPage, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import Base, QueryContext, QueryResult, RevState, execute_query
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
 from .pack import PackedBlobStore, PrefetchStore, is_pack_header, store_at
@@ -1153,7 +1154,18 @@ class ThreadIndex:
         def resolve_keys(manifest: dict[str, Any], keys_: Sequence[str]) -> dict[str, int]:
             return self._lex_index_for(manifest).resolve_keys(keys_)[0]
 
-        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq, resolve_keys)
+        def list_keys(manifest: dict[str, Any], prefix: str) -> list[str]:
+            lex = self._lex_index_for(manifest)
+            out: list[str] = []
+            after: str | None = None
+            while True:
+                page = lex.list_keys(prefix, after, MAX_LIST_KEYS)[0]
+                out.extend(k for k, _ in page.entries)
+                if not page.more:
+                    return out
+                after = page.next
+
+        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq, resolve_keys, list_keys)
 
     def upsert(
         self,
@@ -1166,6 +1178,8 @@ class ThreadIndex:
         metas: Sequence[str | None] | None = None,
         keys: Sequence[str] | None = None,
         replace: bool = True,
+        chunk: ChunkOptions | Mapping[str, Any] | bool | None = None,
+        embed: Callable[[list[str]], Any] | None = None,
     ) -> UpsertResult:
         """Adds or replaces documents: one delta segment (vectors: `n * dim` floats flat, one row per id, or an
         `(n, dim)` numpy array; any norm), one lexical/docs/keys segment (`texts` indexed by BM25, `metas` stored in
@@ -1174,9 +1188,17 @@ class ThreadIndex:
         that revision. With `keys` and no `ids`, a known key keeps its id and a new one is allocated the next id
         (`manifest.nextId`); the result lists the ids. `attrs`: one attribute word per document, as field values
         under the schema (`{"tenant": 5, "lang": "en"}`) or a raw u32; stored with the vector and in the docs store,
-        and what `filter` tests. Up to 4096 per call."""
+        and what `filter` tests. Up to 4096 per call.
+
+        `chunk` (True = the defaults, or `{"words": 200, "overlap": 0}` / `ChunkOptions`) splits each text into flat
+        word windows (`chunk_text`) and writes one document per chunk: chunk `i` of the document keyed `k` is stored
+        under the key `k#i` (`chunk_key`) with the parent's meta and attrs, and its vector comes from `embed`. Needs
+        `keys` (not `ids`) and `texts`; `vectors` cannot be given. Chunk keys of the parent that this put no longer
+        writes (a shorter text) are tombstoned in the same revision; `r.chunks` counts documents, chunks and stale
+        keys. At most 4096 chunks per call. `embed` is called once with the texts to index (the chunks when chunking,
+        else `texts`) and returns one vector per text, as `vectors` takes them; the SDK does no embedding itself."""
         r = upsert(self._writer(), ids, vectors, attrs=attrs, payloads=payloads, texts=texts, metas=metas,
-                   keys_=keys, replace=replace)
+                   keys_=keys, replace=replace, chunk=chunk, embed=embed)
         self.use_revision(r.gen, r.rev)
         return r
 

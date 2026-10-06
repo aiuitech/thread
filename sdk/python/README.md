@@ -296,6 +296,10 @@ index.get(["s3://b/a.bin"], text=True)  # {key: KeyRecord(id, meta, text, attrs,
 index.resolve_keys(["s3://b/a.bin"])    # {key: id}
 page = index.list_keys("s3://b/", limit=100)   # KeyPage(entries=[(key, id)], more, next); continue with after=page.next
 index.delete_keys(["s3://b/c.bin"])     # DeleteResult with .missing
+# long texts: chunked into windows of `words` words (default 200) sharing `overlap` (default 0), one document per chunk keyed `k#i`
+# with the parent's meta/attrs; `embed` is called once with the chunk texts and returns their vectors (r.chunks = {documents, count, stale})
+index.upsert(keys=["docs/a.md"], texts=[long_text], metas=["A"], chunk={"words": 200, "overlap": 20}, embed=embed_all)
+chunk_text(long_text, words=200, overlap=20)   # [Chunk(index, text, start, end, words), ...], the same windows
 index.compact_segments()                # merge the lexical/docs segments into one base segment
 create_lexical_generation(store, "docs1", {"text": True})               # a text-only generation (no dense index)
 ```
@@ -303,7 +307,9 @@ create_lexical_generation(store, "docs1", {"text": True})               # a text
 `vectors` may be `n * dim` floats, one row per id, an `(n, dim)` numpy array or raw f32 bytes. Up to 4096 ids per
 call. `replace=False` skips the tombstone set when the ids are known to be new. Keys (non-empty strings of at most
 4096 bytes, unique per batch) go to the segment's `keys` section and resolve newest segment first; see
-[docs/keys.md](../../docs/keys.md). `configure_lexical` takes the
+[docs/keys.md](../../docs/keys.md). `chunk` (`True`, a dict or `ChunkOptions`) splits each text into flat word
+windows before writing (needs `keys` and `texts`; vectors come from `embed`; chunk keys the parent no longer
+produces are tombstoned in the same revision); see [docs/chunking.md](../../docs/chunking.md). `configure_lexical` takes the
 wire-format dict (`{"bucketTerms": 64}`) or snake_case keyword arguments; the tokenizer of a generation with
 segments is frozen.
 

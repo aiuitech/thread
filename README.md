@@ -77,6 +77,9 @@ await index.delete([1000]);
 await index.upsert({ keys: ["s3://b/a.bin"], metas: [JSON.stringify({ host: "cdn-1", size: 4096 })], texts: ["host:cdn-1"] });
 const { records } = await index.get(["s3://b/a.bin"]);                 // Map<key, { key, id, meta, attrs }>
 const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });  // { entries: [{ key, id }], more, next }
+
+// long texts: one document per window of 200 words (overlap 0), keyed "docs/a.md#0", "docs/a.md#1", ...; vectors from your embedder
+await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk: { words: 200, overlap: 20 }, embed: async (texts) => embedAll(texts) });
 ```
 
 The full API, the stores (R2 binding, S3, memory) and a mapping from Vectorize's calls are in
@@ -95,6 +98,7 @@ with open_index(store) as index:
     index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["A", "B"], attrs=[{"tenant": 42}, {"tenant": 7}])
     index.upsert(keys=["s3://b/a.bin"], metas=['{"host": "cdn-1"}'])          # by key; r.ids holds the allocated ids
     index.get(["s3://b/a.bin"])                                                # {key: KeyRecord(id, meta, text, attrs, key)}
+    index.upsert(keys=["docs/a.md"], texts=[long_text], chunk={"words": 200, "overlap": 20}, embed=embed_all)   # one doc per chunk, keyed "docs/a.md#i"
 ```
 
 Python reads the same bucket the Worker serves from, a local directory holding a copy of it, or a pack
@@ -159,7 +163,7 @@ filters and [docs/keys.md](docs/keys.md) string keys.
 |---|---|
 | `crates/thread-core` | the engine: formats, quantization, k-means, routing, scan, attribute filters, BM25, fusion |
 | `crates/thread-wasm`, `crates/thread-py` | wasm-bindgen and PyO3 bindings over the engine |
-| `crates/thread-cli` | native CLI for lexical segments (`thread seg build\|inspect\|search\|merge`, `thread tokenize`) |
+| `crates/thread-cli` | native CLI for lexical segments (`thread seg build\|inspect\|search\|merge\|keys`, `thread tokenize`, `thread chunk`) |
 | `sdk/ts`, `sdk/python` | the `thread-sdk` packages (npm, PyPI) |
 | `examples/cloudflare-worker` | the reference Worker: queries, writes, and the whole build pipeline in build slots |
 | `bench` | build driver, benchmarks and dataset prep for the deployed Worker |

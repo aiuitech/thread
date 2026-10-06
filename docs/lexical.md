@@ -290,6 +290,8 @@ thread seg search --text "deploy failed" --k 10 --with-docs [--tombstones dead.u
 thread seg keys --get "s3://b/a,s3://b/c" --prefix "s3://b/" [--after k] [--limit 100] seg1.thread seg2.thread
 thread seg merge --out base.thread [--tombstones a.u32,b.u32] seg1.thread seg2.thread
 thread tokenize [--tokenizer '{"identifiers":"both"}'] "INC-12345 failed"
+thread chunk [--words 200] [--overlap 0] [--file report.txt] "a long text ..."    # flat word windows, see chunking.md
+thread seg build --out seg.thread --docs docs.jsonl --chunk-words 200 --chunk-overlap 20 --keys --text   # one doc per chunk, keyed k#i
 ```
 
 `docs.jsonl` is one object per line with an integer `id`, a `text`, an optional `attrs` (the u32 attribute word),

@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from . import _native
 from .attrs import AttrSchema, define_attrs, pack_attrs, schema_extends, validate_schema
+from .chunk import ChunkOptions, chunk_index_of, chunk_key, chunk_text, resolve_chunk_options
 from .store import BlobStore, unique_suffix
 from .wire import (
     ThreadError,
@@ -76,6 +77,9 @@ class UpsertResult:
     ids: list[int] = field(default_factory=list)
     #: Ids allocated to new keys.
     allocated: int = 0
+    #: With `chunk`: `{documents, count, stale}`, the input documents, the chunks written (= `count`) and the stale
+    #: chunk keys tombstoned.
+    chunks: dict[str, int] | None = None
 
 
 @dataclass
@@ -135,6 +139,8 @@ class WriterContext:
     borrow_pq: Callable[[str], Any]
     #: Resolves keys to ids through the `keys` sections of the given (head) revision's manifest.
     resolve_keys: Callable[[dict[str, Any], Sequence[str]], dict[str, int]] = lambda m, k: {}
+    #: Every live key with the prefix in the given (head) revision, in key order.
+    list_keys: Callable[[dict[str, Any], str], list[str]] = lambda m, p: []
 
 
 def _now_iso() -> str:
@@ -494,15 +500,99 @@ def _tomb_bytes(ids: array) -> bytes:
     return _native.tombstones_merge(b"", ids) if len(ids) else b""
 
 
+@dataclass
+class _Chunked:
+    """A chunked upsert's expansion: the parent keys and the chunking recorded in the manifest's `change`."""
+
+    parents: list[str]
+    words: int
+    overlap: int
+
+
+def _expand(ids: Iterable[int] | None, vectors: Any, attrs: Iterable[Any] | None, payloads: Sequence[bytes | str] | None,
+            texts: Sequence[str | None] | None, metas: Sequence[str | None] | None, keys_: Sequence[str] | None,
+            chunk: ChunkOptions | Mapping[str, Any] | bool | None, embed: Callable[[list[str]], Any] | None
+            ) -> tuple[tuple[Any, ...], _Chunked | None]:
+    """Applies `chunk` and `embed`: the arguments with one document per chunk (keyed `chunk_key(parent, i)`, the
+    parent's meta and attrs) and the vectors `embed` returns for the texts to index. Validation of the result is
+    left to `_prepare_batch`, which sees an ordinary batch."""
+    if embed is not None and vectors is not None:
+        raise ThreadError("vectors and embed together: pass one or the other", 400)
+    chunked = None
+    if chunk is not None and chunk is not False:
+        try:
+            opts = resolve_chunk_options(chunk)
+        except ValueError as e:
+            raise ThreadError(str(e), 400) from None
+        if ids is not None or keys_ is None:
+            raise ThreadError("chunked upserts name documents by key: pass keys, not ids", 400)
+        if texts is None:
+            raise ThreadError("chunk needs texts (one per key)", 400)
+        if vectors is not None or payloads is not None:
+            raise ThreadError("with chunk, vectors come from embed (one per chunk)", 400)
+        parents = list(keys_)
+        n = len(parents)
+        if len(texts) != n:
+            raise ThreadError(f"{len(texts)} texts for {n} keys", 400)
+        metas_l = list(metas) if metas is not None else None
+        attrs_l = list(attrs) if attrs is not None else None
+        if metas_l is not None and len(metas_l) != n:
+            raise ThreadError(f"{len(metas_l)} metas for {n} keys", 400)
+        if attrs_l is not None and len(attrs_l) != n:
+            raise ThreadError(f"{len(attrs_l)} attrs for {n} keys", 400)
+        ck: list[str] = []
+        ct: list[str | None] = []
+        cm: list[str | None] = []
+        ca: list[Any] = []
+        for i, parent in enumerate(parents):
+            for c in chunk_text(texts[i] or "", opts.words, opts.overlap):
+                ck.append(chunk_key(parent, c.index))
+                ct.append(c.text)
+                if metas_l is not None:
+                    cm.append(metas_l[i])
+                if attrs_l is not None:
+                    ca.append(attrs_l[i])
+        if len(ck) > MAX_UPSERT:
+            raise ThreadError(f"chunk produced {len(ck)} documents, at most {MAX_UPSERT} per upsert: pass fewer texts", 400)
+        keys_, texts = ck, ct
+        metas = cm if metas_l is not None else None
+        attrs = ca if attrs_l is not None else None
+        chunked = _Chunked(parents, opts.words, opts.overlap)
+    if embed is not None:
+        to_embed = [t or "" for t in (texts or [])]
+        if not to_embed:
+            raise ThreadError("embed needs texts", 400)
+        vectors = embed(to_embed)
+        rows = len(vectors) if isinstance(vectors, (list, tuple)) and vectors and not isinstance(vectors[0], (int, float)) else None
+        if rows is not None and rows != len(to_embed):
+            raise ThreadError(f"embed returned {rows} vectors for {len(to_embed)} texts", 400)
+        if rows is None and len(vectors) == 0:
+            raise ThreadError(f"embed returned 0 vectors for {len(to_embed)} texts", 400)
+    return (ids, vectors, attrs, payloads, texts, metas, keys_), chunked
+
+
+def _stale_chunk_ids(ctx: WriterContext, manifest: dict[str, Any], chunked: _Chunked, written: Sequence[str]) -> array:
+    """The ids of the parents' chunk keys the batch no longer writes (`parent#<i>` for an `i` not in the batch)."""
+    have = set(written)
+    stale = [k for p in chunked.parents for k in ctx.list_keys(manifest, p + "#")
+             if k not in have and chunk_index_of(k, p) is not None]
+    if not stale:
+        return array("I")
+    return array("I", sorted(set(ctx.resolve_keys(manifest, stale).values())))
+
+
 def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *, attrs: Iterable[Any] | None = None,
            payloads: Sequence[bytes | str] | None = None, texts: Sequence[str | None] | None = None,
            metas: Sequence[str | None] | None = None, keys_: Sequence[str] | None = None,
-           replace: bool = True) -> UpsertResult:
+           replace: bool = True, chunk: ChunkOptions | Mapping[str, Any] | bool | None = None,
+           embed: Callable[[list[str]], Any] | None = None) -> UpsertResult:
     t0 = time.perf_counter()
     store, gen = ctx.store, ctx.gen
     _writable(store)
+    (ids, vectors, attrs, payloads, texts, metas, keys_), chunked = _expand(ids, vectors, attrs, payloads, texts, metas,
+                                                                           keys_, chunk, embed)
     st: dict[str, Any] = {"batch": None, "delta": None, "seg": None, "seq": 0, "tomb_key": None, "tomb_bytes": 0,
-                          "ids_key": None, "ids_rev": -1, "allocated": 0}
+                          "ids_key": None, "ids_rev": -1, "allocated": 0, "stale": array("I"), "stale_rev": -1}
 
     def make(rev: int, manifest: dict[str, Any], files: dict[str, Any]) -> dict[str, Any]:
         lex = resolve_lex_config(manifest)
@@ -517,6 +607,12 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
         if not st["seq"]:
             st["seq"] = _alloc_seq(store, gen, manifest.get("nextSeq") or 1)
         seq = st["seq"]
+        # Chunk keys of the parents that this put no longer writes are tombstoned with the batch (per head, like the
+        # id resolution: another writer may have changed the parents meanwhile).
+        if chunked is not None and st["stale_rev"] != rev:
+            assert batch.keys is not None
+            st["stale"] = _stale_chunk_ids(ctx, manifest, chunked, batch.keys)
+            st["stale_rev"] = rev
         # Ids: given, or resolved through the head's keys (re-resolved when a lost race moved the head, since another
         # writer may have allocated ids or written the same keys meanwhile).
         base_next = manifest.get("nextId")
@@ -538,7 +634,9 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
             st["ids_key"], st["delta"], st["seg"] = ids_key, None, None
         # The delta and the segment are reused across retries (unless the means/codebook or the ids changed under
         # us); the tombstone set is keyed by the rev, so it is rewritten for every attempt.
-        tb = _tomb_bytes(batch.ids) if replace else None
+        stale: array = st["stale"]
+        tomb_ids = (array("I", sorted(set(batch.ids) | set(stale))) if len(stale) else batch.ids) if replace else stale
+        tb = _tomb_bytes(tomb_ids) if len(tomb_ids) else None
         delta_f = seg_f = tomb_f = None
         if batch.vectors is not None:
             prev = st["delta"]
@@ -569,6 +667,9 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
                          "dense": delta is not None, "lexical": seg is not None, "writer": "thread-sdk-python"}
         if batch.keys is not None:
             nxt["change"].update(keys=len(batch.keys), allocated=st["allocated"])
+        if chunked is not None:
+            nxt["change"]["chunk"] = {"words": chunked.words, "overlap": chunked.overlap,
+                                      "documents": len(chunked.parents), "stale": len(stale)}
         return nxt
 
     c = _commit_rev(ctx, make)
@@ -590,6 +691,7 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
         ms=round((time.perf_counter() - t0) * 1000, 3),
         ids=list(batch.ids),
         allocated=st["allocated"],
+        chunks={"documents": len(chunked.parents), "count": len(batch.ids), "stale": len(st["stale"])} if chunked else None,
     )
 
 

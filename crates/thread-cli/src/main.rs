@@ -4,11 +4,13 @@
 //!
 //!   thread seg build|search|inspect|merge ...  lexical/docs segments on local files (see lex_cli.rs)
 //!   thread tokenize [--tokenizer json] "text"   the index's tokenizer
+//!   thread chunk [--words 200] [--overlap 0] "text"   flat word-window chunks (see chunk.rs)
 //!   thread bench-scan [n_vectors] [dim] [pq_m]   time v1 (int8), v2 (4-bit + int8 rerank) and v3 (PQ + int8 rerank) scans of a synthetic slab
 //!   thread bench-route [k1] [k2] [dim] [nprobe]  time flat vs two-level routing
 //!   thread bench-neighbors [k] [dim] [count] [n]  time one cell_neighbors range (cells [0, count))
 //!   thread inspect <slab-file>            print slab header info
 
+mod chunk;
 mod lex_cli;
 
 use std::time::Instant;
@@ -277,7 +279,7 @@ fn usage() -> String {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        Some(cmd @ ("seg" | "tokenize")) => match lex_cli::run(cmd, &args[2..]) {
+        Some(cmd @ ("seg" | "tokenize" | "chunk")) => match lex_cli::run(cmd, &args[2..]) {
             Ok(lex_cli::Output::Json(v)) => println!("{}", serde_json::to_string(&v).unwrap()),
             Ok(lex_cli::Output::Help(h)) => print!("{h}"),
             Err(e) => {
