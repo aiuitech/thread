@@ -9,6 +9,7 @@ if you want to use it.
 | [architecture.md](architecture.md) | the design in one sitting: slabs, two tiers, routing, segments, why it is cheap, where the code lives |
 | [cold-start.md](cold-start.md) | cold-start cost against S3 for both SDKs: a summary of what changed (baseline -> merged defaults, opt-in modes, rejected ideas), the `bench/cold/` harness (fake S3 proxy with a network model, benches, packs), the open/query timeline in the SDK stats, the baseline and where the time goes, store-level options, compact routing / cold tree routing / base packs, warm packs, the inline manifest, options outside the SDK |
 | [benchmarks.md](benchmarks.md) | thread vs Cloudflare Vectorize on dbpedia-openai-1M, generation history, update and compaction numbers, offline diagnostics |
+| [research-hops-experiment.md](research-hops-experiment.md) | proposed Wiper experiment: alternate search and reranker objectives, preserve evidence across hops, and compare answer quality under matched budgets |
 | [query-path.md](query-path.md) | slab formats, the two-phase query (scan, rerank, speculative reads), caching of revisions and bases, the SDKs' cache and miss policies, wasm trap recovery, the centroid tree and beam routing, cold opens (compact routing tables, cold tree routing, base packs) |
 | [profiles.md](profiles.md) | the `edge` and `local` layouts, what each knob trades, manifest query defaults and how to change them |
 | [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual and automatic), cell splitting, GC |
