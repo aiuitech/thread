@@ -4,7 +4,7 @@
  * compaction, refresh on another handle and a wasm reset.
  */
 import { describe, expect, it } from "vitest";
-import { createLexicalGeneration, isMissingRanges, keys, LexSegment, MemoryBlobStore, rrf, ThreadError, type Manifest } from "../src/index.js";
+import { createLexicalGeneration, isMissingRanges, keys, LexSegment, MemoryBlobStore, ThreadError, type Manifest } from "../src/index.js";
 import { buildGen, rng, thread, unitRows, w } from "./helpers.js";
 
 const DOCS: { id: number; text: string; meta: string }[] = [
@@ -15,6 +15,14 @@ const DOCS: { id: number; text: string; meta: string }[] = [
 	{ id: 7, text: "", meta: "empty" },
 	{ id: 99, text: "Nothing to see here, move along", meta: "Nothing" },
 ];
+
+/** Reference RRF (`Σ weight / (k + rank)`, rank from 1, ties by ascending id) to check the core's fusion against. */
+function referenceRrf(lists: [number, number[]][], k: number, topN: number): { ids: number[]; scores: number[] } {
+	const scores = new Map<number, number>();
+	for (const [weight, ids] of lists) ids.forEach((id, i) => scores.set(id, (scores.get(id) ?? 0) + weight / (k + i + 1)));
+	const ranked = [...scores].sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, topN);
+	return { ids: ranked.map((p) => p[0]), scores: ranked.map((p) => p[1]) };
+}
 
 /** Reference BM25 (bm25s/Lucene arithmetic) over the live documents for a tokenized query. */
 function referenceBm25(docs: { id: number; tokens: string[] }[], query: string[], k1 = 1.2, b = 0.75): { id: number; score: number }[] {
@@ -220,7 +228,7 @@ describe("hybrid search on a dense generation", () => {
 		const hy = await index.search({ text: "alpha bravo", vector: fresh.subarray(16, 32), topK: 5, dense: { nprobe: 8 }, docs: true });
 		expect(hy.mode).toBe("hybrid");
 		expect(hy.params).toEqual({ topK: 5, recallK: 50, rrfK: 10, weights: { dense: 1, lexical: 0.5 } });
-		const fused = rrf(
+		const fused = referenceRrf(
 			[
 				[1, hy.dense!.hits.map((h) => h.id)],
 				[0.5, hy.lexical!.hits.map((h) => h.id)],
@@ -228,7 +236,7 @@ describe("hybrid search on a dense generation", () => {
 			10,
 			5,
 		);
-		expect(hy.hits.map((h) => h.id)).toEqual(Array.from(fused.ids));
+		expect(hy.hits.map((h) => h.id)).toEqual(fused.ids);
 		hy.hits.forEach((h, i) => expect(h.score).toBe(fused.scores[i]));
 		expect(hy.hits[0].id).toBe(1001); // first in both lists
 		expect(hy.hits[0].dense?.rank).toBe(1);

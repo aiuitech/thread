@@ -80,12 +80,13 @@ such host that also runs the build.
                       Searcher.set_tree/route_beam/cell_dots_for/tree_recall/tree_recall_top, DeltaJob.set_tree,
                       AssignJob.set_tree (not used by the driver yet); compact routing: routing_table_encode/
                       decode, Searcher.from_table, grouped_table_encode/info, ColdRouter; lexical (`src/lex.rs`): LexTokenizer,
-                      SegmentJob, SegmentReader (paged), merge_segments, rrf_fuse, best_doc_ranks, rerank_fuse,
+                      SegmentJob, SegmentReader (paged), merge_segments, plan_search/SearchPlan, fuse_search/SearchHits,
+                      rrf_fuse, best_doc_ranks, rerank_fuse,
                       Lines, Excerpter
 - `crates/thread-cli`    native CLI: `seg build|inspect|search|merge`, `tokenize`, slab/scan benchmarks
 - `crates/thread-py`     PyO3 extension (`thread_sdk._native`): Searcher, PqCodebook, the per-query `QueryRun`
                       (scan, merge, rerank), DeltaJob, tombstones, AssignJob/SlabJob, LexTokenizer, SegmentJob,
-                      SegmentReader (paged), merge_segments
+                      SegmentReader (paged), merge_segments, plan_search/SearchPlan, fuse_search
 - `sdk/ts/`           `thread-sdk` (npm): the query path as a library (R2/S3/memory stores, Cache API; directory
                       stores and packs via `thread-sdk/node`), the lexical index, `search` (dense, lexical, hybrid),
                       the write path (upsert with texts, delete, segment compaction), snapshots and packs

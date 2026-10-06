@@ -19,7 +19,6 @@ from thread_sdk import (
     create_lexical_generation,
     keys,
     open_index,
-    rrf,
 )
 from thread_sdk.lex import LexIo, LexSegment
 from thread_sdk.store import BlobTrace
@@ -38,6 +37,15 @@ DOCS = [
 
 def f32(x: float) -> float:
     return struct.unpack("<f", struct.pack("<f", x))[0]
+
+
+def reference_rrf(lists: list[tuple[float, list[int]]], k: float, top_n: int) -> list[tuple[int, float]]:
+    """`sum(weight / (k + rank))`, rank from 1, ties by ascending id: a check on the core's fusion."""
+    scores: dict[int, float] = {}
+    for weight, ids in lists:
+        for i, id in enumerate(ids):
+            scores[id] = scores.get(id, 0.0) + weight / (k + i + 1)
+    return sorted(scores.items(), key=lambda p: (-p[1], p[0]))[:top_n]
 
 
 def reference_bm25(docs: list[tuple[int, list[str]]], query: list[str], k1: float = 1.2, b: float = 0.75):
@@ -231,7 +239,7 @@ def test_hybrid_on_dense_generation():
     hy = index.search(text="alpha bravo", vector=row(fresh, 1, 16), top_k=5, dense={"nprobe": 8}, docs=True)
     assert hy.mode == "hybrid"
     assert hy.params == {"top_k": 5, "recall_k": 50, "rrf_k": 10, "weights": {"dense": 1, "lexical": 0.5}}
-    fused = rrf([(1, [h.id for h in hy.dense.hits]), (0.5, [h.id for h in hy.lexical.hits])], 10, 5)
+    fused = reference_rrf([(1, [h.id for h in hy.dense.hits]), (0.5, [h.id for h in hy.lexical.hits])], 10, 5)
     assert [(h.id, h.score) for h in hy.hits] == fused
     assert hy.hits[0].id == 1001  # first in both lists
     assert hy.hits[0].dense.rank == 1 and hy.hits[0].lexical.rank == 1

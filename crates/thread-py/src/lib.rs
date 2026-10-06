@@ -33,6 +33,7 @@ use thread_core::slab::{SlabView, SlabWriter};
 use thread_core::tomb::Tombstones;
 use thread_core::topk::{merge_dedup, pack_hits, unpack_hits, TopK};
 
+mod fusion;
 mod lex;
 mod run;
 
@@ -1320,5 +1321,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_centroid_tree, m)?)?;
     m.add_function(wrap_pyfunction!(grouped_table_info, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    fusion::register(m)?;
     lex::register(m)
 }

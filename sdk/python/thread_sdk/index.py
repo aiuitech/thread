@@ -13,7 +13,6 @@ from typing import Any, Iterable, Literal, Mapping, Sequence
 from . import _native
 from .attrs import AttrFilterExpr, AttrSchema, compile_filter, pack_attrs, unpack_attrs, validate_schema
 from .cold import ColdRouting
-from .fusion import DEFAULT_RRF_K, rrf
 from .lex import DocRecord, KeyPage, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import Base, QueryContext, QueryResult, RevState, execute_query
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
@@ -1081,27 +1080,24 @@ class ThreadIndex:
         deeper and resolved through the `docs` store."""
         self._check_open()
         t0 = time.perf_counter()
-        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
             raise ThreadError("top_k must be an integer >= 1", 400)
         has_text = isinstance(text, str) and text.strip() != ""
         has_vector = vector is not None
-        if not has_text and not has_vector:
-            raise ThreadError("search needs a text, a vector or both", 400)
         self._maybe_refresh()
-        cfg = self.lex_config
-        if has_text and cfg is None:
+        lex_cfg = self._rev.manifest.get("lex")
+        if has_text and lex_cfg is None:
             raise ThreadError("this generation has no lexical index (index.configure_lexical first)", 400)
-        if has_vector and not self.has_dense:
-            raise ThreadError("this generation has no dense index", 400)
-        if recall_k is None:
-            recall_k = cfg.recall_k if cfg and cfg.recall_k is not None else max(top_k, 50)
-        if rrf_k is None:
-            rrf_k = cfg.rrf_k if cfg else DEFAULT_RRF_K
-        w = weights or {}
-        wts = {"dense": w.get("dense", cfg.weights["dense"] if cfg else 1),
-               "lexical": w.get("lexical", cfg.weights["lexical"] if cfg else 1)}
-        both = has_text and has_vector
-        depth = max(recall_k, top_k) if both else top_k
+        # Mode, list depth, RRF constant and weights are resolved by the core against `manifest.lex.defaults`.
+        md = (lex_cfg or {}).get("defaults") or {}
+        w, mw = weights or {}, md.get("weights") or {}
+        try:
+            plan = _native.plan_search(float(top_k), has_text, has_vector, lex_cfg is not None, self.has_dense,
+                                       (rrf_k, recall_k, w.get("dense"), w.get("lexical")),
+                                       (md.get("rrfK"), md.get("recallK"), mw.get("dense"), mw.get("lexical")))
+        except ValueError as e:
+            raise ThreadError(str(e), 400) from None
+        depth = plan.depth
         timing = {"dense": 0.0, "lexical": 0.0, "docs": 0.0}
         # The filter is compiled once and applied to both lists.
         words = compile_filter(self.attr_schema, filter) if filter else None
@@ -1112,7 +1108,7 @@ class ThreadIndex:
             timing["lexical"] = round((time.perf_counter() - t) * 1000, 3)
             return r
 
-        lex_fut = self._jobs.submit(run_lex) if both else None
+        lex_fut = self._jobs.submit(run_lex) if has_text and has_vector else None
         dense_r: QueryResult | None = None
         lex_r: LexSearchResult | None = None
         if has_vector:
@@ -1124,23 +1120,11 @@ class ThreadIndex:
         elif has_text:
             lex_r = run_lex()
 
-        hits: list[SearchHit]
-        mode: Literal["dense", "lexical", "hybrid"]
-        if both:
-            mode = "hybrid"
-            assert dense_r is not None and lex_r is not None
-            fused = rrf([(wts["dense"], [h.id for h in dense_r.hits]), (wts["lexical"], [h.id for h in lex_r.hits])],
-                        rrf_k, top_k)
-            d_rank = {h.id: Rank(i + 1, h.score) for i, h in enumerate(dense_r.hits)}
-            l_rank = {h.id: Rank(i + 1, h.score) for i, h in enumerate(lex_r.hits)}
-            hits = [SearchHit(i, s, d_rank.get(i), l_rank.get(i)) for i, s in fused]
-        elif dense_r is not None:
-            mode = "dense"
-            hits = [SearchHit(h.id, h.score, dense=Rank(i + 1, h.score)) for i, h in enumerate(dense_r.hits[:top_k])]
-        else:
-            mode = "lexical"
-            assert lex_r is not None
-            hits = [SearchHit(h.id, h.score, lexical=Rank(i + 1, h.score)) for i, h in enumerate(lex_r.hits[:top_k])]
+        def ranked(hits: Any) -> tuple[list[int], list[float]] | None:
+            return None if hits is None else ([h.id for h in hits], [h.score for h in hits])
+
+        fused = _native.fuse_search(plan, ranked(dense_r.hits if dense_r else None), ranked(lex_r.hits if lex_r else None))
+        hits = [SearchHit(i, s, Rank(*d) if d else None, Rank(*lx) if lx else None) for i, s, d, lx in fused]
         stats: dict[str, Any] = {}
         if docs and hits:
             t = time.perf_counter()
@@ -1150,8 +1134,9 @@ class ThreadIndex:
             stats["docs_io"] = io.as_dict()
             timing["docs"] = round((time.perf_counter() - t) * 1000, 3)
         stats["timing"] = {"total": round((time.perf_counter() - t0) * 1000, 3), **timing}
-        return SearchResult(hits, mode, {"top_k": top_k, "recall_k": depth, "rrf_k": rrf_k, "weights": wts},
-                            dense_r, lex_r, stats)
+        params = {"top_k": plan.top_k, "recall_k": depth, "rrf_k": plan.rrf_k,
+                  "weights": {"dense": plan.dense_weight, "lexical": plan.lexical_weight}}
+        return SearchResult(hits, plan.mode, params, dense_r, lex_r, stats)
 
     # ---- writes ----
 

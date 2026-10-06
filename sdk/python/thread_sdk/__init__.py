@@ -12,7 +12,6 @@ kernels are the same Rust code (`thread-core`) the Worker and the TypeScript SDK
 
 from . import _native
 from .attrs import compile_filter, define_attrs, filter_matches, pack_attrs, unpack_attrs, validate_schema
-from .fusion import DEFAULT_RRF_K, rrf
 from .index import KeyRecord, Rank, SearchHit, SearchResult, ThreadIndex, head_revision, load_rev_state, open_index, resolve_target
 from .lex import DocRecord, KeyPage, LexHit, LexIndex, LexSearchResult, LexSegment
 from .pack import PackedBlobStore, PackResult, PackWriter, copy_objects, pack_index, pack_to_bytes, store_at
@@ -107,8 +106,6 @@ __all__ = [
     "LexIndex",
     "LexSegment",
     "keys",
-    "rrf",
-    "DEFAULT_RRF_K",
     "sign_v4",
     "SigningKeyCache",
     "S3_INFLIGHT",

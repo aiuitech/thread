@@ -15,7 +15,7 @@ use thread_core::container::{self, Container};
 use thread_core::docs::DocEntry;
 use thread_core::error::Error;
 use thread_core::excerpts::{self, DocLines, Term};
-use thread_core::fusion::{rrf, RrfList};
+use thread_core::fusion::{self, rrf, FusionParams, RankedList, RrfList, SearchInput};
 use thread_core::keys::KeyPage;
 use thread_core::lex::{Lengths, LexParams, QueryTerm, Stats, TermInfo};
 use thread_core::rerank;
@@ -1098,6 +1098,169 @@ pub fn rrf_fuse(
         .collect();
     let (ids, scores) = rrf(&rrf_lists, rrf_k, top_n as usize).into_iter().unzip();
     Ok(FusedHits { ids, scores })
+}
+
+/// A resolved unified search (`thread_core::fusion::plan_search`): the mode, the depth to run
+/// each list at, and the fusion parameters `fuse_search` applies.
+#[wasm_bindgen]
+pub struct SearchPlan(fusion::SearchPlan);
+
+#[wasm_bindgen]
+impl SearchPlan {
+    /// `"dense"`, `"lexical"` or `"hybrid"`.
+    #[wasm_bindgen(getter)]
+    pub fn mode(&self) -> String {
+        self.0.mode.as_str().to_string()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn top_k(&self) -> u32 {
+        self.0.top_k
+    }
+    #[wasm_bindgen(getter)]
+    pub fn depth(&self) -> u32 {
+        self.0.depth
+    }
+    #[wasm_bindgen(getter)]
+    pub fn rrf_k(&self) -> f64 {
+        self.0.rrf_k
+    }
+    #[wasm_bindgen(getter)]
+    pub fn dense_weight(&self) -> f64 {
+        self.0.dense_weight
+    }
+    #[wasm_bindgen(getter)]
+    pub fn lexical_weight(&self) -> f64 {
+        self.0.lexical_weight
+    }
+}
+
+/// Resolves a search request (`req_*`) against `manifest.lex.defaults` (`m_*`); an unset value
+/// falls through to the next. Throws a `RangeError` with the reason when the search cannot run.
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn plan_search(
+    top_k: Option<f64>,
+    has_text: bool,
+    has_vector: bool,
+    has_lexical: bool,
+    has_dense: bool,
+    req_rrf_k: Option<f64>,
+    req_recall_k: Option<u32>,
+    req_dense_weight: Option<f64>,
+    req_lexical_weight: Option<f64>,
+    m_rrf_k: Option<f64>,
+    m_recall_k: Option<u32>,
+    m_dense_weight: Option<f64>,
+    m_lexical_weight: Option<f64>,
+) -> Result<SearchPlan, JsValue> {
+    let input = SearchInput {
+        top_k,
+        has_text,
+        has_vector,
+        has_lexical,
+        has_dense,
+    };
+    let request = FusionParams {
+        rrf_k: req_rrf_k,
+        recall_k: req_recall_k,
+        dense_weight: req_dense_weight,
+        lexical_weight: req_lexical_weight,
+    };
+    let manifest = FusionParams {
+        rrf_k: m_rrf_k,
+        recall_k: m_recall_k,
+        dense_weight: m_dense_weight,
+        lexical_weight: m_lexical_weight,
+    };
+    fusion::plan_search(&input, &request, &manifest)
+        .map(SearchPlan)
+        .map_err(|m| arg_error(m.to_string()))
+}
+
+/// The hits of a unified search, column-wise: `ids`, `scores` (fused RRF, else the list score),
+/// and per list the 1-based `*_rank` (0: not in that list) and `*_score` (NaN: not in it).
+#[wasm_bindgen]
+pub struct SearchHits {
+    ids: Vec<u32>,
+    scores: Vec<f64>,
+    dense_rank: Vec<u32>,
+    dense_score: Vec<f64>,
+    lexical_rank: Vec<u32>,
+    lexical_score: Vec<f64>,
+}
+
+#[wasm_bindgen]
+impl SearchHits {
+    #[wasm_bindgen(getter)]
+    pub fn ids(&self) -> Vec<u32> {
+        self.ids.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn scores(&self) -> Vec<f64> {
+        self.scores.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn dense_rank(&self) -> Vec<u32> {
+        self.dense_rank.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn dense_score(&self) -> Vec<f64> {
+        self.dense_score.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn lexical_rank(&self) -> Vec<u32> {
+        self.lexical_rank.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn lexical_score(&self) -> Vec<f64> {
+        self.lexical_score.clone()
+    }
+}
+
+/// The final hits of a planned search (`thread_core::fusion::fuse_search`) from the lists the
+/// host fetched: ids best first and their scores, `undefined` for a list the mode does not run.
+#[wasm_bindgen]
+pub fn fuse_search(
+    plan: &SearchPlan,
+    dense_ids: Option<Vec<u32>>,
+    dense_scores: Option<Vec<f64>>,
+    lexical_ids: Option<Vec<u32>>,
+    lexical_scores: Option<Vec<f64>>,
+) -> Result<SearchHits, JsValue> {
+    if dense_ids.is_some() != dense_scores.is_some()
+        || lexical_ids.is_some() != lexical_scores.is_some()
+    {
+        return Err(arg_error("a list needs both its ids and its scores".into()));
+    }
+    let d = dense_ids
+        .as_deref()
+        .zip(dense_scores.as_deref())
+        .map(|(ids, scores)| RankedList { ids, scores });
+    let l = lexical_ids
+        .as_deref()
+        .zip(lexical_scores.as_deref())
+        .map(|(ids, scores)| RankedList { ids, scores });
+    let hits = fusion::fuse_search(&plan.0, d, l).map_err(|m| arg_error(m.to_string()))?;
+    let rank = |r: Option<fusion::ListRank>| r.map_or((0, f64::NAN), |r| (r.rank, r.score));
+    let mut out = SearchHits {
+        ids: Vec::with_capacity(hits.len()),
+        scores: Vec::with_capacity(hits.len()),
+        dense_rank: Vec::with_capacity(hits.len()),
+        dense_score: Vec::with_capacity(hits.len()),
+        lexical_rank: Vec::with_capacity(hits.len()),
+        lexical_score: Vec::with_capacity(hits.len()),
+    };
+    for h in hits {
+        let (dr, ds) = rank(h.dense);
+        let (lr, ls) = rank(h.lexical);
+        out.ids.push(h.id);
+        out.scores.push(h.score);
+        out.dense_rank.push(dr);
+        out.dense_score.push(ds);
+        out.lexical_rank.push(lr);
+        out.lexical_score.push(ls);
+    }
+    Ok(out)
 }
 
 /// Each window document's best rank over several candidate lists of one family (`flat_ids` /

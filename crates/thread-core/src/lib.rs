@@ -41,7 +41,8 @@
 //! - `docs`: the `docs` section, document id -> metadata (+ optional text), bucketed by id
 //! - `segment`: one object holding `meta`, `terms`, `postings` and `docs` for a batch of
 //!   documents (an upsert) or for the whole corpus (a compaction)
-//! - `fusion`: Reciprocal Rank Fusion of the dense and lexical lists
+//! - `fusion`: a unified search's plan (mode, list depth, defaults) and the Reciprocal Rank Fusion
+//!   of the dense and lexical lists into its hits
 //! - `excerpts`, `rerank`: query-time passages and judge-based rank fusion
 
 pub mod container;

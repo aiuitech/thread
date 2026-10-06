@@ -4,7 +4,7 @@ thread searches by vector (the IVF index of `docs/architecture.md`) and by text 
 lists. This document is the design of the text side and of the document store: what the objects hold, how a query
 reads them from blob storage, how updates and compaction work, and which knobs trade index size for query speed.
 The code is `crates/thread-core/src/{source,container,tokenize,lex,docs,segment,fusion,excerpts,rerank}.rs`, the
-bindings `crates/thread-wasm/src/lex.rs`, the host side `sdk/ts/src/{lex,fusion,write,index}.ts`, and the native CLI
+bindings `crates/thread-wasm/src/lex.rs`, the host side `sdk/ts/src/{lex,write,index}.ts`, and the native CLI
 `crates/thread-cli/src/lex_cli.rs`.
 
 It is a port and reshaping of Wiper's `thread` engine (`../wiper/rust/thread`), which held BM25 postings, a
@@ -14,7 +14,8 @@ current round still needs, coalesced at 4 KiB), the `THREADIX` container of name
 tokenizer with the vendored Snowball 3.1 English stemmer, CJK bigrams, technical identifiers and Harman's light
 stemmer, Reciprocal Rank Fusion, the excerpt cutter and the judge-side rank fusion. What was redesigned for a
 blob store with sparse caller-assigned ids: the inverted index layout (below), the document store (keyed by id, not
-by row), segments with tombstones instead of whole-file appends, and the fusion of the two indexes in the SDK.
+by row), segments with tombstones instead of whole-file appends, and the fusion of the two indexes (planned and fused in the
+core, the two lists fetched by the SDK).
 What was left behind: the flat int8 vector sections (the IVF index covers that), document-range sharding over
 Durable Objects and its skip lists, the SQLite/D1 byte sources, and the feature-gated ICU and charabia segmenters
 (large dependencies; the names are rejected with a config error).
@@ -166,9 +167,12 @@ So a warm isolate answers a text query in **two rounds per segment**, all segmen
 in one or two more, and a `get(key)` in two (keys bucket, docs bucket). Transient bytes are evicted from the wasm reader once they exceed a budget (8 MB by default);
 the resident parts are a few KB per segment (20k documents: 2.5 KB terms directory + 2.5 KB docs directory).
 
-The dense query and the lexical query run concurrently at depth `recallK`; the two id lists are fused with
-Reciprocal Rank Fusion (`score = Σ weight / (rrfK + rank)`, float64, ties by id; `fusion.rs` and `sdk/ts/src/fusion.ts`
-compute identical sums) and the top k is resolved through `docs` when asked. Each hit reports its rank and score in
+`search` is planned and fused in the core (`fusion.rs`); the SDKs only fetch the lists in between.
+`plan_search` resolves the request against `lex.defaults` (request value, else manifest value, else `rrfK` 60,
+`recallK` max(topK, 50), weights 1 / 1, `topK` 10), picks the mode and the depth of each list. The dense query
+and the lexical query then run concurrently at that depth, and `fuse_search` fuses the two id lists with
+Reciprocal Rank Fusion (`score = Σ weight / (rrfK + rank)`, float64, ties by id), or cuts the one list to
+`topK`; the top k is resolved through `docs` when asked. Each hit reports its rank and score in
 each list it appeared in. With an attribute filter the lexical list is taken deeper, each candidate's word is
 resolved through `docs` and non-matching candidates are dropped before fusion ([filtering.md](filtering.md#text-queries-post-filtering-through-the-docs-store)).
 

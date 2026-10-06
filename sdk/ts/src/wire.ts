@@ -237,7 +237,7 @@ export interface LexConfig {
 	bucketDocs?: number;
 	/** Keys per `keys` bucket (default 128): fewer = smaller reads per key lookup, more = smaller resident directory. */
 	bucketKeys?: number;
-	/** Query defaults for `search`: RRF constant (60), per-list depth (max(topK, 50)) and list weights (1 / 1). */
+	/** Query defaults for `search` (unset: the core's RRF constant 60, per-list depth max(topK, 50), weights 1 / 1). */
 	defaults?: { rrfK?: number; recallK?: number; weights?: { dense?: number; lexical?: number } };
 }
 
@@ -251,9 +251,6 @@ export interface ResolvedLexConfig {
 	text: boolean;
 	bucketDocs: number;
 	bucketKeys: number;
-	rrfK: number;
-	recallK: number | null;
-	weights: { dense: number; lexical: number };
 }
 
 /** `manifest.lex` with its defaults filled in (`null` when the generation has no lexical configuration). */
@@ -270,9 +267,6 @@ export function resolveLexConfig(m: Manifest): ResolvedLexConfig | null {
 		text: c.text ?? false,
 		bucketDocs: c.bucketDocs ?? 128,
 		bucketKeys: c.bucketKeys ?? 128,
-		rrfK: c.defaults?.rrfK ?? 60,
-		recallK: c.defaults?.recallK ?? null,
-		weights: { dense: c.defaults?.weights?.dense ?? 1, lexical: c.defaults?.weights?.lexical ?? 1 },
 	};
 }
 

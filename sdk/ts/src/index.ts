@@ -17,7 +17,6 @@ import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSp
 import { chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseManifest, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
 import { asF32, baseKeysOf, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
 import { LexIndex, LexSegment, type DocRecord, type KeyPage, type LexIo, type LexSearchOptions, type LexSearchResult, type ListKeysOptions } from "./lex.js";
-import { DEFAULT_RRF_K, rrf } from "./fusion.js";
 import { ColdRouting } from "./cold.js";
 import { isPackHeader, PackedBlobStore, PrefetchStore } from "./pack.js";
 import { fetchWarmPack, revisionSlabKeys, seedWarmPack, WarmPrefixStore, type PrefixSeed, type WarmPackStats } from "./warm.js";
@@ -27,7 +26,6 @@ export * from "./attrs.js";
 export * from "./store.js";
 export * from "./s3.js";
 export * from "./lex.js";
-export * from "./fusion.js";
 export * from "./routing.js";
 export type { ColdStat } from "./cold.js";
 export * from "./pack.js";
@@ -646,73 +644,68 @@ export class ThreadIndex {
 	async search(req: SearchRequest): Promise<SearchResult> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		const t0 = Date.now();
-		const topK = req.topK ?? 10;
-		if (!Number.isInteger(topK) || topK < 1) throw new ThreadError("topK must be an integer >= 1", 400);
 		const hasText = typeof req.text === "string" && req.text.trim().length > 0;
 		const hasVector = req.vector !== undefined;
-		if (!hasText && !hasVector) throw new ThreadError("search needs a text, a vector or both", 400);
 		this.maybeRefresh();
-		const cfg = this.lexConfig;
-		if (hasText && !cfg) throw new ThreadError("this generation has no lexical index (index.configureLexical first)", 400);
-		if (hasVector && !this.hasDense) throw new ThreadError("this generation has no dense index", 400);
-		const recallK = req.recallK ?? cfg?.recallK ?? Math.max(topK, 50);
-		const rrfK = req.rrfK ?? cfg?.rrfK ?? DEFAULT_RRF_K;
-		const weights = { dense: req.weights?.dense ?? cfg?.weights.dense ?? 1, lexical: req.weights?.lexical ?? cfg?.weights.lexical ?? 1 };
-		const both = hasText && hasVector;
-		const depth = both ? Math.max(recallK, topK) : topK;
+		// Mode, list depth, RRF constant and weights are resolved by the core against `manifest.lex.defaults`.
+		const lexCfg = this.revState.manifest.lex;
+		if (hasText && !lexCfg) throw new ThreadError("this generation has no lexical index (index.configureLexical first)", 400);
+		const md = lexCfg?.defaults;
+		let plan: W.SearchPlan;
+		try {
+			plan = W.plan_search(req.topK, hasText, hasVector, lexCfg != null, this.hasDense, req.rrfK, req.recallK, req.weights?.dense, req.weights?.lexical, md?.rrfK, md?.recallK, md?.weights?.dense, md?.weights?.lexical);
+		} catch (e) {
+			if (e instanceof RangeError) throw new ThreadError(e.message, 400);
+			throw e;
+		}
+		const mode = plan.mode as SearchResult["mode"];
+		const topK = plan.top_k;
+		const depth = plan.depth;
+		const params = { topK, recallK: depth, rrfK: plan.rrf_k, weights: { dense: plan.dense_weight, lexical: plan.lexical_weight } };
 		// The filter is compiled once and applied to both lists.
 		const filter = req.filter ? this.compileFilter(req.filter) : undefined;
 		let tDense = 0;
 		let tLex = 0;
-		const [dense, lexical] = await Promise.all([
-			hasVector
-				? (async () => {
-						const t = Date.now();
-						const r = await this.query(req.vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
-						tDense = Date.now() - t;
-						return r;
-					})()
-				: Promise.resolve(undefined),
-			hasText
-				? (async () => {
-						const t = Date.now();
-						const r = await this.lexicalSearch(req.text!, depth, filter ? { filter } : {});
-						tLex = Date.now() - t;
-						return r;
-					})()
-				: Promise.resolve(undefined),
-		]);
-		let hits: SearchHit[];
-		let mode: SearchResult["mode"];
-		if (both) {
-			mode = "hybrid";
-			const dIds = dense!.hits.map((h) => h.id);
-			const lIds = lexical!.hits.map((h) => h.id);
-			const fused = rrf(
-				[
-					[weights.dense, dIds],
-					[weights.lexical, lIds],
-				],
-				rrfK,
-				topK,
+		let dense: QueryResult | undefined;
+		let lexical: LexSearchResult | undefined;
+		let fused: W.SearchHits;
+		try {
+			[dense, lexical] = await Promise.all([
+				hasVector
+					? (async () => {
+							const t = Date.now();
+							const r = await this.query(req.vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
+							tDense = Date.now() - t;
+							return r;
+						})()
+					: Promise.resolve(undefined),
+				hasText
+					? (async () => {
+							const t = Date.now();
+							const r = await this.lexicalSearch(req.text!, depth, filter ? { filter } : {});
+							tLex = Date.now() - t;
+							return r;
+						})()
+					: Promise.resolve(undefined),
+			]);
+			fused = W.fuse_search(
+				plan,
+				dense && Uint32Array.from(dense.hits, (h) => h.id),
+				dense && Float64Array.from(dense.hits, (h) => h.score),
+				lexical && Uint32Array.from(lexical.hits, (h) => h.id),
+				lexical && Float64Array.from(lexical.hits, (h) => h.score),
 			);
-			const dRank = new Map(dense!.hits.map((h, i) => [h.id, { rank: i + 1, score: h.score }]));
-			const lRank = new Map(lexical!.hits.map((h, i) => [h.id, { rank: i + 1, score: h.score }]));
-			hits = Array.from(fused.ids, (id, i) => {
-				const h: SearchHit = { id, score: fused.scores[i] };
-				const d = dRank.get(id);
-				const l = lRank.get(id);
-				if (d) h.dense = d;
-				if (l) h.lexical = l;
-				return h;
-			});
-		} else if (dense) {
-			mode = "dense";
-			hits = dense.hits.slice(0, topK).map((h, i) => ({ id: h.id, score: h.score, dense: { rank: i + 1, score: h.score } }));
-		} else {
-			mode = "lexical";
-			hits = lexical!.hits.slice(0, topK).map((h, i) => ({ id: h.id, score: h.score, lexical: { rank: i + 1, score: h.score } }));
+		} finally {
+			safeFree(plan);
 		}
+		const [ids, scores, dRank, dScore, lRank, lScore] = [fused.ids, fused.scores, fused.dense_rank, fused.dense_score, fused.lexical_rank, fused.lexical_score];
+		safeFree(fused);
+		const hits: SearchHit[] = Array.from(ids, (id, i) => {
+			const h: SearchHit = { id, score: scores[i] };
+			if (dRank[i]) h.dense = { rank: dRank[i], score: dScore[i] };
+			if (lRank[i]) h.lexical = { rank: lRank[i], score: lScore[i] };
+			return h;
+		});
 		let docsIo: LexIo | undefined;
 		let tDocs = 0;
 		if (req.docs && hits.length) {
@@ -728,7 +721,7 @@ export class ThreadIndex {
 		return {
 			hits,
 			mode,
-			params: { topK, recallK: depth, rrfK, weights },
+			params,
 			...(dense ? { dense } : {}),
 			...(lexical ? { lexical } : {}),
 			stats: { ...(docsIo ? { docsIo } : {}), timing: { total: Date.now() - t0, dense: tDense, lexical: tLex, docs: tDocs } },
