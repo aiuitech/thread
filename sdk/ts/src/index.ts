@@ -150,7 +150,7 @@ export interface OpenOptions {
 	 * (S3) gets a 256 MB `MemoryCache` by default. `false` disables caching.
 	 */
 	cache?: CacheLike | BlobCache | false;
-	/** Synthetic origin of the cache keys (default `https://vib-sdk.cache/`). */
+	/** Synthetic origin of the cache keys (default `https://vib-sdk.cache/`); `prefix` is appended to it. */
 	cacheOrigin?: string;
 	/** What a slab-prefix cache miss reads (see `MissPolicy`): default `"whole"` for the Cache API, `"range+warm"` for an in-process cache. */
 	missPolicy?: MissPolicy;
@@ -366,7 +366,11 @@ export class ThreadIndex {
 		let cache: CacheLike | BlobCache | null = opts.cache === false ? null : (opts.cache ?? ((globalThis as { caches?: { default?: CacheLike } }).caches?.default ?? null));
 		// Outside Workers there is no Cache API: a remote store gets an in-process cache, like the Python SDK.
 		if (!cache && opts.cache === undefined && store.remote && !inWorkers()) cache = new MemoryCache();
-		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
+		// The cache sits in front of the prefixed store, so it sees keys without the prefix: every index in a bucket
+		// has an `idx/g1/seg/1.thread`. The prefix goes into the cache origin, or indexes would read each other's
+		// cached objects.
+		const origin = opts.prefix ? (opts.cacheOrigin ?? "https://vib-sdk.cache/").replace(/\/?$/, "/") + opts.prefix.replace(/^\/+/, "") : opts.cacheOrigin;
+		if (cache) store = new CachedBlobStore(store, cache, { origin, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
 		const t0 = nowMs();
 		// The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it. Its prefixes
 		// go into the in-process cache when it can hold prefixes (`MemoryCache`), else into a prefix layer in front of
