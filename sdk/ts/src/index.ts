@@ -928,10 +928,11 @@ export class ThreadIndex {
 	/**
 	 * @experimental Merges every lexical/docs segment of the head revision into one base segment (tombstoned
 	 * documents dropped, replaced ids resolved to their newest copy) and commits a revision listing only it.
-	 * Reads every segment whole: run it where memory allows (segments' total size, roughly twice).
+	 * By default reads every segment whole. maxInputBytes limits source segment and tombstone bytes
+	 * to a contiguous run; it can return merged: 0 when no pair fits. Allow extra memory for copies and Wasm.
 	 */
-	async compactSegments(): Promise<CompactSegmentsResult> {
-		const r = await compactSegments(this.writer());
+	async compactSegments(opts: { maxInputBytes?: number } = {}): Promise<CompactSegmentsResult> {
+		const r = await compactSegments(this.writer(), opts);
 		await this.useRevision(r.gen, r.rev);
 		return r;
 	}

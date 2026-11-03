@@ -45,6 +45,31 @@ function referenceBm25(docs: { id: number; tokens: string[] }[], query: string[]
 }
 
 describe("lexical-only generation", () => {
+	it("bounds compaction input and preserves newer replacements after a cold reopen", async () => {
+		const store = new MemoryBlobStore();
+		await createLexicalGeneration({ store, gen: "bounded", lex: { docs: true, text: true } });
+		const ix = await thread.open({ store, cache: false, refreshInterval: 0 });
+		await ix.upsert({ keys: ["a"], texts: ["old apple"] });
+		await ix.upsert({ keys: ["b"], texts: ["banana"] });
+		await ix.upsert({ keys: ["a"], texts: ["new apple"] });
+		await ix.upsert({ keys: ["c"], texts: ["cherry"] });
+		const before = ix.segments;
+		const budget = before[0].bytes + before[1].bytes + (ix.manifest.tombstones ?? []).reduce((n, t) => n + t.count * 4, 0);
+		const merged = await ix.compactSegments({ maxInputBytes: budget });
+		expect(merged.merged).toBe(2);
+		expect(merged.readBytes).toBeLessThanOrEqual(budget);
+		expect(ix.segments.length).toBe(3);
+		expect(ix.segments.slice(1).map((s) => s.key)).toEqual(before.slice(2).map((s) => s.key));
+		ix.close();
+		const cold = await thread.open({ store, cache: false, refreshInterval: 0 });
+		const got = (await cold.get(["a", "b", "c"], { text: true })).records;
+		expect(got.get("a")?.text).toBe("new apple");
+		expect(got.get("b")?.text).toBe("banana");
+		expect(got.get("c")?.text).toBe("cherry");
+		expect((await cold.compactSegments({ maxInputBytes: 1 })).merged).toBe(0);
+		cold.close();
+	});
+
 	it("creates, upserts texts, searches by text with corpus-wide scores across segments, resolves docs", async () => {
 		const store = new MemoryBlobStore();
 		const created = await createLexicalGeneration({ store, gen: "lx", lex: { text: true, bucketTerms: 4, bucketDocs: 2 } });

@@ -702,7 +702,7 @@ export async function configureAttrs(ctx: WriterContext, spec: Record<string, At
  * Merges every segment of the head into one base segment and commits a revision listing only it. Reads the
  * segments whole. Nothing is written when the head has at most one segment and no tombstone set newer than it.
  */
-export async function compactSegments(ctx: WriterContext): Promise<CompactSegmentsResult> {
+export async function compactSegments(ctx: WriterContext, opts: { maxInputBytes?: number } = {}): Promise<CompactSegmentsResult> {
 	const t0 = Date.now();
 	const { store, gen, w } = ctx;
 	writable(store);
@@ -715,8 +715,23 @@ export async function compactSegments(ctx: WriterContext): Promise<CompactSegmen
 	const c = await commitRev(ctx, async ({ rev, manifest }) => {
 		const lex = resolveLexConfig(manifest);
 		if (!lex) throw new ThreadError("this generation has no lexical configuration", 400);
-		const segs = manifest.segments ?? [];
+		const all = manifest.segments ?? [];
 		const sets = manifest.tombstones ?? [];
+		let start = 0;
+		let segs = all;
+		if (opts.maxInputBytes !== undefined) {
+			if (!Number.isFinite(opts.maxInputBytes) || opts.maxInputBytes <= 0) throw new ThreadError("maxInputBytes must be positive and finite", 400);
+			const budget = opts.maxInputBytes - sets.reduce((n, t) => n + t.count * 4, 0);
+			// Merge a contiguous run so unmerged newer copies keep their precedence.
+			segs = [];
+			for (start = 0; start < all.length; start++) {
+				let bytes = 0;
+				let end = start;
+				while (end < all.length && bytes + all[end].bytes <= budget) bytes += all[end++].bytes;
+				if (end - start >= 2) { segs = all.slice(start, end); break; }
+			}
+			if (segs.length < 2) return null;
+		}
 		const newest = Math.max(0, ...sets.map((t) => t.rev));
 		const needed = segs.length > 1 || (segs.length === 1 && newest > segs[0].addedRev);
 		if (!needed) return null;
@@ -754,8 +769,8 @@ export async function compactSegments(ctx: WriterContext): Promise<CompactSegmen
 		key = built.key;
 		bytes = built.bytes;
 		count = built.count;
-		const ref: SegmentRef = { seq: 0, key: built.key, addedRev: rev + 1, count, bytes, lex: true, docs: lex.docs, text: lex.docs && lex.text, ...(built.keys ? { keys: true } : {}), base: true };
-		return { ...inherit(manifest), segments: [ref], change: { op: "compact-segments", merged, count, writer: "thread-sdk" } };
+		const ref: SegmentRef = { seq: 0, key: built.key, addedRev: opts.maxInputBytes === undefined ? rev + 1 : Math.max(...segs.map((s) => s.addedRev)), count, bytes, lex: true, docs: lex.docs, text: lex.docs && lex.text, ...(built.keys ? { keys: true } : {}), base: true };
+		return { ...inherit(manifest), segments: [...all.slice(0, start), ref, ...all.slice(start + segs.length)], change: { op: "compact-segments", merged, count, writer: "thread-sdk" } };
 	});
 	return { gen, rev: c.rev, merged, key, count, bytes, readBytes, conflicts: c.conflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
 }
