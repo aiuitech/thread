@@ -226,8 +226,9 @@ a vector a dense generation.
 
 | field | default | meaning |
 |---|---|---|
-| `text` | - | the query text, tokenized with the index's tokenizer, BM25 over the lexical segments |
+| `text` | - | the query text, tokenized with the index's tokenizer, BM25 over the lexical segments; also embedded for the dense list when the index can embed (below) and no `vector` is given |
 | `vector` | - | the query embedding (`query` with `dense` options) |
+| `embed` | when `index.canEmbed` | whether to embed `text` for the dense list; `true` fails when the index cannot embed, `false` keeps the text BM25-only |
 | `topK` | 10 | results |
 | `recallK` | `lex.defaults.recallK`, else max(topK, 50) | depth of each list before fusion |
 | `rrfK` | `lex.defaults.rrfK`, else 60 | RRF constant |
@@ -251,6 +252,30 @@ interface SearchResult {
 `index.docs(ids, {text})` the document store (`Map<id, {id, meta, attrs, text?}>`, newest live copy of each id,
 tombstone-aware). `index.lexConfig`, `index.segments`, `index.attrSchema` and `index.hasDense` describe the
 generation.
+
+### Embedding (`manifest.embedding`)
+
+A generation created for a model ([`createGeneration`](#write-path-experimental), the Worker's `POST /create`)
+names it in `manifest.embedding` (`EmbeddingConfig`: `provider`, `model`, `dim`, `queryPrefix`, `docPrefix`,
+`baseUrl`, `options`, `maxBatch`). The SDK never runs a model; `open({ embed })` says how to call it:
+
+```ts
+const index = await thread.open({ bucket: env.BUCKET, embed: { ai: env.AI } });            // provider "workers-ai", the binding
+const index = await thread.open({ store, embed: { accountId, apiToken } });                 // "workers-ai" outside Workers (REST API)
+const index = await thread.open({ store, embed: { apiKey, headers?, fetch? } });            // "openai": any OpenAI-compatible /embeddings
+const index = await thread.open({ store, embed: (texts, kind) => myModel(texts, kind) });   // "custom", or to override any provider
+index.embedding;                                  // EmbeddingConfig | null: the generation's model
+index.canEmbed;                                   // true when a model is named AND open gave a way to call it
+await index.embed(["a query"], "query");          // Float32Array[]: unit-normalized, with the kind's prefix (ThreadError 400 if it cannot)
+```
+
+With `canEmbed`, `search({ text })` without a `vector` embeds the text as a `"query"` (and still runs BM25 when the
+generation has a lexical index), and `upsert({ texts })` without `vectors` or `embed` embeds them as `"document"`s,
+one per chunk with `chunk`. Both take `embed: false` to skip that. Without `canEmbed` the index behaves as before:
+`search` needs a `vector`, `upsert` needs `vectors` or an `embed` function. Provider failures are `ThreadError`
+502 with the HTTP status. `resolveEmbedder(config, options)` is the function behind this, usable on its own; the
+design, the providers' details (Workers AI `pooling`) and what a created generation lacks compared with a k-means
+build are in [docs/embedding.md](../../docs/embedding.md).
 
 ### Filtering
 

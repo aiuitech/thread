@@ -8,6 +8,12 @@
  *   const index = await thread.open({ bucket: env.BUCKET, waitUntil: ctx.waitUntil.bind(ctx) });
  *   const { hits } = await index.search({ text: "deploy failed", vector: embedding, topK: 10, docs: true });
  *   const { hits } = await index.query(vector, { topK: 10 });        // dense only
+ *
+ * An index for an embedding model (the index calls the model, it never runs one; docs/embedding.md):
+ *   await thread.createGeneration({ store, gen: "docs", embedding: { provider: "workers-ai", model: "@cf/baai/bge-base-en-v1.5", dim: 768, options: { pooling: "cls" } } });
+ *   const index = await thread.open({ bucket: env.BUCKET, embed: { ai: env.AI } });   // or { apiKey }, { accountId, apiToken }, (texts, kind) => ...
+ *   await index.upsert({ keys: ["docs/a.md"], texts: [text], chunk: true });           // texts without vectors: embedded as documents
+ *   const { hits } = await index.search({ text: "deploy failed", topK: 10, docs: true }); // embedded as a query, fused with BM25
  */
 import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
@@ -234,7 +240,7 @@ export interface OpenOptions {
 	warmPack?: string;
 }
 
-/** One wasm instance per isolate. `Thread.init` once, then `open` indexes. */
+/** One wasm instance per isolate. `Thread.init` once, then `open` indexes (or `createGeneration` a new one). */
 export class Thread {
 	/** Bumped on every reset; wasm objects created under an older epoch are invalid and must not be freed. */
 	epoch = 0;
