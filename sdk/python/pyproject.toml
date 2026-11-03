@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "thread-sdk"
-version = "0.1.0"
+version = "0.2.0"
 description = "Query and update a thread blob-native search index (dense vectors, BM25 text, or both fused) in R2, S3 or on disk"
 readme = "README.md"
 license = "MIT"

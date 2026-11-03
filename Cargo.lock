@@ -203,7 +203,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "thread-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thread-core",
@@ -211,11 +211,11 @@ dependencies = [
 
 [[package]]
 name = "thread-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "thread-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pyo3",
  "thread-core",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "thread-wasm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thread-core",
  "wasm-bindgen",

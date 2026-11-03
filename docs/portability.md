@@ -53,7 +53,7 @@ opened from a snapshot is pinned to it: `refresh()` finds nothing newer.
 
 ```ts
 // Node
-import { packIndexToFile, storeAt } from "thread-sdk/node";
+import { packIndexToFile, storeAt } from "@aiuitech/thread-sdk/node";
 await packIndexToFile(store, "/backups/idx-2026-10-04.threadpack");           // the current revision
 await packIndexToFile(store, "g4-rev12.threadpack", { gen: "g4", rev: 12 });  // a specific one
 const index = await thread.open({ store: await storeAt("g4-rev12.threadpack") });

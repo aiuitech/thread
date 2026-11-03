@@ -2,8 +2,8 @@
  * thread-sdk: query and update a thread blob-native search index (dense vectors, BM25 text, or both fused) from a
  * Cloudflare Worker.
  *
- *   import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
- *   import { Thread } from "thread-sdk";
+ *   import wasmModule from "@aiuitech/thread-sdk/wasm/thread_bg.wasm";
+ *   import { Thread } from "@aiuitech/thread-sdk";
  *   const thread = await Thread.init({ wasmModule });                 // once per isolate
  *   const index = await thread.open({ bucket: env.BUCKET, waitUntil: ctx.waitUntil.bind(ctx) });
  *   const { hits } = await index.search({ text: "deploy failed", vector: embedding, topK: 10, docs: true });
@@ -146,7 +146,7 @@ export interface OpenStats {
 }
 
 export interface ThreadInitOptions {
-	/** The compiled `thread_bg.wasm` (`import wasmModule from "thread-sdk/wasm"` with the Cloudflare Vite plugin or Wrangler). */
+	/** The compiled `thread_bg.wasm` (`import wasmModule from "@aiuitech/thread-sdk/wasm"` with the Cloudflare Vite plugin or Wrangler). */
 	wasmModule: WebAssembly.Module;
 }
 

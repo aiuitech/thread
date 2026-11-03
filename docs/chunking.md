@@ -20,7 +20,7 @@ so they produce the same chunks character for character.
 - A text with no words is one empty chunk, so a keyed document always writes at least one chunk.
 
 ```ts
-import { chunkText } from "thread-sdk";
+import { chunkText } from "@aiuitech/thread-sdk";
 chunkText("w1 w2 w3 w4 w5 w6 w7", { words: 3, overlap: 1 });
 // [{ index: 0, text: "w1 w2 w3", start: 0, end: 8, words: 3 }, { index: 1, text: "w3 w4 w5", start: 6, end: 14, words: 3 }, { index: 2, text: "w5 w6 w7", start: 12, end: 20, words: 3 }]
 ```

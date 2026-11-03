@@ -1,0 +1,194 @@
+# Release: on a `v*` tag, build the wasm from source, run every check, publish @aiuitech/thread-sdk to npm and
+# thread-sdk (abi3 wheels + sdist) to PyPI, and attach the artifacts to a GitHub release.
+#
+# The tag must equal the version in sdk/ts/package.json, sdk/python/pyproject.toml and Cargo.toml (checked first).
+# npm: the `npm` environment needs the secret NPM_TOKEN (a granular token with publish rights on @aiuitech) until the
+#      package exists and npm trusted publishing is configured for it; `--provenance` attests the build either way.
+# PyPI: the `pypi` environment, no secret: PyPI trusted publishing (owner aiuitech, repository thread, workflow
+#       release.yml, environment pypi) issues the token through OIDC.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  WASM_BINDGEN_VERSION: 0.2.129 # must equal the wasm-bindgen dependency in crates/thread-wasm/Cargo.toml
+
+jobs:
+  check:
+    name: version + checks (+ wasm)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Versions agree with the tag
+        id: v
+        run: |
+          set -eu
+          ts=$(node -p "require('./sdk/ts/package.json').version")
+          py=$(sed -n 's/^version = "\(.*\)"/\1/p' sdk/python/pyproject.toml | head -1)
+          rs=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "package.json $ts, pyproject $py, Cargo $rs, ref $GITHUB_REF_NAME"
+          [ "$ts" = "$py" ] && [ "$ts" = "$rs" ] || { echo "versions differ"; exit 1; }
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then [ "$GITHUB_REF_NAME" = "v$ts" ] || { echo "tag $GITHUB_REF_NAME is not v$ts"; exit 1; }; fi
+          echo "version=$ts" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - name: Rust checks
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+      - name: Build the wasm
+        run: |
+          cargo build --release --target wasm32-unknown-unknown -p thread-wasm
+          wasm-bindgen --target web --experimental-reset-state-function --out-dir crates/thread-wasm/pkg --out-name thread target/wasm32-unknown-unknown/release/thread_wasm.wasm
+          sdk/ts/scripts/sync-wasm.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: TypeScript checks and build
+        working-directory: sdk/ts
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python checks (native extension built against this checkout)
+        working-directory: sdk/python
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q maturin pytest numpy mypy
+          .venv/bin/maturin develop --profile python
+          .venv/bin/pytest -q
+      - name: Pack the npm tarball
+        working-directory: sdk/ts
+        run: npm pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg
+          path: crates/thread-wasm/pkg/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: sdk/ts/*.tgz
+
+  wheels:
+    name: wheels (${{ matrix.name }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { name: linux-aarch64, os: ubuntu-latest, target: aarch64, manylinux: "2_28" }
+          - { name: macos-arm64, os: macos-14, target: aarch64 }
+          - { name: macos-x86_64, os: macos-13, target: x86_64 }
+          - { name: windows-x86_64, os: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sdk/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: sdk/python/dist/*.whl
+
+  sdist:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sdk/python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: sdk/python/dist/*.tar.gz
+
+  publish-npm:
+    needs: check
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # provenance attestation (and trusted publishing once configured on npmjs.com)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-pkg
+          path: crates/thread-wasm/pkg
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Publish @aiuitech/thread-sdk
+        working-directory: sdk/ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          ./scripts/sync-wasm.sh
+          npm ci
+          npm publish --provenance --access public
+
+  publish-pypi:
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "{wheels-*,sdist}"
+          merge-multiple: true
+          path: dist
+      - run: ls -la dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  github-release:
+    needs: [check, publish-npm, publish-pypi]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect
+        run: |
+          mkdir -p out
+          cp artifacts/npm-tarball/*.tgz out/
+          cp artifacts/wheels-*/*.whl artifacts/sdist/*.tar.gz out/
+          (cd artifacts/wasm-pkg && tar czf ../../out/thread-wasm-${{ needs.check.outputs.version }}.tgz .)
+          ls -la out
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

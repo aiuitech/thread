@@ -1,5 +1,5 @@
 /**
- * Node-only stores and helpers (`import ... from "thread-sdk/node"`): an index in a local directory
+ * Node-only stores and helpers (`import ... from "@aiuitech/thread-sdk/node"`): an index in a local directory
  * (`FileBlobStore`, the layout Python's `FileBlobStore` reads and writes), opening a directory or a pack file from
  * a path (`storeAt`), writing a pack to a file (`packIndexToFile`), a size-bounded disk cache of index objects in
  * the same directory layout (`DiskCache`, shared with Python's `DiskCache`), and a `fetch` with a longer keep-alive

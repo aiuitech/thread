@@ -1,0 +1,55 @@
+# The checks of docs/operations.md "Checks before a commit", on every push and pull request. The wasm is built from
+# source here (it is a gitignored build output locally), so the TypeScript and Python suites test this commit's Rust.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  WASM_BINDGEN_VERSION: 0.2.129 # must equal the wasm-bindgen dependency in crates/thread-wasm/Cargo.toml
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@${{ env.WASM_BINDGEN_VERSION }}
+      - name: Rust
+        run: |
+          cargo fmt --all --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --workspace
+          cargo check -p thread-core -p thread-wasm --target wasm32-unknown-unknown
+      - name: Build the wasm
+        run: |
+          cargo build --release --target wasm32-unknown-unknown -p thread-wasm
+          wasm-bindgen --target web --experimental-reset-state-function --out-dir crates/thread-wasm/pkg --out-name thread target/wasm32-unknown-unknown/release/thread_wasm.wasm
+          sdk/ts/scripts/sync-wasm.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: TypeScript
+        working-directory: sdk/ts
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python
+        working-directory: sdk/python
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -q maturin pytest numpy mypy
+          .venv/bin/maturin develop --profile python
+          .venv/bin/pytest -q

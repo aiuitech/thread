@@ -9,7 +9,7 @@
 		"typecheck": "cf workers types && tsc"
 	},
 	"dependencies": {
-		"thread-sdk": "file:../.."
+		"@aiuitech/thread-sdk": "file:../.."
 	},
 	"devDependencies": {
 		"@cloudflare/vite-plugin": "beta",

@@ -7,8 +7,8 @@ posting lists through the Rust/wasm kernels, like a Vectorize binding but with t
 readable through the Workers Cache API at the edge.
 
 ```ts
-import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
-import { Thread } from "thread-sdk";
+import wasmModule from "@aiuitech/thread-sdk/wasm/thread_bg.wasm";
+import { Thread } from "@aiuitech/thread-sdk";
 
 const thread = await Thread.init({ wasmModule });                   // once per isolate
 const index = await thread.open({ bucket: env.BUCKET, waitUntil: (p) => ctx.waitUntil(p) });
@@ -21,7 +21,7 @@ const f = await index.search({ text: "deploy failed", vector: embedding, topK: 1
 ## Install
 
 ```sh
-npm install thread-sdk
+npm install @aiuitech/thread-sdk
 ```
 
 No runtime dependencies: the package ships its TypeScript build (`dist/`) and the wasm-bindgen output of
@@ -35,11 +35,11 @@ The SDK is bundler-agnostic: you import the `.wasm` through your bundler, which 
 from traps.
 
 **Cloudflare Vite plugin** (`cf init workers`, `@cloudflare/vite-plugin`): import the file by a specifier ending
-in `.wasm` so the plugin's `CompiledWasm` rule applies (a bare `thread-sdk/wasm` is taken over by Vite's own wasm
+in `.wasm` so the plugin's `CompiledWasm` rule applies (a bare `@aiuitech/thread-sdk/wasm` is taken over by Vite's own wasm
 handling and fails):
 
 ```ts
-import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
+import wasmModule from "@aiuitech/thread-sdk/wasm/thread_bg.wasm";
 ```
 
 ```ts
@@ -80,7 +80,7 @@ const index = await thread.open({
 });
 
 // 3. In Node: a directory holding the layout, or a single pack file (see "BlobStore" and docs/portability.md)
-import { storeAt } from "thread-sdk/node";
+import { storeAt } from "@aiuitech/thread-sdk/node";
 const index = await thread.open({ store: await storeAt("/data/idx") });
 const index = await thread.open({ store: await storeAt("/data/idx-g4-rev12.threadpack") });
 
@@ -464,7 +464,7 @@ objects beyond `maxBytes` (order in memory, and in the files' mtimes across rest
 a cold start. A `DiskCache` is also a `FileBlobStore`, so warming a laptop from a bucket is a copy:
 
 ```ts
-import { DiskCache, FileBlobStore } from "thread-sdk/node";
+import { DiskCache, FileBlobStore } from "@aiuitech/thread-sdk/node";
 const disk = new DiskCache("/var/cache/thread", { maxBytes: 8 << 30 });
 await copyObjects(s3, disk, snapshotKeys(index.revision));            // one revision, ~7 GB on g4
 const index = await thread.open({ store: s3, cache: disk });           // or offline: { store: new FileBlobStore(dir), gen, rev }
@@ -487,8 +487,8 @@ that for slab prefixes and uses the rest of the object instead of re-reading it 
 ### Snapshots and packs
 
 ```ts
-import { copyObjects, packIndex, packToBytes, snapshotKeys, MemorySink } from "thread-sdk";
-import { FileBlobStore, packIndexToFile, storeAt } from "thread-sdk/node";
+import { copyObjects, packIndex, packToBytes, snapshotKeys, MemorySink } from "@aiuitech/thread-sdk";
+import { FileBlobStore, packIndexToFile, storeAt } from "@aiuitech/thread-sdk/node";
 
 const keys = snapshotKeys(index.revision);                       // every object the open revision reads, sorted
 await copyObjects(src, dst);                                      // everything src lists -> dst (any two stores)
@@ -550,7 +550,7 @@ directory or a bucket to write on top of it. Format and rationale: [docs/portabi
 - `upsert` / `delete`: the SDK writes delta segments, tombstone sets and manifest revisions exactly as
   docs/update-path.md specifies and as its own tests check (Node, MemoryBlobStore, wasm), but it has not yet
   been run against a revision written by the Worker and vice versa. Points to reconcile: the Worker writes
-  `change.op` fields the SDK copies (`upsert`/`delete` + `writer: "thread-sdk"`); the Worker's `/upsert` also
+  `change.op` fields the SDK copies (`upsert`/`delete` + `writer: "@aiuitech/thread-sdk"`); the Worker's `/upsert` also
   accepts `firstId`, base64 vectors and `{b64}` payloads, which the SDK does not need; compaction and GC are
   Worker-only (`POST /build/compact`, `/build/gc`).
 - Spec notes from the implementation: (1) `scan`/`scan_pq`/`scan_delta` now take the tombstone buffer and apply

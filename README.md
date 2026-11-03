@@ -43,7 +43,7 @@ const { hits } = await index.search({ text: "deploy failed", vector: embedding, 
 ## Install
 
 ```sh
-npm install thread-sdk        # TypeScript, Cloudflare Workers and Node
+npm install @aiuitech/thread-sdk        # TypeScript, Cloudflare Workers and Node
 pip install thread-sdk        # Python 3.11+
 ```
 
@@ -52,8 +52,8 @@ pip install thread-sdk        # Python 3.11+
 ### From a Cloudflare Worker
 
 ```ts
-import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
-import { Thread } from "thread-sdk";
+import wasmModule from "@aiuitech/thread-sdk/wasm/thread_bg.wasm";
+import { Thread } from "@aiuitech/thread-sdk";
 
 const thread = await Thread.init({ wasmModule });                // once per isolate
 const index = await thread.open({ bucket: env.BUCKET });         // an R2 binding; S3 works too

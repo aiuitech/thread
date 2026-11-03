@@ -14,8 +14,8 @@
  * The wasm module is imported through the bundler (the Cloudflare Vite plugin turns the .wasm into a
  * WebAssembly.Module) and handed to the SDK once per isolate; one ThreadIndex per store is kept across requests.
  */
-import wasmModule from "thread-sdk/wasm/thread_bg.wasm";
-import { R2BlobStore, S3BlobStore, Thread, ThreadError, type BlobStore, type QueryOptions, type ThreadIndex } from "thread-sdk";
+import wasmModule from "@aiuitech/thread-sdk/wasm/thread_bg.wasm";
+import { R2BlobStore, S3BlobStore, Thread, ThreadError, type BlobStore, type QueryOptions, type ThreadIndex } from "@aiuitech/thread-sdk";
 
 interface Env {
 	BUCKET: R2Bucket;
