@@ -21,7 +21,7 @@ if you want to use it.
 | [filtering.md](filtering.md) | attribute filters: the 32-bit word and its schema, filter expressions and their compiled clauses, pre-filtering inside the scan with probe widening, post-filtering of text queries |
 | [build-pipeline.md](build-pipeline.md) | the build stages, build slots (Worker Loader), PQ codebook training, incremental k-means, finalize |
 | [build-flags.md](build-flags.md) | every `bench/driver.mjs` flag, and the commands that built g1 and g2 |
-| [operations.md](operations.md) | dataset prep, wasm build, deploy, build a generation, benchmarks, compaction, checks before a commit |
+| [operations.md](operations.md) | dataset prep, wasm build, deploy, build a generation, benchmarks, compaction, checks before a commit, releasing (the `v*` tag workflow, npm and PyPI credentials, moving a tag) |
 | [worker-loader.md](worker-loader.md) | the spike that showed dynamic Workers give each build slot its own isolate |
 
 Raw measurements live in `data/bench-*.txt` (gitignored) and the SDK's [VERIFICATION.md](../sdk/ts/VERIFICATION.md).

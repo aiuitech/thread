@@ -203,6 +203,8 @@ cd sdk/ts && npm run typecheck && npm test
 cd sdk/python && maturin develop --uv && pytest
 ```
 
-The full list of checks, the wasm build and the deploy steps are in [docs/operations.md](docs/operations.md).
+The full list of checks, the wasm build, the deploy steps and how a version is released (a `v*` tag publishes
+`@aiuitech/thread-sdk` and `thread-sdk`) are in [docs/operations.md](docs/operations.md); versions and what changed in
+each are in [CHANGELOG.md](CHANGELOG.md).
 
 MIT licensed.

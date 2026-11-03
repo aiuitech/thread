@@ -422,6 +422,10 @@ maturin develop --uv && pytest            # end to end against memory/file/pack/
 mypy thread_sdk
 ```
 
+Releases: a `v<version>` tag on the repo builds abi3 wheels and an sdist and publishes them to PyPI through trusted
+publishing (see [docs/operations.md](../../docs/operations.md#releasing)); bump `pyproject.toml` together with the
+TypeScript and Cargo versions, and add a [CHANGELOG](../../CHANGELOG.md) entry first.
+
 Layout: `crates/thread-py` (the PyO3 bindings: dense kernels and the per-query `QueryRun` in `lib.rs`/`run.rs`, the
 lexical reader and builders in `lex.rs`), `thread_sdk/` (`index.py` the `ThreadIndex`, `revision.py` resolving and loading a
 revision and `snapshot_keys`, `query.py` the dense query I/O, `lex.py` the segment reader loop and BM25 across

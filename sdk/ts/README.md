@@ -575,5 +575,9 @@ cd examples/basic && npm install && cf deploy --secrets-file .env.secrets
 node scripts/verify.mjs --n 50 --nprobe 34 --rerank 150    # compare the example with the main Worker
 ```
 
+Releases: a `v<version>` tag on the repo publishes this package to npm (see
+[docs/operations.md](../../docs/operations.md#releasing)); bump `package.json` (and the lock) together with the
+Python and Cargo versions, and add a [CHANGELOG](../../CHANGELOG.md) entry first.
+
 `examples/basic/` is a `cf init workers` project bound to the `vib-bench` bucket exposing `POST /search`
 (`{vector, topK?, nprobe?, rerank?, store?: "r2" | "s3"}`), `GET /manifest`, `POST /refresh` and `GET /health`.

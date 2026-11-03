@@ -1,8 +1,8 @@
-# Operations: building, deploying, benchmarking
+# Operations: building, deploying, benchmarking, releasing
 
-The commands behind the `vib-bench` deployment and the dbpedia-openai-1M benchmark. What each stage does:
-[build-pipeline.md](build-pipeline.md); every driver flag: [build-flags.md](build-flags.md); the scripts
-themselves: [bench/README.md](../bench/README.md).
+The commands behind the `vib-bench` deployment and the dbpedia-openai-1M benchmark, and how a version of the SDKs
+is released ([Releasing](#releasing)). What each stage does: [build-pipeline.md](build-pipeline.md); every driver
+flag: [build-flags.md](build-flags.md); the scripts themselves: [bench/README.md](../bench/README.md).
 
 ## Prepare the dataset
 
@@ -30,8 +30,11 @@ built by the same `cf deploy` (vite plugin in `examples/cloudflare-worker/vite.c
 recover from a trap. After rebuilding the wasm, `sdk/ts/scripts/sync-wasm.sh` copies it into the SDK
 (`cd sdk/ts && npm test`).
 
-`examples/cloudflare-worker/.env.secrets` holds `BUILD_TOKEN=<random>`; every endpoint except `/health` requires
-`Authorization: Bearer <token>`.
+`examples/cloudflare-worker/.env.secrets` holds `BUILD_TOKEN=<random>` and `EMBED_API_KEY=<key or ->` (an
+OpenAI-compatible key for generations whose `embedding.provider` is `openai`, `-` for none; Workers AI needs no
+secret, it is the `AI` binding); every endpoint except `/health` requires `Authorization: Bearer <token>`. The SDK
+example Worker deploys the same way from `sdk/ts/examples/basic` (its `.env.secrets`: `AUTH_TOKEN`, the `S3_*`
+values and `EMBED_API_KEY`). Deploy both after a release so the served code and the published SDK share a wasm.
 
 ## Build a generation and benchmark it
 
@@ -130,5 +133,57 @@ cd sdk/python && maturin develop --uv && pytest && mypy thread_sdk
 ```
 
 The dense-side files predate rustfmt and carry `#![cfg_attr(rustfmt, rustfmt::skip)]`, so the formatter touches
-only the lexical modules and new code. The Python tests include a cross-check against the built TypeScript SDK in
-`sdk/ts/dist`.
+only the lexical modules and new code (clippy warns on 64 pre-existing spots in thread-core; warnings are not
+errors). The Python tests include a cross-check against the built TypeScript SDK in `sdk/ts/dist`. The same checks
+run on every push and pull request in `.github/workflows/ci.yml`, with the wasm built from source there.
+
+## Releasing
+
+A release is a `v<version>` tag. `.github/workflows/release.yml` checks the tag against the versions, runs every
+check above, builds the wasm from source (so a stale local build can never be published), publishes
+`@aiuitech/thread-sdk` to npm and `thread-sdk` to PyPI, and attaches the artifacts to a GitHub release.
+
+```sh
+# 1. one version in three places (the workflow refuses a tag that differs from any of them), a CHANGELOG entry
+sed -i 's/"version": "0.2.0"/"version": "0.3.0"/' sdk/ts/package.json sdk/ts/package-lock.json   # the lock's two root entries
+sed -i 's/^version = "0.2.0"/version = "0.3.0"/' sdk/python/pyproject.toml Cargo.toml
+cargo check --workspace                      # updates Cargo.lock
+(cd sdk/ts/examples/basic && npm install)    # its lock records the SDK version
+$EDITOR CHANGELOG.md
+git commit -am "v0.3.0" && git push origin main
+
+# 2. tag: this starts the release
+git tag -a v0.3.0 -m "v0.3.0" && git push origin v0.3.0
+gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
+
+# 3. deploy the Workers from the same commit
+(cd examples/cloudflare-worker && cf deploy --secrets-file .env.secrets)
+(cd sdk/ts/examples/basic && cf deploy --secrets-file .env.secrets)
+```
+
+What the workflow produces: the npm tarball (`dist/` + the wasm), abi3 wheels (CPython >= 3.11, one per platform:
+manylinux x86_64, manylinux aarch64, macOS universal2, Windows x86_64) and an sdist, and a GitHub release
+holding all of them plus the raw `crates/thread-wasm/pkg` as `thread-wasm-<version>.tgz`.
+
+Credentials and settings the workflow relies on (set once):
+
+- **npm**: the repository environment `npm` holds the secret `NPM_TOKEN`, a granular access token for the
+  `aiuitech` org with read/write on packages, scoped to `@aiuitech`, with "Bypass two-factor authentication" (the
+  publish fails with `EOTP` otherwise; Actions cannot answer a 2FA prompt). Once the package exists, npm trusted
+  publishing can be configured on npmjs.com (package settings, GitHub Actions, repository `aiuitech/thread`,
+  workflow `release.yml`, environment `npm`) and the token deleted. The publish runs without `--provenance`: npm
+  only accepts provenance from public source repositories.
+- **PyPI**: no secret. The project `thread-sdk` has a trusted publisher: owner `aiuitech`, repository `thread`,
+  workflow `release.yml`, environment `pypi`. The publish step passes `skip-existing`, so a rerun after a partial
+  publish does not fail on files already uploaded.
+- **GitHub**: environments `npm` and `pypi` exist on the repository (no protection rules; add required reviewers
+  there to gate publishing). `wasm-bindgen` is installed at the version pinned in both workflows
+  (`WASM_BINDGEN_VERSION`), which must equal the dependency in `crates/thread-wasm/Cargo.toml`.
+
+If something fails after the tag: fix on main, move the tag (`git tag -d vX && git push origin :refs/tags/vX`,
+then tag again) and push it; a tag pushed in the same moment as a new workflow file may not trigger the workflow,
+in which case `gh workflow run release.yml --ref vX` runs it on the tag. Published versions are immutable on both
+registries: a broken release is followed by a new patch version, not re-published.
+
+After the release, Workers outside this repo install the SDK with `npm install @aiuitech/thread-sdk@<version>` and
+import it as `sdk/ts/examples/basic` does; Python with `pip install thread-sdk==<version>`.
