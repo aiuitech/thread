@@ -12,7 +12,9 @@ import type { BlobStore } from "./store.js";
 import type * as W from "./wasm/thread.js";
 import { defineAttrs, packAttrs, schemaExtends, validateSchema, type AttrFieldSpec, type AttrSchema, type AttrValues } from "./attrs.js";
 import { chunkIndexOf, chunkKey, chunkText, resolveChunkOptions, type ChunkOptions } from "./chunk.js";
+import type { EmbedKind } from "./embed.js";
 import { buildTombState, currentBody, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
+export { CREATE_DEFAULTS, createGeneration, type CreateGenerationOptions, type CreateGenerationResult, type SlabWasm } from "./create.js";
 
 export interface UpsertInput {
 	/** The documents' u32 ids. Optional with `keys`: the ids of known keys are reused, new keys get fresh ones. */
@@ -60,9 +62,11 @@ export interface UpsertInput {
 	/**
 	 * Produces the vectors: called once with the texts to index (the chunks when chunking, else `texts`) and
 	 * returns one vector per text, as `vectors` takes them (`n * dim` floats flat or one array per text). The SDK
-	 * does no embedding itself; this is where an embedding API call goes.
+	 * runs no model itself; this is where an embedding API call goes. Absent, with texts and no vectors, a
+	 * generation that names its model (`manifest.embedding`) embeds the texts through the index's embedder
+	 * (`open({ embed })`); `false` skips that (text-only documents).
 	 */
-	embed?: Embedder;
+	embed?: Embedder | false;
 }
 
 /** `upsert({ embed })`: the texts to embed, in order -> their vectors (`n * dim` flat or one row per text). */
@@ -118,6 +122,8 @@ export interface WriterContext {
 	resolveKeys: (manifest: Manifest, keys: readonly string[]) => Promise<Map<string, number>>;
 	/** Every live key with the prefix in the given (head) revision, in key order. */
 	listKeys: (manifest: Manifest, prefix: string) => Promise<string[]>;
+	/** The index's embedder for `manifest.embedding` (rows per text), or null when it cannot embed. */
+	embedder?: ((texts: readonly string[], kind: EmbedKind) => Promise<Float32Array[]>) | null;
 }
 
 export interface ConfigureLexicalResult {
@@ -159,6 +165,7 @@ export interface CreateLexicalOptions {
 	setCurrent?: boolean;
 	notes?: unknown;
 }
+
 
 export const MAX_UPSERT = 4096;
 /** Longest key (UTF-8 bytes). */
@@ -496,40 +503,49 @@ interface Chunked {
  * and attrs) and the vectors `embed` returns for the texts to index. Validation of the result is left to
  * `prepareBatch`, which sees an ordinary batch.
  */
-async function expandInput(input: UpsertInput): Promise<{ input: UpsertInput; chunked: Chunked | null }> {
+async function expandInput(input: UpsertInput, defaultEmbed: WriterContext["embedder"], dense: boolean): Promise<{ input: UpsertInput; chunked: Chunked | null }> {
 	if (input.embed && input.vectors !== undefined) throw new ThreadError("vectors and embed together: pass one or the other", 400);
 	let out = input;
+	// The generation names its model and the index can call it: texts without vectors are embedded as documents.
+	if (out.embed === undefined && out.vectors === undefined && out.texts && dense && defaultEmbed) out = { ...out, embed: (texts) => defaultEmbed(texts, "document") };
+	if (out.embed === false) {
+		const { embed: _e, ...rest } = out;
+		out = rest;
+	}
 	let chunked: Chunked | null = null;
-	if (input.chunk !== undefined && input.chunk !== false) {
+	if (out.chunk !== undefined && out.chunk !== false) {
 		let opts: { words: number; overlap: number };
 		try {
-			opts = resolveChunkOptions(input.chunk);
+			opts = resolveChunkOptions(out.chunk);
 		} catch (e) {
 			throw new ThreadError(String((e as Error).message ?? e), 400);
 		}
-		if (input.ids !== undefined || !input.keys) throw new ThreadError("chunked upserts name documents by key: pass keys, not ids", 400);
-		if (!input.texts) throw new ThreadError("chunk needs texts (one per key)", 400);
-		if (input.vectors !== undefined || input.payloads) throw new ThreadError("with chunk, vectors come from embed (one per chunk)", 400);
-		const parents = Array.from(input.keys);
+		if (out.ids !== undefined || !out.keys) throw new ThreadError("chunked upserts name documents by key: pass keys, not ids", 400);
+		if (!out.texts) throw new ThreadError("chunk needs texts (one per key)", 400);
+		if (out.vectors !== undefined || out.payloads) throw new ThreadError("with chunk, vectors come from embed (one per chunk)", 400);
+		const parents = Array.from(out.keys);
 		const n = parents.length;
-		if (input.texts.length !== n) throw new ThreadError(`${input.texts.length} texts for ${n} keys`, 400);
-		if (input.metas && input.metas.length !== n) throw new ThreadError(`${input.metas.length} metas for ${n} keys`, 400);
-		if (input.attrs && input.attrs.length !== n) throw new ThreadError(`${input.attrs.length} attrs for ${n} keys`, 400);
+		if (out.texts.length !== n) throw new ThreadError(`${out.texts.length} texts for ${n} keys`, 400);
+		if (out.metas && out.metas.length !== n) throw new ThreadError(`${out.metas.length} metas for ${n} keys`, 400);
+		if (out.attrs && out.attrs.length !== n) throw new ThreadError(`${out.attrs.length} attrs for ${n} keys`, 400);
 		const keys: string[] = [];
 		const texts: string[] = [];
 		const metas: (string | null)[] = [];
 		const attrs: AttrValues[] = [];
+		const inTexts = out.texts;
+		const inMetas = out.metas;
+		const inAttrs = out.attrs;
 		parents.forEach((parent, i) => {
-			for (const c of chunkText(input.texts![i] ?? "", opts)) {
+			for (const c of chunkText(inTexts[i] ?? "", opts)) {
 				keys.push(chunkKey(parent, c.index));
 				texts.push(c.text);
-				if (input.metas) metas.push(input.metas[i]);
-				if (input.attrs) attrs.push(input.attrs[i]);
+				if (inMetas) metas.push(inMetas[i]);
+				if (inAttrs) attrs.push(inAttrs[i]);
 			}
 		});
 		if (keys.length > MAX_UPSERT) throw new ThreadError(`chunk produced ${keys.length} documents, at most ${MAX_UPSERT} per upsert: pass fewer texts`, 400);
-		const { chunk: _c, ids: _i, ...rest } = input;
-		out = { ...rest, keys, texts, ...(input.metas ? { metas } : {}), ...(input.attrs ? { attrs } : {}) };
+		const { chunk: _c, ids: _i, ...rest } = out;
+		out = { ...rest, keys, texts, ...(inMetas ? { metas } : {}), ...(inAttrs ? { attrs } : {}) };
 		chunked = { parents, ...opts };
 	}
 	if (out.embed) {
@@ -564,7 +580,7 @@ export async function upsert(ctx: WriterContext, inputIn: UpsertInput): Promise<
 	writable(store);
 	const replace = inputIn.replace ?? true;
 	return ctx.thread.withRecovery("upsert", async () => {
-		const { input, chunked } = await expandInput(inputIn);
+		const { input, chunked } = await expandInput(inputIn, ctx.embedder ?? null, await headHasDense(ctx));
 		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number; idsKey: string; idsRev: number; allocated: number; stale: Uint32Array; staleRev: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0, idsKey: "", idsRev: -1, allocated: 0, stale: new Uint32Array(0), staleRev: -1 };
 		const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
 			const lex = resolveLexConfig(manifest);
@@ -742,6 +758,17 @@ export async function compactSegments(ctx: WriterContext): Promise<CompactSegmen
 		return { ...inherit(manifest), segments: [ref], change: { op: "compact-segments", merged, count, writer: "thread-sdk" } };
 	});
 	return { gen, rev: c.rev, merged, key, count, bytes, readBytes, conflicts: c.conflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
+}
+
+/** Whether the generation's head revision has a dense index (decides whether texts without vectors are embedded). */
+async function headHasDense(ctx: WriterContext): Promise<boolean> {
+	if (!ctx.embedder) return false;
+	const { store, gen } = ctx;
+	const cur = await readCurrent(store);
+	const head = cur && cur.cur.gen === gen ? cur.cur.rev : await latestRev(store, gen);
+	const mb = cur?.cur.manifest && cur.cur.gen === gen && cur.cur.rev === head ? null : await store.get(keys.manifest(gen, head));
+	const m = mb ? parseManifest(mb, gen, head) : cur!.cur.manifest!;
+	return hasDense(m);
 }
 
 /**

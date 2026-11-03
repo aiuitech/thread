@@ -12,7 +12,8 @@
 import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
-import { compactSegments, configureAttrs, configureLexical, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
+import { compactSegments, configureAttrs, configureLexical, createGeneration, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateGenerationOptions, type CreateGenerationResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
+import { normalizeRows, resolveEmbedder, splitRows, type EmbedKind, type EmbedOptions, type EmbeddingConfig, type TextEmbedder } from "./embed.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
 import { chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseManifest, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
 import { asF32, baseKeysOf, getRequired, loadRevState, resolveTarget, snapshotKeys, type RevTimeline } from "./revision.js";
@@ -28,14 +29,15 @@ export * from "./s3.js";
 export * from "./lex.js";
 export * from "./routing.js";
 export * from "./chunk.js";
+export * from "./embed.js";
 export type { ColdStat } from "./cold.js";
 export * from "./pack.js";
 export * from "./warm.js";
 export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
-export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateLexicalOptions, DeleteResult, Embedder, UpsertInput, UpsertResult } from "./write.js";
-export { createLexicalGeneration } from "./write.js";
+export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
+export { CREATE_DEFAULTS, createGeneration, createLexicalGeneration } from "./write.js";
 
 /** A document fetched by key: its id and `docs` entry. */
 export interface KeyRecord extends DocRecord {
@@ -44,10 +46,19 @@ export interface KeyRecord extends DocRecord {
 
 /** A unified search: text, vector or both. */
 export interface SearchRequest {
-	/** The query text (BM25 over the lexical segments, tokenized with the index's tokenizer). */
+	/**
+	 * The query text: BM25 over the lexical segments and, when the generation names its embedding model and the
+	 * index can call it (`open({ embed })`), also embedded for the dense list unless `vector` is given or `embed` is
+	 * false.
+	 */
 	text?: string;
 	/** The query embedding (dense index). */
 	vector?: Float32Array | number[];
+	/**
+	 * Whether to embed `text` for the dense list (default: when the index can embed and no `vector` is given).
+	 * `true` fails when the index cannot embed; `false` keeps the text lexical-only.
+	 */
+	embed?: boolean;
 	/** Results to return (default 10). */
 	topK?: number;
 	/** Depth of each list before fusion (default `manifest.lex.defaults.recallK`, else max(topK, 50)). */
@@ -167,6 +178,13 @@ export interface OpenOptions {
 	/** Cold-path policy applied to every query (see `ColdPolicy`); off by default. */
 	coldPolicy?: ColdPolicy;
 	/**
+	 * How the index embeds texts when the generation names its model (`manifest.embedding`): the Workers AI binding
+	 * (`{ ai: env.AI }`), Workers AI REST credentials (`{ accountId, apiToken }`), an OpenAI-compatible key
+	 * (`{ apiKey }`), or a function `(texts, kind) => vectors` (used for any provider). Without it, `search` needs a
+	 * `vector` and `upsert` needs `vectors` or `embed`.
+	 */
+	embed?: TextEmbedder | EmbedOptions;
+	/**
 	 * How often a query checks `current.json` for a new revision (ms; default 30 000; 0 = only `refresh()`). The check
 	 * runs in the background: the query that triggers it reads the current revision, and the switch happens once the
 	 * new revision's manifest, slabs table, tombstones, new delta segments and (if they changed) base files are loaded.
@@ -283,6 +301,11 @@ export class Thread {
 	open(opts: OpenOptions): Promise<ThreadIndex> {
 		return ThreadIndex.open(this, opts);
 	}
+
+	/** Publishes a dense generation from nothing, for an embedding model or a vector size (see `createGeneration`). */
+	createGeneration(opts: CreateGenerationOptions): Promise<CreateGenerationResult> {
+		return createGeneration(W, opts);
+	}
 }
 
 /** Bytes a revision switch prefetches by default (`OpenOptions.prefetchBytes`). */
@@ -331,6 +354,8 @@ export class ThreadIndex {
 	warmStats: WarmPackStats | null = null;
 	/** Resolves once the warm pack is seeded (or failed: see `warmStats.error`); null without one. Never rejects. */
 	warmReady: Promise<WarmPackStats | null> = Promise.resolve(null);
+	/** The embedder resolved for the current `manifest.embedding` (keyed by its JSON); null = cannot embed. */
+	private embedderFor: { key: string; fn: ((texts: readonly string[], kind: EmbedKind) => Promise<Float32Array[]>) | null } | null = null;
 
 	private constructor(
 		readonly thread: Thread,
@@ -451,6 +476,45 @@ export class ThreadIndex {
 		return this.revState;
 	}
 	/** Whether the generation has a dense (vector) index. A lexical-only generation has none. */
+	/** The embedding model the generation is for (`manifest.embedding`), or null. */
+	get embedding(): EmbeddingConfig | null {
+		return this.revState.manifest.embedding ?? null;
+	}
+
+	/** Whether `embed` works: the generation names a model and `open({ embed })` gave a way to call it. */
+	get canEmbed(): boolean {
+		return this.embedder() !== null;
+	}
+
+	/**
+	 * Embeds texts through the generation's model (`manifest.embedding`): one unit-normalized row per text, as a
+	 * `"query"` (search) or a `"document"` (upsert), with the config's prefix. Throws when the index cannot embed.
+	 */
+	async embed(texts: readonly string[], kind: EmbedKind): Promise<Float32Array[]> {
+		const fn = this.embedder();
+		if (!fn) throw new ThreadError(this.embedding ? `this index cannot embed: open({ embed }) with credentials or a function for ${this.embedding.provider} ${this.embedding.model}` : "this generation names no embedding model (createGeneration({ embedding }))", 400);
+		if (!texts.length) return [];
+		return fn(texts, kind);
+	}
+
+	private embedder(): ((texts: readonly string[], kind: EmbedKind) => Promise<Float32Array[]>) | null {
+		const cfg = this.revState.manifest.embedding;
+		if (!cfg) return null;
+		const key = JSON.stringify(cfg);
+		if (this.embedderFor?.key === key) return this.embedderFor.fn;
+		let fn: ((texts: readonly string[], kind: EmbedKind) => Promise<Float32Array[]>) | null = null;
+		const e = this.opts.embed;
+		try {
+			const inner = e === undefined ? (cfg.provider === "custom" ? null : resolveEmbedder(cfg)) : resolveEmbedder(cfg, typeof e === "function" ? { embedder: e } : e);
+			if (inner) fn = async (texts, kind) => normalizeRows(await inner(texts, kind), `${cfg.provider} ${cfg.model}`);
+		} catch (err) {
+			// No credentials for the provider: the index reads and takes vectors, but cannot embed.
+			if (!(err instanceof ThreadError && err.status === 400)) throw err;
+		}
+		this.embedderFor = { key, fn };
+		return fn;
+	}
+
 	get hasDense(): boolean {
 		return hasDense(this.revState.manifest);
 	}
@@ -650,15 +714,20 @@ export class ThreadIndex {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		const t0 = Date.now();
 		const hasText = typeof req.text === "string" && req.text.trim().length > 0;
-		const hasVector = req.vector !== undefined;
 		this.maybeRefresh();
+		// The query text is embedded for the dense list when the index can (and no vector was given).
+		let vector = req.vector;
+		if (hasText && vector === undefined && req.embed !== false && this.hasDense && (req.embed || this.canEmbed)) vector = (await this.embed([req.text!], "query"))[0];
+		const hasVector = vector !== undefined;
 		// Mode, list depth, RRF constant and weights are resolved by the core against `manifest.lex.defaults`.
 		const lexCfg = this.revState.manifest.lex;
-		if (hasText && !lexCfg) throw new ThreadError("this generation has no lexical index (index.configureLexical first)", 400);
+		// A text the index embedded is a dense query; it is also a BM25 query when the generation has a lexical index.
+		const lexText = hasText && (lexCfg != null || !hasVector);
+		if (lexText && !lexCfg) throw new ThreadError("this generation has no lexical index (index.configureLexical first)", 400);
 		const md = lexCfg?.defaults;
 		let plan: W.SearchPlan;
 		try {
-			plan = W.plan_search(req.topK, hasText, hasVector, lexCfg != null, this.hasDense, req.rrfK, req.recallK, req.weights?.dense, req.weights?.lexical, md?.rrfK, md?.recallK, md?.weights?.dense, md?.weights?.lexical);
+			plan = W.plan_search(req.topK, lexText, hasVector, lexCfg != null, this.hasDense, req.rrfK, req.recallK, req.weights?.dense, req.weights?.lexical, md?.rrfK, md?.recallK, md?.weights?.dense, md?.weights?.lexical);
 		} catch (e) {
 			if (e instanceof RangeError) throw new ThreadError(e.message, 400);
 			throw e;
@@ -679,12 +748,12 @@ export class ThreadIndex {
 				hasVector
 					? (async () => {
 							const t = Date.now();
-							const r = await this.query(req.vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
+							const r = await this.query(vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
 							tDense = Date.now() - t;
 							return r;
 						})()
 					: Promise.resolve(undefined),
-				hasText
+				lexText
 					? (async () => {
 							const t = Date.now();
 							const r = await this.lexicalSearch(req.text!, depth, filter ? { filter } : {});
@@ -983,6 +1052,7 @@ export class ThreadIndex {
 			store: this.store,
 			gen: this.revState.gen,
 			borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.thread.epoch ? this.base.pq : null),
+			embedder: this.embedder(),
 			resolveKeys: async (manifest, keys) => (await (await this.lexIndexFor(manifest)).resolveKeys(keys)).ids,
 			listKeys: async (manifest, prefix) => {
 				const lex = await this.lexIndexFor(manifest);

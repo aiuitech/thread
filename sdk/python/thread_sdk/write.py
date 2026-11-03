@@ -8,6 +8,7 @@ advance `idx/current.json` with a compare-and-swap.
 from __future__ import annotations
 
 import json
+import math
 import operator
 import random
 import re
@@ -16,13 +17,16 @@ from array import array
 from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
 
 from . import _native
 from .attrs import AttrSchema, define_attrs, pack_attrs, schema_extends, validate_schema
 from .chunk import ChunkOptions, chunk_index_of, chunk_key, chunk_text, resolve_chunk_options
+from .embed import Rows, validate_embedding_config
 from .store import BlobStore, unique_suffix
 from .wire import (
+    COMPACTION_PROFILES,
+    CREATE_DEFAULTS,
     ThreadError,
     current_body,
     build_tomb_state,
@@ -32,6 +36,7 @@ from .wire import (
     manifest_files,
     manifest_rev_of_key,
     parse_current,
+    parse_current_full,
     parse_manifest,
     resolve_lex_config,
     tomb_for_segment,
@@ -47,6 +52,7 @@ __all__ = [
     "ConfigureAttrsResult",
     "CompactSegmentsResult",
     "create_lexical_generation",
+    "create_generation",
 ]
 
 MAX_UPSERT = 4096
@@ -141,6 +147,8 @@ class WriterContext:
     resolve_keys: Callable[[dict[str, Any], Sequence[str]], dict[str, int]] = lambda m, k: {}
     #: Every live key with the prefix in the given (head) revision, in key order.
     list_keys: Callable[[dict[str, Any], str], list[str]] = lambda m, p: []
+    #: The index's embedder for `manifest.embedding` (`(texts, kind) -> rows`), or None when it cannot embed.
+    embedder: Callable[[Sequence[str], str], Rows] | None = None
 
 
 def _now_iso() -> str:
@@ -511,13 +519,20 @@ class _Chunked:
 
 def _expand(ids: Iterable[int] | None, vectors: Any, attrs: Iterable[Any] | None, payloads: Sequence[bytes | str] | None,
             texts: Sequence[str | None] | None, metas: Sequence[str | None] | None, keys_: Sequence[str] | None,
-            chunk: ChunkOptions | Mapping[str, Any] | bool | None, embed: Callable[[list[str]], Any] | None
+            chunk: ChunkOptions | Mapping[str, Any] | bool | None, embed: Callable[[list[str]], Any] | Literal[False] | None,
+            default_embed: Callable[[Sequence[str], str], Rows] | None = None, dense: bool = False
             ) -> tuple[tuple[Any, ...], _Chunked | None]:
     """Applies `chunk` and `embed`: the arguments with one document per chunk (keyed `chunk_key(parent, i)`, the
     parent's meta and attrs) and the vectors `embed` returns for the texts to index. Validation of the result is
-    left to `_prepare_batch`, which sees an ordinary batch."""
-    if embed is not None and vectors is not None:
+    left to `_prepare_batch`, which sees an ordinary batch. With `embed` absent, texts and no vectors, a dense
+    generation that names its model embeds the texts as documents through `default_embed`; `embed=False` skips that."""
+    if embed and vectors is not None:
         raise ThreadError("vectors and embed together: pass one or the other", 400)
+    if embed is None and vectors is None and texts is not None and dense and default_embed is not None:
+        de = default_embed
+        embed = lambda t: de(t, "document")  # noqa: E731
+    if embed is False:
+        embed = None
     chunked = None
     if chunk is not None and chunk is not False:
         try:
@@ -585,12 +600,13 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
            payloads: Sequence[bytes | str] | None = None, texts: Sequence[str | None] | None = None,
            metas: Sequence[str | None] | None = None, keys_: Sequence[str] | None = None,
            replace: bool = True, chunk: ChunkOptions | Mapping[str, Any] | bool | None = None,
-           embed: Callable[[list[str]], Any] | None = None) -> UpsertResult:
+           embed: Callable[[list[str]], Any] | Literal[False] | None = None) -> UpsertResult:
     t0 = time.perf_counter()
     store, gen = ctx.store, ctx.gen
     _writable(store)
     (ids, vectors, attrs, payloads, texts, metas, keys_), chunked = _expand(ids, vectors, attrs, payloads, texts, metas,
-                                                                           keys_, chunk, embed)
+                                                                           keys_, chunk, embed, ctx.embedder,
+                                                                           _head_has_dense(ctx))
     st: dict[str, Any] = {"batch": None, "delta": None, "seg": None, "seq": 0, "tomb_key": None, "tomb_bytes": 0,
                           "ids_key": None, "ids_rev": -1, "allocated": 0, "stale": array("I"), "stale_rev": -1}
 
@@ -855,6 +871,101 @@ def compact_segments(ctx: WriterContext) -> CompactSegmentsResult:
 
 
 _GEN_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _head_has_dense(ctx: WriterContext) -> bool:
+    """Whether the generation's head revision has a dense index (decides whether texts without vectors are embedded)."""
+    if ctx.embedder is None:
+        return False
+    store, gen = ctx.store, ctx.gen
+    inline: dict[str, Any] | None = None
+    head: int | None = None
+    b = store.get(keys.current())
+    if b is not None:
+        g, r, inline = parse_current_full(b)
+        if g == gen:
+            head = r
+        else:
+            inline = None
+    if head is None:
+        head = latest_rev(store, gen)
+    if inline is None:
+        mb = store.get(keys.manifest(gen, head))
+        if mb is None:
+            raise ThreadError(f"no manifest {keys.manifest(gen, head)}", 404)
+        inline = parse_manifest(mb, gen, head)
+    return has_dense(inline)
+
+
+def create_generation(store: BlobStore, gen: str, *, embedding: dict[str, Any] | None = None, dim: int | None = None,
+                      lex: dict[str, Any] | None | Literal[False] = None, attrs: Mapping[str, Any] | None = None,
+                      profile: str = "edge", defaults: Mapping[str, int] | None = None,
+                      compaction: Mapping[str, int] | None | Literal[False] = None, set_current: bool = True,
+                      notes: Any = None) -> dict[str, Any]:
+    """Publishes a dense generation from nothing, for an embedding model (`embedding`, a manifest `embedding` block)
+    or a vector size (`dim`): rev 0 with ONE cell (an empty format-2 slab, `fine.f32` and `coarse.f32` of one unit
+    row, a slabs table) plus the lexical configuration (`lex`, default `{}`; `False` for a dense-only generation)
+    and the compaction policy of `profile` (`"edge"`: cells split at 3000 entries, `"local"`: 1000; `compaction`
+    overrides fields, `False` = no automatic compaction). Vectors (or texts, with `embedding` and an embedder) are
+    then added with ordinary upserts: they go to delta segments, the Worker's automatic compaction folds them into
+    the cell and splits it in two when it passes `maxCellEntries`, so the cell count grows with the data. No k-means
+    build, no PQ codebook: the scan tier is 4-bit (`sq4+sq8`). Returns the manifest."""
+    _writable(store)
+    if not _GEN_NAME.match(gen):
+        raise ThreadError(f"bad generation name {json.dumps(gen)}", 400)
+    emb = validate_embedding_config(embedding, dim) if embedding is not None else None
+    d = emb["dim"] if emb is not None else dim
+    if d is None:
+        raise ThreadError("create_generation needs an embedding model (embedding) or a vector size (dim)", 400)
+    if isinstance(d, bool) or not isinstance(d, int) or d < 1 or d > 65_536:
+        raise ThreadError("dim must be an integer in [1, 65536]", 400)
+    if profile not in COMPACTION_PROFILES:
+        raise ThreadError('profile must be "edge" or "local"', 400)
+    dfl = {**CREATE_DEFAULTS, **(defaults or {})}
+    for name, lo in (("nprobe", 1), ("rerank", 0), ("pc", 0)):
+        v = dfl.get(name)
+        if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+            raise ThreadError(f"defaults.{name} must be an integer >= {lo}", 400)
+    policy = None if compaction is False else {**COMPACTION_PROFILES[profile], **(compaction or {})}
+    lex_cfg: dict[str, Any] | None = {} if lex is None else (None if lex is False else dict(lex))
+    schema = None
+    if attrs is not None:
+        schema = validate_schema(attrs) if isinstance(attrs.get("fields"), list) else define_attrs(attrs)
+    # One cell whose mean is an arbitrary unit vector (the data decides the means once compaction splits the cell).
+    mean = array("f", [1 / math.sqrt(d)] * d)
+    job = _native.SlabJob(d, 0, mean, 2)
+    slab = bytes(job.finish())
+    info = _native.slab_info(slab)
+    manifest: dict[str, Any] = {"gen": gen, "k1": 1, "k2": 1, "dim": d, "m": 1, "probeCoarse": 1, "vectors": 0,
+                                "format": 2, "tiers": "sq4+sq8", "profile": profile, "defaults": dfl,
+                                "createdAt": _now_iso()}
+    if notes is not None:
+        manifest["notes"] = notes
+    if lex_cfg is not None:
+        manifest["lex"] = lex_cfg
+    if schema is not None:
+        manifest["attrs"] = schema
+    if emb is not None:
+        manifest["embedding"] = emb
+    if policy is not None:
+        manifest["compaction"] = policy
+    manifest.update({"deltas": [], "tombstones": [], "segments": [], "nextSeq": 1, "nextId": 0})
+    # The manifest is the create-only lock: written first, so two creators of the same name cannot both succeed.
+    if not _put_if_absent(store, keys.manifest(gen, 0), dumps(manifest), "application/json"):
+        raise ThreadError(f"generation {gen} already exists", 409)
+    mean_bytes = mean.tobytes()
+    store.put(f"idx/{gen}/coarse.f32", mean_bytes)
+    store.put(f"idx/{gen}/fine.f32", mean_bytes)
+    store.put(keys.slab(gen, 0), slab)
+    store.put(keys.slabs_table(gen, 0), dumps([[int(info[5]), int(info[6]), 0, len(slab)]]), content_type="application/json")
+    if set_current:
+        cur = _read_current(store)
+        body = current_body(gen, 0, manifest)
+        if cur is None:
+            _put_if_absent(store, keys.current(), body, "application/json")
+        else:
+            store.put(keys.current(), body, if_match=cur[1], content_type="application/json")
+    return manifest
 
 
 def create_lexical_generation(store: BlobStore, gen: str, lex: dict[str, Any] | None = None, *,

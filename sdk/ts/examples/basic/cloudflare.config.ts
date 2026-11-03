@@ -5,7 +5,9 @@ import * as entrypoint from "./src/index.ts" with { type: "cf-worker" };
  * thread-sdk example: POST /search over the `vib-bench` index, through the R2 binding by default or through R2's
  * S3 API (`S3BlobStore`) when `?store=s3` / `{"store":"s3"}` is given and the S3_* secrets are set.
  * Secrets (deploy with `--secrets-file .env.secrets`): AUTH_TOKEN (bearer token for every endpoint but /health;
- * "-" disables auth), S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY ("-" = not configured).
+ * "-" disables auth), S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY ("-" = not configured),
+ * EMBED_API_KEY (an OpenAI-compatible key for generations whose `embedding.provider` is "openai"; "-" = none).
+ * AI is the Workers AI binding, used when the generation's `embedding.provider` is "workers-ai".
  */
 export default defineConfig({
 	worker: {
@@ -20,6 +22,8 @@ export default defineConfig({
 			S3_BUCKET: bindings.secret(),
 			S3_ACCESS_KEY_ID: bindings.secret(),
 			S3_SECRET_ACCESS_KEY: bindings.secret(),
+			EMBED_API_KEY: bindings.secret(),
+			AI: bindings.ai(),
 		},
 	},
 });

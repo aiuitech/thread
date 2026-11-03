@@ -3,7 +3,10 @@
  *
  *   POST /search            JSON {vector: number[], topK?, nprobe?, rerank?, pc?, returnPayload?, store?: "r2" | "s3"}
  *                           or an f32 LE body (content-type application/octet-stream) with the options as query
- *                           parameters (?topK=10&nprobe=34&rerank=150&store=r2)
+ *                           parameters (?topK=10&nprobe=34&rerank=150&store=r2); or JSON {text, topK?, docs?}: the
+ *                           text is embedded through the generation's model (manifest.embedding: Workers AI via the
+ *                           AI binding, or an OpenAI-compatible endpoint with EMBED_API_KEY) and fused with BM25
+ *                           when the generation has a lexical index
  *   GET  /health            {ok, gen, rev}
  *   GET  /manifest          the manifest revision the index reads (?store=s3 for the S3 handle)
  *   POST /refresh           re-read current.json now (?store=)
@@ -21,6 +24,8 @@ interface Env {
 	S3_BUCKET: string;
 	S3_ACCESS_KEY_ID: string;
 	S3_SECRET_ACCESS_KEY: string;
+	EMBED_API_KEY?: string;
+	AI?: Ai;
 }
 
 type StoreKind = "r2" | "s3";
@@ -54,6 +59,8 @@ function getIndex(env: Env, ctx: ExecutionContext, kind: StoreKind): Promise<Thr
 				// Cache API in front of the store (default caches.default); keep each store's cache keys apart.
 				cacheOrigin: `https://vib-sdk-example.cache/${kind}/`,
 				waitUntil: (pr) => ctx.waitUntil(pr),
+				// How texts are embedded when the generation names its model (manifest.embedding).
+				embed: { ai: env.AI, apiKey: configured(env.EMBED_API_KEY) ? env.EMBED_API_KEY : undefined },
 			}),
 		);
 		indexes.set(kind, p);
@@ -74,6 +81,9 @@ function intParam(url: URL, name: string): number | undefined {
 
 interface SearchBody {
 	vector?: number[];
+	/** A query text: embedded through the generation's model (and BM25 when it has a lexical index). */
+	text?: string;
+	docs?: boolean | "text";
 	topK?: number;
 	nprobe?: number;
 	rerank?: number;
@@ -91,10 +101,20 @@ async function handleSearch(request: Request, env: Env, ctx: ExecutionContext, u
 		opts = { topK: intParam(url, "topK") ?? intParam(url, "k"), nprobe: intParam(url, "nprobe"), rerank: intParam(url, "rerank"), pc: intParam(url, "pc"), returnPayload: url.searchParams.get("returnPayload") === "1" };
 	} else {
 		const body = (await request.json().catch(() => null)) as SearchBody | null;
-		if (!body || !Array.isArray(body.vector)) throw new ThreadError("body must be JSON {vector: number[], ...}", 400);
-		vector = Float32Array.from(body.vector);
-		opts = { topK: body.topK, nprobe: body.nprobe, rerank: body.rerank, pc: body.pc, returnPayload: body.returnPayload };
+		if (!body || (!Array.isArray(body.vector) && typeof body.text !== "string")) throw new ThreadError("body must be JSON {vector: number[], ...} or {text: string, ...}", 400);
 		if (body.store) kind = body.store;
+		if (kind !== "r2" && kind !== "s3") throw new ThreadError("store must be r2 or s3", 400);
+		opts = { topK: body.topK, nprobe: body.nprobe, rerank: body.rerank, pc: body.pc, returnPayload: body.returnPayload };
+		if (typeof body.text === "string") {
+			// search({text}) embeds the text when the index can (open({embed})), and runs BM25 when the generation has
+			// a lexical index; the lists are fused in thread-core.
+			const t0 = Date.now();
+			const index = await getIndex(env, ctx, kind);
+			const tOpen = Date.now();
+			const res = await index.search({ text: body.text, vector: Array.isArray(body.vector) ? body.vector : undefined, topK: body.topK, docs: body.docs, dense: opts });
+			return json({ store: kind, gen: index.gen, rev: index.rev, mode: res.mode, embedded: res.mode !== "lexical" && !Array.isArray(body.vector), hits: res.hits, params: res.params, stats: res.stats, timing: { request: Date.now() - t0, open: tOpen - t0, ...res.stats.timing } });
+		}
+		vector = Float32Array.from(body.vector!);
 	}
 	if (kind !== "r2" && kind !== "s3") throw new ThreadError("store must be r2 or s3", 400);
 	const t0 = Date.now();

@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+from array import array
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
@@ -14,6 +15,7 @@ from . import _native
 from .attrs import AttrFilterExpr, AttrSchema, compile_filter, pack_attrs, unpack_attrs, validate_schema
 from .cold import ColdRouting
 from .chunk import ChunkOptions
+from .embed import Rows, normalize_rows, resolve_embedder
 from .lex import MAX_LIST_KEYS, DocRecord, KeyPage, LexIndex, LexIo, LexSearchResult, LexSegment
 from .query import Base, QueryContext, QueryResult, RevState, execute_query
 from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache, PrefixedBlobStore, phase_stat
@@ -26,6 +28,7 @@ from .wire import (
     ResolvedLexConfig,
     ThreadError,
     choose_routing,
+    dumps,
     grouped_table_of,
     has_dense,
     keys,
@@ -282,8 +285,12 @@ class ThreadIndex:
     def __init__(self, store: BlobStore, rev: RevState, *, gen: str | None, pinned: bool, refresh_interval: float,
                  delta_cache_bytes: int, lex_transient_bytes: int, io_workers: int, job_workers: int,
                  cold_policy: dict[str, Any] | None = None, prefetch_bytes: int = DEFAULT_PREFETCH_BYTES,
-                 routing: str = "f32", cold_routing: str = "off", cold_beam: int | None = None) -> None:
+                 routing: str = "f32", cold_routing: str = "off", cold_beam: int | None = None,
+                 embed: Callable[[list[str], str], Any] | Mapping[str, Any] | None = None) -> None:
         self.store = store
+        self._embed_opt = embed
+        #: The embedder resolved for the current `manifest.embedding` (keyed by its JSON); None = cannot embed.
+        self._embedder_for: tuple[str, Callable[[Sequence[str], str], Rows] | None] | None = None
         self._rev = rev
         self._gen_opt = gen
         self._pinned = pinned
@@ -350,6 +357,7 @@ class ThreadIndex:
         cold_beam: int | None = None,
         base_pack: bool = True,
         warm_pack: str | None = None,
+        embed: Callable[[list[str], str], Any] | Mapping[str, Any] | None = None,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
@@ -394,7 +402,8 @@ class ThreadIndex:
                  refresh_interval=refresh_interval, delta_cache_bytes=delta_cache_bytes,
                  lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
                  job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), cold_policy=cold_policy,
-                 prefetch_bytes=prefetch_bytes, routing=routing, cold_routing=cold_routing, cold_beam=cold_beam)
+                 prefetch_bytes=prefetch_bytes, routing=routing, cold_routing=cold_routing, cold_beam=cold_beam,
+                 embed=embed)
         try:
             # Connection warm-up: HEADs on the I/O pool's threads (each keeps its own connection), overlapping the
             # open's own sequential reads (current.json, manifest, base files).
@@ -493,6 +502,59 @@ class ThreadIndex:
     def has_dense(self) -> bool:
         """Whether the generation has a dense (vector) index. A lexical-only generation has none."""
         return has_dense(self._rev.manifest)
+
+    @property
+    def embedding(self) -> dict[str, Any] | None:
+        """The embedding model the generation is for (`manifest.embedding`), or None."""
+        return self._rev.manifest.get("embedding")
+
+    @property
+    def can_embed(self) -> bool:
+        """Whether `embed` works: the generation names a model and `open_index(embed=...)` gave a way to call it."""
+        return self._embedder() is not None
+
+    def embed(self, texts: Sequence[str], kind: str) -> list[array]:
+        """Embeds texts through the generation's model (`manifest.embedding`): one unit-normalized `array("f")` row per
+        text, as a `"query"` (search) or a `"document"` (upsert), with the config's prefix. Raises when the index
+        cannot embed."""
+        fn = self._embedder()
+        if fn is None:
+            cfg = self.embedding
+            raise ThreadError(f"this index cannot embed: open_index(embed=...) with credentials or a function for "
+                              f"{cfg['provider']} {cfg['model']}" if cfg else
+                              "this generation names no embedding model (create_generation(embedding=...))", 400)
+        if kind not in ("query", "document"):
+            raise ThreadError('kind must be "query" or "document"', 400)
+        return fn(texts, kind) if texts else []
+
+    def _embedder(self) -> Callable[[Sequence[str], str], Rows] | None:
+        cfg = self._rev.manifest.get("embedding")
+        if not cfg:
+            return None
+        key = dumps(cfg)
+        with self._lock:
+            if self._embedder_for is not None and self._embedder_for[0] == key:
+                return self._embedder_for[1]
+        fn: Callable[[Sequence[str], str], Rows] | None = None
+        e = self._embed_opt
+        try:
+            if e is None:
+                inner = None if cfg["provider"] == "custom" else resolve_embedder(cfg)
+            elif callable(e):
+                inner = resolve_embedder(cfg, embedder=e)
+            else:
+                inner = resolve_embedder(cfg, **dict(e))
+        except ThreadError as err:
+            # No credentials for the provider: the index reads and takes vectors, but cannot embed.
+            if err.status != 400:
+                raise
+            inner = None
+        if inner is not None:
+            what = f"{cfg['provider']} {cfg['model']}"
+            fn = lambda texts, kind, _i=inner, _w=what: normalize_rows(_i(texts, kind), _w)  # noqa: E731
+        with self._lock:
+            self._embedder_for = (key, fn)
+        return fn
 
     @property
     def lex_config(self) -> ResolvedLexConfig | None:
@@ -1071,6 +1133,7 @@ class ThreadIndex:
         dense: dict[str, Any] | None = None,
         docs: bool | Literal["text"] = False,
         filter: AttrFilterExpr | None = None,
+        embed: bool | None = None,
     ) -> SearchResult:
         """Searches by text, by vector, or by both: the dense list (`query`, options in `dense`) and the lexical list
         (BM25 over the segments) run concurrently at depth `recall_k` and are fused with Reciprocal Rank Fusion
@@ -1078,22 +1141,29 @@ class ThreadIndex:
         as is. With `docs`, hits are resolved through the `docs` store (`"text"`: the stored text too). `filter`
         (field conditions under the attribute schema) applies to both lists: the dense scan drops non-matching
         entries before top-k insertion (widening its probes up to `dense["max_nprobe"]`), the BM25 list is taken
-        deeper and resolved through the `docs` store."""
+        deeper and resolved through the `docs` store. When the generation names its embedding model and the index
+        can call it (`open_index(embed=...)`), a `text` without a `vector` is also embedded for the dense list
+        (`embed=False` keeps it lexical-only; `embed=True` fails when the index cannot embed)."""
         self._check_open()
         t0 = time.perf_counter()
         if isinstance(top_k, bool) or not isinstance(top_k, int):
             raise ThreadError("top_k must be an integer >= 1", 400)
         has_text = isinstance(text, str) and text.strip() != ""
-        has_vector = vector is not None
         self._maybe_refresh()
+        # The query text is embedded for the dense list when the index can (and no vector was given).
+        if has_text and vector is None and embed is not False and self.has_dense and (embed or self.can_embed):
+            vector = self.embed([text], "query")[0]  # type: ignore[list-item]
+        has_vector = vector is not None
         lex_cfg = self._rev.manifest.get("lex")
-        if has_text and lex_cfg is None:
+        # A text the index embedded is a dense query; it is also a BM25 query when the generation has a lexical index.
+        lex_text = has_text and (lex_cfg is not None or not has_vector)
+        if lex_text and lex_cfg is None:
             raise ThreadError("this generation has no lexical index (index.configure_lexical first)", 400)
         # Mode, list depth, RRF constant and weights are resolved by the core against `manifest.lex.defaults`.
         md = (lex_cfg or {}).get("defaults") or {}
         w, mw = weights or {}, md.get("weights") or {}
         try:
-            plan = _native.plan_search(float(top_k), has_text, has_vector, lex_cfg is not None, self.has_dense,
+            plan = _native.plan_search(float(top_k), lex_text, has_vector, lex_cfg is not None, self.has_dense,
                                        (rrf_k, recall_k, w.get("dense"), w.get("lexical")),
                                        (md.get("rrfK"), md.get("recallK"), mw.get("dense"), mw.get("lexical")))
         except ValueError as e:
@@ -1109,7 +1179,7 @@ class ThreadIndex:
             timing["lexical"] = round((time.perf_counter() - t) * 1000, 3)
             return r
 
-        lex_fut = self._jobs.submit(run_lex) if has_text and has_vector else None
+        lex_fut = self._jobs.submit(run_lex) if lex_text and has_vector else None
         dense_r: QueryResult | None = None
         lex_r: LexSearchResult | None = None
         if has_vector:
@@ -1118,7 +1188,7 @@ class ThreadIndex:
             timing["dense"] = round((time.perf_counter() - t) * 1000, 3)
         if lex_fut is not None:
             lex_r = lex_fut.result()
-        elif has_text:
+        elif lex_text:
             lex_r = run_lex()
 
         def ranked(hits: Any) -> tuple[list[int], list[float]] | None:
@@ -1165,7 +1235,7 @@ class ThreadIndex:
                     return out
                 after = page.next
 
-        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq, resolve_keys, list_keys)
+        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq, resolve_keys, list_keys, self._embedder())
 
     def upsert(
         self,
@@ -1179,7 +1249,7 @@ class ThreadIndex:
         keys: Sequence[str] | None = None,
         replace: bool = True,
         chunk: ChunkOptions | Mapping[str, Any] | bool | None = None,
-        embed: Callable[[list[str]], Any] | None = None,
+        embed: Callable[[list[str]], Any] | Literal[False] | None = None,
     ) -> UpsertResult:
         """Adds or replaces documents: one delta segment (vectors: `n * dim` floats flat, one row per id, or an
         `(n, dim)` numpy array; any norm), one lexical/docs/keys segment (`texts` indexed by BM25, `metas` stored in
@@ -1196,7 +1266,9 @@ class ThreadIndex:
         `keys` (not `ids`) and `texts`; `vectors` cannot be given. Chunk keys of the parent that this put no longer
         writes (a shorter text) are tombstoned in the same revision; `r.chunks` counts documents, chunks and stale
         keys. At most 4096 chunks per call. `embed` is called once with the texts to index (the chunks when chunking,
-        else `texts`) and returns one vector per text, as `vectors` takes them; the SDK does no embedding itself."""
+        else `texts`) and returns one vector per text, as `vectors` takes them; the SDK runs no model itself. Absent,
+        with texts and no vectors, a generation that names its model (`manifest.embedding`) embeds the texts through
+        the index's embedder (`open_index(embed=...)`); `embed=False` skips that (text-only documents)."""
         r = upsert(self._writer(), ids, vectors, attrs=attrs, payloads=payloads, texts=texts, metas=metas,
                    keys_=keys, replace=replace, chunk=chunk, embed=embed)
         self.use_revision(r.gen, r.rev)
@@ -1283,6 +1355,7 @@ def open_index(
     cold_beam: int | None = None,
     base_pack: bool = True,
     warm_pack: str | None = None,
+    embed: Callable[[list[str], str], Any] | Mapping[str, Any] | None = None,
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -1323,11 +1396,15 @@ def open_index(
       the cache's miss policy, and counts as resident for `cold_policy`), else into a prefix layer in front of the
       store (`index.warm_layer`). Read from `store` (with `prefix`, around an in-process cache), or from the inner
       store of a `PackedBlobStore`. `index.warm_ready` (a Future) resolves once it is seeded; `index.warm_stats` says
-      how it went. Measured: no gain on the dbpedia workload (docs/cold-start.md, "Warm packs"); opt-in.
+      how it went. Measured: no gain on the dbpedia workload (docs/cold-start.md, "Warm packs"); opt-in;
+    - `embed`: how the index embeds texts when the generation names its model (`manifest.embedding`,
+      `create_generation(embedding=...)`): a function `(texts, kind) -> vectors` (used for any provider), or
+      credentials for the provider: `{"account_id", "api_token"}` for Workers AI (its REST API), `{"api_key"}` for
+      an OpenAI-compatible endpoint. Without it, `search` needs a `vector` and `upsert` needs `vectors` or `embed`.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
                             io_workers=io_workers, job_workers=job_workers, miss_policy=miss_policy,
                             warm_concurrency=warm_concurrency, warmup=warmup, cold_policy=cold_policy,
                             prefetch_bytes=prefetch_bytes, routing=routing, cold_routing=cold_routing,
-                            cold_beam=cold_beam, base_pack=base_pack, warm_pack=warm_pack)
+                            cold_beam=cold_beam, base_pack=base_pack, warm_pack=warm_pack, embed=embed)

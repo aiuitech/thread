@@ -35,7 +35,9 @@ from .store import (
     PrefixedBlobStore,
 )
 from .warm import WarmPrefixStore, build_warm_pack, parse_warm_pack, seed_warm_pack, write_warm_pack
-from .wire import ResolvedLexConfig, ThreadError, keys
+from .embed import (EMBED_BATCH_DEFAULTS, EMBEDDING_PROVIDERS, embedding_batches, embedding_inputs, normalize_rows,
+                    resolve_embedder, split_rows, validate_embedding_config)
+from .wire import COMPACTION_PROFILES, CREATE_DEFAULTS, ResolvedLexConfig, ThreadError, keys
 from .write import (
     MAX_UPSERT,
     CompactSegmentsResult,
@@ -43,6 +45,7 @@ from .write import (
     ConfigureLexicalResult,
     DeleteResult,
     UpsertResult,
+    create_generation,
     create_lexical_generation,
 )
 
@@ -51,6 +54,17 @@ __version__ = _native.__version__
 
 __all__ = [
     "open_index",
+    "create_generation",
+    "EMBED_BATCH_DEFAULTS",
+    "EMBEDDING_PROVIDERS",
+    "COMPACTION_PROFILES",
+    "CREATE_DEFAULTS",
+    "embedding_batches",
+    "embedding_inputs",
+    "normalize_rows",
+    "resolve_embedder",
+    "split_rows",
+    "validate_embedding_config",
     "ThreadIndex",
     "ThreadError",
     "MissingRanges",

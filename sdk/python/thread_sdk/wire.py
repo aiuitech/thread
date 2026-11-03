@@ -442,6 +442,17 @@ def parse_current(b: BytesLike) -> tuple[str, int]:
     return gen, rev
 
 
+#: Automatic compaction policies by profile (the Worker's defaults; `edge` splits cells at 3000 entries, `local` at 1000).
+COMPACTION_PROFILES: dict[str, dict[str, int]] = {
+    "edge": {"maxDeltas": 16, "maxDeltaBytes": 32 * 1024 * 1024, "maxTombstones": 50_000, "maxCellEntries": 3000,
+             "cellsPerRun": 256, "deadlineMs": 27_000},
+    "local": {"maxDeltas": 16, "maxDeltaBytes": 32 * 1024 * 1024, "maxTombstones": 50_000, "maxCellEntries": 1000,
+              "cellsPerRun": 256, "deadlineMs": 27_000},
+}
+#: `defaults` of a generation `create_generation` publishes.
+CREATE_DEFAULTS: dict[str, int] = {"nprobe": 32, "rerank": 150, "pc": 0}
+
+
 def has_dense(m: dict[str, Any]) -> bool:
     """Whether a generation has a dense index (a lexical-only generation is published with `k2: 0, dim: 0`)."""
     return m.get("k2", 0) > 0 and m.get("dim", 0) > 0

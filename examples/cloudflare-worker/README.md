@@ -20,7 +20,9 @@ cd examples/cloudflare-worker && cf deploy --secrets-file .env.secrets  # BUILD_
 ```
 
 `cf deploy` runs `vite build`, which builds the stage bundle as part of the same build (no separate step).
-Bindings: `BUCKET` (R2 `vib-bench`), `BUILD_TOKEN` (secret), `LOADER` (`bindings.workerLoader()`; Workers Paid).
+Bindings: `BUCKET` (R2 `vib-bench`), `BUILD_TOKEN` (secret), `LOADER` (`bindings.workerLoader()`; Workers Paid),
+`AI` (Workers AI, for generations whose `embedding.provider` is `workers-ai`), `EMBED_API_KEY` (secret; an
+OpenAI-compatible key for `embedding.provider: "openai"`, `-` for none).
 `THREAD_WORKER_NAME=<name> cf deploy ...` deploys a copy under another name (e.g. a staging Worker).
 
 ## Routing
@@ -28,7 +30,10 @@ Bindings: `BUCKET` (R2 `vib-bench`), `BUILD_TOKEN` (secret), `LOADER` (`bindings
 | request | runs in |
 |---|---|
 | `POST /build/<stage>?slot=<id>` | dynamic Worker `thread-build:<hash>:slot-<id>` (default slot `admin`) |
-| `POST /upsert`, `POST /delete` | slot `writer` (or `?slot=<id>`) |
+| `POST /upsert`, `POST /delete` | slot `writer` (or `?slot=<id>`); a JSON `/upsert {texts}` without `vectors` is embedded here first |
+| `POST /query` (JSON `{text}` without `vector`) | the text is embedded here (Workers AI `AI`, or `EMBED_API_KEY` for an OpenAI-compatible endpoint, per `manifest.embedding`), then this isolate |
+| `POST /embed {gen?, texts, kind?}` | this isolate: the texts' unit vectors under the generation's model |
+| `POST /create {gen, embedding?, dim?, ...}` | this isolate: a dense generation from nothing ([docs/embedding.md](../../docs/embedding.md)) |
 | `?slot=local` on any of the above | this isolate (debugging; a write here grows a query isolate's wasm memory) |
 | everything else (`/query`, `/manifest`, `/index/status`, `/stat`, ...) | this isolate |
 

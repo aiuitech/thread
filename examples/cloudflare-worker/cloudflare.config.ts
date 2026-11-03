@@ -2,7 +2,9 @@ import { bindings, defineConfig } from "cf/config";
 import * as entrypoint from "./src/main.ts" with { type: "cf-worker" };
 
 // One deployment: query serving + the build orchestrator. Build stages and writes run in dynamic Workers
-// (LOADER, one isolate per slot id; see src/main.ts), which replaced the vib-bench-0..7 pool.
+// (LOADER, one isolate per slot id; see src/main.ts), which replaced the vib-bench-0..7 pool. AI (Workers AI) and
+// EMBED_API_KEY (an OpenAI-compatible key; "-" = none) let the orchestrator embed texts for generations that name
+// their embedding model (`manifest.embedding`): /query {text}, /upsert {texts}, /embed.
 export default defineConfig({
 	worker: {
 		name: process.env.THREAD_WORKER_NAME ?? "vib-bench",
@@ -14,7 +16,9 @@ export default defineConfig({
 		env: {
 			BUCKET: bindings.r2({ name: "vib-bench" }),
 			BUILD_TOKEN: bindings.secret(),
+			EMBED_API_KEY: bindings.secret(),
 			LOADER: bindings.workerLoader(),
+			AI: bindings.ai(),
 		},
 	},
 });

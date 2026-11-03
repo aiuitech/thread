@@ -5,6 +5,7 @@
  */
 
 import type { AttrSchema } from "./attrs.js";
+import type { EmbeddingConfig } from "./embed.js";
 
 export class ThreadError extends Error {
 	constructor(
@@ -347,6 +348,30 @@ export interface TreeRef {
 	[extra: string]: unknown;
 }
 
+/**
+ * `manifest.compaction`: when the Worker's automatic compaction runs after a write and how it splits cells (see
+ * docs/update-path.md). `createGeneration` writes the profile's policy; `publish-rev` changes it.
+ */
+export interface CompactionPolicy {
+	/** Thresholds: more delta segments / bytes of them / tombstone ids than this trigger a run. */
+	maxDeltas: number;
+	maxDeltaBytes: number;
+	maxTombstones: number;
+	/** A rewritten cell with more entries than this is split in two (0 = never). */
+	maxCellEntries?: number;
+	cellsPerRun?: number;
+	deadlineMs?: number;
+	splitCellsPerRun?: number;
+	slots?: number;
+	cellsPerSlot?: number;
+}
+
+/** Automatic compaction policies by profile (the Worker's defaults; `edge` splits cells at 3000 entries, `local` at 1000). */
+export const COMPACTION_PROFILES: Record<"edge" | "local", CompactionPolicy> = {
+	edge: { maxDeltas: 16, maxDeltaBytes: 32 * 1024 * 1024, maxTombstones: 50_000, maxCellEntries: 3000, cellsPerRun: 256, deadlineMs: 27_000 },
+	local: { maxDeltas: 16, maxDeltaBytes: 32 * 1024 * 1024, maxTombstones: 50_000, maxCellEntries: 1000, cellsPerRun: 256, deadlineMs: 27_000 },
+};
+
 export interface Manifest {
 	gen: string;
 	k1: number;
@@ -389,6 +414,13 @@ export interface Manifest {
 	routing?: RoutingTables;
 	/** Centroid tree over the fine means. */
 	tree?: TreeRef;
+	/**
+	 * The embedding model the dense index is for (`createGeneration({embedding})`): queries and upserts given texts
+	 * without vectors embed them through it (`open({embed})`). Absent: vectors come from the caller.
+	 */
+	embedding?: EmbeddingConfig;
+	/** Automatic compaction policy (the Worker's); absent: no automatic compaction, no splits. */
+	compaction?: CompactionPolicy;
 }
 
 /** `idx/current.json`: the generation and revision queries use by default. */

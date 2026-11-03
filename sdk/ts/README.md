@@ -122,6 +122,7 @@ once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 | `waitUntil` | - | `ctx.waitUntil`, keeps background cache writes and warm fetches alive |
 | `warmup` | on for remote stores outside Workers | open connections during `open` (`true` = the store's `inflight`, 32 against S3 from Node; a number; `false`) |
 | `coldPolicy` | off | `{ nprobe?, rerank?, threshold? }` for queries whose probed slabs are mostly not cached (see `query`) |
+| `embed` | - | how texts are embedded when the generation names its model (`manifest.embedding`): `{ ai: env.AI }` (Workers AI binding), `{ accountId, apiToken }` (Workers AI REST), `{ apiKey, headers?, fetch? }` (OpenAI-compatible), or a function `(texts, kind) => vectors`; without it `search` needs a `vector` and `upsert` needs `vectors` or `embed` (see [docs/embedding.md](../../docs/embedding.md)) |
 | `refreshInterval` | 30 000 ms | how often a query checks `current.json` for a new revision, in the background (0 = only `refresh()`) |
 | `prefetchBytes` | 64 MB | slab prefixes / delta and lexical segments a revision switch prefetches into the cache |
 | `deltaCacheBytes` | 40 MB | delta segments kept in memory across queries (per index) |
@@ -331,6 +332,11 @@ await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk
 chunkText(longText, { words: 200, overlap: 20 });                       // [{ index, text, start, end, words }, ...], the same windows
 await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
 await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only generation (no dense index)
+// a dense generation from nothing, for an embedding model (one empty cell; grows by compaction and cell splits)
+await thread.createGeneration({ store, gen: "docs2", embedding: { provider: "openai", model: "text-embedding-3-small", dim: 1536 }, lex: { text: true } });
+const ix = await thread.open({ store, embed: { apiKey } });   // ix.canEmbed; ix.embedding; await ix.embed(texts, "query" | "document")
+await ix.upsert({ keys: ["docs/a.md"], texts: [longText], chunk: true });     // no vectors: embedded as documents (embed: false = text-only)
+await ix.search({ text: "deploy failed", topK: 10, docs: true });            // embedded as a query + BM25, fused (embed: false = BM25 only)
 ```
 
 `manifest.lex` (`LexConfig`): `tokenizer` (frozen once a segment exists), `k1`, `b`, `lengths: "exact" | "byte"`,
@@ -340,6 +346,10 @@ segment's `keys` section and resolved newest segment first; the design and the k
 [docs/keys.md](../../docs/keys.md). `chunk` splits each text into flat word windows before writing (needs `keys`
 and `texts`; vectors come from `embed`; chunk keys the parent no longer produces are tombstoned in the same
 revision); the rule, the key scheme and the limits are in [docs/chunking.md](../../docs/chunking.md).
+`createGeneration` (also `createGeneration(thread.wasm, opts)` and the Worker's `POST /create`) publishes rev 0
+with one empty cell for `embedding` (or a bare `dim`), `lex` (default `{}`; `null` for ids only), `attrs`, a
+`profile` (`edge` splits cells at 3000 entries, `local` at 1000), `defaults` and the automatic `compaction` policy;
+what that generation lacks compared with a k-means build is in [docs/embedding.md](../../docs/embedding.md).
 
 Implemented against [docs/update-path.md](../../docs/update-path.md): an upsert encodes one delta segment
 (`DeltaJob`: primary cell + residual codes, PQ codes with the generation's codebook) and, unless

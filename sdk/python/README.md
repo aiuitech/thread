@@ -128,6 +128,7 @@ rest starts as soon as the first response's headers give the size, so the split 
 | `io_workers` | 32 | threads for reads, shared by concurrent queries |
 | `routing` | `"f32"` | routing table to load: `"f32"` (`fine.f32`, 25 MB at 4096 x 1536), `"f16"` (half), `"i8"` (a quarter) or `"auto"` (the smallest the revision has); decoded to f32 on load, a revision without the table falls back to f32 |
 | `cold_routing` | `"off"` | `"tree"`: the open waits only for the centroid tree and the codebook; until the full table has loaded (on a background thread) queries route over the tree's best `cold_beam` groups, range-reading just those groups' means |
+| `embed` | - | how texts are embedded when the generation names its model (`manifest.embedding`): `{"account_id", "api_token"}` (Workers AI REST), `{"api_key"}` (OpenAI-compatible; also `headers`, `post`), or a function `(texts, kind) -> vectors`; without it `search` needs a `vector` and `upsert` needs `vectors` or `embed` (see [docs/embedding.md](../../docs/embedding.md)) |
 | `cold_beam` | `defaults.beam`, else 16 | groups ranked per cold-routed query |
 | `base_pack` | True | GET the revision's base pack (one object with everything the open reads) and, without one, start every read of the open as soon as the manifest is in; False: one read after another |
 | `job_workers` | 4-16 (CPUs) | threads for `query_many`, the lexical half of a hybrid search and background refreshes |
@@ -302,6 +303,11 @@ index.upsert(keys=["docs/a.md"], texts=[long_text], metas=["A"], chunk={"words":
 chunk_text(long_text, words=200, overlap=20)   # [Chunk(index, text, start, end, words), ...], the same windows
 index.compact_segments()                # merge the lexical/docs segments into one base segment
 create_lexical_generation(store, "docs1", {"text": True})               # a text-only generation (no dense index)
+# a dense generation from nothing, for an embedding model (one empty cell; grows by the Worker's compaction and cell splits)
+create_generation(store, "docs2", embedding={"provider": "openai", "model": "text-embedding-3-small", "dim": 1536}, lex={"text": True})
+ix = open_index(store, embed={"api_key": api_key})   # ix.can_embed; ix.embedding; ix.embed(texts, "query" | "document")
+ix.upsert(keys=["docs/a.md"], texts=[long_text], chunk=True)   # no vectors: embedded as documents (embed=False = text-only)
+ix.search(text="deploy failed", top_k=10, docs=True)           # embedded as a query + BM25, fused (embed=False = BM25 only)
 ```
 
 `vectors` may be `n * dim` floats, one row per id, an `(n, dim)` numpy array or raw f32 bytes. Up to 4096 ids per
@@ -311,7 +317,10 @@ call. `replace=False` skips the tombstone set when the ids are known to be new. 
 windows before writing (needs `keys` and `texts`; vectors come from `embed`; chunk keys the parent no longer
 produces are tombstoned in the same revision); see [docs/chunking.md](../../docs/chunking.md). `configure_lexical` takes the
 wire-format dict (`{"bucketTerms": 64}`) or snake_case keyword arguments; the tokenizer of a generation with
-segments is frozen.
+segments is frozen. `create_generation` publishes rev 0 with one empty cell for `embedding` (or a bare `dim`),
+`lex` (default `{}`; `False` for ids only), `attrs`, a `profile` (`edge` splits cells at 3000 entries, `local` at
+1000), `defaults` and the automatic `compaction` policy (`False` for none); what that generation lacks compared
+with a k-means build is in [docs/embedding.md](../../docs/embedding.md).
 
 Commits follow docs/update-path.md, as the TypeScript SDK does: a delta segment and/or a lexical segment and a
 tombstone set, then a create-only put of `manifest.{rev+1}.json` (the writer lock; a lost race rebuilds on the new

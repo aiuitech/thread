@@ -1,0 +1,49 @@
+{
+  "_comment": "Shared by sdk/ts/test/embed.test.ts and sdk/python/tests/test_embed.py: the manifest `embedding` block (validation and the fields kept), the prefixing rule (`inputs`) and the provider batching (`batches`).",
+  "providers": ["workers-ai", "openai", "custom"],
+  "batch_defaults": { "workers-ai": 100, "openai": 2048, "custom": 256 },
+  "configs": [
+    {
+      "name": "workers-ai bge-base with cls pooling",
+      "config": { "provider": "workers-ai", "model": "@cf/baai/bge-base-en-v1.5", "dim": 768, "options": { "pooling": "cls" } },
+      "dim": 768,
+      "resolved": { "provider": "workers-ai", "model": "@cf/baai/bge-base-en-v1.5", "dim": 768, "options": { "pooling": "cls" } }
+    },
+    {
+      "name": "openai text-embedding-3-small truncated, e5-style prefixes, unknown fields dropped",
+      "config": { "provider": "openai", "model": "text-embedding-3-small", "dim": 256, "options": { "dimensions": 256 }, "queryPrefix": "query: ", "docPrefix": "passage: ", "baseUrl": "https://example.test/v1", "maxBatch": 64, "extra": true },
+      "dim": null,
+      "resolved": { "provider": "openai", "model": "text-embedding-3-small", "dim": 256, "queryPrefix": "query: ", "docPrefix": "passage: ", "baseUrl": "https://example.test/v1", "options": { "dimensions": 256 }, "maxBatch": 64 }
+    },
+    {
+      "name": "custom provider, empty prefixes and options dropped",
+      "config": { "provider": "custom", "model": "my-model", "dim": 16, "queryPrefix": "", "docPrefix": "", "options": {} },
+      "dim": 16,
+      "resolved": { "provider": "custom", "model": "my-model", "dim": 16 }
+    },
+    { "name": "dim mismatch", "config": { "provider": "openai", "model": "text-embedding-3-small", "dim": 1536 }, "dim": 768, "error": true },
+    { "name": "unknown provider", "config": { "provider": "cohere", "model": "embed-v3", "dim": 1024 }, "dim": null, "error": true },
+    { "name": "no model", "config": { "provider": "openai", "dim": 1536 }, "dim": null, "error": true },
+    { "name": "bad dim", "config": { "provider": "openai", "model": "m", "dim": 0 }, "dim": null, "error": true },
+    { "name": "fractional dim", "config": { "provider": "openai", "model": "m", "dim": 1.5 }, "dim": null, "error": true },
+    { "name": "bad prefix type", "config": { "provider": "openai", "model": "m", "dim": 8, "queryPrefix": 1 }, "dim": null, "error": true },
+    { "name": "bad options", "config": { "provider": "openai", "model": "m", "dim": 8, "options": [1] }, "dim": null, "error": true },
+    { "name": "bad maxBatch", "config": { "provider": "openai", "model": "m", "dim": 8, "maxBatch": 0 }, "dim": null, "error": true },
+    { "name": "not an object", "config": "openai", "dim": null, "error": true }
+  ],
+  "inputs": [
+    { "config": { "provider": "custom", "model": "m", "dim": 4, "queryPrefix": "query: ", "docPrefix": "passage: " }, "kind": "query", "texts": ["a b", ""], "inputs": ["query: a b", "query: "] },
+    { "config": { "provider": "custom", "model": "m", "dim": 4, "queryPrefix": "query: ", "docPrefix": "passage: " }, "kind": "document", "texts": ["a b"], "inputs": ["passage: a b"] },
+    { "config": { "provider": "custom", "model": "m", "dim": 4 }, "kind": "query", "texts": ["x", "y"], "inputs": ["x", "y"] },
+    { "config": { "provider": "custom", "model": "m", "dim": 4, "docPrefix": "D " }, "kind": "query", "texts": ["x"], "inputs": ["x"] }
+  ],
+  "batches": [
+    { "config": { "provider": "workers-ai", "model": "m", "dim": 4 }, "n": 250, "batches": [100, 100, 50] },
+    { "config": { "provider": "workers-ai", "model": "m", "dim": 4 }, "n": 100, "batches": [100] },
+    { "config": { "provider": "workers-ai", "model": "m", "dim": 4 }, "n": 0, "batches": [] },
+    { "config": { "provider": "openai", "model": "m", "dim": 4 }, "n": 2049, "batches": [2048, 1] },
+    { "config": { "provider": "custom", "model": "m", "dim": 4, "maxBatch": 3 }, "n": 7, "batches": [3, 3, 1] }
+  ],
+  "create_defaults": { "nprobe": 32, "rerank": 150, "pc": 0 },
+  "create_manifest": { "k1": 1, "k2": 1, "m": 1, "vectors": 0, "format": 2, "tiers": "sq4+sq8", "nextSeq": 1, "nextId": 0 }
+}

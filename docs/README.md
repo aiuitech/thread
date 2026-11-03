@@ -15,6 +15,7 @@ if you want to use it.
 | [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual and automatic), cell splitting, GC |
 | [portability.md](portability.md) | moving an index: copying between stores, snapshotting one revision, packs (one file, queried in place) and their format, base packs, warm packs |
 | [lexical.md](lexical.md) | BM25 segments, the `docs` store, the `keys` section, the tokenizer, fusion, size-vs-speed tuning, the native CLI |
+| [embedding.md](embedding.md) | an index for an embedding model: `manifest.embedding`, how the SDKs and the Worker call the model (Workers AI, OpenAI-compatible, your function) for `search({text})` and `upsert({texts})`, a dense generation created from nothing and grown by compaction and cell splits, what that path lacks |
 | [chunking.md](chunking.md) | flat word-window chunking before embedding (`words` 200, `overlap` 0), `upsert({chunk, embed})` in both SDKs, chunk keys `k#i`, stale chunks on re-put, `thread chunk` / `seg build --chunk-words` |
 | [keys.md](keys.md) | string keys: `get(key)` in two reads, keyed upserts and id allocation (`manifest.nextId`), prefix listings, delete by key, the key-value index case (keys + JSON meta + facet tokens) |
 | [filtering.md](filtering.md) | attribute filters: the 32-bit word and its schema, filter expressions and their compiled clauses, pre-filtering inside the scan with probe widening, post-filtering of text queries |

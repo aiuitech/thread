@@ -80,6 +80,12 @@ const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });  // { entr
 
 // long texts: one document per window of 200 words (overlap 0), keyed "docs/a.md#0", "docs/a.md#1", ...; vectors from your embedder
 await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk: { words: 200, overlap: 20 }, embed: async (texts) => embedAll(texts) });
+
+// an index for an embedding model: created from nothing, filled from texts, searched by text (docs/embedding.md)
+await thread.createGeneration({ store: new R2BlobStore(env.BUCKET), gen: "docs", embedding: { provider: "workers-ai", model: "@cf/baai/bge-base-en-v1.5", dim: 768, options: { pooling: "cls" } } });
+const ix = await thread.open({ bucket: env.BUCKET, embed: { ai: env.AI } });      // the index calls the model; it never runs one
+await ix.upsert({ keys: ["docs/a.md"], texts: [longText], chunk: true });           // embedded as documents, one per chunk
+const hits = await ix.search({ text: "deploy failed", topK: 10, docs: true });     // embedded as a query + BM25, fused
 ```
 
 The full API, the stores (R2 binding, S3, memory) and a mapping from Vectorize's calls are in
@@ -99,6 +105,11 @@ with open_index(store) as index:
     index.upsert(keys=["s3://b/a.bin"], metas=['{"host": "cdn-1"}'])          # by key; r.ids holds the allocated ids
     index.get(["s3://b/a.bin"])                                                # {key: KeyRecord(id, meta, text, attrs, key)}
     index.upsert(keys=["docs/a.md"], texts=[long_text], chunk={"words": 200, "overlap": 20}, embed=embed_all)   # one doc per chunk, keyed "docs/a.md#i"
+
+create_generation(store, "docs", embedding={"provider": "openai", "model": "text-embedding-3-small", "dim": 1536})   # an index for a model, from nothing
+with open_index(store, embed={"api_key": os.environ["OPENAI_API_KEY"]}) as index:
+    index.upsert(keys=["docs/a.md"], texts=[long_text], chunk=True)        # embedded as documents through the model
+    index.search(text="deploy failed", top_k=10, docs=True)                 # embedded as a query + BM25, fused
 ```
 
 Python reads the same bucket the Worker serves from, a local directory holding a copy of it, or a pack
@@ -107,9 +118,14 @@ and [docs/portability.md](docs/portability.md) for moving an index between all o
 
 ### Building an index
 
-A text-only index can be created from either SDK (`createLexicalGeneration` / `create_lexical_generation`) and
-filled with upserts. Building the dense base for a large corpus is a k-means pipeline that runs inside Workers
-today, driven by a script on your laptop; a 975k-vector index takes about 30 minutes. See
+An index for an embedding model is created from nothing with `createGeneration` / `create_generation` / the
+Worker's `POST /create` (one empty cell, `manifest.embedding` naming the model) and filled with upserts: vectors go
+to delta segments, the Worker's automatic compaction folds them into cells and splits cells as they pass 3000
+entries, so the cell count grows with the data. Texts are embedded through the model on upsert and search (Workers
+AI, any OpenAI-compatible endpoint, or your own function); thread never runs a model itself. See
+[docs/embedding.md](docs/embedding.md). A text-only index is `createLexicalGeneration` / `create_lexical_generation`.
+Building the dense base for a large pre-embedded corpus with a global k-means and a PQ codebook is a pipeline that
+runs inside Workers, driven by a script on your laptop; a 975k-vector index takes about 30 minutes. See
 [docs/operations.md](docs/operations.md) and [docs/build-pipeline.md](docs/build-pipeline.md). Once a generation
 exists, vectors are added with ordinary upserts from any SDK.
 

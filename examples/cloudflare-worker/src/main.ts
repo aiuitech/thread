@@ -12,7 +12,13 @@
  *   /build/<stage>?slot=<id>   forwarded to slot <id> (default `admin`); `?slot=local` runs it in this isolate
  *   /upsert, /delete           forwarded to slot `writer` (or `?slot=<id>`) so DeltaJob's ~50 MB of wasm memory
  *                              never lands in a query isolate (wasm memory never shrinks); `?slot=local` runs here
+ *   /embed                     embeds texts through the generation's model (manifest.embedding): this isolate
  *   everything else            this isolate (app.fetch)
+ *
+ * Embedding: a generation created for a model (`POST /create {embedding}`, thread-sdk's `createGeneration`) names it
+ * in `manifest.embedding`. A JSON `/query {text}` without `vector` and a JSON `/upsert {texts}` without `vectors`
+ * are embedded HERE, before forwarding (bindings cannot be passed into a dynamic Worker's env, and a query isolate
+ * has the AI binding): Workers AI through `env.AI`, an OpenAI-compatible endpoint with `env.EMBED_API_KEY`.
  *
  * Slot ids in use: driver and bench/compact.mjs jobs `0`..`N-1` (THREAD_SLOTS), compact.mjs commit/plan `admin`,
  * writes `writer`, automatic compaction slices `auto-0`..`auto-3` (dispatched from the writer through SlotRpc).
@@ -26,11 +32,17 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import wasmModule from "../../../crates/thread-wasm/pkg/thread_bg.wasm";
 import stageBundle from "virtual:thread-stage-bundle";
 import app from "./index.ts";
+import { normalizeRows, resolveEmbedder, validateEmbeddingConfig, type EmbedKind, type EmbeddingConfig } from "../../../sdk/ts/src/embed.ts";
+import { ThreadError } from "../../../sdk/ts/src/wire.ts";
 
 interface Env {
 	BUCKET: R2Bucket;
 	BUILD_TOKEN: string;
 	LOADER: WorkerLoader;
+	/** Workers AI (for generations whose `embedding.provider` is `workers-ai`). */
+	AI?: Ai;
+	/** API key for `embedding.provider: "openai"` endpoints ("-" or unset = none). */
+	EMBED_API_KEY?: string;
 }
 
 const COMPAT_DATE = "2026-10-01";
@@ -227,6 +239,125 @@ export class SlotRpc extends WorkerEntrypoint<Env> {
 	}
 }
 
+// ---------- embedding (manifest.embedding) ----------
+
+/** How long the (gen -> embedding config) answer of /manifest is reused. */
+const EMBEDDING_TTL_MS = 30_000;
+const embeddingCache = new Map<string, { at: number; gen: string; dim: number; embedding: EmbeddingConfig | null }>();
+/** Texts per /embed or embedded /upsert call (the upsert batch limit). */
+const MAX_EMBED_TEXTS = 4096;
+
+/** The embedding block of the head revision of `gen` (default: the current generation), through the app's /manifest. */
+async function embeddingOf(env: Env, ctx: ExecutionContext, gen: string | null): Promise<{ gen: string; dim: number; embedding: EmbeddingConfig | null }> {
+	const key = gen ?? "";
+	const hit = embeddingCache.get(key);
+	if (hit && Date.now() - hit.at < EMBEDDING_TTL_MS) return hit;
+	const url = new URL("https://thread-local/manifest");
+	if (gen) url.searchParams.set("gen", gen);
+	const resp = await app.fetch(new Request(url, { headers: { authorization: `Bearer ${env.BUILD_TOKEN}` } }), { ...env, SLOTS: loopback(ctx).SlotRpc({ props: {} }) } as any, ctx);
+	const j = (await resp.json()) as { gen?: string; manifest?: { dim?: number; embedding?: unknown }; error?: string };
+	if (!resp.ok || !j.gen || !j.manifest) throw new HttpError(resp.status === 200 ? 500 : resp.status, j.error ?? "no manifest");
+	const embedding = j.manifest.embedding ? validateEmbeddingConfig(j.manifest.embedding, j.manifest.dim) : null;
+	const out = { at: Date.now(), gen: j.gen, dim: j.manifest.dim ?? 0, embedding };
+	embeddingCache.set(key, out);
+	return out;
+}
+
+/** Embeds `texts` as `kind` through the model of `gen`'s head revision: one unit-normalized row per text. */
+async function embedTexts(env: Env, ctx: ExecutionContext, gen: string | null, texts: string[], kind: EmbedKind): Promise<{ gen: string; embedding: EmbeddingConfig; rows: Float32Array[] }> {
+	if (!Array.isArray(texts) || !texts.length || !texts.every((t) => typeof t === "string")) throw new HttpError(400, "texts must be a non-empty array of strings");
+	if (texts.length > MAX_EMBED_TEXTS) throw new HttpError(413, `at most ${MAX_EMBED_TEXTS} texts per call`);
+	const m = await embeddingOf(env, ctx, gen);
+	if (!m.embedding) throw new HttpError(400, `generation ${m.gen} names no embedding model: pass vectors`);
+	const apiKey = env.EMBED_API_KEY && env.EMBED_API_KEY !== "-" ? env.EMBED_API_KEY : undefined;
+	let embed: ReturnType<typeof resolveEmbedder>;
+	try {
+		embed = resolveEmbedder(m.embedding, { ai: env.AI, apiKey });
+	} catch (e) {
+		throw new HttpError(400, e instanceof Error ? e.message : String(e));
+	}
+	try {
+		const rows = normalizeRows(await embed(texts, kind), `${m.embedding.provider} ${m.embedding.model}`);
+		return { gen: m.gen, embedding: m.embedding, rows };
+	} catch (e) {
+		if (e instanceof ThreadError) throw new HttpError(e.status, e.message);
+		throw e;
+	}
+}
+
+class HttpError extends Error {
+	constructor(
+		public readonly status: number,
+		message: string,
+	) {
+		super(message);
+	}
+}
+
+/**
+ * A JSON /query with `text` and no `vector`, or a JSON /upsert with `texts` and no `vectors`, with the texts embedded
+ * through the generation's model; any other request as is. The body is only parsed when it looks like one of those
+ * (a 25 MB vectors upsert is not parsed here).
+ */
+async function withEmbeddedBody(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Request> {
+	if (request.method !== "POST" || (url.pathname !== "/query" && url.pathname !== "/upsert")) return request;
+	if (!(request.headers.get("content-type") ?? "").includes("json")) return request;
+	// The body is read from a clone, so the original request is returned untouched when nothing is embedded.
+	const text = await request.clone().text();
+	const query = url.pathname === "/query";
+	const field = query ? '"text"' : '"texts"';
+	const have = query ? '"vector"' : '"vectors"';
+	if (!text.includes(field) || text.includes(have)) return request;
+	let body: Record<string, unknown>;
+	try {
+		body = JSON.parse(text) as Record<string, unknown>;
+	} catch {
+		return request;
+	}
+	if (!body || typeof body !== "object") return request;
+	const gen = (typeof body.gen === "string" ? body.gen : url.searchParams.get("gen")) || null;
+	const rewritten = (b: Record<string, unknown>) => {
+		const headers = new Headers(request.headers);
+		headers.delete("content-length");
+		return new Request(request.url, { method: "POST", headers, body: JSON.stringify(b) });
+	};
+	if (query) {
+		if (typeof body.text !== "string" || body.vector !== undefined) return request;
+		const { rows } = await embedTexts(env, ctx, gen, [body.text], "query");
+		const { text: _t, ...rest } = body;
+		return rewritten({ ...rest, vector: Array.from(rows[0]) });
+	}
+	if (!Array.isArray(body.texts) || body.vectors !== undefined) return request;
+	const { rows } = await embedTexts(env, ctx, gen, body.texts as string[], "document");
+	const flat = new Float32Array(rows.length * (rows[0]?.length ?? 0));
+	rows.forEach((r, i) => flat.set(r, i * r.length));
+	const { texts: _x, ...rest } = body;
+	return rewritten({ ...rest, vectors: base64Of(new Uint8Array(flat.buffer)) });
+}
+
+/** Base64 of bytes without spreading them into one call (a 4096 x 1536 f32 batch is 25 MB). */
+function base64Of(bytes: Uint8Array): string {
+	let s = "";
+	for (let i = 0; i < bytes.length; i += 8192) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192) as unknown as number[]);
+	return btoa(s);
+}
+
+/** POST /embed {gen?, texts, kind?: "query" | "document"}: the texts' unit vectors under the generation's model. */
+async function handleEmbed(request: Request, env: Env, ctx: ExecutionContext, url: URL): Promise<Response> {
+	const t0 = Date.now();
+	let body: { gen?: string; texts?: unknown; kind?: unknown };
+	try {
+		body = (await request.json()) as typeof body;
+	} catch {
+		throw new HttpError(400, "invalid JSON body");
+	}
+	const kind = body.kind ?? "query";
+	if (kind !== "query" && kind !== "document") throw new HttpError(400, 'kind must be "query" or "document"');
+	const gen = body.gen ?? url.searchParams.get("gen");
+	const { gen: g, embedding, rows } = await embedTexts(env, ctx, gen, body.texts as string[], kind);
+	return json({ gen: g, model: embedding.model, provider: embedding.provider, dim: embedding.dim, kind, vectors: rows.map((r) => Array.from(r)), ms: Date.now() - t0 });
+}
+
 function authorized(request: Request, env: Env): boolean {
 	const token: unknown = env.BUILD_TOKEN;
 	if (typeof token !== "string" || token === "") return false;
@@ -255,10 +386,25 @@ export default {
 		} catch (e) {
 			return json({ error: errText(e) }, 400);
 		}
-		// Local execution: the app gets SLOTS too, so a ?slot=local write can still spread its compaction over slots.
-		if (slot === "local") return app.fetch(request, { ...env, SLOTS: loopback(ctx).SlotRpc({ props: {} }) } as any, ctx);
-		// Do not start dynamic Workers for unauthenticated requests.
-		if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
+		// Embedding and local execution: the app gets SLOTS too, so a ?slot=local write can still spread its
+		// compaction over slots. Texts are embedded in this isolate before a request is forwarded anywhere.
+		try {
+			if (url.pathname === "/embed" && request.method === "POST") {
+				if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
+				return await handleEmbed(request, env, ctx, url);
+			}
+			// /query runs here, /upsert in the writer slot: both get their texts embedded first (never unauthenticated).
+			if (request.method === "POST" && (url.pathname === "/query" || url.pathname === "/upsert")) {
+				if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
+				request = await withEmbeddedBody(request, env, ctx, url);
+			}
+			if (slot === "local") return app.fetch(request, { ...env, SLOTS: loopback(ctx).SlotRpc({ props: {} }) } as any, ctx);
+			// Do not start dynamic Workers for unauthenticated requests.
+			if (!authorized(request, env)) return json({ error: "unauthorized" }, 401);
+		} catch (e) {
+			if (e instanceof HttpError) return json({ error: e.message }, e.status);
+			return json({ error: errText(e) }, 500);
+		}
 		const t0 = Date.now();
 		const loaded = { cold: false };
 		try {

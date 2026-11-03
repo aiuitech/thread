@@ -52,11 +52,16 @@ import { buildRoutingObjects } from "../../../sdk/ts/src/routing.ts";
 import { buildBasePack } from "../../../sdk/ts/src/pack.ts";
 import { loadRevState as sdkLoadRevState } from "../../../sdk/ts/src/revision.ts";
 import { R2BlobStore } from "../../../sdk/ts/src/store.ts";
+import { createGeneration, type CreateGenerationOptions } from "../../../sdk/ts/src/create.ts";
+import { ThreadError } from "../../../sdk/ts/src/wire.ts";
 import { currentBody, groupedTableOf, keys as sdkKeys, type Manifest as SdkManifest, type RoutingElem, type RoutingOption, type RoutingTables } from "../../../sdk/ts/src/wire.ts";
 
 interface Env {
 	BUCKET: R2Bucket;
 	BUILD_TOKEN: string;
+	/** Workers AI and an OpenAI-compatible key (used by src/main.ts to embed texts; unused here). */
+	AI?: Ai;
+	EMBED_API_KEY?: string;
 	/** Runs a stage in another dynamic slot (src/main.ts SlotRpc); absent when this module runs on its own. */
 	SLOTS?: SlotsRpc;
 	/** The slot this isolate is (absent: the orchestrator / query isolate). */
@@ -2520,11 +2525,12 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	const manifest = rv.manifest;
 	if (qRaw.length !== manifest.dim) throw new HttpError(400, `query dim ${qRaw.length} != ${manifest.dim}`);
 	const defaults = manifest.defaults ?? LEGACY_DEFAULTS;
-	const nprobe = p.nprobe ?? defaults.nprobe;
+	// A manifest default is clamped to the cell count (a generation created from nothing starts with one cell and
+	// its default nprobe); a query's own value is bounded by the index shape (route allocates per probe): rejected.
+	const nprobe = p.nprobe ?? Math.min(defaults.nprobe, manifest.k1 * manifest.k2);
 	const probeCoarse = p.probeCoarse ?? defaults.pc;
 	const rerankParam = p.rerank ?? defaults.rerank;
 	const source = (v: number | null) => (v !== null ? "query" : manifest.defaults ? "manifest" : "legacy");
-	// Bounded by the index shape (route_from_dots / route allocate per probe); rejected, not clamped.
 	if (nprobe > manifest.k1 * manifest.k2) throw new HttpError(400, `nprobe must be <= ${manifest.k1 * manifest.k2} (k1*k2)`);
 	if (probeCoarse > manifest.k1) throw new HttpError(400, `pc must be <= ${manifest.k1} (k1)`);
 	// The attribute filter, compiled against the generation's schema (thread-sdk's attrs module); applied inside
@@ -3494,6 +3500,30 @@ async function targetGen(env: Env, gen: string | null): Promise<string> {
 	const r = await readCurrent(env);
 	if (!r) throw new HttpError(404, "no published index");
 	return r.cur.gen;
+}
+
+/**
+ * POST /create {gen, embedding?, dim?, lex?, attrs?, profile?, defaults?, compaction?, setCurrent?, notes?}: a dense
+ * generation from nothing (thread-sdk's `createGeneration`): one empty cell for an embedding model (`embedding`:
+ * {provider, model, dim, ...}, then /query {text} and /upsert {texts} embed through it) or a vector size (`dim`).
+ * Upserts fill it; automatic compaction folds and splits the cell as it grows.
+ */
+async function handleCreate(request: Request, env: Env): Promise<Response> {
+	const t0 = Date.now();
+	const body = await readJson<Partial<CreateGenerationOptions> & { gen?: unknown }>(request);
+	if (typeof body.gen !== "string" || !body.gen) throw new HttpError(400, "gen required");
+	await ensureWasm();
+	const { store: _s, ...opts } = body as CreateGenerationOptions;
+	try {
+		const r = await createGeneration(thread, { ...opts, gen: body.gen, store: new R2BlobStore(env.BUCKET) });
+		// This isolate's cached current pointer may now be stale.
+		currentPtr = null;
+		genHeads.delete(r.gen);
+		return json({ ok: true, gen: r.gen, rev: r.rev, manifest: r.manifest, keys: r.keys, currentUpdated: r.currentUpdated, ms: Date.now() - t0 });
+	} catch (e) {
+		if (e instanceof ThreadError) throw new HttpError(e.status, e.message);
+		throw e;
+	}
 }
 
 /** POST /upsert: one delta segment + (by default) a tombstone set for its ids, in one new manifest revision. */
@@ -4623,6 +4653,9 @@ export default {
 			}
 			if (url.pathname === "/upsert" && request.method === "POST") {
 				return await handleUpsert(request, env, ctx, url);
+			}
+			if (url.pathname === "/create" && request.method === "POST") {
+				return await handleCreate(request, env);
 			}
 			if (url.pathname === "/delete" && request.method === "POST") {
 				return await handleDelete(request, env, ctx, url);
