@@ -2,8 +2,9 @@
 # thread-sdk (abi3 wheels + sdist) to PyPI, and attach the artifacts to a GitHub release.
 #
 # The tag must equal the version in sdk/ts/package.json, sdk/python/pyproject.toml and Cargo.toml (checked first).
-# npm: the `npm` environment needs the secret NPM_TOKEN (a granular token with publish rights on @aiuitech) until the
-#      package exists and npm trusted publishing is configured for it; `--provenance` attests the build either way.
+# npm: the `npm` environment needs the secret NPM_TOKEN (a granular token with publish rights on @aiuitech and 2FA
+#      bypass) until the package exists and npm trusted publishing is configured for it. No `--provenance`: npm only
+#      accepts provenance from public source repositories, and this one is private.
 # PyPI: the `pypi` environment, no secret: PyPI trusted publishing (owner aiuitech, repository thread, workflow
 #       release.yml, environment pypi) issues the token through OIDC.
 name: release
@@ -94,8 +95,7 @@ jobs:
         include:
           - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: auto }
           - { name: linux-aarch64, os: ubuntu-latest, target: aarch64, manylinux: "2_28" }
-          - { name: macos-arm64, os: macos-14, target: aarch64 }
-          - { name: macos-x86_64, os: macos-13, target: x86_64 }
+          - { name: macos-universal2, os: macos-14, target: universal2-apple-darwin } # arm64 + x86_64 in one wheel (macos-13 runners are retired)
           - { name: windows-x86_64, os: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@v4
@@ -134,7 +134,7 @@ jobs:
     environment: npm
     permissions:
       contents: read
-      id-token: write # provenance attestation (and trusted publishing once configured on npmjs.com)
+      id-token: write # npm trusted publishing, once configured on npmjs.com
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -152,7 +152,7 @@ jobs:
         run: |
           ./scripts/sync-wasm.sh
           npm ci
-          npm publish --provenance --access public
+          npm publish --access public
 
   publish-pypi:
     needs: [wheels, sdist]
@@ -170,6 +170,7 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          skip-existing: true # a rerun after a partial publish does not fail on the files already there
 
   github-release:
     needs: [check, publish-npm, publish-pypi]
