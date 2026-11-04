@@ -2,7 +2,8 @@
 
 Status: implemented in the Worker (`examples/cloudflare-worker/src/index.ts`) on top of the Rust delta kernels (`DeltaJob`,
 `scan_delta`, `delta_records_for_cell`, `slab_to_records`, `filter_hits`, `split_slab`, `split_slab_records`, ...),
-including automatic compaction after writes and cell splitting. Benchmarks: `bench/update_bench.mjs` ->
+including automatic compaction after writes and cell splitting; the TypeScript SDK runs the same compaction in one
+isolate ([Compaction in the SDK](#compaction-in-the-sdk)). Benchmarks: `bench/update_bench.mjs` ->
 `data/bench-updates.txt` (and `--only trigger` -> `data/bench-trigger.txt`), `bench/split_bench.mjs` ->
 `data/bench-split.txt`.
 
@@ -265,6 +266,52 @@ node bench/compact.mjs [--gen g4] [--purge 1] [--cells a,b] [--maxCellEntries N]
 Query cost grows with total delta bytes (every query scans every segment), and replace/delete tombstone sets
 accumulate (~4 B per id per query isolate; every slab hit is filtered through them) until a compaction can drop
 them, so compactions are now triggered automatically from thresholds:
+
+## Compaction in the SDK
+
+`index.compact(opts)` / `compactDeltas(ctx, opts)` (TypeScript, `sdk/ts/src/compact.ts`) runs the same compaction in
+one isolate, for a writer that owns its index and has no build slots (a Durable Object with 128 MB). It writes the
+Worker's objects (`slab/{cell:05}.{baseRev + 1}`, `slabs.{rev}.json`, `fine.{rev}.f32`, `tree.{rev}.bin`, the
+routing tables of the new means) and the same manifest fields; `sdk/ts/test/compact-worker.test.ts` compacts one
+index with the Worker's `POST /build/compact` and with the SDK over three rounds (folds, splits from k 1 to 8, a
+rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
+
+1. **Lock** `compact.lock` exactly as the automatic runs take it (create-only, stale after 10 minutes, etag
+   takeover), so the Worker and the SDK never compact one generation at once. A stable `owner` takes over its own
+   lock (a crash left it); an isolate never runs two compactions of one generation. A store without `delete` marks
+   the lock released (`ms: 0`), which the Worker treats as stale.
+2. **Plan** on the newest manifest (listed): unless `force`, nothing happens below every threshold. The delta
+   segments' cells come from their entry tables only (two small range reads each). Whole deltas, oldest first, join
+   the slice while their cells fit `cellsPerRun` and the estimated peak fits `maxBytes` (the folded deltas, the
+   tombstone sets, the slabs table, the fine means of a split, and per cell in flight 4x its new slab, 6x plus the
+   decoded vectors when it splits); the cells in flight are as many as the rest of the budget holds (at most
+   `concurrency`). A delta that does not fit waits; when none fits, the call is `blocked` and says which. With the
+   tombstone threshold exceeded (or `purge`, or `force`) purge cells follow, and with `force` the cells over the
+   cap, while the budgets allow. Splits as in the Worker, except that a cell an unfolded delta has entries in is
+   split with its mean kept (the new cell takes the 2-means centre farther from it, and the entries nearer that
+   centre): those entries stay valid, and a backlog larger than the budget cannot keep a cell from splitting.
+3. **Cells** under the caches (whole slabs would only fill them), split cells first, then each delta's cells, oldest
+   delta first. Slab objects are written create-only: the same bytes already there (a rerun on the same base after a
+   crash) are reused; other bytes are overwritten only while no revision after the base changed the slabs table (so
+   none can list them), else the run ends as a `conflict`.
+4. **Deadline**: no cell starts after `deadline - 2.5 s` (7 s with splits). When the deadline cuts the slice, the run
+   commits the finished cells whose deltas are all finished (a cell only with every folded delta in it, splits only
+   as a prefix, since new cells are numbered in order; to the fixpoint) as `partial`, so a slice too large for the
+   time still makes progress. Nothing committable: `deadline`.
+5. **Commit**: `compactCommit`'s rules on the head (409 if the slabs table or the fine means changed, a folded delta
+   left, or a delta that stays has entries in a cell whose mean changed), then `compact.last.json` and the lock
+   release. `r.more` is true while a threshold is exceeded (with `force`: while deltas remain, or cells stay over
+   the cap after a split that moved entries), a split was deferred or the slice was cut.
+
+A delta fold and cell split in a Durable Object then looks like:
+
+```ts
+const r = await ix.upsert({ keys, texts, chunk: true });
+if (ix.compactionDue().due) for (let c = await ix.compact({ owner: state.id.toString() }); c.more && c.outcome !== "locked"; c = await ix.compact({ owner: state.id.toString() }));
+```
+
+Tombstone sets also wait for the lexical segments that predate them: run `compactSegments` (a full merge, or
+bounded runs) too, or the sets stay. The Python SDK does not compact.
 
 ## Automatic compaction
 

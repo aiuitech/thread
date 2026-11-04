@@ -357,6 +357,12 @@ await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk
 chunkText(longText, { words: 200, overlap: 20 });                       // [{ index, text, start, end, words }, ...], the same windows
 await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
 await index.compactSegments({ maxInputBytes: 4 << 20 });   // or merge one contiguous run that fits 4 MB (memory-limited writers)
+// dense compaction in this isolate: fold delta segments into slabs, split cells over maxCellEntries, drop tombstone sets
+if (index.compactionDue().due) {                            // no I/O: the open revision against manifest.compaction
+	let r;
+	do r = await index.compact({ maxBytes: 48 << 20 });      // { outcome, rev, cells, folded, splits, k, more, estimatedPeakBytes, ... }
+	while (r.more);
+}
 await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only generation (no dense index)
 // a dense generation from nothing, for an embedding model (one empty cell; grows by compaction and cell splits)
 await thread.createGeneration({ store, gen: "docs2", embedding: { provider: "openai", model: "text-embedding-3-small", dim: 1536 }, lex: { text: true } });
@@ -376,6 +382,25 @@ revision); the rule, the key scheme and the limits are in [docs/chunking.md](../
 with one empty cell for `embedding` (or a bare `dim`), `lex` (default `{}`; `null` for ids only), `attrs`, a
 `profile` (`edge` splits cells at 3000 entries, `local` at 1000), `defaults` and the automatic `compaction` policy;
 what that generation lacks compared with a k-means build is in [docs/embedding.md](../../docs/embedding.md).
+
+`index.compact(opts)` (also `compactDeltas(writerContext, opts)`) is the Worker's dense compaction in one isolate:
+one call folds a slice of delta segments (whole segments, oldest first) into new slab revisions, splits the
+rewritten cells over `maxCellEntries` (2-means; new fine means, `k2` + splits, the centroid tree rebuilt when the
+head has one) and drops the tombstone sets nothing references. A call is bounded by `maxBytes` (estimated peak
+memory, default 48 MiB; `r.estimatedPeakBytes` is the plan's figure), `cellsPerRun` (default the policy's, 256) and
+`deadlineMs` (default the policy's, 27 s: no cell starts after `deadline - 2.5 s`, 7 s with splits; the finished
+cells whose deltas are complete are committed, `outcome: "partial"`). `r.more` says whether another call has work;
+`r.outcome` is `committed`, `partial`, `noop`, `blocked` (a delta that alone does not fit the budgets; `r.note`),
+`locked` (another run holds `idx/{gen}/compact.lock`), `deadline` or `conflict` (another writer changed what the
+slice depends on; call again). Without `force` a head below every threshold is a `noop`, as in the Worker's
+automatic runs; `force: true` folds everything the budgets allow and also splits oversized cells. Other options:
+`concurrency` (cells in flight, default 4), `maxCellEntries`, `splitCellsPerRun`, `purge` (rewrite the cells that
+keep tombstone sets alive; default when the tombstone threshold is exceeded), `lock` (default true), `owner` (a
+stable lock owner, e.g. a Durable Object id, takes over its own lock after a crash at once instead of after 10
+minutes), `record` (append the run to `compact.last.json`, default true). The objects are the Worker's, byte for
+byte (`test/compact-worker.test.ts` compacts one index both ways), so the Worker and the SDK can compact one index;
+a run commits through the manifest create-only put and is safe to repeat after a crash. Details:
+[docs/update-path.md](../../docs/update-path.md#compaction-in-the-sdk).
 
 Implemented against [docs/update-path.md](../../docs/update-path.md): an upsert encodes one delta segment
 (`DeltaJob`: primary cell + residual codes, PQ codes with the generation's codebook) and, unless
@@ -527,6 +552,11 @@ directory or a bucket to write on top of it. Format and rationale: [docs/portabi
   lists before they are evicted. The wasm module is ~750 KB with the tokenizer, stemmer and lexical kernels.
 - Payloads: `returnPayload` reads them with one (multi-)range request per slab; keep payloads small or store
   them elsewhere keyed by id.
+- `index.compact()`: the planner keeps its estimate under `maxBytes` (48 MiB by default): the folded deltas held
+  for the run, the tombstone sets (x3), the slabs table (x2), the fine means of a split commit (x3), the largest
+  folded delta again (its copy in wasm) and, per cell in flight, about 4x its new slab (6x plus 4 B x entries x dim
+  of decoded vectors when it splits). Reads and writes go under the caches. The wasm memory keeps its high-water
+  mark afterwards, so run it in the isolate that writes (a Durable Object), not one that serves many queries.
 
 ## Vectorize mapping
 

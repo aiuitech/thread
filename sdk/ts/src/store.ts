@@ -106,6 +106,13 @@ export interface BlobStore {
 	put?(key: string, data: Uint8Array | string, opts?: PutOptions): Promise<BlobHead | null>;
 	/** Keys under `prefix`. Optional (used to find a generation's head revision and by writers). */
 	list?(prefix: string): Promise<string[]>;
+	/**
+	 * Objects under `prefix` with their size and upload time (ms since the epoch). Optional: GC needs it for its grace
+	 * period (an object younger than it may belong to a writer that has not committed yet).
+	 */
+	listObjects?(prefix: string): Promise<ObjectInfo[]>;
+	/** Deletes an object (a missing one is not an error). Optional: GC, and releasing `compact.lock`. */
+	delete?(key: string): Promise<void>;
 	/** Whether reads cross a network (`open` puts an in-process cache in front of remote stores outside Workers). */
 	readonly remote?: boolean;
 	/** Preferred reads in flight per query (a query's `inflight` default; 12 when absent). */
@@ -123,6 +130,14 @@ export interface BlobStore {
 	warmup?(n: number): Promise<void>;
 }
 
+/** One object of a `listObjects` listing. */
+export interface ObjectInfo {
+	key: string;
+	size: number;
+	/** Upload (last modification) time, ms since the epoch. */
+	uploaded: number;
+}
+
 export const rangeHeader = (ranges: BlobRange[]): string => "bytes=" + ranges.map((r) => `${r.offset}-${r.offset + r.length - 1}`).join(", ");
 
 const toView = (data: Uint8Array | string): Uint8Array | string => (typeof data === "string" ? data : new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
@@ -134,7 +149,8 @@ export interface R2BucketLike {
 	get(key: string, options?: { range?: BlobRange | { suffix: number } }): Promise<{ arrayBuffer(): Promise<ArrayBuffer>; etag: string; size: number } | null>;
 	head(key: string): Promise<{ etag: string; size: number } | null>;
 	put(key: string, value: ArrayBuffer | ArrayBufferView | string, options?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string }; httpMetadata?: { contentType?: string } }): Promise<{ etag: string; size: number } | null>;
-	list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{ objects: { key: string }[]; truncated: boolean; cursor?: string }>;
+	list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{ objects: { key: string; size?: number; uploaded?: Date }[]; truncated: boolean; cursor?: string }>;
+	delete?(keys: string | string[]): Promise<void>;
 }
 
 export class R2BlobStore implements BlobStore {
@@ -185,12 +201,33 @@ export class R2BlobStore implements BlobStore {
 		} while (cursor);
 		return out;
 	}
+
+	async listObjects(prefix: string): Promise<ObjectInfo[]> {
+		const out: ObjectInfo[] = [];
+		let cursor: string | undefined;
+		do {
+			const r = await this.bucket.list({ prefix, cursor, limit: 1000 });
+			for (const o of r.objects) {
+				if (!o.uploaded || o.size === undefined) throw new ThreadError("this R2 binding's list() gives no upload times", 400);
+				out.push({ key: o.key, size: o.size, uploaded: o.uploaded.getTime() });
+			}
+			cursor = r.truncated ? r.cursor : undefined;
+		} while (cursor);
+		return out;
+	}
+
+	async delete(key: string): Promise<void> {
+		if (!this.bucket.delete) throw new ThreadError("this R2 binding cannot delete", 400);
+		await this.bucket.delete(key);
+	}
 }
 
 // ---------- in-memory store (tests, tiny local indexes) ----------
 
 export class MemoryBlobStore implements BlobStore {
-	readonly objects = new Map<string, { bytes: Uint8Array; etag: string }>();
+	readonly objects = new Map<string, { bytes: Uint8Array; etag: string; uploaded?: number }>();
+	/** The clock upload times come from (tests move it to age objects). */
+	now: () => number = Date.now;
 	private seq = 0;
 
 	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
@@ -240,13 +277,24 @@ export class MemoryBlobStore implements BlobStore {
 		if (opts.ifAbsent && cur) return null;
 		if (opts.ifMatch !== undefined && cur?.etag !== opts.ifMatch) return null;
 		const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data.slice();
-		const o = { bytes, etag: `m${++this.seq}` };
+		const o = { bytes, etag: `m${++this.seq}`, uploaded: this.now() };
 		this.objects.set(key, o);
 		return { size: bytes.byteLength, etag: o.etag };
 	}
 
 	async list(prefix: string): Promise<string[]> {
 		return [...this.objects.keys()].filter((k) => k.startsWith(prefix)).sort();
+	}
+
+	async listObjects(prefix: string): Promise<ObjectInfo[]> {
+		return (await this.list(prefix)).map((key) => {
+			const o = this.objects.get(key)!;
+			return { key, size: o.bytes.byteLength, uploaded: o.uploaded ?? 0 };
+		});
+	}
+
+	async delete(key: string): Promise<void> {
+		this.objects.delete(key);
 	}
 }
 
@@ -256,6 +304,8 @@ export class MemoryBlobStore implements BlobStore {
 export interface CacheLike {
 	match(request: Request): Promise<Response | undefined>;
 	put(request: Request, response: Response): Promise<void>;
+	/** Optional: dropped entries of deleted objects (Workers' `Cache.delete`). */
+	delete?(request: Request): Promise<boolean>;
 }
 
 /**
@@ -298,6 +348,8 @@ export interface BlobCache {
 	holds?(key: string, range: BlobRange): boolean;
 	/** Drops the held prefixes `keep` rejects (a revision switch). */
 	retainPrefixes?(keep: (key: string) => boolean): void;
+	/** Drops an object (a store delete). Optional. */
+	delete?(key: string): void;
 }
 
 const ownBuffer = (b: Uint8Array): Uint8Array => (b.byteOffset === 0 && b.buffer.byteLength === b.byteLength ? b : b.slice());
@@ -366,6 +418,13 @@ export class MemoryCache implements BlobCache {
 			if (r.offset < 0 || r.length < 0 || r.offset + r.length > b.byteLength) throw new ThreadError(`cached ${key} is ${b.byteLength} bytes, need [${r.offset}, +${r.length})`);
 			return b.subarray(r.offset, r.offset + r.length);
 		});
+	}
+
+	delete(key: string): void {
+		const old = this.items.get(key);
+		if (old) this.held -= old.byteLength;
+		this.items.delete(key);
+		this.prefixes.delete(key);
 	}
 
 	async put(key: string, bytes: Uint8Array): Promise<void> {
@@ -822,6 +881,23 @@ export class CachedBlobStore implements BlobStore {
 		if (!this.inner.list) throw new ThreadError("the underlying store cannot list", 400);
 		return this.inner.list(prefix);
 	}
+
+	get listObjects(): BlobStore["listObjects"] {
+		const inner = this.inner;
+		return inner.listObjects ? (prefix) => inner.listObjects!(prefix) : undefined;
+	}
+
+	/** Deletes from the store and drops the cached copy (in-process; the Cache API entry when it can delete). */
+	get delete(): BlobStore["delete"] {
+		const inner = this.inner;
+		if (!inner.delete) return undefined;
+		return async (key) => {
+			await inner.delete!(key);
+			this.known.delete(key);
+			this.blobCache?.delete?.(this.scope + key);
+			if (this.cacheApi?.delete) await this.cacheApi.delete(this.request(key)).catch(() => false);
+		};
+	}
 }
 
 /** A store with every key prefixed (one bucket holding several indexes, e.g. `tenants/a/`). */
@@ -865,5 +941,13 @@ export class PrefixedBlobStore implements BlobStore {
 	async list(prefix: string) {
 		if (!this.inner.list) throw new ThreadError("the underlying store cannot list", 400);
 		return (await this.inner.list(this.prefix + prefix)).map((k) => k.slice(this.prefix.length));
+	}
+	get listObjects(): BlobStore["listObjects"] {
+		const inner = this.inner;
+		return inner.listObjects ? async (prefix) => (await inner.listObjects!(this.prefix + prefix)).map((o) => ({ ...o, key: o.key.slice(this.prefix.length) })) : undefined;
+	}
+	get delete(): BlobStore["delete"] {
+		const inner = this.inner;
+		return inner.delete ? (key) => inner.delete!(this.prefix + key) : undefined;
 	}
 }

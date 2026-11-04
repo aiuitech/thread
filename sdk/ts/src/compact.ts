@@ -1,0 +1,984 @@
+/**
+ * @experimental Dense compaction in one isolate: the SDK's port of the Worker's compaction (plan, cells, commit,
+ * `compact.lock`, docs/update-path.md "Compaction" / "Automatic compaction" / "Cell splitting"). One call folds a
+ * bounded slice of delta segments into new slab revisions, splits rewritten cells that pass `maxCellEntries`
+ * (2-means, new fine means, a rebuilt centroid tree) and drops the tombstone sets nothing references any more.
+ *
+ * The slice is bounded three ways: cells (`cellsPerRun`), time (`deadlineMs`; at the deadline the run commits the
+ * cells it finished whose deltas are complete, instead of throwing the work away) and memory (`maxBytes`: whole
+ * deltas, oldest first, while the estimated peak fits). The output is the Worker's, object for object: slab
+ * revisions `slab/{cell:05}.{baseRev + 1}`, `slabs.{rev}.json`, `fine.{rev}.f32` and `tree.{rev}.bin` after splits,
+ * and the same manifest fields, so the Worker and the SDK can compact one index (both take `compact.lock`).
+ */
+import { CachedBlobStore, type BlobStore } from "./store.js";
+import { WarmPrefixStore } from "./warm.js";
+import type * as W from "./wasm/thread.js";
+import { buildRoutingObjects } from "./routing.js";
+import { buildTombState, decodeJson, DELTA_ENTRY_BYTES, keys, manifestFiles, parseDeltaHeader, parseManifest, parseSlabsTable, ThreadError, tombFor, tombForDelta, type CompactionPolicy, type DeltaRef, type IndexFiles, type Manifest, type RoutingTables, type SlabRow, type TombRef, type TreeRef } from "./wire.js";
+import { commitRev, inherit, latestRev, putIfAbsent, putUnique, writable, type WriterContext } from "./write.js";
+
+// ---------- policy and pressure ----------
+
+/** Update pressure of a revision: what the compaction thresholds are compared with. */
+export interface CompactionPressure {
+	deltas: number;
+	deltaBytes: number;
+	deltaEntries: number;
+	/** Tombstone ids over all sets (with repeats). */
+	tombstones: number;
+	tombSets: number;
+}
+
+export function compactionPressure(m: Manifest): CompactionPressure {
+	const deltas = m.deltas ?? [];
+	const tombs = m.tombstones ?? [];
+	return {
+		deltas: deltas.length,
+		deltaBytes: deltas.reduce((a, d) => a + d.bytes, 0),
+		deltaEntries: deltas.reduce((a, d) => a + d.count, 0),
+		tombstones: tombs.reduce((a, t) => a + t.count, 0),
+		tombSets: tombs.length,
+	};
+}
+
+/** The thresholds of `manifest.compaction` a revision exceeds (empty: none, or no policy), worded as the Worker words them. */
+export function compactionExceeded(m: Manifest, policy: CompactionPolicy | undefined = m.compaction): string[] {
+	if (!policy) return [];
+	const p = compactionPressure(m);
+	const out: string[] = [];
+	if (p.deltas > policy.maxDeltas) out.push(`deltas ${p.deltas} > ${policy.maxDeltas}`);
+	if (p.deltaBytes > policy.maxDeltaBytes) out.push(`deltaBytes ${p.deltaBytes} > ${policy.maxDeltaBytes}`);
+	if (p.tombstones > policy.maxTombstones) out.push(`tombstones ${p.tombstones} > ${policy.maxTombstones}`);
+	return out;
+}
+
+/** Whether a revision is due for a dense compaction (`ix.compactionDue()`): no I/O, just the manifest. */
+export interface CompactionStatus {
+	/** A threshold is exceeded: `compact()` would do work. */
+	due: boolean;
+	reasons: string[];
+	pressure: CompactionPressure;
+	/** The policy compared with (`manifest.compaction`), or null when the generation has none (never due). */
+	policy: CompactionPolicy | null;
+}
+
+export function compactionStatus(m: Manifest): CompactionStatus {
+	const reasons = compactionExceeded(m);
+	return { due: reasons.length > 0, reasons, pressure: compactionPressure(m), policy: m.compaction ?? null };
+}
+
+// ---------- options and result ----------
+
+export interface CompactOptions {
+	/**
+	 * Run even when no threshold of `manifest.compaction` is exceeded (or the generation has no policy): fold every
+	 * delta the budgets allow and split oversized cells. Default false: like the Worker's automatic runs, a call on
+	 * a head below every threshold is a `noop`.
+	 */
+	force?: boolean;
+	/**
+	 * Estimated peak memory of the call (bytes, default 48 MiB): the folded deltas held for the run, the tombstone
+	 * sets, the fine means of a split, and the cells in flight (each about 4x its new slab, 6x plus its decoded
+	 * vectors when it splits). Deltas that would pass it wait for a later call. See `CompactResult.estimatedPeakBytes`.
+	 */
+	maxBytes?: number;
+	/** Cells one call may rewrite (default `compaction.cellsPerRun`, else 256). */
+	cellsPerRun?: number;
+	/**
+	 * Wall-clock budget of the call (ms, default `compaction.deadlineMs`, else 27,000). No cell starts after
+	 * `deadline - 2.5 s` (7 s with splits); the cells finished by then are committed when their deltas are complete
+	 * (`outcome: "partial"`), else nothing is (`"deadline"`).
+	 */
+	deadlineMs?: number;
+	/** Cells in flight at most (default 4; fewer when `maxBytes` does not hold more). */
+	concurrency?: number;
+	/** Split cap for this call (default `compaction.maxCellEntries`, else 0 = no splits). */
+	maxCellEntries?: number;
+	/** A slice of more cells than this defers its splits (default `compaction.splitCellsPerRun`, else 160). */
+	splitCellsPerRun?: number;
+	/**
+	 * Also rewrite the cells that keep tombstone sets alive (slabs written at a rev up to the newest set). Default:
+	 * when the tombstone threshold is exceeded, or with `force`.
+	 */
+	purge?: boolean;
+	/** Take `idx/{gen}/compact.lock` (default true; the Worker's automatic runs take it too). */
+	lock?: boolean;
+	/**
+	 * Lock owner (default a random id). A stable owner (a Durable Object's id) lets a call take over its own lock
+	 * left by a crashed run at once, instead of after the 10-minute staleness.
+	 */
+	owner?: string;
+	/** Append the run to `idx/{gen}/compact.last.json` (default true; what the Worker's `/index/status` shows). */
+	record?: boolean;
+}
+
+/** One executed split: entries before, and in the two halves. */
+export interface SplitDone {
+	cell: number;
+	newCell: number;
+	entries: number;
+	a: number;
+	b: number;
+}
+
+export interface CompactResult {
+	gen: string;
+	/**
+	 * `committed`: the slice is in a new revision. `partial`: the deadline cut the slice; the finished part is
+	 * committed. `noop`: nothing to do. `blocked`: work remains that these budgets cannot take (see `note`).
+	 * `locked`: another run holds `compact.lock`. `deadline`: the deadline passed before anything committable was
+	 * done. `conflict`: another writer changed what the slice depends on (a compaction, or a delta in a split cell).
+	 */
+	outcome: "committed" | "partial" | "noop" | "blocked" | "locked" | "deadline" | "conflict";
+	/** The head after the call (the new revision when one was committed). */
+	rev: number;
+	/** The revision the slice was planned on (null when the call did not plan). */
+	baseRev: number | null;
+	/** Cells rewritten in the committed revision (new cells of splits included). */
+	cells: number;
+	/** Delta segments folded into slabs (they left the manifest). */
+	folded: number;
+	/** Delta segments left in the head. */
+	remainingDeltas: number;
+	/** Deltas the slice could not take (cells or memory). */
+	skippedDeltas: number;
+	/** Cells rewritten only to let tombstone sets go. */
+	purgeCells: number;
+	splits: SplitDone[];
+	/** Cells over `maxCellEntries` whose split waits for a later call. */
+	splitsDeferred: number[];
+	/** Cells of the head after the call. */
+	k: number;
+	droppedTombstoneSets: number[];
+	readBytes: number;
+	writtenBytes: number;
+	/** The planner's estimate of this call's peak memory (bytes), at most `maxBytes` unless `outcome` is `blocked`. */
+	estimatedPeakBytes: number;
+	/** Cells that ran in parallel. */
+	concurrency: number;
+	/** Thresholds the base exceeded when the call started. */
+	reasons: string[];
+	/** Whether another call has work to do (a threshold is still exceeded, a split was deferred, the slice was cut). */
+	more: boolean;
+	conflicts: number;
+	currentUpdated: boolean;
+	staleLockTaken: boolean;
+	ms: number;
+	note?: string;
+}
+
+/** The wasm exports compaction uses (the SDK's bindings, or the Worker's own wasm-bindgen module). */
+export type CompactWasm = Pick<typeof W, "SlabJob" | "slab_info" | "slab_centroid" | "slab_to_records" | "delta_records_for_cell" | "split_slab" | "split_slab_records" | "build_centroid_tree" | "centroid_tree_info" | "routing_table_encode" | "grouped_table_encode" | "grouped_table_info">;
+
+export const COMPACT_DEFAULT_MAX_BYTES = 48 * 1024 * 1024;
+const DEFAULT_CELLS_PER_RUN = 256;
+const DEFAULT_DEADLINE_MS = 27_000;
+const DEFAULT_SPLIT_CELLS_PER_RUN = 160;
+const DEFAULT_CONCURRENCY = 4;
+/** Time kept for the commit when deciding whether to start another cell (more with splits: fine means + tree). */
+const COMMIT_RESERVE_MS = 2_500;
+const SPLIT_COMMIT_RESERVE_MS = 7_000;
+/** A compact.lock older than this is abandoned (the Worker's rule). */
+export const COMPACT_LOCK_STALE_MS = 10 * 60 * 1000;
+/** Peak memory of a cell in flight, in multiples of its new slab: old slab, records, the job's copy, the output. */
+const CELL_FACTOR = 4;
+/** A split also holds the merged slab and the re-encoded halves (and `split_slab`'s decoded vectors, counted apart). */
+const SPLIT_FACTOR = 6;
+
+// ---------- the lock ----------
+
+export const compactLockKey = (gen: string): string => `idx/${gen}/compact.lock`;
+export const compactLastKey = (gen: string): string => `idx/${gen}/compact.last.json`;
+
+interface CompactLock {
+	owner: string;
+	ms: number;
+	at: string;
+	trigger?: Record<string, unknown>;
+	released?: boolean;
+}
+
+/** This isolate's runs in progress (`{prefix}|{gen}`): a stable owner must not take over a lock it is still using. */
+const active = new Set<string>();
+
+async function readLock(store: BlobStore, gen: string): Promise<{ lock: CompactLock; etag: string } | null> {
+	const h = await store.head(compactLockKey(gen));
+	if (!h) return null;
+	const b = await store.get(compactLockKey(gen));
+	if (!b) return null;
+	try {
+		return { lock: decodeJson<CompactLock>(b), etag: h.etag };
+	} catch {
+		return { lock: { owner: "?", ms: 0, at: "" }, etag: h.etag };
+	}
+}
+
+/**
+ * Takes `compact.lock` with a create-only put; a lock older than 10 minutes (or released without a delete, or
+ * held by `owner` itself after a crash) is taken over with an etag compare-and-swap, so exactly one contender wins.
+ */
+async function acquireLock(store: BlobStore, gen: string, owner: string, trigger: Record<string, unknown>): Promise<{ acquired: boolean; stale: boolean; holder?: CompactLock }> {
+	const now = Date.now();
+	const body = JSON.stringify({ owner, ms: now, at: new Date(now).toISOString(), trigger } satisfies CompactLock);
+	for (let attempt = 0; attempt < 2; attempt++) {
+		if (await putIfAbsent(store, compactLockKey(gen), body, "application/json")) return { acquired: true, stale: false };
+		const cur = await readLock(store, gen);
+		if (!cur) continue;
+		const takeover = cur.lock.released === true || cur.lock.owner === owner || now - cur.lock.ms >= COMPACT_LOCK_STALE_MS;
+		if (!takeover) return { acquired: false, stale: false, holder: cur.lock };
+		const ok = await writable(store).put(compactLockKey(gen), body, { ifMatch: cur.etag, contentType: "application/json" });
+		return { acquired: ok !== null, stale: true, holder: cur.lock };
+	}
+	return { acquired: false, stale: false };
+}
+
+/** Deletes the lock if it is still ours; a store without `delete` marks it released (the Worker then sees it as stale). */
+async function releaseLock(store: BlobStore, gen: string, owner: string): Promise<void> {
+	const cur = await readLock(store, gen);
+	if (cur?.lock.owner !== owner || cur.lock.released) return;
+	if (store.delete) await store.delete(compactLockKey(gen));
+	else await writable(store).put(compactLockKey(gen), JSON.stringify({ owner, ms: 0, at: new Date().toISOString(), released: true } satisfies CompactLock), { ifMatch: cur.etag, contentType: "application/json" });
+}
+
+async function recordRun(store: BlobStore, gen: string, run: Record<string, unknown>): Promise<void> {
+	const b = await store.get(compactLastKey(gen));
+	let prev: { recent?: unknown[] } | null = null;
+	try {
+		prev = b ? decodeJson<{ recent?: unknown[] }>(b) : null;
+	} catch {
+		prev = null;
+	}
+	const recent = [run, ...(prev?.recent ?? [])].slice(0, 21);
+	await writable(store).put(compactLastKey(gen), JSON.stringify({ last: run, recent }), { contentType: "application/json" });
+}
+
+// ---------- inputs ----------
+
+/** The store under the caches (compaction reads and writes whole slabs: none of them belongs in a cache). */
+export function uncachedStore(store: BlobStore): BlobStore {
+	let s = store;
+	while (s instanceof CachedBlobStore || s instanceof WarmPrefixStore) s = s.inner;
+	return s;
+}
+
+/** The whole key prefix under the caches (`PrefixedBlobStore` chain), for the in-process run guard. */
+function prefixOf(store: BlobStore): string {
+	const p = store as { inner?: BlobStore; prefix?: string };
+	return p.inner && typeof p.prefix === "string" ? prefixOf(p.inner) + p.prefix : "";
+}
+
+interface DeltaCells {
+	ref: DeltaRef;
+	/** Entries per cell (> 0). */
+	counts: Map<number, number>;
+}
+
+/** Entries per cell of a delta segment from its entry table only (two small range reads, not the segment). */
+async function readDeltaCells(store: BlobStore, ref: DeltaRef): Promise<DeltaCells> {
+	const hb = await store.get(ref.key, { offset: 0, length: 64 });
+	if (!hb) throw new ThreadError(`missing ${ref.key}`, 404);
+	const h = parseDeltaHeader(hb);
+	const counts = new Map<number, number>();
+	if (h.count > 0) {
+		const t = await store.get(ref.key, { offset: h.entriesOff, length: h.count * DELTA_ENTRY_BYTES });
+		if (!t) throw new ThreadError(`missing ${ref.key}`, 404);
+		const dv = new DataView(t.buffer, t.byteOffset, t.byteLength);
+		for (let i = 0; i < h.count; i++) {
+			const cell = dv.getUint32(i * DELTA_ENTRY_BYTES + 4, true);
+			counts.set(cell, (counts.get(cell) ?? 0) + 1);
+		}
+	}
+	return { ref, counts };
+}
+
+async function getOrThrow(store: BlobStore, key: string): Promise<Uint8Array> {
+	const b = await store.get(key);
+	if (!b) throw new ThreadError(`missing ${key}`, 404);
+	return b;
+}
+
+const slabRevOf = (row: SlabRow | undefined): number => (row && row.length > 4 ? (row[4] as number) : 0);
+
+/**
+ * Whether a tombstone set can leave the manifest (the Worker's `tombDroppable`): no remaining delta or lexical/docs
+ * segment predates it, no slab written at a rev in (0, set.rev] remains, and none of its ids is a build id.
+ */
+export function tombDroppable(t: { rev: number; ids: Uint32Array }, deltas: { addedRev: number }[], slabs: SlabRow[], baseIds: number, segments: { addedRev: number }[] = []): boolean {
+	if (deltas.some((d) => d.addedRev < t.rev)) return false;
+	if (segments.some((s) => s.addedRev < t.rev)) return false;
+	if (slabs.some((row) => slabRevOf(row) > 0 && slabRevOf(row) <= t.rev)) return false;
+	for (const id of t.ids) if (id < baseIds) return false;
+	return true;
+}
+
+// ---------- plan ----------
+
+interface Plan {
+	cells: number[];
+	folded: DeltaRef[];
+	skipped: DeltaRef[];
+	purgeCells: number;
+	/** [cell, newCell], new cells numbered k, k + 1, ... in cell order. */
+	splits: [number, number][];
+	splitsDeferred: number[];
+	/**
+	 * Split cells that keep their mean (an unfolded delta has entries in them, encoded against it): the new cell
+	 * takes the 2-means centre farther from it and the entries nearer that centre.
+	 */
+	pinned: Set<number>;
+	/** Oversized cells that cannot split (a two-level generation, k1 > 1). */
+	splitBlocked: number[];
+	concurrency: number;
+	estimatedPeakBytes: number;
+	/** The cells each folded delta has entries in. */
+	deltaCells: Map<string, number[]>;
+	note?: string;
+}
+
+interface Base {
+	gen: string;
+	baseRev: number;
+	manifest: Manifest;
+	files: IndexFiles;
+	slabs: SlabRow[];
+	slabsBytes: number;
+	tombs: { rev: number; key: string; ids: Uint32Array }[];
+	dcells: DeltaCells[];
+}
+
+/**
+ * The slice: whole deltas, oldest first, while their cells fit in `cellsPerRun` and the estimated peak fits in
+ * `maxBytes`; then (purge) the cells that keep tombstone sets alive and (force) oversized cells, while the budgets
+ * allow; then the splits of the rewritten cells over the cap.
+ */
+function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurrency: number; cap: number; splitCellsPerRun: number; purge: boolean; force: boolean }): Plan {
+	const m = b.manifest;
+	const dim = m.dim;
+	const k = m.k1 * m.k2;
+	const tombIds = b.tombs.reduce((a, t) => a + t.ids.length, 0);
+	// Held for the whole run: tombstone sets (and their unions), the slabs table (and the new one), the fine means
+	// of a split commit (old, new, and the tree build's copy).
+	const fixed = tombIds * 4 * 3 + b.slabsBytes * 2 + (o.cap > 0 && m.k1 === 1 ? k * dim * 4 * 3 : 0);
+	const est = new Map<number, { bytes: number; entries: number }>();
+	const cellOf = (c: number) => est.get(c) ?? { bytes: b.slabs[c]?.[3] ?? 0, entries: b.slabs[c]?.[2] ?? 0 };
+	const peak = (e: { bytes: number; entries: number }) => {
+		const split = o.cap > 0 && e.entries > o.cap;
+		return split ? SPLIT_FACTOR * e.bytes + e.entries * dim * 4 : CELL_FACTOR * e.bytes;
+	};
+	let held = 0;
+	let maxDelta = 0;
+	let maxPeak = 0;
+	const need = (h: number, md: number, mp: number) => fixed + h + md + mp;
+	const folded: DeltaRef[] = [];
+	const skipped: DeltaRef[] = [];
+	const deltaCells = new Map<string, number[]>();
+	const order = [...b.dcells].sort((x, y) => x.ref.addedRev - y.ref.addedRev || x.ref.seq - y.ref.seq);
+	for (const d of order) {
+		const own = [...d.counts.keys()];
+		const add = own.filter((c) => !est.has(c));
+		if (est.size + add.length > o.cellsPerRun) {
+			skipped.push(d.ref);
+			continue;
+		}
+		const per = d.ref.bytes / Math.max(1, d.ref.count);
+		const next = new Map<number, { bytes: number; entries: number }>();
+		let mp = maxPeak;
+		for (const c of own) {
+			const e = cellOf(c);
+			const n = d.counts.get(c)!;
+			const ne = { bytes: e.bytes + n * per, entries: e.entries + n };
+			next.set(c, ne);
+			mp = Math.max(mp, peak(ne));
+		}
+		if (need(held + d.ref.bytes, Math.max(maxDelta, d.ref.bytes), mp) > o.maxBytes) {
+			skipped.push(d.ref);
+			continue;
+		}
+		for (const [c, e] of next) est.set(c, e);
+		held += d.ref.bytes;
+		maxDelta = Math.max(maxDelta, d.ref.bytes);
+		maxPeak = mp;
+		folded.push(d.ref);
+		deltaCells.set(d.ref.key, own);
+	}
+	// Extra cells without deltas: the ones that keep tombstone sets alive, oldest slab revision first, then (force)
+	// the cells over the cap, largest first.
+	const extra = (cells: number[]): number => {
+		let n = 0;
+		for (const c of cells) {
+			if (est.has(c) || est.size >= o.cellsPerRun) continue;
+			const e = cellOf(c);
+			const mp = Math.max(maxPeak, peak(e));
+			if (need(held, maxDelta, mp) > o.maxBytes) continue;
+			est.set(c, e);
+			maxPeak = mp;
+			n++;
+		}
+		return n;
+	};
+	let purgeCells = 0;
+	if (o.purge && b.tombs.length) {
+		const purgeable = b.tombs.filter((t) => !t.ids.some((id) => id < m.vectors));
+		const maxRev = purgeable.reduce((a, t) => Math.max(a, t.rev), 0);
+		const blockers = b.slabs
+			.map((row, cell) => ({ cell, r: slabRevOf(row) }))
+			.filter(({ r }) => r > 0 && r <= maxRev)
+			.sort((x, y) => x.r - y.r || x.cell - y.cell)
+			.map((x) => x.cell);
+		purgeCells = extra(blockers);
+	}
+	if (o.force && o.cap > 0 && m.k1 === 1) {
+		const unfolded = new Set(b.dcells.filter((d) => !deltaCells.has(d.ref.key)).flatMap((d) => [...d.counts.keys()]));
+		const over = b.slabs
+			.map((row, cell) => ({ cell, n: row[2] }))
+			.filter(({ cell, n }) => n > o.cap && !unfolded.has(cell))
+			.sort((x, y) => y.n - x.n || x.cell - y.cell)
+			.map((x) => x.cell);
+		extra(over);
+	}
+	const cells = [...est.keys()].sort((x, y) => x - y);
+	// Splits (the Worker's planSplits), except that a cell an unfolded delta has entries in still splits, with its
+	// mean pinned (those entries were encoded against it); the Worker leaves such a cell unsplit. Without that, a
+	// backlog larger than the budget would keep a cell from ever splitting. No splits in a two-level generation.
+	const splits: [number, number][] = [];
+	const pinned = new Set<number>();
+	const candidates: number[] = [];
+	const splitBlocked: number[] = [];
+	if (o.cap > 0) {
+		const foldedKeys = new Set(folded.map((d) => d.key));
+		let next = k;
+		for (const cell of cells) {
+			if (est.get(cell)!.entries <= o.cap) continue;
+			if (m.k1 !== 1) {
+				splitBlocked.push(cell);
+				continue;
+			}
+			if (b.dcells.some((d) => !foldedKeys.has(d.ref.key) && d.counts.has(cell))) pinned.add(cell);
+			splits.push([cell, next++]);
+			candidates.push(cell);
+		}
+	}
+	const deferred = splits.length && cells.length > o.splitCellsPerRun ? candidates : [];
+	const free = o.maxBytes - need(held, maxDelta, 0);
+	const concurrency = cells.length ? Math.max(1, Math.min(o.concurrency, cells.length, maxPeak > 0 ? Math.floor(free / maxPeak) : o.concurrency)) : 0;
+	const plan: Plan = { cells, folded, skipped, purgeCells, splits: deferred.length ? [] : splits, pinned: deferred.length ? new Set() : pinned, splitsDeferred: deferred, splitBlocked, concurrency, estimatedPeakBytes: need(held, maxDelta, concurrency * maxPeak), deltaCells };
+	if (!cells.length && skipped.length) {
+		const d = skipped[0];
+		plan.note = `delta ${d.key} (${d.count} entries, ${d.bytes} bytes in ${b.dcells.find((x) => x.ref.key === d.key)?.counts.size ?? "?"} cells) does not fit cellsPerRun ${o.cellsPerRun} / maxBytes ${o.maxBytes}: raise them, or compact with the Worker (bench/compact.mjs)`;
+	}
+	return plan;
+}
+
+// ---------- the call ----------
+
+/**
+ * One bounded dense compaction of the generation's head (see the module comment and `CompactOptions`). Safe to call
+ * again at any time, also after a crash: a run commits through the manifest create-only put, so it either lands as
+ * one new revision or not at all; the slab objects it writes are keyed by the base revision and written
+ * create-only, so a rerun on the same base reuses identical bytes and never overwrites an object a revision lists.
+ */
+export async function compactDeltas(ctx: WriterContext, opts: CompactOptions = {}): Promise<CompactResult> {
+	const t0 = Date.now();
+	const { gen } = ctx;
+	const w = ctx.w as CompactWasm;
+	writable(ctx.store);
+	// Everything below reads and writes under the caches: whole slabs and deltas would only fill them.
+	const store = uncachedStore(ctx.store);
+	const rctx: WriterContext = { ...ctx, store };
+	const owner = opts.owner ?? crypto.randomUUID();
+	const guard = `${prefixOf(store)}|${gen}`;
+	const result: CompactResult = { gen, outcome: "noop", rev: -1, baseRev: null, cells: 0, folded: 0, remainingDeltas: 0, skippedDeltas: 0, purgeCells: 0, splits: [], splitsDeferred: [], k: 0, droppedTombstoneSets: [], readBytes: 0, writtenBytes: 0, estimatedPeakBytes: 0, concurrency: 0, reasons: [], more: false, conflicts: 0, currentUpdated: false, staleLockTaken: false, ms: 0 };
+	const finish = () => ((result.ms = Date.now() - t0), result);
+	if (active.has(guard)) {
+		result.outcome = "locked";
+		result.more = true;
+		result.note = "a compaction of this generation started by this isolate is in progress";
+		result.rev = await latestRev(store, gen);
+		return finish();
+	}
+	active.add(guard);
+	let locked = false;
+	try {
+		const headRev = await latestRev(store, gen);
+		const headM = parseManifest(await getOrThrow(store, keys.manifest(gen, headRev)), gen, headRev);
+		result.rev = headRev;
+		result.k = headM.k1 * headM.k2;
+		result.reasons = compactionExceeded(headM);
+		result.remainingDeltas = headM.deltas?.length ?? 0;
+		if (!opts.force && !result.reasons.length) {
+			result.note = headM.compaction ? `head rev ${headRev} is below every threshold` : `head rev ${headRev} has no compaction policy (pass force)`;
+			return finish();
+		}
+		if (opts.lock !== false) {
+			const trigger = { rev: headRev, op: "sdk-compact", reasons: result.reasons, pressure: compactionPressure(headM), ms: t0 };
+			const l = await acquireLock(store, gen, owner, trigger);
+			result.staleLockTaken = l.stale;
+			if (!l.acquired) {
+				result.outcome = "locked";
+				result.more = true;
+				result.note = `compact.lock held by ${l.holder?.owner ?? "?"} since ${l.holder?.at ?? "?"}`;
+				return finish();
+			}
+			locked = true;
+		}
+		let run: Record<string, unknown>;
+		try {
+			run = await ctx.thread.withRecovery("compact", () => runCompaction(rctx, w, opts, result, t0));
+		} catch (e) {
+			const conflict = e instanceof ThreadError && e.status === 409;
+			run = { trigger: { rev: headRev, op: "sdk-compact", reasons: result.reasons }, outcome: conflict ? "conflict" : "error", ms: Date.now() - t0, baseRev: result.baseRev, error: e instanceof Error ? e.message : String(e) };
+			if (!conflict) throw e;
+			result.outcome = "conflict";
+			result.more = true;
+			result.note = e instanceof Error ? e.message : String(e);
+		} finally {
+			if (opts.record !== false) await recordRun(store, gen, { owner, writer: "thread-sdk", startedAt: new Date(t0).toISOString(), finishedAt: new Date().toISOString(), ...run! }).catch((e) => console.error(`thread-sdk: compact ${gen}: recording the run failed: ${String(e)}`));
+		}
+		return finish();
+	} finally {
+		active.delete(guard);
+		if (locked) await releaseLock(store, gen, owner).catch((e) => console.error(`thread-sdk: compact ${gen}: releasing the lock failed: ${String(e)}`));
+	}
+}
+
+/** Plan, cells and commit on the head (inside the lock). Fills `result`; returns what `compact.last.json` records. */
+async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOptions, result: CompactResult, t0: number): Promise<Record<string, unknown>> {
+	const { store, gen, thread } = ctx;
+	const epoch = thread.epoch;
+	const free = (o: { free(): void }) => {
+		if (epoch === thread.epoch)
+			try {
+				o.free();
+			} catch {
+				/* poisoned instance */
+			}
+	};
+	// ---- base ---- (a retry after a wasm trap starts over)
+	Object.assign(result, { readBytes: 0, writtenBytes: 0, splits: [], cells: 0, folded: 0, droppedTombstoneSets: [] });
+	const baseRev = await latestRev(store, gen);
+	const manifest = parseManifest(await getOrThrow(store, keys.manifest(gen, baseRev)), gen, baseRev);
+	const files = manifestFiles(manifest);
+	const policy = manifest.compaction;
+	result.baseRev = baseRev;
+	result.rev = baseRev;
+	result.k = manifest.k1 * manifest.k2;
+	result.reasons = compactionExceeded(manifest);
+	result.remainingDeltas = manifest.deltas?.length ?? 0;
+	const record = (extra: Record<string, unknown> = {}) => ({ trigger: { rev: baseRev, op: "sdk-compact", reasons: result.reasons }, outcome: result.outcome, ms: Date.now() - t0, baseRev, rev: result.rev, cells: result.cells, folded: result.folded, purgeCells: result.purgeCells, skippedDeltas: result.skippedDeltas, splits: result.splits, splitsDeferred: result.splitsDeferred, k: result.k, remainingDeltas: result.remainingDeltas, droppedTombstoneSets: result.droppedTombstoneSets.length, readMB: +(result.readBytes / 1e6).toFixed(1), writtenMB: +(result.writtenBytes / 1e6).toFixed(1), slots: 1, estimatedPeakMB: +(result.estimatedPeakBytes / 1e6).toFixed(1), ...(result.note ? { note: result.note } : {}), ...extra });
+	if (!opts.force && !result.reasons.length) {
+		result.outcome = "noop";
+		result.note = `head rev ${baseRev} is below every threshold`;
+		return record();
+	}
+	if (!(manifest.k2 > 0 && manifest.dim > 0)) {
+		result.outcome = "noop";
+		result.note = "this generation has no dense index";
+		return record();
+	}
+	if (!files.slabs) throw new ThreadError(`${gen} has no slabs table`, 400);
+	if ((manifest.format ?? 1) < 2) throw new ThreadError("compaction needs a format 2 or 3 generation", 400);
+	const k = manifest.k1 * manifest.k2;
+	const dim = manifest.dim;
+	const format = manifest.format ?? 1;
+	const slabRev = baseRev + 1;
+	const slabsBytes = await getOrThrow(store, files.slabs);
+	const slabs = parseSlabsTable(slabsBytes, k, files.slabs);
+	const tombs = await Promise.all((manifest.tombstones ?? []).map(async (t) => ({ rev: t.rev, key: t.key, ids: u32View(await getOrThrow(store, t.key)) })));
+	const dcells = await mapLimit(manifest.deltas ?? [], 6, (d) => readDeltaCells(store, d));
+	const maxBytes = opts.maxBytes ?? COMPACT_DEFAULT_MAX_BYTES;
+	if (!(maxBytes > 0)) throw new ThreadError("maxBytes must be positive", 400);
+	const cap = opts.maxCellEntries ?? policy?.maxCellEntries ?? 0;
+	if (!Number.isInteger(cap) || cap < 0 || cap === 1) throw new ThreadError("maxCellEntries must be 0 (no splits) or an integer >= 2", 400);
+	const tombThreshold = result.reasons.some((r) => r.startsWith("tombstones"));
+	const plan = planSlice(
+		{ gen, baseRev, manifest, files, slabs, slabsBytes: slabsBytes.byteLength, tombs, dcells },
+		{
+			cellsPerRun: opts.cellsPerRun ?? policy?.cellsPerRun ?? DEFAULT_CELLS_PER_RUN,
+			maxBytes,
+			concurrency: Math.max(1, opts.concurrency ?? DEFAULT_CONCURRENCY),
+			cap,
+			splitCellsPerRun: opts.splitCellsPerRun ?? policy?.splitCellsPerRun ?? DEFAULT_SPLIT_CELLS_PER_RUN,
+			purge: opts.purge ?? (tombThreshold || opts.force === true),
+			force: opts.force === true,
+		},
+	);
+	Object.assign(result, { skippedDeltas: plan.skipped.length, purgeCells: plan.purgeCells, splitsDeferred: plan.splitsDeferred, estimatedPeakBytes: plan.estimatedPeakBytes, concurrency: plan.concurrency });
+	if (!plan.cells.length) {
+		result.outcome = plan.skipped.length ? "blocked" : "noop";
+		result.note = plan.note ?? (tombs.length ? "nothing to rewrite (tombstone sets held by build ids, lexical segments or no blocking slabs)" : "nothing to rewrite");
+		// Tombstone sets may still be droppable without rewriting anything (e.g. after a segment compaction).
+		if (!plan.skipped.length && tombs.some((t) => tombDroppable(t, manifest.deltas ?? [], slabs, manifest.vectors, manifest.segments ?? []))) {
+			await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombs, slabRev, rows: [], folded: [], splits: [], means: new Map(), deltaCells: plan.deltaCells, cap, pinned: new Set() }, result);
+			result.outcome = "committed";
+			result.note = "dropped tombstone sets nothing references";
+		}
+		result.more = false;
+		return record();
+	}
+
+	// ---- cells ----
+	const deadline = t0 + (opts.deadlineMs ?? policy?.deadlineMs ?? DEFAULT_DEADLINE_MS);
+	const cellDeadline = deadline - (plan.splits.length ? SPLIT_COMMIT_RESERVE_MS : COMMIT_RESERVE_MS);
+	const splitOf = new Map(plan.splits);
+	const codebook = plan.splits.length && format === 3 ? await getOrThrow(store, files.pq!) : new Uint8Array(0);
+	// The folded deltas, in manifest order (the order the Worker adds their records in: same bytes).
+	const foldedKeys = new Set(plan.folded.map((d) => d.key));
+	const foldedRefs = (manifest.deltas ?? []).filter((d) => foldedKeys.has(d.key));
+	const deltaBytes = new Map<string, Uint8Array>();
+	await mapLimit(foldedRefs, 6, async (d) => {
+		const b = await getOrThrow(store, d.key);
+		deltaBytes.set(d.key, b);
+		result.readBytes += b.byteLength;
+	});
+	const ts = buildTombState(tombs.map((t) => ({ rev: t.rev, ids: t.ids })));
+	const cellDeltas = new Map<number, DeltaRef[]>();
+	for (const d of foldedRefs) for (const c of plan.deltaCells.get(d.key)!) (cellDeltas.get(c) ?? cellDeltas.set(c, []).get(c)!).push(d);
+	const rows = new Map<number, SlabRow>();
+	const means = new Map<number, Float32Array>();
+	const done = new Set<number>();
+	const splitsDone: SplitDone[] = [];
+	let stopped = false;
+	const writeSlab = async (cell: number, mean: Float32Array, records: Uint8Array[]): Promise<number> => {
+		const job = new w.SlabJob(dim, cell, mean, format);
+		let out: Uint8Array;
+		let n: number;
+		let finished = false;
+		try {
+			for (const r of records) job.add_records(r);
+			n = job.len();
+			finished = true;
+			out = job.finish();
+		} finally {
+			if (!finished) free(job);
+		}
+		const oi = w.slab_info(out);
+		await putSlab(store, gen, baseRev, files, keys.slab(gen, cell, slabRev), out);
+		result.writtenBytes += out.byteLength;
+		rows.set(cell, [oi[5], oi[6], n, out.byteLength, slabRev]);
+		return n;
+	};
+	const doCell = async (cell: number) => {
+		const row = slabs[cell];
+		const oldRev = slabRevOf(row);
+		if (oldRev >= slabRev) throw new ThreadError(`cell ${cell} already has slabRev ${oldRev} >= ${slabRev}`, 409);
+		const oldKey = keys.slab(gen, cell, oldRev);
+		let old: Uint8Array | null = await getOrThrow(store, oldKey);
+		result.readBytes += old.byteLength;
+		const info = w.slab_info(old);
+		if (info[2] !== cell) throw new ThreadError(`slab ${oldKey} is for cell ${info[2]}`, 500);
+		const mean = w.slab_centroid(old);
+		const records = [w.slab_to_records(old, tombFor(ts, oldRev))];
+		old = null;
+		for (const d of cellDeltas.get(cell) ?? []) records.push(w.delta_records_for_cell(deltaBytes.get(d.key)!, cell, tombForDelta(ts, d.addedRev)));
+		const newCell = splitOf.get(cell);
+		if (newCell === undefined) {
+			await writeSlab(cell, mean, records);
+			return;
+		}
+		// Split: the merged cell -> 2-means over its decoded entries -> every entry re-encoded against the nearer
+		// new mean; the cell keeps mean A, the new cell gets mean B (the Worker's compactCells).
+		const job = new w.SlabJob(dim, cell, mean, format);
+		let merged: Uint8Array;
+		let n: number;
+		let finished = false;
+		try {
+			for (const r of records) job.add_records(r);
+			n = job.len();
+			finished = true;
+			merged = job.finish();
+		} finally {
+			if (!finished) free(job);
+		}
+		records.length = 0;
+		let means2: Float32Array;
+		if (n >= 2) means2 = w.split_slab(merged, new Float32Array(0), cell + 1);
+		else {
+			means2 = new Float32Array(2 * dim);
+			means2.set(mean);
+			means2.set(mean, dim);
+		}
+		if (plan.pinned.has(cell)) {
+			// The cell keeps its mean; the new cell takes the centre farther from it.
+			const dotMean = (o: number) => {
+				let d = 0;
+				for (let i = 0; i < dim; i++) d += means2[o + i] * mean[i];
+				return d;
+			};
+			const far = dotMean(0) < dotMean(dim) ? means2.slice(0, dim) : means2.slice(dim);
+			means2 = new Float32Array(2 * dim);
+			means2.set(mean);
+			means2.set(far, dim);
+		}
+		const packed = w.split_slab_records(merged, new Uint8Array(0), means2, codebook);
+		const la = new DataView(packed.buffer, packed.byteOffset, 4).getUint32(0, true);
+		const meanA = means2.slice(0, dim);
+		const meanB = means2.slice(dim);
+		const a = await writeSlab(cell, meanA, [packed.subarray(4, 4 + la)]);
+		const bn = await writeSlab(newCell, meanB, [packed.subarray(4 + la)]);
+		means.set(cell, meanA);
+		means.set(newCell, meanB);
+		splitsDone.push({ cell, newCell, entries: n, a, b: bn });
+	};
+	// Split cells first (their new cells are numbered in order, so a cut keeps a prefix of them), then the cells of
+	// each delta, oldest delta first (a cut then completes as many deltas as it can), then the extra cells.
+	const ordered: number[] = [];
+	const seen = new Set<number>();
+	const push = (c: number) => {
+		if (!seen.has(c)) {
+			seen.add(c);
+			ordered.push(c);
+		}
+	};
+	for (const [c] of plan.splits) push(c);
+	for (const d of [...foldedRefs].sort((x, y) => x.addedRev - y.addedRev || x.seq - y.seq)) for (const c of plan.deltaCells.get(d.key)!) push(c);
+	for (const c of plan.cells) push(c);
+	let next = 0;
+	await Promise.all(
+		Array.from({ length: plan.concurrency }, async () => {
+			while (next < ordered.length && !stopped) {
+				if (Date.now() > cellDeadline) {
+					stopped = true;
+					break;
+				}
+				const cell = ordered[next++];
+				await doCell(cell);
+				done.add(cell);
+			}
+		}),
+	);
+	deltaBytes.clear();
+
+	// ---- what can be committed ----
+	let commitCells = new Set(done);
+	let prefix = plan.splits.length;
+	let commitFolded = foldedRefs;
+	if (stopped) {
+		// A split counts only with every split before it (new cells are numbered in order); a delta only when every
+		// cell it has entries in is committed; a cell only when every folded delta in it is (else its new slab would
+		// hold entries the delta still serves). Iterate to the fixpoint.
+		prefix = 0;
+		while (prefix < plan.splits.length && done.has(plan.splits[prefix][0])) prefix++;
+		for (const [c] of plan.splits.slice(prefix)) commitCells.delete(c);
+		for (;;) {
+			commitFolded = foldedRefs.filter((d) => plan.deltaCells.get(d.key)!.every((c) => commitCells.has(c)));
+			const fk = new Set(commitFolded.map((d) => d.key));
+			const cc = new Set([...commitCells].filter((c) => (cellDeltas.get(c) ?? []).every((d) => fk.has(d.key))));
+			let p = 0;
+			while (p < prefix && cc.has(plan.splits[p][0])) p++;
+			for (const [c] of plan.splits.slice(p, prefix)) cc.delete(c);
+			prefix = p;
+			if (cc.size === commitCells.size) break;
+			commitCells = cc;
+		}
+		if (!commitCells.size) {
+			result.outcome = "deadline";
+			result.more = true;
+			result.note = `deadline: ${done.size} of ${plan.cells.length} cells done, none committable`;
+			return record();
+		}
+	}
+	const commitSplits = plan.splits.slice(0, prefix);
+	const commitRows: [number, SlabRow][] = [];
+	for (const c of [...commitCells].sort((x, y) => x - y)) {
+		commitRows.push([c, rows.get(c)!]);
+		const nc = commitSplits.find(([x]) => x === c)?.[1];
+		if (nc !== undefined) commitRows.push([nc, rows.get(nc)!]);
+	}
+	commitRows.sort((x, y) => x[0] - y[0]);
+	const head = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombs, slabRev, rows: commitRows, folded: commitFolded, splits: commitSplits, means, deltaCells: plan.deltaCells, cap, pinned: plan.pinned }, result);
+	result.splits = splitsDone.filter((s) => commitSplits.some(([c]) => c === s.cell)).sort((x, y) => x.cell - y.cell);
+	result.outcome = stopped ? "partial" : "committed";
+	// More splitting only helps while splits move entries (a split with an empty half would repeat forever).
+	const moved = result.splits.some((x) => x.a > 0 && x.b > 0);
+	result.more = stopped || moreWork(head.manifest, opts.force === true, moved && head.oversized > 0) || result.splitsDeferred.length > 0;
+	return record();
+}
+
+interface Slice {
+	baseRev: number;
+	manifest: Manifest;
+	files: IndexFiles;
+	slabs: SlabRow[];
+	k: number;
+	dim: number;
+	tombs: { rev: number; key: string; ids: Uint32Array }[];
+	slabRev: number;
+	rows: [number, SlabRow][];
+	folded: DeltaRef[];
+	splits: [number, number][];
+	/** Means of the rewritten cells (split cells: the new means). */
+	means: Map<number, Float32Array>;
+	deltaCells: Map<string, number[]>;
+	/** The split cap (counts the cells still over it). */
+	cap: number;
+	/** Split cells that kept their mean. */
+	pinned: Set<number>;
+}
+
+/**
+ * Whether another call has work: with `force`, deltas remain, or this call split cells and others are still over the
+ * cap; else a threshold is still exceeded.
+ */
+function moreWork(m: Manifest, force: boolean, splitMore: boolean): boolean {
+	if (!force) return compactionExceeded(m).length > 0;
+	return (m.deltas?.length ?? 0) > 0 || splitMore;
+}
+
+/** The Worker's compactCommit on the head (which may be newer than the base): rows, folded deltas, splits, tombstones. */
+async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result: CompactResult): Promise<{ manifest: Manifest; oversized: number }> {
+	const { store, gen } = ctx;
+	const folded = new Set(s.folded.map((d) => d.key));
+	// Cells whose mean changes (a pinned split keeps it): no delta that stays may have entries in them.
+	const splitCells = new Set(s.splits.map(([c]) => c).filter((c) => !s.pinned.has(c)));
+	const rowCells = new Set(s.rows.map(([c]) => c));
+	s.splits.forEach(([cell, newCell], i) => {
+		if (newCell !== s.k + i || !rowCells.has(cell) || !rowCells.has(newCell)) throw new ThreadError(`split ${i} of cell ${cell} -> ${newCell} is inconsistent`, 500);
+	});
+	for (const d of s.folded) for (const c of s.deltaCells.get(d.key)!) if (!rowCells.has(c)) throw new ThreadError(`folded delta ${d.key} has entries in cell ${c}, which is not among the rewritten rows`, 500);
+	const cellsMemo = new Map<string, Promise<DeltaCells>>();
+	const cellsOf = (d: DeltaRef) => {
+		let p = cellsMemo.get(d.key);
+		if (!p) cellsMemo.set(d.key, (p = readDeltaCells(store, d)));
+		return p;
+	};
+	const tombIds = new Map(s.tombs.map((t) => [t.key, t.ids]));
+	let routing: { forFine: string; fine: string; k: number; tree?: TreeRef; routing?: RoutingTables } | null = null;
+	let dropped: number[] = [];
+	let oversized = 0;
+	const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
+		if (files.slabs !== s.files.slabs) throw new ThreadError(`slabs table changed since rev ${s.baseRev} (another compaction committed)`, 409);
+		if (manifest.k1 * manifest.k2 !== s.k || files.fine !== s.files.fine) throw new ThreadError(`routing table changed since rev ${s.baseRev}`, 409);
+		const deltas = manifest.deltas ?? [];
+		for (const key of folded) if (!deltas.some((d) => d.key === key)) throw new ThreadError(`folded delta ${key} is no longer in rev ${rev}`, 409);
+		const remaining = deltas.filter((d) => !folded.has(d.key));
+		if (splitCells.size) {
+			for (const d of remaining) {
+				const dc = await cellsOf(d);
+				for (const cell of dc.counts.keys()) if (splitCells.has(cell)) throw new ThreadError(`delta ${d.key} (not folded) has entries in split cell ${cell}`, 409);
+			}
+		}
+		const kk = s.k + s.splits.length;
+		const table: SlabRow[] = s.slabs.slice();
+		for (const [cell, row] of s.rows) table[cell] = row;
+		if (table.length !== kk || table.some((r) => !r)) throw new ThreadError(`slabs table would have ${table.length} rows, expected ${kk}`, 500);
+		oversized = s.cap > 0 ? table.filter((r) => r[2] > s.cap).length : 0;
+		const tombRefs: TombRef[] = manifest.tombstones ?? [];
+		const sets = await Promise.all(tombRefs.map(async (t) => ({ ...t, ids: tombIds.get(t.key) ?? u32View(await getOrThrow(store, t.key)) })));
+		const keep = sets.filter((t) => !tombDroppable(t, remaining, table, manifest.vectors, manifest.segments ?? []));
+		dropped = sets.filter((t) => !keep.includes(t)).map((t) => t.rev);
+		if (!s.rows.length && !dropped.length) return null;
+		const next: Manifest = { ...inherit(manifest), deltas: remaining, tombstones: keep.map(({ rev: r, key, count }) => ({ rev: r, key, count })) };
+		if (s.rows.length) next.files = { ...files, slabs: await putUnique(store, keys.slabsTable(gen, rev + 1), JSON.stringify(table)) };
+		if (s.splits.length) {
+			if (!routing || routing.forFine !== files.fine) routing = { forFine: files.fine, ...(await splitRouting(ctx, w, rev + 1, manifest, files, s, kk)) };
+			next.k2 = routing.k;
+			next.files = { ...next.files!, fine: routing.fine };
+			if (routing.tree) next.tree = routing.tree;
+			if (routing.routing) next.routing = routing.routing;
+			else delete next.routing;
+		}
+		const splitChange = s.splits.length ? { splits: s.splits.map(([cell, newCell]) => [cell, newCell, table[cell][2], table[newCell][2]]), k: { from: s.k, to: kk } } : {};
+		return { ...next, change: { op: "compact", baseRev: s.baseRev, slabRev: s.slabRev, cells: s.rows.length, foldedDeltas: folded.size, droppedTombstoneSets: dropped.length, ...splitChange, writer: "thread-sdk" } };
+	});
+	result.rev = c.rev;
+	result.cells = s.rows.length;
+	result.folded = folded.size;
+	result.remainingDeltas = c.manifest.deltas?.length ?? 0;
+	result.droppedTombstoneSets = dropped;
+	result.k = c.manifest.k1 * c.manifest.k2;
+	result.conflicts = c.conflicts;
+	result.currentUpdated = c.currentUpdated;
+	return { manifest: c.manifest, oversized };
+}
+
+/**
+ * The routing objects of a revision whose compaction split cells (the Worker's splitRouting): fine means with
+ * k + splits rows (a split cell keeps its index with mean A, each new cell is appended with mean B), a centroid tree
+ * rebuilt over them with the same groups/iters/seed/beam when the head has one (no recall measurement, as in the
+ * Worker's automatic runs), and the compact routing tables the head had for the old means.
+ */
+async function splitRouting(ctx: WriterContext, w: CompactWasm, rev: number, m: Manifest, files: IndexFiles, s: Slice, kk: number): Promise<{ fine: string; k: number; tree?: TreeRef; routing?: RoutingTables }> {
+	const { store, gen } = ctx;
+	const dim = m.dim;
+	const old = await getOrThrow(store, files.fine);
+	if (old.byteLength !== s.k * dim * 4) throw new ThreadError(`${files.fine} has ${old.byteLength / 4 / dim} means, expected ${s.k}`, 500);
+	const means = new Float32Array(kk * dim);
+	means.set(new Float32Array(old.slice().buffer));
+	for (const [cell, newCell] of s.splits) {
+		means.set(s.means.get(cell)!, cell * dim);
+		means.set(s.means.get(newCell)!, newCell * dim);
+	}
+	const fine = await putUnique(store, `idx/${gen}/fine.${rev}.f32`, new Uint8Array(means.buffer));
+	let tree: TreeRef | undefined;
+	let treeBytes: Uint8Array | null = null;
+	if (m.tree) {
+		const t = m.tree;
+		const groups = Math.min(t.groups, kk);
+		const iters = typeof t.iters === "number" ? t.iters : 10;
+		const seed = typeof t.seed === "number" ? t.seed : 7;
+		const bytes = w.build_centroid_tree(means, dim, groups, iters, seed);
+		const [tDim, tK, tGroups] = w.centroid_tree_info(bytes);
+		if (tDim !== dim || tK !== kk) throw new ThreadError(`tree is dim ${tDim} k ${tK}, expected ${dim} / ${kk}`, 500);
+		tree = { key: await putUnique(store, `idx/${gen}/tree.${rev}.bin`, bytes), groups: tGroups, beam: Math.min(t.beam, tGroups), iters, seed, bytes: bytes.byteLength };
+		treeBytes = bytes;
+	}
+	const r = m.routing && m.routing.fine === files.fine ? m.routing : undefined;
+	const tables = r ? (["f16", "i8"] as const).filter((e) => r[e]) : [];
+	let routing: RoutingTables | undefined;
+	if (r && (tables.length || r.grouped)) {
+		const grouped = r.grouped?.elem;
+		const built = buildRoutingObjects(w, { fineKey: fine, fine: means, dim, tables: [...tables], grouped: tree && treeBytes && grouped ? { gen, rev, treeKey: tree.key, tree: treeBytes, elem: grouped } : undefined });
+		const put = async (key: string) => putUnique(store, key, built.objects.find(([k]) => k === key)![1]);
+		routing = { fine };
+		for (const elem of tables) routing[elem] = { ...built.routing[elem]!, key: await put(built.routing[elem]!.key) };
+		if (built.routing.grouped) routing.grouped = { ...built.routing.grouped, key: await put(built.routing.grouped.key) };
+	}
+	return { fine, k: kk, tree, routing };
+}
+
+/**
+ * Writes a slab revision at its conventional key (the slabs table names slabs by cell and slabRev, so the key cannot
+ * be made unique). Create-only; an existing object with the same bytes (a rerun on the same base) is reused. One
+ * with other bytes is overwritten only while no revision after the base has changed the slabs table, i.e. no
+ * revision can list it; otherwise the run stops with a conflict.
+ */
+async function putSlab(store: BlobStore, gen: string, baseRev: number, files: IndexFiles, key: string, bytes: Uint8Array): Promise<void> {
+	if (await putIfAbsent(store, key, bytes)) return;
+	const cur = await store.get(key);
+	if (cur && equalBytes(cur, bytes)) return;
+	if (await slabsChangedAfter(store, gen, baseRev, files)) throw new ThreadError(`${key} exists with other bytes and a revision after ${baseRev} changed the slabs table`, 409);
+	await writable(store).put(key, bytes);
+}
+
+async function slabsChangedAfter(store: BlobStore, gen: string, baseRev: number, files: IndexFiles): Promise<boolean> {
+	const head = await latestRev(store, gen);
+	for (let rev = baseRev + 1; rev <= head; rev++) {
+		const b = await store.get(keys.manifest(gen, rev));
+		if (b && manifestFiles(parseManifest(b, gen, rev)).slabs !== files.slabs) return true;
+	}
+	return false;
+}
+
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.byteLength !== b.byteLength) return false;
+	for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+function u32View(b: Uint8Array): Uint32Array {
+	return b.byteOffset % 4 === 0 ? new Uint32Array(b.buffer, b.byteOffset, b.byteLength >> 2) : new Uint32Array(b.slice().buffer);
+}
+
+async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+	const out: R[] = new Array(items.length);
+	let i = 0;
+	await Promise.all(
+		Array.from({ length: Math.min(limit, items.length) }, async () => {
+			while (i < items.length) {
+				const j = i++;
+				out[j] = await fn(items[j]);
+			}
+		}),
+	);
+	return out;
+}

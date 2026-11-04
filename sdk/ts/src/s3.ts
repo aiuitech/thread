@@ -8,7 +8,7 @@
  * Signing costs one SHA-256 and one HMAC per request: the derived signing key of each (date, region, service) is
  * imported once as an HMAC `CryptoKey` and reused (`SigningKeyCache`).
  */
-import { inWorkers, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type PutOptions } from "./store.js";
+import { inWorkers, type BlobHead, type BlobRange, type BlobStore, type GetOptions, type ObjectInfo, type PutOptions } from "./store.js";
 import { ThreadError } from "./wire.js";
 
 export interface S3BlobStoreOptions {
@@ -425,7 +425,12 @@ export class S3BlobStore implements BlobStore {
 	}
 
 	async list(prefix: string): Promise<string[]> {
-		const out: string[] = [];
+		return (await this.listObjects(prefix)).map((o) => o.key);
+	}
+
+	/** ListObjectsV2 pages: key, size and LastModified of each object. */
+	async listObjects(prefix: string): Promise<ObjectInfo[]> {
+		const out: ObjectInfo[] = [];
 		let token: string | undefined;
 		do {
 			const query: Record<string, string> = { "list-type": "2", prefix, "max-keys": "1000" };
@@ -433,11 +438,23 @@ export class S3BlobStore implements BlobStore {
 			const r = await this.send("GET", "", {}, undefined, query);
 			if (!r.ok) return this.fail(r, `LIST ${prefix}`);
 			const xml = await r.text();
-			for (const m of xml.matchAll(/<Key>([^<]*)<\/Key>/g)) out.push(decodeXml(m[1]));
+			for (const c of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+				const key = c[1].match(/<Key>([^<]*)<\/Key>/);
+				if (!key) continue;
+				const size = c[1].match(/<Size>(\d+)<\/Size>/);
+				const mod = c[1].match(/<LastModified>([^<]*)<\/LastModified>/);
+				out.push({ key: decodeXml(key[1]), size: size ? Number(size[1]) : 0, uploaded: mod ? Date.parse(mod[1]) : 0 });
+			}
 			const next = xml.match(/<NextContinuationToken>([^<]*)<\/NextContinuationToken>/);
 			token = /<IsTruncated>true<\/IsTruncated>/.test(xml) && next ? decodeXml(next[1]) : undefined;
 		} while (token);
 		return out;
+	}
+
+	async delete(key: string): Promise<void> {
+		const r = await this.send("DELETE", key, {});
+		await settle(r);
+		if (!r.ok && r.status !== 404) throw new ThreadError(`S3 DELETE ${key}: HTTP ${r.status}`, 502);
 	}
 }
 

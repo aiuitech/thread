@@ -12,6 +12,14 @@ from source, runs every check and publishes.
   adjacent segments fit.
 - **Cache keys**: the in-process cache (`MemoryCache`, any `BlobCache`) is scoped by the index's key prefix, as
   the Cache API was in 0.2.0, and so is a `store` passed as a `PrefixedBlobStore` without `prefix`.
+- **Dense compaction in the TypeScript SDK**: `index.compact(opts)` / `compactDeltas(ctx, opts)` folds delta
+  segments into slab revisions, splits cells over `maxCellEntries` and drops unreferenced tombstone sets in one
+  isolate, bounded by `maxBytes` (estimated peak memory, default 48 MiB), `cellsPerRun` and `deadlineMs` (a cut slice
+  commits its finished part); `r.more` tells whether to call again. Same objects as the Worker's compaction, byte for
+  byte, and the same `compact.lock`. `index.compactionDue()` / `compactionStatus(manifest)` check the thresholds
+  without I/O. Not in the Python SDK.
+- `BlobStore.delete` and `BlobStore.listObjects` (key, size, upload time), optional; implemented by the R2, S3,
+  memory, file, prefixed and cached stores.
 - `sdk/ts/package-lock.json` names the package `@aiuitech/thread-sdk`.
 
 ## 0.2.0 (2026-11-03)

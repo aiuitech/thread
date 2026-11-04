@@ -8,7 +8,7 @@
 import { promises as fs, readdirSync, statSync } from "node:fs";
 import path from "node:path";
 import { isPackHeader, PACK_HEADER_BYTES, packIndex, PackedBlobStore, type PackIndexOptions, type PackIndexResult, type PackSink } from "./pack.js";
-import type { BlobCache, BlobHead, BlobRange, BlobStore, GetOptions, MissPolicy, PutOptions } from "./store.js";
+import type { BlobCache, BlobHead, BlobRange, BlobStore, GetOptions, MissPolicy, ObjectInfo, PutOptions } from "./store.js";
 import { ThreadError } from "./wire.js";
 
 const LOCK_DIR = ".thread-lock.d";
@@ -220,6 +220,21 @@ export class FileBlobStore implements BlobStore {
 		};
 		await walk(base, head ? head + "/" : "");
 		return out.sort();
+	}
+
+	async listObjects(prefix: string): Promise<ObjectInfo[]> {
+		const out: ObjectInfo[] = [];
+		for (const key of await this.list(prefix)) {
+			const st = await fs.stat(this.path(key)).catch(() => null);
+			if (st) out.push({ key, size: st.size, uploaded: st.mtimeMs });
+		}
+		return out;
+	}
+
+	async delete(key: string): Promise<void> {
+		await fs.unlink(this.path(key)).catch((e: unknown) => {
+			if (errno(e) !== "ENOENT") throw e;
+		});
 	}
 }
 

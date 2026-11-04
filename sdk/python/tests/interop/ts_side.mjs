@@ -187,6 +187,20 @@ if (cmd === "build") {
 	for (const req of requests) results.push(await answer(index, req));
 	process.stdout.write(JSON.stringify({ gen: index.gen, rev: index.rev, results }));
 	index.close();
+} else if (cmd === "compact") {
+	// Dense compaction in the TS SDK (folds every delta, splits cells over 120 entries), then the requests on the result.
+	const { requests } = JSON.parse(fs.readFileSync(path.join(dir, "requests.json"), "utf8"));
+	const index = await thread.open({ store, cache: false, refreshInterval: 0 });
+	const runs = [];
+	for (let i = 0; i < 20; i++) {
+		const r = await index.compact({ force: true, maxCellEntries: 120 });
+		runs.push({ outcome: r.outcome, folded: r.folded, splits: r.splits.length, k: r.k });
+		if (!r.more) break;
+	}
+	const results = [];
+	for (const req of requests) results.push(await answer(index, req));
+	process.stdout.write(JSON.stringify({ gen: index.gen, rev: index.rev, k: index.manifest.k1 * index.manifest.k2, deltas: index.manifest.deltas.length, runs, results }));
+	index.close();
 } else if (cmd === "pack") {
 	const r = await packIndexToFile(store, extra);
 	process.stdout.write(JSON.stringify(r));
@@ -195,4 +209,4 @@ if (cmd === "build") {
 	const r = await buildBasePack(store, await loadRevState(store, t.gen, t.rev), process.argv[5] ?? "base");
 	fs.writeFileSync(extra, r.bytes);
 	process.stdout.write(JSON.stringify({ key: r.key, keys: r.keys, routing: r.routing }));
-} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | pack <dir> <file> | basepack <dir> <file> <kind>`);
+} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | compact <dir> | pack <dir> <file> | basepack <dir> <file> <kind>`);

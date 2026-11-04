@@ -237,6 +237,20 @@ export class WarmPrefixStore implements BlobStore, PrefixSeed {
 		const inner = this.inner;
 		return inner.list ? (prefix) => inner.list!(prefix) : undefined;
 	}
+
+	get listObjects(): BlobStore["listObjects"] {
+		const inner = this.inner;
+		return inner.listObjects ? (prefix) => inner.listObjects!(prefix) : undefined;
+	}
+
+	get delete(): BlobStore["delete"] {
+		const inner = this.inner;
+		if (!inner.delete) return undefined;
+		return async (key) => {
+			this.prefixes.delete(key);
+			await inner.delete!(key);
+		};
+	}
 }
 
 /** What loading a warm pack did (`index.warmStats`). */

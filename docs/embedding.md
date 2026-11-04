@@ -110,11 +110,14 @@ From there the generation grows through the ordinary update path ([update-path.m
 
 1. **Upserts** write delta segments (every vector's primary cell is cell 0, residuals against the seed mean) and
    lexical segments; queries scan the deltas next to the one slab. Nothing else is needed for a small index.
-2. **Automatic compaction** (the Worker's, after a write that passes a threshold: 16 segments, 32 MB, 50k
-   tombstones) folds the deltas into the cell's slab.
+2. **Compaction** folds the deltas into the cell's slab: the Worker's automatic runs (after a write that passes a
+   threshold: 16 segments, 32 MB, 50k tombstones), or the TypeScript SDK's `index.compact()` in the writer's own
+   isolate (a Durable Object), bounded by memory, cells and time ([update-path.md](update-path.md#compaction-in-the-sdk)).
+   `index.compactionDue()` checks the thresholds without I/O.
 3. **Cell splitting** (same run): a rewritten cell over `maxCellEntries` is split by 2-means over its decoded
    entries, every entry re-encoded against its new mean, `fine.{rev}.f32` gets one more row and `k2` grows. So a
-   generation of N vectors converges to about N / `maxCellEntries` cells, each with a data-derived mean.
+   generation of N vectors converges to about N / `maxCellEntries` cells, each with a data-derived mean. (When a
+   delta that stays has entries in the cell, the SDK splits it with the cell's mean kept; the Worker waits.)
 
 Readers clamp a manifest default `nprobe` to the cell count (the SDKs always did; the Worker now does for a
 default, and still rejects an explicit `nprobe` above `k1 * k2`), so `nprobe: 32` is right from the first cell on.
@@ -131,8 +134,9 @@ What this path does not give, and when to care:
   that has grown large (hundreds of thousands of vectors), a rebuild stage that runs the existing pipeline in build
   slots over the generation's own int8 records (sample, k-means, PQ, assign, finalize, publish as a new generation
   with the same `embedding` block) is the planned follow-up; the SDKs need nothing new for it.
-- The SDKs' own writers do not compact or split (only the Worker does); a generation written only by the SDKs
-  accumulates deltas, which still query correctly (every delta is scanned) but slower past a few dozen segments.
+- Only the TypeScript SDK and the Worker compact and split. The Python SDK writes deltas but does not compact
+  them: a generation written only from Python accumulates deltas, which still query correctly (every delta is
+  scanned) but slower past a few dozen segments; compact it from TypeScript or the Worker.
 
 ## Workers AI specifics
 

@@ -18,6 +18,7 @@
 import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
+import { compactDeltas, compactionStatus, type CompactionStatus, type CompactOptions, type CompactResult } from "./compact.js";
 import { compactSegments, configureAttrs, configureLexical, createGeneration, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateGenerationOptions, type CreateGenerationResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { normalizeRows, resolveEmbedder, splitRows, type EmbedKind, type EmbedOptions, type EmbeddingConfig, type TextEmbedder } from "./embed.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
@@ -42,6 +43,7 @@ export * from "./warm.js";
 export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
+export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionPressure, compactionStatus, tombDroppable, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
 export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
 export { CREATE_DEFAULTS, createGeneration, createLexicalGeneration } from "./write.js";
 
@@ -935,6 +937,27 @@ export class ThreadIndex {
 		const r = await compactSegments(this.writer(), opts);
 		await this.useRevision(r.gen, r.rev);
 		return r;
+	}
+
+	/**
+	 * @experimental One bounded dense compaction of the head (`compactDeltas`): folds delta segments into slab
+	 * revisions, splits cells over `maxCellEntries`, drops tombstone sets nothing references. Bounded by
+	 * `maxBytes` (estimated peak memory, default 48 MiB), `cellsPerRun` and `deadlineMs`; takes
+	 * `idx/{gen}/compact.lock` like the Worker. `r.more` says whether another call has work. Without `force` a head
+	 * below every threshold of `manifest.compaction` is a `noop` (see `compactionDue`).
+	 */
+	async compact(opts: CompactOptions = {}): Promise<CompactResult> {
+		const r = await compactDeltas(this.writer(), opts);
+		if ((r.outcome === "committed" || r.outcome === "partial") && r.rev !== this.revState.rev) await this.useRevision(r.gen, r.rev);
+		return r;
+	}
+
+	/**
+	 * Whether the open revision exceeds a threshold of `manifest.compaction` (no I/O): the cheap check before
+	 * `compact()`. The writes of this index move it to their revision, so after an upsert it describes the head.
+	 */
+	compactionDue(): CompactionStatus {
+		return compactionStatus(this.revState.manifest);
 	}
 
 	/** The lexical index of the current revision (segments opened on first use and cached by key). */

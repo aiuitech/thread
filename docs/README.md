@@ -12,7 +12,7 @@ if you want to use it.
 | [research-hops-experiment.md](research-hops-experiment.md) | proposed Wiper experiment: alternate search and reranker objectives, preserve evidence across hops, and compare answer quality under matched budgets |
 | [query-path.md](query-path.md) | slab formats, the two-phase query (scan, rerank, speculative reads), caching of revisions and bases, the SDKs' cache and miss policies, wasm trap recovery, the centroid tree and beam routing, cold opens (compact routing tables, cold tree routing, base packs) |
 | [profiles.md](profiles.md) | the `edge` and `local` layouts, what each knob trades, manifest query defaults and how to change them |
-| [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual and automatic), cell splitting, GC |
+| [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual, automatic, and in the SDK in one isolate), cell splitting, GC |
 | [portability.md](portability.md) | moving an index: copying between stores, snapshotting one revision, packs (one file, queried in place) and their format, base packs, warm packs |
 | [lexical.md](lexical.md) | BM25 segments, the `docs` store, the `keys` section, the tokenizer, fusion, size-vs-speed tuning, the native CLI |
 | [embedding.md](embedding.md) | an index for an embedding model: `manifest.embedding`, how the SDKs and the Worker call the model (Workers AI, OpenAI-compatible, your function) for `search({text})` and `upsert({texts})`, a dense generation created from nothing and grown by compaction and cell splits, what that path lacks |

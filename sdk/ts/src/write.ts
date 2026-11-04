@@ -175,18 +175,21 @@ const COMMIT_ATTEMPTS = 12;
 const DELTA_ADD_CHUNK = 256;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function writable(store: BlobStore): Required<Pick<BlobStore, "put">> & BlobStore {
+/** @internal */
+export function writable(store: BlobStore): Required<Pick<BlobStore, "put">> & BlobStore {
 	if (!store.put) throw new ThreadError("this store is read-only (no put)", 400);
 	return store as Required<Pick<BlobStore, "put">> & BlobStore;
 }
 
 /** PUT only if the key does not exist yet. */
-async function putIfAbsent(store: BlobStore, key: string, data: Uint8Array | string, contentType?: string): Promise<boolean> {
+/** @internal */
+export async function putIfAbsent(store: BlobStore, key: string, data: Uint8Array | string, contentType?: string): Promise<boolean> {
 	return (await writable(store).put(key, data, { ifAbsent: true, contentType })) !== null;
 }
 
 /** Writes an immutable object at `key`, or at a unique sibling `{stem}.{nonce}{ext}` if the key is taken. */
-async function putUnique(store: BlobStore, key: string, data: Uint8Array | string): Promise<string> {
+/** @internal */
+export async function putUnique(store: BlobStore, key: string, data: Uint8Array | string): Promise<string> {
 	if (await putIfAbsent(store, key, data)) return key;
 	const dot = key.lastIndexOf(".");
 	for (let i = 0; i < 4; i++) {
@@ -196,7 +199,8 @@ async function putUnique(store: BlobStore, key: string, data: Uint8Array | strin
 	throw new ThreadError(`could not write a unique key for ${key}`);
 }
 
-async function readCurrent(store: BlobStore): Promise<{ cur: CurrentPointer; etag: string } | null> {
+/** @internal */
+export async function readCurrent(store: BlobStore): Promise<{ cur: CurrentPointer; etag: string } | null> {
 	// head first: if the pointer changes between the two reads the CAS fails and the writer re-reads.
 	const h = await store.head(keys.current());
 	if (!h) return null;
@@ -225,7 +229,8 @@ async function advanceCurrent(store: BlobStore, gen: string, rev: number, manife
 }
 
 /** The newest manifest revision in the store (a crashed writer's manifest beyond current.json counts). */
-async function latestRev(store: BlobStore, gen: string): Promise<number> {
+/** @internal */
+export async function latestRev(store: BlobStore, gen: string): Promise<number> {
 	if (!store.list) throw new ThreadError("this store cannot list objects, which the writer needs after a lost race", 400);
 	const prefix = `idx/${gen}/manifest.`;
 	let head = -1;
@@ -237,7 +242,8 @@ async function latestRev(store: BlobStore, gen: string): Promise<number> {
 	return head;
 }
 
-interface CommitResult {
+/** @internal */
+export interface CommitResult {
 	rev: number;
 	manifest: Manifest;
 	manifestKey: string;
@@ -252,7 +258,8 @@ interface CommitResult {
  * objects it references first). The create-only put of `manifest.{rev+1}.json` serializes writers; a lost
  * race rebuilds on the new head.
  */
-async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifest: Manifest; files: IndexFiles }) => Promise<Manifest | null>): Promise<CommitResult> {
+/** @internal */
+export async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifest: Manifest; files: IndexFiles }) => Promise<Manifest | null>): Promise<CommitResult> {
 	const { store, gen } = ctx;
 	let conflicts = 0;
 	let useList = false;
@@ -280,7 +287,8 @@ async function commitRev(ctx: WriterContext, make: (head: { rev: number; manifes
 }
 
 /** The fields a new revision inherits (build notes and the previous change stay with their revision). */
-function inherit(m: Manifest): Manifest {
+/** @internal */
+export function inherit(m: Manifest): Manifest {
 	const { notes: _n, change: _c, rev: _r, parentRev: _p, updatedAt: _u, ...rest } = m;
 	return { ...rest, files: manifestFiles(m), deltas: m.deltas ?? [], tombstones: m.tombstones ?? [], segments: m.segments ?? [], nextSeq: m.nextSeq ?? 1 };
 }

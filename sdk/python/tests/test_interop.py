@@ -5,7 +5,9 @@
 2. Python writes on top (upserts with vectors and texts, a delete, a segment compaction); the TS SDK opens the
    result and must return what Python returns;
 3. both SDKs pack that revision into one file: the bytes must be identical, and each SDK must answer the same
-   queries from the other's pack; their base packs (full and cold) of the revision are byte-identical too.
+   queries from the other's pack; their base packs (full and cold) of the revision are byte-identical too;
+4. the TS SDK compacts the dense side (`index.compact`: deltas folded into slab revisions, cells split, new fine
+   means); Python reads the compacted revision and must answer the same requests.
 
 Ids, their order, attrs, payloads, docs, tokens and BM25 scores must match exactly. Cosine scores may differ in the
 last float32 ulps: the wasm build accumulates dot products in 16 SIMD lanes, the native build in 8 scalar partial
@@ -180,3 +182,11 @@ def test_typescript_and_python_agree(tmp_path):
         info = json.loads(node("basepack", tmp_path, str(out), kind))
         assert info["key"] == mine_bp.key and info["keys"] == mine_bp.keys and info["routing"] == mine_bp.routing
         assert out.read_bytes() == mine_bp.data
+
+    # 5. TypeScript compacts the dense side (folds, splits); Python reads the compacted revision the same way.
+    after = json.loads(node("compact", tmp_path))
+    assert after["deltas"] == 0 and after["k"] > 16 and any(r["splits"] for r in after["runs"])
+    with open_index(store) as index:
+        assert (index.rev, index.manifest["k1"] * index.manifest["k2"]) == (after["rev"], after["k"])
+        for req, want in zip(requests, after["results"]):
+            same(json.loads(json.dumps(answer(index, req))), want, json.dumps(req)[:80])
