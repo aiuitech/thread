@@ -4,6 +4,16 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## 0.2.1 (unreleased)
+
+- **Bounded lexical compaction**: `compactSegments({ maxInputBytes })` / `compact_segments(max_input_bytes=)`
+  merges one contiguous run of segments whose bytes (plus 4 bytes per tombstoned id) fit the budget, for writers
+  with little memory (a Durable Object). The run keeps its place and its newest `addedRev`; `merged` 0 when no two
+  adjacent segments fit.
+- **Cache keys**: the in-process cache (`MemoryCache`, any `BlobCache`) is scoped by the index's key prefix, as
+  the Cache API was in 0.2.0, and so is a `store` passed as a `PrefixedBlobStore` without `prefix`.
+- `sdk/ts/package-lock.json` names the package `@aiuitech/thread-sdk`.
+
 ## 0.2.0 (2026-11-03)
 
 First published version.
