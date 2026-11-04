@@ -167,7 +167,7 @@ export interface OpenOptions {
 	 * (S3) gets a 256 MB `MemoryCache` by default. `false` disables caching.
 	 */
 	cache?: CacheLike | BlobCache | false;
-	/** Synthetic origin of the cache keys (default `https://vib-sdk.cache/`); `prefix` is appended to it. */
+	/** Synthetic origin of the cache keys (default `https://vib-sdk.cache/`); the index's key prefix follows it. */
 	cacheOrigin?: string;
 	/** What a slab-prefix cache miss reads (see `MissPolicy`): default `"whole"` for the Cache API, `"range+warm"` for an in-process cache. */
 	missPolicy?: MissPolicy;
@@ -398,10 +398,10 @@ export class ThreadIndex {
 		// Outside Workers there is no Cache API: a remote store gets an in-process cache, like the Python SDK.
 		if (!cache && opts.cache === undefined && store.remote && !inWorkers()) cache = new MemoryCache();
 		// The cache sits in front of the prefixed store, so it sees keys without the prefix: every index in a bucket
-		// has an `idx/g1/seg/1.thread`. The prefix goes into the cache origin, or indexes would read each other's
-		// cached objects.
-		const origin = opts.prefix ? (opts.cacheOrigin ?? "https://vib-sdk.cache/").replace(/\/?$/, "/") + opts.prefix.replace(/^\/+/, "") : opts.cacheOrigin;
-		if (cache) store = new CachedBlobStore(store, cache, { origin, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
+		// has an `idx/g1/seg/1.thread`. The prefix scopes every cache key (Cache API URL and in-process cache), or
+		// indexes that share a cache would read each other's `current.json`, manifests and segments.
+		const scope = keyPrefix(store).replace(/^\/+/, "");
+		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, scope, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
 		const t0 = nowMs();
 		// The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it. Its prefixes
 		// go into the in-process cache when it can hold prefixes (`MemoryCache`), else into a prefix layer in front of
@@ -1277,6 +1277,11 @@ async function prefetchOpen(store: BlobStore, pre: PrefetchStore, gen: string, r
 	const m = await manifestOf();
 	if (m) for (const k of baseKeysOf(m, gen, rev, cold ? "cold" : "base", routing)) if (!(m0 && k === mkey)) pre.prefetch(k);
 	return done("files", null);
+}
+
+/** The whole key prefix of a store built from `PrefixedBlobStore`s ("" for none). */
+function keyPrefix(store: BlobStore): string {
+	return store instanceof PrefixedBlobStore ? keyPrefix(store.inner) + store.prefix : "";
 }
 
 function freeBase(b: Base): void {

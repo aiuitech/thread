@@ -391,8 +391,13 @@ export class MemoryCache implements BlobCache {
 export const CACHE_API_INFLIGHT = 12;
 
 export interface CachedBlobStoreOptions {
-	/** Synthetic origin the cache keys live under (any https URL; objects are keyed `${origin}${key}`). Cache API only. */
+	/** Synthetic origin the cache keys live under (any https URL; objects are keyed `${origin}${scope}${key}`). Cache API only. */
 	origin?: string;
+	/**
+	 * A prefix for every cache key (Cache API and in-process), so two indexes that share one cache but live under
+	 * different prefixes of one bucket never see each other's objects. `ThreadIndex.open` sets it to `prefix`.
+	 */
+	scope?: string;
 	/** Keeps background cache writes and warm fetches alive after the response (pass `ctx.waitUntil`). */
 	waitUntil?: (p: Promise<unknown>) => void;
 	/** Which keys are immutable and may be cached. Default: everything except `current.json`. */
@@ -498,6 +503,7 @@ export function sliceRanges(parts: RangePart[], ranges: BlobRange[], key: string
  */
 export class CachedBlobStore implements BlobStore {
 	readonly origin: string;
+	readonly scope: string;
 	readonly missPolicy: MissPolicy;
 	readonly remote: boolean;
 	readonly inflight: number | undefined;
@@ -533,6 +539,7 @@ export class CachedBlobStore implements BlobStore {
 		this.cacheApi = isApi ? (cache as CacheLike) : null;
 		this.blobCache = isApi ? null : (cache as BlobCache);
 		this.origin = (opts.origin ?? "https://vib-sdk.cache/").replace(/\/?$/, "/");
+		this.scope = opts.scope ?? "";
 		this.waitUntil = opts.waitUntil;
 		this.cacheable = opts.cacheable ?? ((k) => !k.endsWith("current.json"));
 		this.cacheControl = opts.cacheControl ?? "public, max-age=31536000, immutable";
@@ -547,7 +554,7 @@ export class CachedBlobStore implements BlobStore {
 	}
 
 	request(key: string, range?: string): Request {
-		return new Request(this.origin + key.replace(/^\/+/, ""), { method: "GET", headers: range ? { range } : {} });
+		return new Request(this.origin + this.scope + key.replace(/^\/+/, ""), { method: "GET", headers: range ? { range } : {} });
 	}
 
 	private note(key: string): void {
@@ -565,7 +572,7 @@ export class CachedBlobStore implements BlobStore {
 				headers: { "content-type": "application/octet-stream", "content-length": String(bytes.byteLength), "cache-control": this.cacheControl, "accept-ranges": "bytes" },
 			});
 			p = this.cacheApi.put(this.request(key), resp);
-		} else p = this.blobCache!.put(key, bytes).then(() => {});
+		} else p = this.blobCache!.put(this.scope + key, bytes).then(() => {});
 		p = p.catch((e: unknown) => console.error(`thread-sdk: cache put ${key} failed: ${e instanceof Error ? e.message : String(e)}`));
 		this.waitUntil?.(p);
 		return p;
@@ -622,7 +629,7 @@ export class CachedBlobStore implements BlobStore {
 
 	seedPrefix(key: string, bytes: Uint8Array): void {
 		if (!this.blobCache?.seedPrefix) throw new ThreadError("this cache does not hold prefixes", 400);
-		this.blobCache.seedPrefix(key, bytes);
+		this.blobCache.seedPrefix(this.scope + key, bytes);
 	}
 
 	/** Drops seeded prefixes `keep` rejects. */
@@ -632,7 +639,7 @@ export class CachedBlobStore implements BlobStore {
 
 	/** Queues a background whole-object fetch of `key` (`"range+warm"`). */
 	private warm(key: string, trace?: BlobTrace): void {
-		if (this.warmConcurrency <= 0 || this.warming.has(key) || this.fills.has(key) || this.blobCache?.has(key)) return;
+		if (this.warmConcurrency <= 0 || this.warming.has(key) || this.fills.has(key) || this.blobCache?.has(this.scope + key)) return;
 		if (this.warmQ.length >= this.warmQueueMax) {
 			this.warmStats.dropped++;
 			return;
@@ -650,7 +657,7 @@ export class CachedBlobStore implements BlobStore {
 			const key = this.warmQ.shift()!;
 			this.warmActive++;
 			const p = (async () => {
-				if (this.blobCache?.has(key)) return;
+				if (this.blobCache?.has(this.scope + key)) return;
 				const full = await this.inner.get(key);
 				if (!full) return;
 				this.warmStats.fetched++;
@@ -685,7 +692,7 @@ export class CachedBlobStore implements BlobStore {
 
 	contains(key: string, range?: BlobRange): boolean | undefined {
 		if (!this.cacheable(key)) return this.inner.contains?.(key, range);
-		if (this.blobCache) return this.blobCache.has(key) || (range !== undefined && !!this.blobCache.holds?.(key, range)) || this.inner.contains?.(key, range) || false;
+		if (this.blobCache) return this.blobCache.has(this.scope + key) || (range !== undefined && !!this.blobCache.holds?.(this.scope + key, range)) || this.inner.contains?.(key, range) || false;
 		return this.known.has(key) ? true : this.inner.contains?.(key, range);
 	}
 
@@ -709,7 +716,7 @@ export class CachedBlobStore implements BlobStore {
 		if (!this.cacheable(key)) return this.inner.get(key, range, opts);
 		const trace = opts?.trace;
 		if (this.blobCache) {
-			const got = range ? await this.blobCache.getRanges(key, [range]) : await this.blobCache.get(key).then((b) => (b ? [b] : null));
+			const got = range ? await this.blobCache.getRanges(this.scope + key, [range]) : await this.blobCache.get(this.scope + key).then((b) => (b ? [b] : null));
 			if (got) {
 				if (trace) {
 					trace.hits++;
@@ -717,7 +724,7 @@ export class CachedBlobStore implements BlobStore {
 					if (range) trace.r206++;
 				}
 				// A seeded prefix served a fill read: fetch the whole slab in the background, as a miss would have.
-				if (range && opts?.fill && this.missPolicy !== "range" && !this.blobCache.has(key)) this.warm(key, trace);
+				if (range && opts?.fill && this.missPolicy !== "range" && !this.blobCache.has(this.scope + key)) this.warm(key, trace);
 				return got[0];
 			}
 		} else {
@@ -751,14 +758,14 @@ export class CachedBlobStore implements BlobStore {
 		if (!this.cacheable(key)) return this.inner.getRanges?.(key, ranges, opts) ?? null;
 		const trace = opts?.trace;
 		if (this.blobCache) {
-			const got = await this.blobCache.getRanges(key, ranges);
+			const got = await this.blobCache.getRanges(this.scope + key, ranges);
 			if (got) {
 				if (trace) {
 					trace.hits++;
 					trace.r206++;
 					trace.bytes += got.reduce((a, b) => a + b.byteLength, 0);
 				}
-				if (opts?.fill && this.missPolicy !== "range" && !this.blobCache.has(key)) this.warm(key, trace);
+				if (opts?.fill && this.missPolicy !== "range" && !this.blobCache.has(this.scope + key)) this.warm(key, trace);
 				return got;
 			}
 		} else {
@@ -789,7 +796,7 @@ export class CachedBlobStore implements BlobStore {
 		const inner = this.inner;
 		if (!inner.getTail) return undefined;
 		return async (key, length, opts) => {
-			const full = this.blobCache && this.cacheable(key) ? await this.blobCache.get(key) : null;
+			const full = this.blobCache && this.cacheable(key) ? await this.blobCache.get(this.scope + key) : null;
 			if (full) {
 				const bytes = full.subarray(Math.max(0, full.byteLength - length));
 				if (opts?.trace) {

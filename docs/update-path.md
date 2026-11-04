@@ -52,6 +52,15 @@ Writes run in the `writer` build slot (the Worker forwards `/upsert` and `/delet
 write must not run in an isolate that serves queries. (Until g4 the benchmarks sent writes to vib-bench-0 of the
 build pool for the same reason.)
 
+## Several indexes in one bucket
+
+`thread.open({ prefix })`, or a `store` that is a `PrefixedBlobStore`, puts the index under a key prefix. Cache
+keys (the Cache API URL and the in-process `BlobCache` key) carry the whole prefix as a `scope`, so two indexes
+that share one cache, which every index in one Worker does, never see each other's `idx/current.json`, manifests
+or segments. `CachedBlobStore` takes `scope` directly when it is built by hand. Before 0.2.0 a second prefixed
+index read the first one's objects from the shared cache (seen as `section "docs": bad range` on the second
+index); 0.2.0 scoped the Cache API keys only, 0.2.1 the in-process cache and `PrefixedBlobStore` stores too.
+
 ## Objects and revisions
 
 All index objects stay immutable (the edge cache depends on it). Every change is new objects plus a new
