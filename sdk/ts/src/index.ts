@@ -18,6 +18,7 @@
 import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
+import { dropGeneration, gcGeneration, setCurrent, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
 import { compactDeltas, compactionStatus, type CompactionStatus, type CompactOptions, type CompactResult } from "./compact.js";
 import { compactSegments, configureAttrs, configureLexical, createGeneration, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateGenerationOptions, type CreateGenerationResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { normalizeRows, resolveEmbedder, splitRows, type EmbedKind, type EmbedOptions, type EmbeddingConfig, type TextEmbedder } from "./embed.js";
@@ -43,6 +44,7 @@ export * from "./warm.js";
 export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryParams, QueryResult, QueryStats, QueryTimeline, RevState } from "./query.js";
 export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
+export { dropGeneration, gcGeneration, setCurrent, supersededKey, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
 export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionPressure, compactionStatus, tombDroppable, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
 export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
 export { CREATE_DEFAULTS, createGeneration, createLexicalGeneration } from "./write.js";
@@ -958,6 +960,29 @@ export class ThreadIndex {
 	 */
 	compactionDue(): CompactionStatus {
 		return compactionStatus(this.revState.manifest);
+	}
+
+	/**
+	 * Points `idx/current.json` of this index's store at (gen, rev) of any generation, with a compare-and-swap
+	 * (`setCurrent`): `expect` must match the pointer or nothing is written (409). This index keeps reading what it
+	 * reads; indexes opened without `gen` follow the pointer within their refresh interval.
+	 */
+	async setCurrent(opts: SetCurrentOptions): Promise<SetCurrentResult> {
+		if (this.closed) throw new ThreadError("index is closed", 400);
+		return setCurrent(this.store, opts);
+	}
+
+	/** Deletes a generation's objects no kept revision references (`gcGeneration`, the Worker's `/build/gc`); dry run by default. */
+	async gc(opts: Partial<GcOptions> = {}): Promise<GcResult> {
+		if (this.closed) throw new ThreadError("index is closed", 400);
+		return gcGeneration(this.store, { ...opts, gen: opts.gen ?? this.revState.gen });
+	}
+
+	/** Deletes a generation `current.json` left (`dropGeneration`); dry run by default. Never this index's own. */
+	async dropGeneration(opts: DropGenerationOptions): Promise<DropGenerationResult> {
+		if (this.closed) throw new ThreadError("index is closed", 400);
+		if (opts.gen === this.revState.gen) throw new ThreadError(`this index reads ${opts.gen}: open another one to drop it`, 409);
+		return dropGeneration(this.store, opts);
 	}
 
 	/** The lexical index of the current revision (segments opened on first use and cached by key). */

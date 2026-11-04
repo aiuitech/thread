@@ -427,6 +427,43 @@ deleted 8748 objects (12.2 GB: superseded slab revisions including the rev-0 sla
 cells, 58 deltas, 66 tombstone sets, 8 slabs tables). So g4's rev 0 can no longer be served, and republishing it
 from `data/slabs-g4.json` would point at deleted slabs; rebuild instead.
 
+From the TypeScript SDK the same rule is `gcGeneration(store, {gen, keep, graceSec, dryRun})` (or `index.gc(opts)`
+for the index's own generation; dry run unless `dryRun: false`), over any store with `listObjects` (upload times)
+and `delete`. It returns the same fields as `/build/gc` (`keptRevs`, `garbage`, `kinds`, `deleted`, `sample`).
+
+## Switching generations
+
+A generation can be built beside the live one and swapped in: `createGeneration({ setCurrent: false })`, writes
+through `open({ gen })` (they commit to that generation and never move `idx/current.json`, which names another
+one), then one compare-and-swap of the pointer:
+
+```ts
+const r = await setCurrent(store, { gen: "dense", rev, expect: { gen: "lex", rev: liveRev } });   // or index.setCurrent(...)
+// r = { gen, rev, previous: { gen: "lex", rev: liveRev }, updated: true, conflicts }
+```
+
+`rev` defaults to the generation's newest manifest, which must exist. With `expect` (`{gen, rev}`, or `null` for no
+pointer) the switch fails with a 409 and writes nothing unless the pointer is exactly that; without it any pointer
+is replaced, still through an etag CAS (`previous` says what was replaced). The pointer carries the new manifest
+inline when it is small, as every writer's does. Readers that follow the pointer (`open()` without `gen`) move
+within their refresh interval (30 s); writers still on the old generation keep committing to it but no longer
+advance the pointer, since a writer only moves it within its own generation. The switch is recorded in
+`idx/{old}/superseded.json` (`{by: {gen, rev}, rev, ms, at}`).
+
+The old generation can then go, as a whole:
+
+```ts
+await dropGeneration(store, { gen: "lex", graceSec: 300 });                    // dry run: { objects, bytes, kinds, ... }
+await dropGeneration(store, { gen: "lex", graceSec: 300, dryRun: false });     // deletes every object under idx/lex/
+```
+
+It refuses (409) the current generation, a generation the pointer left less than `graceSec` ago (from
+`superseded.json`, else the pointer's own age when another writer made the switch), one written less than
+`graceSec` ago (a writer may still use it) and one whose `compact.lock` is held. Manifests are deleted first, so a
+reader that still opens it gets a clean 404 instead of missing slabs, and a rerun after a crash finishes the rest.
+Readers pinned to the old generation (`open({ gen: "lex" })`) are not protected: close them before the grace
+period ends. To keep the old generation readable but smaller instead, `gcGeneration` it with `keep: 1`.
+
 ## Cell splitting
 
 A compaction splits every rewritten cell whose entry count would exceed `maxCellEntries` (`manifest.compaction`,

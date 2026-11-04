@@ -18,6 +18,10 @@ from source, runs every check and publishes.
   commits its finished part); `r.more` tells whether to call again. Same objects as the Worker's compaction, byte for
   byte, and the same `compact.lock`. `index.compactionDue()` / `compactionStatus(manifest)` check the thresholds
   without I/O. Not in the Python SDK.
+- **Switching generations from the SDK**: `setCurrent(store, { gen, rev?, expect? })` / `index.setCurrent` moves
+  `idx/current.json` to another generation with a compare-and-swap (409 unless the pointer is `expect`);
+  `gcGeneration` / `index.gc` is the Worker's `/build/gc` (keep, graceSec, dry run); `dropGeneration` deletes a
+  generation the pointer left once the grace period has passed with no write to it. TypeScript only.
 - `BlobStore.delete` and `BlobStore.listObjects` (key, size, upload time), optional; implemented by the R2, S3,
   memory, file, prefixed and cached stores.
 - `sdk/ts/package-lock.json` names the package `@aiuitech/thread-sdk`.

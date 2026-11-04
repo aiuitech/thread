@@ -86,7 +86,9 @@ automatically unless `--gcBuild 0` is set; older builds may still have leftovers
 
 For superseded index objects, use `POST /build/gc` with `{ "gen": "g4", "keep": 2, "graceSec": 300,
 "dryRun": true }` before repeating with `dryRun: false`. This keeps objects referenced by the newest two
-revisions and protects recent writes. Older revisions can become unreadable; see [GC](update-path.md#gc).
+revisions and protects recent writes. Older revisions can become unreadable; see [GC](update-path.md#gc). The
+TypeScript SDK has the same collector (`gcGeneration`) and deletes a whole superseded generation with
+`dropGeneration` ([Switching generations](update-path.md#switching-generations)).
 
 ### Cleanup on 2026-10-04
 

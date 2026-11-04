@@ -119,6 +119,10 @@ From there the generation grows through the ordinary update path ([update-path.m
    generation of N vectors converges to about N / `maxCellEntries` cells, each with a data-derived mean. (When a
    delta that stays has entries in the cell, the SDK splits it with the cell's mean kept; the Worker waits.)
 
+To add a model to a live index, build the dense generation beside it and swap it in: `createGeneration({ setCurrent:
+false })`, fill it through `open({ gen })`, then `setCurrent(store, { gen, expect })` (a compare-and-swap of
+`idx/current.json`) and later `dropGeneration` of the old one ([update-path.md](update-path.md#switching-generations)).
+
 Readers clamp a manifest default `nprobe` to the cell count (the SDKs always did; the Worker now does for a
 default, and still rejects an explicit `nprobe` above `k1 * k2`), so `nprobe: 32` is right from the first cell on.
 

@@ -358,6 +358,12 @@ chunkText(longText, { words: 200, overlap: 20 });                       // [{ in
 await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
 await index.compactSegments({ maxInputBytes: 4 << 20 });   // or merge one contiguous run that fits 4 MB (memory-limited writers)
 // dense compaction in this isolate: fold delta segments into slabs, split cells over maxCellEntries, drop tombstone sets
+// a generation built beside the live one, then swapped in with a compare-and-swap of idx/current.json
+await thread.createGeneration({ store, gen: "dense", embedding, lex: { text: true }, setCurrent: false });
+const next = await thread.open({ store, gen: "dense", embed: { ai: env.AI } });     // writes commit to "dense", the pointer stays
+await setCurrent(store, { gen: "dense", expect: { gen: "lex", rev: liveRev } });    // 409 unless the pointer is exactly that
+await gcGeneration(store, { gen: "dense", keep: 2, graceSec: 300, dryRun: false }); // superseded objects of a generation (/build/gc)
+await dropGeneration(store, { gen: "lex", graceSec: 300, dryRun: false });          // a whole generation the pointer left
 if (index.compactionDue().due) {                            // no I/O: the open revision against manifest.compaction
 	let r;
 	do r = await index.compact({ maxBytes: 48 << 20 });      // { outcome, rev, cells, folded, splits, k, more, estimatedPeakBytes, ... }
@@ -401,6 +407,14 @@ minutes), `record` (append the run to `compact.last.json`, default true). The ob
 byte (`test/compact-worker.test.ts` compacts one index both ways), so the Worker and the SDK can compact one index;
 a run commits through the manifest create-only put and is safe to repeat after a crash. Details:
 [docs/update-path.md](../../docs/update-path.md#compaction-in-the-sdk).
+
+`setCurrent(store, { gen, rev?, expect? })` (or `index.setCurrent`) moves `idx/current.json` to any generation with
+an etag compare-and-swap; `expect: {gen, rev}` (or `null`: no pointer) makes it fail with a 409, writing nothing,
+unless the pointer is exactly that. `gcGeneration(store, { gen, keep = 2, graceSec = 300, dryRun = true })` (or
+`index.gc`) is the Worker's `/build/gc`, and `dropGeneration(store, { gen, graceSec = 300, dryRun = true })` deletes
+a whole generation once the pointer left it and nothing wrote to it for `graceSec`. Both need a store with
+`listObjects` and `delete` (R2 binding, `S3BlobStore`, `MemoryBlobStore`, `FileBlobStore`). Details:
+[docs/update-path.md](../../docs/update-path.md#switching-generations).
 
 Implemented against [docs/update-path.md](../../docs/update-path.md): an upsert encodes one delta segment
 (`DeltaJob`: primary cell + residual codes, PQ codes with the generation's codebook) and, unless
