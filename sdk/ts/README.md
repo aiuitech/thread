@@ -360,6 +360,7 @@ await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk
 chunkText(longText, { words: 200, overlap: 20 });                       // [{ index, text, start, end, words }, ...], the same windows
 await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
 await index.compactSegments({ maxInputBytes: 4 << 20 });   // or merge one contiguous run that fits 4 MB (memory-limited writers)
+await index.commitMergedSegment({ run, readRev, key, bytes, count, keys }); // commit a run merged by another process (merged 0: the run changed)
 // dense compaction in this isolate: fold delta segments into slabs, split cells over maxCellEntries, drop tombstone sets
 // a generation built beside the live one, then swapped in with a compare-and-swap of idx/current.json
 await thread.createGeneration({ store, gen: "dense", embedding, lex: { text: true }, setCurrent: false });

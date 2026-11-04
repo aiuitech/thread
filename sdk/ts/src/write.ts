@@ -853,6 +853,66 @@ export async function compactSegments(ctx: WriterContext, opts: { maxInputBytes?
 	return { gen, rev: c.rev, merged, key, count, bytes, readBytes, conflicts: c.conflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
 }
 
+export interface MergedSegmentInput {
+	/** The keys of the segments the merge read, oldest first: a contiguous run of manifest `readRev`. */
+	run: readonly string[];
+	/**
+	 * The manifest rev whose tombstone sets the merge applied: each run segment left out the ids of every set
+	 * with rev > its `addedRev` that hides the lexical side (`tombForSegment`), as `compactSegments` does.
+	 */
+	readRev: number;
+	/** The merged segment, already in the store under `idx/{gen}/seg/` (thread-core `segment::merge` output). */
+	key: string;
+	/** Its size in bytes. */
+	bytes: number;
+	/** Documents in it (`segment_meta`: `docs.n`, else `lex.num_docs`). */
+	count: number;
+	/** Whether it has a `keys` section. */
+	keys: boolean;
+}
+
+/**
+ * Commits a segment that another process merged (one with the memory to read a large run whole) in place of the
+ * run it read. Nothing is written (`merged` 0) when the head no longer lists the run contiguously, for example
+ * after a compaction here merged part of it. The new segment keeps the run's place and gets `addedRev` =
+ * `readRev`: sets newer than `readRev` still hide its ids, and the lexical-only sets it already applied drop
+ * once no segment predates them, as after `compactSegments`.
+ */
+export async function commitMergedSegment(ctx: WriterContext, input: MergedSegmentInput): Promise<CompactSegmentsResult> {
+	const t0 = Date.now();
+	const { store, gen } = ctx;
+	writable(store);
+	if (input.run.length < 1) throw new ThreadError("a merged segment needs a run of at least one segment", 400);
+	if (!input.key.startsWith(`idx/${gen}/seg/`)) throw new ThreadError(`a merged segment of ${gen} must be under idx/${gen}/seg/`, 400);
+	if (!Number.isInteger(input.readRev) || input.readRev < 0) throw new ThreadError("readRev must be a revision", 400);
+	if (!Number.isInteger(input.count) || input.count < 0 || !Number.isInteger(input.bytes) || input.bytes <= 0) throw new ThreadError("count and bytes must be counts", 400);
+	let merged = 0;
+	const c = await commitRev(ctx, async ({ rev, manifest }) => {
+		merged = 0;
+		const lex = resolveLexConfig(manifest);
+		if (!lex) throw new ThreadError("this generation has no lexical configuration", 400);
+		if (input.readRev > rev) throw new ThreadError(`readRev ${input.readRev} is newer than the head ${rev}`, 400);
+		const all = manifest.segments ?? [];
+		if (all.some((s) => s.key === input.key)) return null;
+		const start = all.findIndex((s) => s.key === input.run[0]);
+		if (start < 0 || start + input.run.length > all.length) return null;
+		for (let i = 0; i < input.run.length; i++) if (all[start + i].key !== input.run[i]) return null;
+		const segs = all.slice(start, start + input.run.length);
+		// A set the merge applied must not be applied again (it could hide the run's newest copy of an id), and a set
+		// it did not see must still be: both hold when addedRev is between the run's newest addedRev and readRev.
+		const addedRev = Math.max(input.readRev, ...segs.map((s) => s.addedRev));
+		merged = segs.length;
+		const ref: SegmentRef = { seq: 0, key: input.key, addedRev, count: input.count, bytes: input.bytes, lex: true, docs: lex.docs, text: lex.docs && lex.text, ...(input.keys ? { keys: true } : {}), base: true };
+		const segments = [...all.slice(0, start), ref, ...all.slice(start + segs.length)];
+		const sets = manifest.tombstones ?? [];
+		const lexOnly = (t: TombRef) => t.scope === "lexical" || (t.scope === undefined && !hasDense(manifest) && !(manifest.deltas ?? []).length && manifest.vectors === 0);
+		const tombstones = sets.filter((t) => !(lexOnly(t) && !segments.some((x) => x.addedRev < t.rev)));
+		const droppedTombstoneSets = sets.length - tombstones.length;
+		return { ...inherit(manifest), segments, tombstones, change: { op: "commit-merged-segment", merged, count: input.count, ...(droppedTombstoneSets ? { droppedTombstoneSets } : {}), writer: "thread-sdk" } };
+	});
+	return { gen, rev: c.rev, merged, key: merged ? input.key : null, count: merged ? input.count : 0, bytes: merged ? input.bytes : 0, readBytes: 0, conflicts: c.conflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
+}
+
 /** Whether the generation's head revision has a dense index (decides whether texts without vectors are embedded). */
 async function headHasDense(ctx: WriterContext): Promise<boolean> {
 	if (!ctx.embedder) return false;

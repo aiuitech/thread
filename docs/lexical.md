@@ -212,6 +212,14 @@ segments still win. No pair fits: nothing is written (`merged` 0). Peak memory i
 parts, their concatenation, its copy in wasm memory) plus the merged output; repeated calls with the same budget fold
 small segments together until no two adjacent ones fit.
 
+`index.commitMergedSegment({ run, readRev, key, bytes, count, keys })` (TypeScript) splits a compaction between
+two processes: one with memory reads a run of manifest `readRev` whole, applies to each segment the lexical view of
+the sets newer than its `addedRev` (`tombForSegment`), merges with thread-core `segment::merge` (what wasm
+`merge_segments` wraps) and writes the result under `idx/{gen}/seg/`; the index's writer then commits it in place of
+the run. The writer opens the object (container, section headers, directories) and checks its size first. Nothing
+is written (`merged` 0) when the head no longer lists the run contiguously. The merged segment takes `addedRev =
+readRev`: sets newer than the plan still hide its ids, and the sets it applied drop by the rule above.
+
 ## Tuning: size or query speed
 
 Every knob is a build parameter in `manifest.lex` (or a flag of `thread seg build`); segments record what they were

@@ -20,7 +20,7 @@ import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, Pr
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { dropGeneration, gcGeneration, setCurrent, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
 import { compactDeltas, compactionStatus, type CompactionStatus, type CompactOptions, type CompactResult } from "./compact.js";
-import { compactSegments, configureAttrs, configureLexical, createGeneration, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateGenerationOptions, type CreateGenerationResult, type CreateLexicalOptions, type DeleteResult, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
+import { commitMergedSegment, compactSegments, configureAttrs, configureLexical, createGeneration, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateGenerationOptions, type CreateGenerationResult, type CreateLexicalOptions, type DeleteResult, type MergedSegmentInput, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { normalizeRows, resolveEmbedder, splitRows, type EmbedKind, type EmbedOptions, type EmbeddingConfig, type TextEmbedder } from "./embed.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
 import { chooseRouting, groupedTableOf, hasDense, keys, manifestFiles, parseManifest, resolveLexConfig, slabRevOf, ThreadError, type DeltaRef, type LexConfig, type Manifest, type QueryDefaults, type ResolvedLexConfig, type RoutingOption, type SegmentRef } from "./wire.js";
@@ -46,8 +46,8 @@ export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
 export { dropGeneration, gcGeneration, setCurrent, supersededKey, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
 export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionPressure, compactionStatus, tombDroppable, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
-export type { UpsertScope, CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
-export { CREATE_DEFAULTS, createGeneration, createLexicalGeneration } from "./write.js";
+export type { UpsertScope, CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, MergedSegmentInput, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
+export { CREATE_DEFAULTS, commitMergedSegment, createGeneration, createLexicalGeneration } from "./write.js";
 
 /** A document fetched by key: its id and `docs` entry. */
 export interface KeyRecord extends DocRecord {
@@ -937,6 +937,33 @@ export class ThreadIndex {
 	 */
 	async compactSegments(opts: { maxInputBytes?: number } = {}): Promise<CompactSegmentsResult> {
 		const r = await compactSegments(this.writer(), opts);
+		await this.useRevision(r.gen, r.rev);
+		return r;
+	}
+
+	/**
+	 * @experimental Commits a segment merged elsewhere (`commitMergedSegment`): a process with the memory to read a
+	 * large run whole (thread-core `segment::merge`) writes the merged object, and the index's writer commits it in
+	 * place of the run. The object is opened first (container, section headers and directories, by range reads), so
+	 * a truncated or foreign object is refused before any revision names it. `merged` 0 when the run changed.
+	 */
+	async commitMergedSegment(input: MergedSegmentInput): Promise<CompactSegmentsResult> {
+		const ctx = this.writer();
+		const head = await this.store.head(input.key);
+		if (!head) throw new ThreadError(`missing merged segment ${input.key}`, 404);
+		if (head.size !== input.bytes) throw new ThreadError(`merged segment ${input.key} has ${head.size} bytes, not ${input.bytes}`, 400);
+		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
+		const probe: SegmentRef = { seq: 0, key: input.key, addedRev: input.readRev, count: input.count, bytes: input.bytes, lex: true, docs: true, text: true, base: true };
+		const seg = await LexSegment.open(W, this.store, probe, this.thread.epoch, io);
+		try {
+			const lex = this.lexConfig;
+			if (!seg.hasLex) throw new ThreadError(`merged segment ${input.key} has no lexical index`, 400);
+			if (lex?.docs && !seg.hasDocs) throw new ThreadError(`merged segment ${input.key} has no docs section`, 400);
+			if (input.keys !== seg.hasKeys) throw new ThreadError(`merged segment ${input.key} ${seg.hasKeys ? "has" : "has no"} keys section`, 400);
+		} finally {
+			seg.free();
+		}
+		const r = await commitMergedSegment(ctx, input);
 		await this.useRevision(r.gen, r.rev);
 		return r;
 	}

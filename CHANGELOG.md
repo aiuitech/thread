@@ -4,6 +4,18 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## 0.2.2 (2026-11-04)
+
+- **Committing a segment merged elsewhere**: `index.commitMergedSegment({ run, readRev, key, bytes, count, keys })` /
+  `commitMergedSegment(ctx, input)`. A process with the memory to read a large run whole (thread-core
+  `segment::merge`, which the wasm `merge_segments` wraps) writes the merged object under `idx/{gen}/seg/`, and the
+  index's writer commits it in place of the run. The object is opened first (container, section headers,
+  directories) and its size checked, so a truncated or foreign object is refused before a revision names it.
+  `merged` 0 and no revision when the head no longer lists the run contiguously. The segment gets
+  `addedRev = readRev`: sets newer than the plan still hide its ids, and the lexical-only sets the merge applied
+  drop once no segment predates them. For writers with little memory (a Durable Object) whose bounded
+  `compactSegments({ maxInputBytes })` cannot keep a large index in shape. TypeScript only.
+
 ## 0.2.1 (2026-11-03)
 
 - **Bounded lexical compaction**: `compactSegments({ maxInputBytes })` / `compact_segments(max_input_bytes=)`
