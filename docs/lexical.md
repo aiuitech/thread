@@ -197,9 +197,11 @@ concatenated per term with tombstoned documents dropped and documents re-sorted,
 id, texts kept when configured, keys with the newest copy of each key) into `seg/base.{rev}.thread` and commits a
 revision listing only it. The merged
 `terms`/`postings` are byte-identical to a fresh build over the live documents (checked); a document with no tokens
-leaves the lexical count then (it stays in `docs`). Tombstone sets are not dropped here; the dense compaction's
-rule now also keeps a set while any segment predates it (`tombDroppable` in the Worker), and the Worker's GC keeps
-every segment a kept revision lists. Compaction reads the segments whole, so it runs where memory allows (a build
+leaves the lexical count then (it stays in `docs`). Segment compaction drops the tombstone sets only the lexical
+side needed once no segment predates them: sets scoped `lexical` ([scoped tombstone sets](update-path.md#scoped-tombstone-sets-one-sided-updates)),
+and in a generation without a dense index every set; the others wait for the dense compaction, whose rule keeps a
+set while any segment predates it (`tombDroppable`). Segments apply the lexical view of the sets (unscoped and
+`lexical`). The Worker's GC keeps every segment a kept revision lists. Compaction reads the segments whole, so it runs where memory allows (a build
 slot or a laptop with the CLI, `thread seg merge`), not in a query isolate, for large bases.
 
 `compactSegments({ maxInputBytes })` / `compact_segments(max_input_bytes=)` bounds one call for a memory-limited

@@ -119,13 +119,14 @@ def load_rev_state(store: BlobStore, gen: str, rev: int, timeline: dict[str, Any
             elif fmt >= 2 or manifest.get("files"):
                 # v1 generations may predate slabs tables: their slabs are read whole.
                 raise ThreadError(f"missing {files['slabs']}", 404)
-        sets = [(t["rev"], u32_array(get_required(store, t["key"], trace), t["key"]))
-                for t in manifest.get("tombstones") or []]
+        refs = manifest.get("tombstones") or []
+        sets = [(t["rev"], u32_array(get_required(store, t["key"], trace), t["key"])) for t in refs]
+        scopes = [t.get("scope") for t in refs]
     if fmt >= 2 and slabs is None and has_dense(manifest):
         raise ThreadError(f"{files['slabs']} missing for format {fmt}")
     return RevState(gen=gen, rev=rev, manifest=manifest, files=files, format=fmt, slabs=slabs,
                     deltas=list(manifest.get("deltas") or []), segments=list(manifest.get("segments") or []),
-                    tomb=build_tomb_state(sets) if sets else None,
+                    tomb=build_tomb_state(sets, scopes) if sets else None,
                     base_key=f"{gen}|{files['coarse']}|{files['fine']}|{files.get('pq') or '-'}")
 
 

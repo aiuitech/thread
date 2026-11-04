@@ -40,6 +40,7 @@ from .wire import (
     parse_manifest,
     resolve_lex_config,
     tomb_for_segment,
+    FEATURE_SCOPED_TOMBSTONES,
     u32_array,
     ResolvedLexConfig,
 )
@@ -149,6 +150,8 @@ class WriterContext:
     list_keys: Callable[[dict[str, Any], str], list[str]] = lambda m, p: []
     #: The index's embedder for `manifest.embedding` (`(texts, kind) -> rows`), or None when it cannot embed.
     embedder: Callable[[Sequence[str], str], Rows] | None = None
+    #: The live attrs word of each id with a docs entry in the given (head) revision (a lexical-scoped upsert).
+    doc_attrs: Callable[[dict[str, Any], Sequence[int]], dict[int, int]] = lambda m, ids: {}
 
 
 def _now_iso() -> str:
@@ -596,19 +599,46 @@ def _stale_chunk_ids(ctx: WriterContext, manifest: dict[str, Any], chunked: _Chu
     return array("I", sorted(set(ctx.resolve_keys(manifest, stale).values())))
 
 
+def _check_scope(scope: str, vectors: Any, payloads: Any, texts: Any, metas: Any, chunk: Any, embed: Any) -> None:
+    """The fields a scoped upsert may carry (see `ThreadIndex.upsert`'s `scope`)."""
+    if scope not in ("both", "dense", "lexical"):
+        raise ThreadError('scope must be "both", "dense" or "lexical"', 400)
+    if scope == "both":
+        return
+    if chunk not in (None, False):
+        raise ThreadError('chunk needs scope "both" (stale chunks are hidden on both sides)', 400)
+    if scope == "lexical":
+        if vectors is not None or payloads or embed:
+            raise ThreadError('scope "lexical" leaves the vectors alone: no vectors, payloads or embed', 400)
+    else:
+        if metas:
+            raise ThreadError('scope "dense" leaves the docs alone: no metas', 400)
+        if texts and vectors is not None:
+            raise ThreadError('scope "dense" stores no texts: pass vectors, or texts to embed', 400)
+
+
 def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *, attrs: Iterable[Any] | None = None,
            payloads: Sequence[bytes | str] | None = None, texts: Sequence[str | None] | None = None,
            metas: Sequence[str | None] | None = None, keys_: Sequence[str] | None = None,
            replace: bool = True, chunk: ChunkOptions | Mapping[str, Any] | bool | None = None,
-           embed: Callable[[list[str]], Any] | Literal[False] | None = None) -> UpsertResult:
+           embed: Callable[[list[str]], Any] | Literal[False] | None = None,
+           scope: Literal["both", "dense", "lexical"] = "both") -> UpsertResult:
     t0 = time.perf_counter()
     store, gen = ctx.store, ctx.gen
     _writable(store)
+    _check_scope(scope, vectors, payloads, texts, metas, chunk, embed)
+    attrs_given = attrs is not None
     (ids, vectors, attrs, payloads, texts, metas, keys_), chunked = _expand(ids, vectors, attrs, payloads, texts, metas,
                                                                            keys_, chunk, embed, ctx.embedder,
-                                                                           _head_has_dense(ctx))
+                                                                           scope != "lexical" and _head_has_dense(ctx))
+    if scope == "dense":
+        # The texts were only the embedder's input: a dense-scoped upsert writes no segment.
+        if vectors is None:
+            raise ThreadError('scope "dense" needs vectors (or texts and an embedder)', 400)
+        texts = None
     st: dict[str, Any] = {"batch": None, "delta": None, "seg": None, "seq": 0, "tomb_key": None, "tomb_bytes": 0,
-                          "ids_key": None, "ids_rev": -1, "allocated": 0, "stale": array("I"), "stale_rev": -1}
+                          "ids_key": None, "ids_rev": -1, "allocated": 0, "stale": array("I"), "stale_rev": -1,
+                          "attrs_rev": -1}
 
     def make(rev: int, manifest: dict[str, Any], files: dict[str, Any]) -> dict[str, Any]:
         lex = resolve_lex_config(manifest)
@@ -617,7 +647,10 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
             st["batch"] = _prepare_batch(ids, vectors, attrs, payloads, texts, metas,
                                          manifest["dim"] if has_dense(manifest) else 0, lex, schema, keys_)
         batch: _Batch = st["batch"]
-        want_seg = lex is not None and (batch.texts is not None or batch.metas is not None or batch.keys is not None)
+        want_seg = scope != "dense" and lex is not None and (batch.texts is not None or batch.metas is not None
+                                                            or batch.keys is not None)
+        if scope == "lexical" and lex is None:
+            raise ThreadError('scope "lexical" needs a lexical configuration', 400)
         nxt = _inherit(manifest)
         new_rev = rev + 1
         if not st["seq"]:
@@ -638,13 +671,38 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
         if not batch.given_ids:
             if st["ids_rev"] != rev:
                 assert batch.keys is not None
-                batch.ids, st["allocated"] = _assign_ids(ctx, manifest, batch.keys)
+                if scope == "dense":
+                    # No segment is written, so a key must already name a document.
+                    found = ctx.resolve_keys(manifest, batch.keys)
+                    missing = [k for k in batch.keys if k not in found]
+                    if missing:
+                        raise ThreadError(f'scope "dense" attaches vectors to existing documents: unknown keys '
+                                          f'{", ".join(json.dumps(k) for k in missing[:5])}', 404)
+                    batch.ids, st["allocated"] = array("I", (found[k] for k in batch.keys)), 0
+                else:
+                    batch.ids, st["allocated"] = _assign_ids(ctx, manifest, batch.keys)
                 st["ids_rev"] = rev
             next_id = base_next + st["allocated"]  # the allocation took the next ids of this head
         else:
             next_id = max(next_id, max(batch.ids) + 1)
         if next_id != base_next or manifest.get("nextId") is not None:
             nxt["nextId"] = next_id
+        if scope == "lexical" and st["attrs_rev"] != rev:
+            # Absent attrs keep the live word; in a dense generation a changed word is refused, since the dense entry
+            # (where vector filters test it) keeps the old one.
+            live = ctx.doc_attrs(manifest, list(batch.ids))
+            if attrs_given:
+                if has_dense(manifest):
+                    assert batch.attrs is not None
+                    for i, id_ in enumerate(batch.ids):
+                        was = live.get(id_)
+                        if was is not None and was != batch.attrs[i]:
+                            raise ThreadError(f'id {id_}: scope "lexical" cannot change the attrs word of a document with '
+                                              f'a dense entry ({was} -> {batch.attrs[i]}); upsert it with its vector '
+                                              f'(scope "both")', 400)
+            else:
+                batch.attrs = array("I", (live.get(i, 0) for i in batch.ids))
+            st["attrs_rev"], st["seg"] = rev, None
         ids_key = batch.ids.tobytes()
         if ids_key != st["ids_key"]:
             st["ids_key"], st["delta"], st["seg"] = ids_key, None, None
@@ -672,7 +730,12 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
         seg: _EncodedSegment | None = st["seg"] if want_seg else None
         if tb is not None:
             st["tomb_bytes"] = len(tb)
-            nxt["tombstones"].append({"rev": new_rev, "key": st["tomb_key"], "count": len(tb) // 4})
+            ref = {"rev": new_rev, "key": st["tomb_key"], "count": len(tb) // 4}
+            if scope != "both":
+                ref["scope"] = scope
+                if FEATURE_SCOPED_TOMBSTONES not in (nxt.get("features") or []):
+                    nxt["features"] = [*(nxt.get("features") or []), FEATURE_SCOPED_TOMBSTONES]
+            nxt["tombstones"].append(ref)
         if delta is not None:
             nxt["deltas"].append({"seq": delta.seq, "key": delta.key, "count": len(batch.ids), "bytes": delta.bytes,
                                   "addedRev": new_rev, "cells": delta.n_cells})
@@ -680,6 +743,7 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
             nxt["segments"] = [*nxt["segments"], {**seg.ref, "addedRev": new_rev}]
         nxt["nextSeq"] = max(nxt.get("nextSeq") or 1, seq + 1)
         nxt["change"] = {"op": "upsert", "seq": seq, "count": len(batch.ids), "replace": replace,
+                         **({"scope": scope} if scope != "both" else {}),
                          "dense": delta is not None, "lexical": seg is not None, "writer": "thread-sdk-python"}
         if batch.keys is not None:
             nxt["change"].update(keys=len(batch.keys), allocated=st["allocated"])
@@ -867,7 +931,7 @@ def compact_segments(ctx: WriterContext, max_input_bytes: int | None = None) -> 
                 if tb is None:
                     raise ThreadError(f"missing {t['key']}", 404)
                 tomb_sets.append((t["rev"], u32_array(tb, t["key"])))
-            tomb = build_tomb_state(tomb_sets) if tomb_sets else None
+            tomb = build_tomb_state(tomb_sets, [t.get("scope") for t in sets]) if tomb_sets else None
             tombs = [tomb_for_segment(tomb, s["addedRev"]) if tomb else None for s in segs]
             out = _native.merge_segments(parts, tombs, dumps(lex.tokenizer or {}), lex.k1, lex.b, lex.lengths,
                                          lex.bucket_terms, lex.docs, lex.text, lex.bucket_docs, False, lex.bucket_keys)
@@ -883,9 +947,20 @@ def compact_segments(ctx: WriterContext, max_input_bytes: int | None = None) -> 
                "lex": True, "docs": lex.docs, "text": lex.docs and lex.text, "base": True}
         if built["keys"]:
             ref["keys"] = True
-        return {**_inherit(manifest), "segments": [*all_segs[:start], ref, *all_segs[start + len(segs):]],
-                "change": {"op": "compact-segments", "merged": len(segs), "count": built["count"],
-                           "writer": "thread-sdk-python"}}
+        segments = [*all_segs[:start], ref, *all_segs[start + len(segs):]]
+
+        # Sets only the lexical side held (scoped "lexical", or any set of a generation without a dense index) go once
+        # no segment predates them; the dense compaction drops the others.
+        def lex_only(t: dict[str, Any]) -> bool:
+            return t.get("scope") == "lexical" or (t.get("scope") is None and not has_dense(manifest)
+                                                   and not manifest.get("deltas") and not manifest.get("vectors"))
+
+        kept = [t for t in sets if not (lex_only(t) and not any(x["addedRev"] < t["rev"] for x in segments))]
+        change: dict[str, Any] = {"op": "compact-segments", "merged": len(segs), "count": built["count"]}
+        if len(kept) != len(sets):
+            change["droppedTombstoneSets"] = len(sets) - len(kept)
+        return {**_inherit(manifest), "segments": segments, "tombstones": kept,
+                "change": {**change, "writer": "thread-sdk-python"}}
 
     c = _commit_rev(ctx, make)
     return CompactSegmentsResult(gen, c.rev, st["merged"], st["key"], st["count"], st["bytes"], st["read_bytes"],

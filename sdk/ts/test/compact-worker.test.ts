@@ -78,14 +78,22 @@ class FakeR2 {
 
 type WorkerModule = { default: { fetch(req: Request, env: unknown, ctx: unknown): Promise<Response> } };
 
-async function workerCompact(bucket: FakeR2, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+async function workerPost(bucket: FakeR2, path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
 	const subtle = crypto.subtle as unknown as { timingSafeEqual?: (a: Uint8Array, b: Uint8Array) => boolean };
 	subtle.timingSafeEqual ??= (a, b) => a.byteLength === b.byteLength && a.every((x, i) => x === b[i]);
 	const worker = (await import(/* @vite-ignore */ WORKER)) as WorkerModule;
-	const res = await worker.default.fetch(new Request("https://w/build/compact", { method: "POST", headers: { authorization: "Bearer t" }, body: JSON.stringify(body) }), { BUCKET: bucket, BUILD_TOKEN: "t" }, { waitUntil() {}, passThroughOnException() {} });
+	const res = await worker.default.fetch(new Request(`https://w${path}`, { method: "POST", headers: { authorization: "Bearer t", "content-type": "application/json" }, body: JSON.stringify(body) }), { BUCKET: bucket, BUILD_TOKEN: "t" }, { waitUntil() {}, passThroughOnException() {} });
 	const j = (await res.json()) as { ok?: boolean; result?: Record<string, unknown>; error?: string };
-	if (!j.ok) throw new Error(`worker /build/compact: HTTP ${res.status}: ${j.error}`);
-	return j.result!;
+	if (!res.ok || j.error) throw new Error(`worker ${path}: HTTP ${res.status}: ${j.error}`);
+	return j.result ?? j;
+}
+const workerCompact = (bucket: FakeR2, body: Record<string, unknown>) => workerPost(bucket, "/build/compact", body);
+
+/** The FakeR2 bucket as an SDK store (the SDK reading what the Worker wrote). */
+function asStore(bucket: FakeR2): MemoryBlobStore {
+	const m = new MemoryBlobStore();
+	for (const [k, o] of bucket.objects) m.objects.set(k, { bytes: o.bytes.slice(), etag: o.etag, uploaded: o.uploaded.getTime() });
+	return m;
 }
 
 const DIM = 16;
@@ -172,3 +180,45 @@ async function addTree(store: MemoryBlobStore, gen: string) {
 	await store.put(keys.manifest(gen, rev + 1), JSON.stringify(next));
 	await store.put(keys.current(), JSON.stringify({ gen, rev: rev + 1 }));
 }
+
+describe.skipIf(!haveWorkerWasm)("scoped tombstones in the Worker", () => {
+	it("takes dense-scoped upserts, and rolls back across a scoped revision", async () => {
+		const gen = "sc";
+		const src = new MemoryBlobStore();
+		await thread.createGeneration({ store: src, gen, dim: DIM, lex: { text: true }, compaction: null });
+		const r = rng(8);
+		const v = unitRows(4, DIM, r);
+		const ix = await thread.open({ store: src, cache: false, refreshInterval: 0 });
+		const a = await ix.upsert({ keys: ["k1", "k2"], texts: ["alpha words", "bravo words"], vectors: v.subarray(0, 2 * DIM) });
+		const before = ix.rev;
+		await ix.upsert({ keys: ["k1"], texts: ["alpha renamed"], scope: "lexical" });
+		ix.close();
+		const bucket = new FakeR2();
+		copyInto(src, bucket);
+		// The Worker's dense-scoped upsert replaces k2's vector and leaves its docs, text and key.
+		const up = await workerPost(bucket, "/upsert", { gen, ids: [a.ids[1]], vectors: Array.from(v.subarray(3 * DIM, 4 * DIM)), scope: "dense" });
+		expect(up.rev).toBe(before + 2);
+		const read = await thread.open({ store: asStore(bucket), cache: false });
+		expect(read.manifest.tombstones!.map((t) => t.scope ?? "both")).toEqual(["both", "lexical", "dense"]);
+		expect((await read.query(v.subarray(3 * DIM, 4 * DIM), { topK: 1 })).hits[0].id).toBe(a.ids[1]);
+		expect((await read.query(v.subarray(1 * DIM, 2 * DIM), { topK: 2 })).hits.map((h) => h.id)).toContain(a.ids[0]);
+		expect((await read.search({ text: "bravo", topK: 3, embed: false })).hits.map((h) => h.id)).toEqual([a.ids[1]]);
+		expect((await read.search({ text: "renamed", topK: 3, embed: false })).hits.map((h) => h.id)).toEqual([a.ids[0]]);
+		read.close();
+		await expect(workerPost(bucket, "/upsert", { gen, ids: [a.ids[0]], vectors: Array.from(v.subarray(0, DIM)), scope: "lexical" })).rejects.toThrow(/scope/);
+		// Rollback to the revision before the scoped ones, then forward to the last scoped one.
+		const back = await workerPost(bucket, "/build/rollback", { gen, toRev: before, force: true });
+		const r1 = await thread.open({ store: asStore(bucket), cache: false });
+		expect(r1.rev).toBe(back.rev);
+		expect((await r1.search({ text: "alpha", topK: 3, embed: false })).hits.map((h) => h.id)).toEqual([a.ids[0]]);
+		expect((await r1.search({ text: "renamed", topK: 3, embed: false })).hits).toEqual([]);
+		expect((await r1.query(v.subarray(1 * DIM, 2 * DIM), { topK: 1 })).hits[0].id).toBe(a.ids[1]);
+		r1.close();
+		await workerPost(bucket, "/build/rollback", { gen, toRev: before + 2 });
+		const r2 = await thread.open({ store: asStore(bucket), cache: false });
+		expect(r2.manifest.features).toEqual(["scoped-tombstones"]);
+		expect((await r2.search({ text: "renamed", topK: 3, embed: false })).hits.map((h) => h.id)).toEqual([a.ids[0]]);
+		expect((await r2.query(v.subarray(3 * DIM, 4 * DIM), { topK: 1 })).hits[0].id).toBe(a.ids[1]);
+		r2.close();
+	});
+});

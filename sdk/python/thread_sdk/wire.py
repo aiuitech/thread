@@ -59,6 +59,8 @@ __all__ = [
     "tomb_for_segment",
     "tomb_hides",
     "NO_TOMBSTONES",
+    "FEATURE_SCOPED_TOMBSTONES",
+    "KNOWN_FEATURES",
     "dumps",
 ]
 
@@ -472,8 +474,18 @@ def check_manifest(m: Any, gen: str, rev: int) -> dict[str, Any]:
             raise ThreadError(f"manifest {gen} rev {rev}: missing {f}")
     if m.get("rev", 0) != rev:
         raise ThreadError(f"manifest {gen} rev {rev} says rev {m.get('rev')}")
+    unknown = [f for f in m.get("features") or [] if f not in KNOWN_FEATURES]
+    if unknown:
+        raise ThreadError(f"manifest {gen} rev {rev} uses {', '.join(unknown)}, which this SDK does not understand: upgrade it",
+                          400)
     m["rev"] = rev
     return m
+
+
+#: `manifest.features` entry of a revision with scoped tombstone sets (`TombRef.scope`).
+FEATURE_SCOPED_TOMBSTONES = "scoped-tombstones"
+#: The features this SDK reads; a manifest naming any other is refused (it could be misread).
+KNOWN_FEATURES: tuple[str, ...] = (FEATURE_SCOPED_TOMBSTONES,)
 
 
 def parse_slabs_table(b: BytesLike, cells: int, key: str) -> list[list[int]]:
@@ -519,14 +531,25 @@ class TombState:
     total: int
     unions: dict[int, bytes] = field(default_factory=dict)
     delta_unions: dict[int, bytes] = field(default_factory=dict)
+    #: The side each set hides, aligned with `sets` (None = both; "dense" / "lexical": a scoped upsert's set).
+    scopes: list[str | None] = field(default_factory=list)
+    segment_unions: dict[int, bytes] = field(default_factory=dict)
     _max_rev: dict[int, int] | None = None
+
+    def dense(self) -> list[tuple[int, array]]:
+        """The dense view (slabs, deltas): sets without a scope or scoped "dense"."""
+        return [s for s, sc in zip(self.sets, self.scopes or [None] * len(self.sets)) if sc != "lexical"]
+
+    def lexical(self) -> list[tuple[int, array]]:
+        """The lexical view (segments: postings, docs, keys): sets without a scope or scoped "lexical"."""
+        return [s for s, sc in zip(self.sets, self.scopes or [None] * len(self.sets)) if sc != "dense"]
 
     @property
     def max_rev(self) -> dict[int, int]:
-        """id -> highest rev of a set containing it (the delta rule), built on first use."""
+        """id -> highest rev of a lexical-view set containing it (the segment rule), built on first use."""
         if self._max_rev is None:
             mr: dict[int, int] = {}
-            for rev, ids in self.sets:
+            for rev, ids in self.lexical():
                 for i in ids:
                     if mr.get(i, -1) < rev:
                         mr[i] = rev
@@ -534,8 +557,12 @@ class TombState:
         return self._max_rev
 
 
-def build_tomb_state(sets: list[tuple[int, array]]) -> TombState:
-    return TombState(sets=sets, total=sum(len(ids) for _, ids in sets))
+def build_tomb_state(sets: list[tuple[int, array]], scopes: list[str | None] | None = None) -> TombState:
+    """`scopes`: the side each set hides (`TombRef.scope`; None = both), aligned with `sets`."""
+    sc: list[str | None] = list(scopes) if scopes is not None else [None] * len(sets)
+    if len(sc) != len(sets):
+        raise ThreadError(f"{len(sc)} scopes for {len(sets)} tombstone sets", 500)
+    return TombState(sets=sets, total=sum(len(ids) for _, ids in sets), scopes=sc)
 
 
 def tomb_for(t: TombState, slab_rev: int) -> bytes:
@@ -544,7 +571,7 @@ def tomb_for(t: TombState, slab_rev: int) -> bytes:
     rev-0 slabs are hidden by every set."""
     u = t.unions.get(slab_rev)
     if u is None:
-        u = id_union(ids for rev, ids in t.sets if rev >= slab_rev)
+        u = id_union(ids for rev, ids in t.dense() if rev >= slab_rev)
         t.unions[slab_rev] = u
     return u
 
@@ -554,13 +581,19 @@ def tomb_for_delta(t: TombState, added_rev: int) -> bytes:
     with rev > added_rev (the upsert's own set has rev = added_rev and hides older copies, not the new one)."""
     u = t.delta_unions.get(added_rev)
     if u is None:
-        u = id_union(ids for rev, ids in t.sets if rev > added_rev)
+        u = id_union(ids for rev, ids in t.dense() if rev > added_rev)
         t.delta_unions[added_rev] = u
     return u
 
 
-#: Filter buffer for the entries of a lexical/docs segment added at rev `added_rev`: the delta rule.
-tomb_for_segment = tomb_for_delta
+def tomb_for_segment(t: TombState, added_rev: int) -> bytes:
+    """Filter buffer for the entries of a lexical/docs segment added at rev `added_rev`: the delta rule over the
+    lexical view."""
+    u = t.segment_unions.get(added_rev)
+    if u is None:
+        u = id_union(ids for rev, ids in t.lexical() if rev > added_rev)
+        t.segment_unions[added_rev] = u
+    return u
 
 
 def tomb_hides(t: TombState | None, id: int, added_rev: int) -> bool:

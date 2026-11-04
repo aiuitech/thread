@@ -351,6 +351,9 @@ const { records } = await index.get(["s3://b/a.bin"], { text: true });   // Map<
 const { ids } = await index.resolveKeys(["s3://b/a.bin"]);              // Map<key, id>
 const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });   // { entries: [{ key, id }], more, next }; continue with { after: page.next }
 await index.deleteKeys(["s3://b/c.bin"]);                                // { count, missing, ... }
+// one side only: a vector for an existing key (text, meta, key untouched), or new text without the vector
+await index.upsert({ keys: ["s3://b/a.bin"], vectors: [emb], scope: "dense" });
+await index.upsert({ keys: ["s3://b/a.bin"], texts: ["host:cdn-2"], metas: ["A2"], scope: "lexical" });
 // long texts: chunked into windows of `words` words (default 200) sharing `overlap` (default 0), one document per chunk keyed `k#i`
 // with the parent's meta/attrs; `embed` is called once with the chunk texts and returns their vectors (r.chunks = { documents, count, stale })
 await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk: { words: 200, overlap: 20 }, embed: async (texts) => embedAll(texts) });
@@ -384,6 +387,12 @@ segment's `keys` section and resolved newest segment first; the design and the k
 [docs/keys.md](../../docs/keys.md). `chunk` splits each text into flat word windows before writing (needs `keys`
 and `texts`; vectors come from `embed`; chunk keys the parent no longer produces are tombstoned in the same
 revision); the rule, the key scheme and the limits are in [docs/chunking.md](../../docs/chunking.md).
+`scope` (default `"both"`) replaces one side of the documents: `"dense"` writes the delta and a tombstone set that
+hides only older dense copies (keys must exist; no segment, so docs, texts and keys stay; `texts` only feed the
+embedder; no `metas`/`chunk`), `"lexical"` writes the segment and a set that hides only older lexical copies (no
+`vectors`/`payloads`/`embed`/`chunk`; absent `attrs` keep the live word, a changed word is refused in a dense
+generation). Deletes stay unscoped. Scoped sets mark the manifest `features: ["scoped-tombstones"]`, which readers
+before 0.2.1 ignore ([docs/update-path.md](../../docs/update-path.md#scoped-tombstone-sets-one-sided-updates)).
 `createGeneration` (also `createGeneration(thread.wasm, opts)` and the Worker's `POST /create`) publishes rev 0
 with one empty cell for `embedding` (or a bare `dim`), `lex` (default `{}`; `null` for ids only), `attrs`, a
 `profile` (`edge` splits cells at 3000 entries, `local` at 1000), `defaults` and the automatic `compaction` policy;

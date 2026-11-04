@@ -201,6 +201,19 @@ if (cmd === "build") {
 	for (const req of requests) results.push(await answer(index, req));
 	process.stdout.write(JSON.stringify({ gen: index.gen, rev: index.rev, k: index.manifest.k1 * index.manifest.k2, deltas: index.manifest.deltas.length, runs, results }));
 	index.close();
+} else if (cmd === "scoped") {
+	// Scoped upserts from TS on a fresh dense generation (vectors from scoped-input.json), then the requests.
+	const { vectors } = JSON.parse(fs.readFileSync(path.join(dir, "scoped-input.json"), "utf8"));
+	await thread.createGeneration({ store, gen: "sc", dim: vectors[0].length, lex: { text: true }, attrs: { tag: { bits: 4 } }, compaction: null });
+	const index = await thread.open({ store, cache: false, refreshInterval: 0 });
+	await index.upsert({ keys: ["t/1", "t/2", "t/3"], texts: ["first text only", "second has a vector", "third will be renamed"], metas: ["m1", "m2", "m3"], vectors: [vectors[0], vectors[1], vectors[2]], attrs: [{ tag: 1 }, { tag: 2 }, { tag: 3 }] });
+	await index.upsert({ keys: ["t/2"], vectors: [vectors[3]], attrs: [{ tag: 2 }], scope: "dense" });
+	await index.upsert({ keys: ["t/3"], texts: ["third renamed by typescript"], metas: ["m3b"], scope: "lexical" });
+	const { requests } = JSON.parse(fs.readFileSync(path.join(dir, "requests.json"), "utf8"));
+	const results = [];
+	for (const req of requests) results.push(await answer(index, req));
+	process.stdout.write(JSON.stringify({ gen: index.gen, rev: index.rev, results }));
+	index.close();
 } else if (cmd === "pack") {
 	const r = await packIndexToFile(store, extra);
 	process.stdout.write(JSON.stringify(r));
@@ -209,4 +222,4 @@ if (cmd === "build") {
 	const r = await buildBasePack(store, await loadRevState(store, t.gen, t.rev), process.argv[5] ?? "base");
 	fs.writeFileSync(extra, r.bytes);
 	process.stdout.write(JSON.stringify({ key: r.key, keys: r.keys, routing: r.routing }));
-} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | compact <dir> | pack <dir> <file> | basepack <dir> <file> <kind>`);
+} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | compact <dir> | scoped <dir> | pack <dir> <file> | basepack <dir> <file> <kind>`);

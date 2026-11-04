@@ -1235,7 +1235,11 @@ class ThreadIndex:
                     return out
                 after = page.next
 
-        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq, resolve_keys, list_keys, self._embedder())
+        def doc_attrs(manifest: dict[str, Any], ids: Sequence[int]) -> dict[int, int]:
+            return self._lex_index_for(manifest).attrs(ids)
+
+        return WriterContext(self.store, self._rev.gen, self._io, borrow_pq, resolve_keys, list_keys, self._embedder(),
+                             doc_attrs)
 
     def upsert(
         self,
@@ -1250,6 +1254,7 @@ class ThreadIndex:
         replace: bool = True,
         chunk: ChunkOptions | Mapping[str, Any] | bool | None = None,
         embed: Callable[[list[str]], Any] | Literal[False] | None = None,
+        scope: Literal["both", "dense", "lexical"] = "both",
     ) -> UpsertResult:
         """Adds or replaces documents: one delta segment (vectors: `n * dim` floats flat, one row per id, or an
         `(n, dim)` numpy array; any norm), one lexical/docs/keys segment (`texts` indexed by BM25, `metas` stored in
@@ -1268,9 +1273,16 @@ class ThreadIndex:
         keys. At most 4096 chunks per call. `embed` is called once with the texts to index (the chunks when chunking,
         else `texts`) and returns one vector per text, as `vectors` takes them; the SDK runs no model itself. Absent,
         with texts and no vectors, a generation that names its model (`manifest.embedding`) embeds the texts through
-        the index's embedder (`open_index(embed=...)`); `embed=False` skips that (text-only documents)."""
+        the index's embedder (`open_index(embed=...)`); `embed=False` skips that (text-only documents).
+
+        `scope` picks the side of the documents the upsert replaces (default "both", the whole document).
+        "lexical": writes the segment and a tombstone set that hides only older lexical copies; the vectors stay (no
+        `vectors`, `payloads`, `embed` or `chunk`); absent `attrs` keep each document's live word, and in a dense
+        generation a different word is refused. "dense": writes the delta and a tombstone set that hides only older
+        dense copies; docs, texts and keys stay; keys must already exist; `texts` are only the embedder's input; no
+        `metas` or `chunk`. Deletes stay unscoped."""
         r = upsert(self._writer(), ids, vectors, attrs=attrs, payloads=payloads, texts=texts, metas=metas,
-                   keys_=keys, replace=replace, chunk=chunk, embed=embed)
+                   keys_=keys, replace=replace, chunk=chunk, embed=embed, scope=scope)
         self.use_revision(r.gen, r.rev)
         return r
 

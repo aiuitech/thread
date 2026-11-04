@@ -115,6 +115,15 @@ keys directory (one entry plus one key per bucket). `get` is two rounds (keys bu
 immutable cached objects: a few milliseconds from a local copy, tens of milliseconds from a Worker through a warm
 edge cache, the same as resolving a hit's document today.
 
+## Adding vectors to a text-first index
+
+A keyed index often gets its texts and metas first and its embeddings later. `upsert({ keys, vectors, scope:
+"dense" })` (Python `scope="dense"`) attaches the vectors to the existing documents: the keys resolve through the
+head (a key without a document is an error), no segment is written, and the tombstone set hides only older dense
+copies, so `get(key)`, `listKeys`, text search and the stored meta and text stay as they were. With an embedding
+model, `texts` (not stored) can stand in for `vectors`. The other way round, `scope: "lexical"` changes texts or
+metas without the vector. See [update-path.md](update-path.md#scoped-tombstone-sets-one-sided-updates).
+
 ## Not done
 
 - No reverse lookup (id -> key): put the key in `meta` if a search hit must show it.

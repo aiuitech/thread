@@ -14,7 +14,7 @@ import { CachedBlobStore, type BlobStore } from "./store.js";
 import { WarmPrefixStore } from "./warm.js";
 import type * as W from "./wasm/thread.js";
 import { buildRoutingObjects } from "./routing.js";
-import { buildTombState, decodeJson, DELTA_ENTRY_BYTES, keys, manifestFiles, parseDeltaHeader, parseManifest, parseSlabsTable, ThreadError, tombFor, tombForDelta, type CompactionPolicy, type DeltaRef, type IndexFiles, type Manifest, type RoutingTables, type SlabRow, type TombRef, type TreeRef } from "./wire.js";
+import { buildTombState, hidesDense, hidesLexical, type TombScope, decodeJson, DELTA_ENTRY_BYTES, keys, manifestFiles, parseDeltaHeader, parseManifest, parseSlabsTable, ThreadError, tombFor, tombForDelta, type CompactionPolicy, type DeltaRef, type IndexFiles, type Manifest, type RoutingTables, type SlabRow, type TombRef, type TreeRef } from "./wire.js";
 import { commitRev, inherit, latestRev, putIfAbsent, putUnique, writable, type WriterContext } from "./write.js";
 
 // ---------- policy and pressure ----------
@@ -300,12 +300,15 @@ async function getOrThrow(store: BlobStore, key: string): Promise<Uint8Array> {
 const slabRevOf = (row: SlabRow | undefined): number => (row && row.length > 4 ? (row[4] as number) : 0);
 
 /**
- * Whether a tombstone set can leave the manifest (the Worker's `tombDroppable`): no remaining delta or lexical/docs
- * segment predates it, no slab written at a rev in (0, set.rev] remains, and none of its ids is a build id.
+ * Whether a tombstone set can leave the manifest (the Worker's `tombDroppable`), per side: the dense side holds it
+ * while a remaining delta predates it, a slab written at a rev in (0, set.rev] remains, or one of its ids is a
+ * build id; the lexical side while a lexical/docs segment predates it. A scoped set needs only its own side clear,
+ * an unscoped one both.
  */
-export function tombDroppable(t: { rev: number; ids: Uint32Array }, deltas: { addedRev: number }[], slabs: SlabRow[], baseIds: number, segments: { addedRev: number }[] = []): boolean {
+export function tombDroppable(t: { rev: number; ids: Uint32Array; scope?: TombScope }, deltas: { addedRev: number }[], slabs: SlabRow[], baseIds: number, segments: { addedRev: number }[] = []): boolean {
+	if (hidesLexical(t) && segments.some((s) => s.addedRev < t.rev)) return false;
+	if (!hidesDense(t)) return true;
 	if (deltas.some((d) => d.addedRev < t.rev)) return false;
-	if (segments.some((s) => s.addedRev < t.rev)) return false;
 	if (slabs.some((row) => slabRevOf(row) > 0 && slabRevOf(row) <= t.rev)) return false;
 	for (const id of t.ids) if (id < baseIds) return false;
 	return true;
@@ -342,7 +345,7 @@ interface Base {
 	files: IndexFiles;
 	slabs: SlabRow[];
 	slabsBytes: number;
-	tombs: { rev: number; key: string; ids: Uint32Array }[];
+	tombs: { rev: number; key: string; ids: Uint32Array; scope?: TombScope }[];
 	dcells: DeltaCells[];
 }
 
@@ -418,7 +421,8 @@ function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurre
 	};
 	let purgeCells = 0;
 	if (o.purge && b.tombs.length) {
-		const purgeable = b.tombs.filter((t) => !t.ids.some((id) => id < m.vectors));
+		// Only dense-side sets wait for slabs; of those, only sets without build ids can ever be dropped.
+		const purgeable = b.tombs.filter((t) => hidesDense(t) && !t.ids.some((id) => id < m.vectors));
 		const maxRev = purgeable.reduce((a, t) => Math.max(a, t.rev), 0);
 		const blockers = b.slabs
 			.map((row, cell) => ({ cell, r: slabRevOf(row) }))
@@ -583,7 +587,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 	const slabRev = baseRev + 1;
 	const slabsBytes = await getOrThrow(store, files.slabs);
 	const slabs = parseSlabsTable(slabsBytes, k, files.slabs);
-	const tombs = await Promise.all((manifest.tombstones ?? []).map(async (t) => ({ rev: t.rev, key: t.key, ids: u32View(await getOrThrow(store, t.key)) })));
+	const tombs = await Promise.all((manifest.tombstones ?? []).map(async (t) => ({ rev: t.rev, key: t.key, ids: u32View(await getOrThrow(store, t.key)), ...(t.scope ? { scope: t.scope } : {}) })));
 	const dcells = await mapLimit(manifest.deltas ?? [], 6, (d) => readDeltaCells(store, d));
 	const maxBytes = opts.maxBytes ?? COMPACT_DEFAULT_MAX_BYTES;
 	if (!(maxBytes > 0)) throw new ThreadError("maxBytes must be positive", 400);
@@ -630,7 +634,8 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		deltaBytes.set(d.key, b);
 		result.readBytes += b.byteLength;
 	});
-	const ts = buildTombState(tombs.map((t) => ({ rev: t.rev, ids: t.ids })));
+	// The dense view (tombFor / tombForDelta skip the lexical-scoped sets).
+	const ts = buildTombState(tombs.map((t) => ({ rev: t.rev, ids: t.ids, ...(t.scope ? { scope: t.scope } : {}) })));
 	const cellDeltas = new Map<number, DeltaRef[]>();
 	for (const d of foldedRefs) for (const c of plan.deltaCells.get(d.key)!) (cellDeltas.get(c) ?? cellDeltas.set(c, []).get(c)!).push(d);
 	const rows = new Map<number, SlabRow>();
@@ -801,7 +806,7 @@ interface Slice {
 	slabs: SlabRow[];
 	k: number;
 	dim: number;
-	tombs: { rev: number; key: string; ids: Uint32Array }[];
+	tombs: { rev: number; key: string; ids: Uint32Array; scope?: TombScope }[];
 	slabRev: number;
 	rows: [number, SlabRow][];
 	folded: DeltaRef[];
@@ -867,7 +872,7 @@ async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result:
 		const keep = sets.filter((t) => !tombDroppable(t, remaining, table, manifest.vectors, manifest.segments ?? []));
 		dropped = sets.filter((t) => !keep.includes(t)).map((t) => t.rev);
 		if (!s.rows.length && !dropped.length) return null;
-		const next: Manifest = { ...inherit(manifest), deltas: remaining, tombstones: keep.map(({ rev: r, key, count }) => ({ rev: r, key, count })) };
+		const next: Manifest = { ...inherit(manifest), deltas: remaining, tombstones: keep.map(({ rev: r, key, count, scope }) => ({ rev: r, key, count, ...(scope ? { scope } : {}) })) };
 		if (s.rows.length) next.files = { ...files, slabs: await putUnique(store, keys.slabsTable(gen, rev + 1), JSON.stringify(table)) };
 		if (s.splits.length) {
 			if (!routing || routing.forFine !== files.fine) routing = { forFine: files.fine, ...(await splitRouting(ctx, w, rev + 1, manifest, files, s, kk)) };

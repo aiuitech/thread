@@ -301,6 +301,8 @@ index.delete_keys(["s3://b/c.bin"])     # DeleteResult with .missing
 # with the parent's meta/attrs; `embed` is called once with the chunk texts and returns their vectors (r.chunks = {documents, count, stale})
 index.upsert(keys=["docs/a.md"], texts=[long_text], metas=["A"], chunk={"words": 200, "overlap": 20}, embed=embed_all)
 chunk_text(long_text, words=200, overlap=20)   # [Chunk(index, text, start, end, words), ...], the same windows
+index.upsert(keys=["s3://b/a.bin"], vectors=[emb], scope="dense")       # a vector for an existing key, text/meta untouched
+index.upsert(keys=["s3://b/a.bin"], texts=["host:cdn-2"], scope="lexical")   # new text, the vector untouched
 index.compact_segments()                # merge the lexical/docs segments into one base segment
 index.compact_segments(max_input_bytes=4 << 20)   # or one contiguous run that fits 4 MB (memory-limited writers)
 create_lexical_generation(store, "docs1", {"text": True})               # a text-only generation (no dense index)

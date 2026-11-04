@@ -46,7 +46,7 @@ export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
 export { dropGeneration, gcGeneration, setCurrent, supersededKey, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
 export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionPressure, compactionStatus, tombDroppable, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
-export type { CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
+export type { UpsertScope, CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
 export { CREATE_DEFAULTS, createGeneration, createLexicalGeneration } from "./write.js";
 
 /** A document fetched by key: its id and `docs` entry. */
@@ -1109,6 +1109,7 @@ export class ThreadIndex {
 			borrowPq: (key) => (this.base && !this.base.dropped && this.base.key === key && this.base.epoch === this.thread.epoch ? this.base.pq : null),
 			embedder: this.embedder(),
 			resolveKeys: async (manifest, keys) => (await (await this.lexIndexFor(manifest)).resolveKeys(keys)).ids,
+			docAttrs: async (manifest, ids) => (await this.lexIndexFor(manifest)).attrs(ids),
 			listKeys: async (manifest, prefix) => {
 				const lex = await this.lexIndexFor(manifest);
 				const out: string[] = [];

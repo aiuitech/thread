@@ -1322,6 +1322,19 @@ interface TombRef {
 	rev: number;
 	key: string;
 	count: number;
+	/** The side it hides (thread-sdk scoped upserts, docs/update-path.md); absent = both. This Worker reads the dense side. */
+	scope?: "dense" | "lexical";
+}
+
+/** manifest.features this Worker understands; a manifest naming another one is refused (it could be misread). */
+const KNOWN_FEATURES = ["scoped-tombstones"];
+const FEATURE_SCOPED_TOMBSTONES = "scoped-tombstones";
+/** Whether a tombstone set hides the dense side (slabs, deltas), the only side this Worker reads. */
+const hidesDense = (t: { scope?: string }): boolean => t.scope !== "lexical";
+
+function checkFeatures(m: { gen: string; rev?: number; features?: string[] }): void {
+	const unknown = (m.features ?? []).filter((f) => !KNOWN_FEATURES.includes(f));
+	if (unknown.length) throw new HttpError(500, `manifest ${m.gen} rev ${m.rev ?? 0} uses ${unknown.join(", ")}, which this Worker does not understand`);
 }
 
 /** Objects a revision reads. Manifests without `files` (rev 0) use the generation's fixed names. */
@@ -1380,6 +1393,8 @@ interface Manifest {
 	lex?: Record<string, unknown>;
 	/** Lexical / docs segments (SDK, `idx/{gen}/seg/*`): filtered by tombstone sets with rev > addedRev, like deltas. */
 	segments?: { seq: number; key: string; addedRev: number; count: number; bytes: number }[];
+	/** Format extensions (KNOWN_FEATURES); inherited. */
+	features?: string[];
 }
 
 /**
@@ -1549,6 +1564,7 @@ async function latestRev(env: Env, gen: string): Promise<number> {
 /** A manifest read straight from R2 (writers; legacy rev-0 manifests may have been republished, so not through the cache). */
 async function readManifestR2(env: Env, gen: string, rev: number): Promise<Manifest> {
 	const m = decodeJson<Manifest>(await getBuffer(env.BUCKET, manifestKey(gen, rev)));
+	checkFeatures(m);
 	return { ...m, rev: m.rev ?? rev };
 }
 
@@ -2037,9 +2053,11 @@ async function loadRevState(env: Env, ctx: ExecutionContext, gen: string, rev: n
 	if (!m) throw new HttpError(404, `no manifest ${manifestKey(gen, rev)}`);
 	const manifest = decodeJson<Manifest>(m.buf);
 	if (manifest.gen !== gen) throw new HttpError(500, `${manifestKey(gen, rev)} is for generation ${manifest.gen}`);
+	checkFeatures(manifest);
 	const files = manifestFiles(manifest);
 	const format = manifest.format ?? 1;
-	const tombRefs = manifest.tombstones ?? [];
+	// Queries here read the dense side only: lexical-scoped sets do not apply.
+	const tombRefs = (manifest.tombstones ?? []).filter(hidesDense);
 	const [s, tombs] = await Promise.all([
 		files.slabs ? loadSlabsTable(env, ctx, files.slabs, format < 2 && !manifest.files) : Promise.resolve({ table: null, outcome: "none" as CacheOutcome }),
 		Promise.all(
@@ -3274,6 +3292,8 @@ interface UpsertInput {
 	payloads: Uint8Array[] | null;
 	/** Write a tombstone set for the ids (replace older copies). Default true. */
 	replace: boolean;
+	/** "both" (default) or "dense": the tombstone set hides only older dense copies (thread-sdk scoped upserts). */
+	scope: "both" | "dense";
 }
 
 function b64ToBytes(s: string): Uint8Array {
@@ -3303,6 +3323,7 @@ async function parseUpsert(request: Request, url: URL): Promise<UpsertInput> {
 	const ct = request.headers.get("content-type") ?? "";
 	let gen = url.searchParams.get("gen");
 	let replace = url.searchParams.get("replace") !== "0";
+	let scope = url.searchParams.get("scope") ?? "both";
 	let ids: Uint32Array | null = null;
 	let firstId: number | null = null;
 	let vectors: Float32Array;
@@ -3317,9 +3338,10 @@ async function parseUpsert(request: Request, url: URL): Promise<UpsertInput> {
 		firstId = optIntParam(url, "firstId", 0);
 		if (!ids && firstId === null) throw new HttpError(400, "binary upsert needs ids (x-ids header, ?ids=) or ?firstId=");
 	} else {
-		const body = await readJson<{ gen?: string; ids: number[]; vectors: number[] | string; attrs?: number[]; payloads?: (string | { b64: string })[]; replace?: boolean }>(request);
+		const body = await readJson<{ gen?: string; ids: number[]; vectors: number[] | string; attrs?: number[]; payloads?: (string | { b64: string })[]; replace?: boolean; scope?: string }>(request);
 		gen = body.gen ?? gen;
 		if (body.replace === false) replace = false;
+		if (body.scope !== undefined) scope = body.scope;
 		ids = u32Array(body.ids, "ids");
 		if (typeof body.vectors === "string") {
 			const b = b64ToBytes(body.vectors);
@@ -3333,7 +3355,9 @@ async function parseUpsert(request: Request, url: URL): Promise<UpsertInput> {
 			payloads = body.payloads.map((p) => (typeof p === "string" ? enc.encode(p) : p && typeof p === "object" && typeof p.b64 === "string" ? b64ToBytes(p.b64) : enc.encode(JSON.stringify(p))));
 		}
 	}
-	return { gen, ids, firstId, vectors, attrs, payloads, replace };
+	// This upsert writes no segment: "lexical" does not apply, "dense" keeps the documents' docs, texts and keys.
+	if (scope !== "both" && scope !== "dense") throw new HttpError(400, `scope must be "both" or "dense" here (lexical-scoped upserts go through the SDKs)`);
+	return { gen, ids, firstId, vectors, attrs, payloads, replace, scope };
 }
 
 /** Validates the batch against the manifest and returns the final ids and the vectors, unit-normalized in place. */
@@ -3551,11 +3575,12 @@ async function handleUpsert(request: Request, env: Env, ctx: ExecutionContext, u
 			if (tb) {
 				if (!st.tombKey) st.tombKey = await putUnique(env, tombKey(gen, newRev), tb);
 				st.tombBytes = tb.byteLength;
-				next.tombstones!.push({ rev: newRev, key: st.tombKey, count: tb.byteLength / 4 });
+				next.tombstones!.push({ rev: newRev, key: st.tombKey, count: tb.byteLength / 4, ...(input.scope === "dense" ? { scope: "dense" as const } : {}) });
+				if (input.scope === "dense" && !(next.features ?? []).includes(FEATURE_SCOPED_TOMBSTONES)) next.features = [...(next.features ?? []), FEATURE_SCOPED_TOMBSTONES];
 			}
 			next.deltas!.push({ seq: delta.seq, key: delta.key, count: delta.count, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
 			next.nextSeq = Math.max(next.nextSeq ?? 1, delta.seq + 1);
-			return { ...next, change: { op: "upsert", seq: delta.seq, count: delta.count, replace: input.replace } };
+			return { ...next, change: { op: "upsert", seq: delta.seq, count: delta.count, replace: input.replace, ...(input.scope === "dense" ? { scope: "dense" } : {}) } };
 		});
 		const d = st.delta!;
 		const m = c.manifest;
@@ -3628,7 +3653,7 @@ interface CompactBase {
 	files: IndexFiles;
 	slabs: SlabMeta[];
 	deltas: DeltaRef[];
-	tombs: { rev: number; key: string; ids: Uint32Array }[];
+	tombs: { rev: number; key: string; ids: Uint32Array; scope?: "dense" | "lexical" }[];
 }
 
 async function loadCompactBase(env: Env, gen: string, baseRev: number): Promise<CompactBase> {
@@ -3638,7 +3663,7 @@ async function loadCompactBase(env: Env, gen: string, baseRev: number): Promise<
 	if ((manifest.format ?? 1) < 2) throw new HttpError(400, "compaction needs a format 2 or 3 generation");
 	const [slabs, tombs] = await Promise.all([
 		getBuffer(env.BUCKET, files.slabs).then((b) => decodeJson<SlabMeta[]>(b)),
-		pmap(manifest.tombstones ?? [], SUBREQUEST_CONCURRENCY, async (t) => ({ rev: t.rev, key: t.key, ids: new Uint32Array(await getBuffer(env.BUCKET, t.key)) })),
+		pmap(manifest.tombstones ?? [], SUBREQUEST_CONCURRENCY, async (t) => ({ rev: t.rev, key: t.key, ids: new Uint32Array(await getBuffer(env.BUCKET, t.key)), ...(t.scope ? { scope: t.scope } : {}) })),
 	]);
 	return { gen, baseRev, manifest, files, slabs, deltas: manifest.deltas ?? [], tombs };
 }
@@ -3716,7 +3741,7 @@ async function stageCompactPlan(env: Env, body: CompactPlanReq) {
 	const dcells = await loadDeltaCells(env, b.deltas, false);
 	const deltaCells = new Set<number>();
 	for (const d of dcells.values()) for (const c of d.counts.keys()) deltaCells.add(c);
-	const maxTomb = b.tombs.reduce((a, t) => Math.max(a, t.rev), 0);
+	const maxTomb = b.tombs.filter(hidesDense).reduce((a, t) => Math.max(a, t.rev), 0);
 	const tombCells = new Set<number>();
 	if (b.tombs.length && body.purge) b.slabs.forEach((row, cell) => slabRevOf(row) > 0 && slabRevOf(row) <= maxTomb && tombCells.add(cell));
 	let cells: number[];
@@ -3816,7 +3841,8 @@ async function compactCells(env: Env, b: CompactBase, cells: number[], concurren
 	if (splitOf.size && manifest.k1 !== 1) throw new HttpError(400, "cell splits need a flat generation (k1 = 1)");
 	// Format 3 halves are re-encoded with the index's PQ codebook.
 	const codebook = splitOf.size && cells.some((c) => splitOf.has(c)) && format === 3 ? new Uint8Array(await getBuffer(env.BUCKET, b.files.pq!)) : new Uint8Array(0);
-	const sets = b.tombs.map((t) => ({ rev: t.rev, ids: t.ids }));
+	// Slabs and deltas: the dense view (lexical-scoped sets hide only segments).
+	const sets = b.tombs.filter(hidesDense).map((t) => ({ rev: t.rev, ids: t.ids }));
 	const unionCache = new Map<string, Uint8Array>();
 	const union = (pred: (rev: number) => boolean, tag: string) => {
 		let u = unionCache.get(tag);
@@ -3964,13 +3990,15 @@ interface CompactCommitReq {
 }
 
 /**
- * Whether a tombstone set can be dropped from the manifest: no remaining delta or lexical/docs segment predates
- * it, no slab written at a rev in (0, set.rev] remains (such a slab may hold an id the set hides), and none of
- * its ids is a build id (rev-0 slabs hold ids [0, manifest.vectors), the driver's id space).
+ * Whether a tombstone set can be dropped from the manifest, per side: the lexical side holds it while a
+ * lexical/docs segment predates it; the dense side while a remaining delta predates it, a slab written at a rev in
+ * (0, set.rev] remains (such a slab may hold an id the set hides), or one of its ids is a build id (rev-0 slabs hold
+ * ids [0, manifest.vectors), the driver's id space). A scoped set needs only its side clear, an unscoped one both.
  */
-function tombDroppable(t: { rev: number; ids: Uint32Array }, deltas: DeltaRef[], slabs: SlabMeta[], baseIds: number, segments: { addedRev: number }[] = []): boolean {
+function tombDroppable(t: { rev: number; ids: Uint32Array; scope?: "dense" | "lexical" }, deltas: DeltaRef[], slabs: SlabMeta[], baseIds: number, segments: { addedRev: number }[] = []): boolean {
+	if (t.scope !== "dense" && segments.some((s) => s.addedRev < t.rev)) return false;
+	if (t.scope === "lexical") return true;
 	if (deltas.some((d) => d.addedRev < t.rev)) return false;
-	if (segments.some((s) => s.addedRev < t.rev)) return false;
 	if (slabs.some((row) => slabRevOf(row) > 0 && slabRevOf(row) <= t.rev)) return false;
 	for (const id of t.ids) if (id < baseIds) return false;
 	return true;
@@ -4090,7 +4118,7 @@ async function compactCommit(env: Env, body: CompactCommitReq) {
 			...inherit(manifest),
 			files: { ...files, slabs: slabsKeyWritten },
 			deltas: remaining,
-			tombstones: keep.map(({ rev: r, key, count }) => ({ rev: r, key, count })),
+			tombstones: keep.map(({ rev: r, key, count, scope }) => ({ rev: r, key, count, ...(scope ? { scope } : {}) })),
 		};
 		if (splits.length) {
 			// Built once (a retry on a newer head reuses it: the means only depend on the base and the new slabs).
@@ -4369,7 +4397,7 @@ async function planAutoSlice(env: Env, b: CompactBase, policy: CompactionPolicy,
 	let purgeCells = 0;
 	if (reasons.some((r) => r.startsWith("tombstones")) && chosen.size < budget) {
 		// Only sets without build ids can ever be dropped; rewrite the slabs that block the newest of those.
-		const purgeable = b.tombs.filter((t) => !t.ids.some((id) => id < b.manifest.vectors));
+		const purgeable = b.tombs.filter((t) => hidesDense(t) && !t.ids.some((id) => id < b.manifest.vectors));
 		const maxRev = purgeable.reduce((a, t) => Math.max(a, t.rev), 0);
 		const blockers = b.slabs
 			.map((row, cell) => ({ cell, r: slabRevOf(row) }))

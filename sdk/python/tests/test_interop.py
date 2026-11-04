@@ -190,3 +190,32 @@ def test_typescript_and_python_agree(tmp_path):
         assert (index.rev, index.manifest["k1"] * index.manifest["k2"]) == (after["rev"], after["k"])
         for req, want in zip(requests, after["results"]):
             same(json.loads(json.dumps(answer(index, req))), want, json.dumps(req)[:80])
+
+
+def test_scoped_tombstones_across_sdks(tmp_path):
+    """TS writes scoped upserts and Python reads them identically; Python writes scoped upserts on top and TS
+    reads those identically."""
+    v = unit_rows(8, 16, rng(31))
+    rows = [list(v[i * 16:(i + 1) * 16]) for i in range(8)]
+    (tmp_path / "scoped-input.json").write_text(json.dumps({"vectors": rows}))
+    requests = [{"kind": "query", "vector": rows[i], "topK": 3, "nprobe": 4, "rerank": 20} for i in range(8)]
+    requests += [{"kind": "lexical", "text": t, "topK": 5} for t in ("first", "second", "third", "renamed", "python")]
+    requests += [{"kind": "query", "vector": rows[3], "topK": 3, "nprobe": 4, "rerank": 20, "filter": {"tag": 2}}]
+    requests += [{"kind": "get", "keys": ["t/1", "t/2", "t/3", "t/4"]}]
+    (tmp_path / "requests.json").write_text(json.dumps({"requests": requests}))
+    theirs = json.loads(node("scoped", tmp_path))
+    store = FileBlobStore(tmp_path)
+    with open_index(store) as index:
+        assert (index.gen, index.rev) == (theirs["gen"], theirs["rev"])
+        assert [t.get("scope") for t in index.manifest["tombstones"]] == [None, "dense", "lexical"]
+        for req, want in zip(requests, theirs["results"]):
+            same(json.loads(json.dumps(answer(index, req))), want, json.dumps(req)[:80])
+        # Python's scoped writes on top
+        index.upsert(keys=["t/1"], vectors=[rows[4]], attrs=[{"tag": 1}], scope="dense")
+        index.upsert(keys=["t/2"], texts=["second renamed by python"], scope="lexical")
+        mine = [json.loads(json.dumps(answer(index, r))) for r in requests]
+        rev = index.rev
+    back = json.loads(node("run", tmp_path))
+    assert back["rev"] == rev
+    for req, a, b in zip(requests, mine, back["results"]):
+        same(a, b, json.dumps(req)[:80])

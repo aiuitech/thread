@@ -164,6 +164,27 @@ An upsert is a delete + insert: by default (`replace`, opt out with `replace: fa
 ids are known to be new) it writes a tombstone set of its ids at the same rev as the delta, so older copies in
 slabs and older deltas stop resolving immediately, whatever cells they live in.
 
+### Scoped tombstone sets (one-sided updates)
+
+A set may hide one side of its documents only: `{"rev": 14, "key": "...", "count": 3, "scope": "dense"}` hides older
+dense copies (slab and delta entries), `"scope": "lexical"` older lexical copies (postings, docs entries, keys in
+segments); no `scope` hides both, as before. The SDKs' `upsert({ scope })` writes them: `"dense"` attaches a vector
+to documents that already exist (keys resolve through the head, a new key is an error; no segment is written, so
+the docs, text and key stay), `"lexical"` re-puts texts, metas or keys and leaves the vectors (an absent attrs word
+keeps the live one; in a dense generation a changed word is refused, because vector filters test the copy in the
+dense entry). Deletes stay unscoped. The Worker's `/upsert` takes `scope: "dense"` (it writes no segments).
+
+The rules above apply per view: slabs and deltas use the sets without a scope or scoped `dense` (`tombFor`,
+`tombForDelta`); segments, docs, `get`, `resolveKeys` and `listKeys` the sets without a scope or scoped `lexical`
+(`tombForSegment`, `tombHides`). Dropping is per side too (`tombDroppable`): a lexical set goes once no segment
+predates it (segment compaction drops those, and in a generation without a dense index the unscoped ones as well),
+a dense set once no delta or written slab predates it and it holds no build id (the dense compaction), an unscoped
+set when both hold. A revision with a scoped set lists `"features": ["scoped-tombstones"]` (inherited); readers
+refuse a manifest naming a feature they do not know (TS and Python SDKs from 0.2.1, the Worker). Readers before
+0.2.1 do not check `features`: they would apply a scoped set to both sides, hiding too much (a document's text after
+a vector-only upsert, its vector after a text-only one), never too little. Upgrade readers before writing scoped
+upserts.
+
 ## Write path
 
 Serialization: the manifest PUT is the lock. `manifest.{rev+1}.json` is written with a create-only conditional

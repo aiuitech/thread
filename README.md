@@ -77,6 +77,7 @@ await index.delete([1000]);
 await index.upsert({ keys: ["s3://b/a.bin"], metas: [JSON.stringify({ host: "cdn-1", size: 4096 })], texts: ["host:cdn-1"] });
 const { records } = await index.get(["s3://b/a.bin"]);                 // Map<key, { key, id, meta, attrs }>
 const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });  // { entries: [{ key, id }], more, next }
+await index.upsert({ keys: ["s3://b/a.bin"], vectors: [emb], scope: "dense" });   // one side only: the vector, text and meta stay
 
 // long texts: one document per window of 200 words (overlap 0), keyed "docs/a.md#0", "docs/a.md#1", ...; vectors from your embedder
 await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk: { words: 200, overlap: 20 }, embed: async (texts) => embedAll(texts) });

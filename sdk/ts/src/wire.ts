@@ -271,12 +271,25 @@ export function resolveLexConfig(m: Manifest): ResolvedLexConfig | null {
 	};
 }
 
+/** Which side of a document a tombstone set hides: the dense entries (slabs, deltas) or the lexical/docs/keys side. */
+export type TombScope = "dense" | "lexical";
+
 /** A tombstone set: ids deleted (or replaced by an upsert) at manifest rev `rev`. */
 export interface TombRef {
 	rev: number;
 	key: string;
 	count: number;
+	/**
+	 * The side it hides (a scoped upsert, `upsert({ scope })`); absent = both. A manifest with a scoped set lists
+	 * `"scoped-tombstones"` in `features`, which readers that do not apply scopes refuse.
+	 */
+	scope?: TombScope;
 }
+
+/** `manifest.features`: format extensions a reader must understand to read the revision correctly. */
+export const FEATURE_SCOPED_TOMBSTONES = "scoped-tombstones";
+/** The features this SDK reads; a manifest naming any other is refused (it could be misread). */
+export const KNOWN_FEATURES: readonly string[] = [FEATURE_SCOPED_TOMBSTONES];
 
 /** Objects a revision reads. Manifests without `files` (rev 0) use the generation's fixed names. */
 export interface IndexFiles {
@@ -421,6 +434,11 @@ export interface Manifest {
 	embedding?: EmbeddingConfig;
 	/** Automatic compaction policy (the Worker's); absent: no automatic compaction, no splits. */
 	compaction?: CompactionPolicy;
+	/**
+	 * Format extensions this revision uses (`KNOWN_FEATURES`); a reader refuses a manifest with one it does not know.
+	 * Inherited by later revisions.
+	 */
+	features?: string[];
 }
 
 /** `idx/current.json`: the generation and revision queries use by default. */
@@ -533,6 +551,8 @@ export function checkManifest(m: Manifest, gen: string, rev: number): Manifest {
 	if (m.gen !== gen) throw new ThreadError(`manifest for ${gen} rev ${rev} is for generation ${m.gen}`);
 	for (const f of ["k1", "k2", "dim", "vectors"] as const) if (!Number.isInteger(m[f])) throw new ThreadError(`manifest ${gen} rev ${rev}: missing ${f}`);
 	if ((m.rev ?? 0) !== rev) throw new ThreadError(`manifest ${gen} rev ${rev} says rev ${m.rev}`);
+	const unknown = (m.features ?? []).filter((f) => !KNOWN_FEATURES.includes(f));
+	if (unknown.length) throw new ThreadError(`manifest ${gen} rev ${rev} uses ${unknown.join(", ")}, which this SDK does not understand: upgrade it`, 400);
 	return { ...m, rev };
 }
 
@@ -560,26 +580,45 @@ export function idUnion(sets: ArrayLike<number>[]): Uint8Array {
 	return new Uint8Array(all.buffer, 0, w * 4);
 }
 
-/** The tombstone sets of a revision, parsed once; `unions` caches the per-slabRev filter buffers. */
-export interface TombState {
-	sets: { rev: number; ids: Uint32Array }[];
-	/** Ids over all sets (with repeats). */
-	total: number;
-	/** id -> highest rev of a set containing it (the delta rule). */
-	maxRev: Map<number, number>;
-	unions: Map<number, Uint8Array>;
-	/** Union of the sets with rev > a (the filter for delta segments added at rev a), by a. */
-	deltaUnions: Map<number, Uint8Array>;
+/** One parsed tombstone set (`scope` absent = both sides). */
+export interface TombSet {
+	rev: number;
+	ids: Uint32Array;
+	scope?: TombScope;
 }
 
-export function buildTombState(sets: { rev: number; ids: Uint32Array }[]): TombState {
+/**
+ * The tombstone sets of a revision, parsed once, with two views: the dense one (sets without a scope or scoped
+ * `dense`: slabs and deltas) and the lexical one (without a scope or scoped `lexical`: segments, docs, keys).
+ * `unions` caches the per-slabRev filter buffers.
+ */
+export interface TombState {
+	sets: TombSet[];
+	/** Ids over all sets (with repeats). */
+	total: number;
+	/** id -> highest rev of a set of the lexical view containing it (the segment rule). */
+	maxRev: Map<number, number>;
+	unions: Map<number, Uint8Array>;
+	/** Union of the dense sets with rev > a (the filter for delta segments added at rev a), by a. */
+	deltaUnions: Map<number, Uint8Array>;
+	/** Union of the lexical sets with rev > a (the filter for lexical segments added at rev a), by a. */
+	segmentUnions: Map<number, Uint8Array>;
+}
+
+/** Whether a set applies to the dense side (slabs, deltas). */
+export const hidesDense = (s: { scope?: TombScope }): boolean => s.scope !== "lexical";
+/** Whether a set applies to the lexical side (segments: postings, docs, keys). */
+export const hidesLexical = (s: { scope?: TombScope }): boolean => s.scope !== "dense";
+
+export function buildTombState(sets: TombSet[]): TombState {
 	const maxRev = new Map<number, number>();
 	let total = 0;
 	for (const s of sets) {
 		total += s.ids.length;
+		if (!hidesLexical(s)) continue;
 		for (const id of s.ids) if ((maxRev.get(id) ?? -1) < s.rev) maxRev.set(id, s.rev);
 	}
-	return { sets, total, maxRev, unions: new Map(), deltaUnions: new Map() };
+	return { sets, total, maxRev, unions: new Map(), deltaUnions: new Map(), segmentUnions: new Map() };
 }
 
 /**
@@ -590,7 +629,7 @@ export function buildTombState(sets: { rev: number; ids: Uint32Array }[]): TombS
 export function tombFor(t: TombState, slabRev: number): Uint8Array {
 	let u = t.unions.get(slabRev);
 	if (!u) {
-		u = idUnion(t.sets.filter((s) => s.rev >= slabRev).map((s) => s.ids));
+		u = idUnion(t.sets.filter((s) => s.rev >= slabRev && hidesDense(s)).map((s) => s.ids));
 		t.unions.set(slabRev, u);
 	}
 	return u;
@@ -603,16 +642,23 @@ export function tombFor(t: TombState, slabRev: number): Uint8Array {
 export function tombForDelta(t: TombState, addedRev: number): Uint8Array {
 	let u = t.deltaUnions.get(addedRev);
 	if (!u) {
-		u = idUnion(t.sets.filter((s) => s.rev > addedRev).map((s) => s.ids));
+		u = idUnion(t.sets.filter((s) => s.rev > addedRev && hidesDense(s)).map((s) => s.ids));
 		t.deltaUnions.set(addedRev, u);
 	}
 	return u;
 }
 
-/** Filter buffer for the entries of a lexical/docs segment added at rev `addedRev`: the delta rule. */
-export const tombForSegment = tombForDelta;
+/** Filter buffer for the entries of a lexical/docs segment added at rev `addedRev`: the delta rule over the lexical view. */
+export function tombForSegment(t: TombState, addedRev: number): Uint8Array {
+	let u = t.segmentUnions.get(addedRev);
+	if (!u) {
+		u = idUnion(t.sets.filter((s) => s.rev > addedRev && hidesLexical(s)).map((s) => s.ids));
+		t.segmentUnions.set(addedRev, u);
+	}
+	return u;
+}
 
-/** Whether `id` is hidden in a segment added at `addedRev` (a set with rev > addedRev holds it). */
+/** Whether `id` is hidden in a lexical segment added at `addedRev` (a set of the lexical view with rev > addedRev holds it). */
 export function tombHides(t: TombState | null, id: number, addedRev: number): boolean {
 	if (!t) return false;
 	const r = t.maxRev.get(id);

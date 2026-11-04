@@ -98,7 +98,7 @@ export async function loadRevState(store: BlobStore, gen: string, rev: number, t
 			(manifest.tombstones ?? []).map(async (t) => {
 				const b = await getRequired(store, t.key, trace);
 				if (b.byteLength % 4 !== 0) throw new ThreadError(`${t.key} is not u32-aligned`);
-				return { rev: t.rev, ids: new Uint32Array(b.slice().buffer) };
+				return { rev: t.rev, ids: new Uint32Array(b.slice().buffer), ...(t.scope ? { scope: t.scope } : {}) };
 			}),
 		),
 	]));

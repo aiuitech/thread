@@ -13,7 +13,7 @@ import type * as W from "./wasm/thread.js";
 import { defineAttrs, packAttrs, schemaExtends, validateSchema, type AttrFieldSpec, type AttrSchema, type AttrValues } from "./attrs.js";
 import { chunkIndexOf, chunkKey, chunkText, resolveChunkOptions, type ChunkOptions } from "./chunk.js";
 import type { EmbedKind } from "./embed.js";
-import { buildTombState, currentBody, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef } from "./wire.js";
+import { buildTombState, currentBody, hasDense, idUnion, keys, manifestFiles, parseCurrent, parseManifest, resolveLexConfig, tombForSegment, ThreadError, type CurrentPointer, type IndexFiles, type LexConfig, type Manifest, type ResolvedLexConfig, type SegmentRef, type TombRef, type TombScope, FEATURE_SCOPED_TOMBSTONES } from "./wire.js";
 export { CREATE_DEFAULTS, createGeneration, type CreateGenerationOptions, type CreateGenerationResult, type SlabWasm } from "./create.js";
 
 export interface UpsertInput {
@@ -67,7 +67,20 @@ export interface UpsertInput {
 	 * (`open({ embed })`); `false` skips that (text-only documents).
 	 */
 	embed?: Embedder | false;
+	/**
+	 * Which side of the documents the upsert replaces (default `"both"`: the whole document, as before).
+	 * `"lexical"`: writes the segment (keys, docs, postings) and a tombstone set that hides only older lexical
+	 * copies; the vectors stay. No `vectors`, `payloads`, `embed` or `chunk`. Absent `attrs` keep each document's
+	 * live word; in a dense generation a word that differs from the live one is refused (the dense entry would keep
+	 * the old one). `"dense"`: writes the delta and a tombstone set that hides only older dense copies; the docs,
+	 * texts and keys stay. Keys must already exist (no segment is written, so a new key could not be stored); `texts`
+	 * are only the input of the embedder (not stored); no `metas` or `chunk`. Deletes stay unscoped.
+	 */
+	scope?: UpsertScope;
 }
+
+/** `upsert({ scope })`: the side of the documents an upsert replaces. */
+export type UpsertScope = "both" | "dense" | "lexical";
 
 /** `upsert({ embed })`: the texts to embed, in order -> their vectors (`n * dim` flat or one row per text). */
 export type Embedder = (texts: string[]) => Promise<Float32Array | number[] | (Float32Array | number[])[]> | Float32Array | number[] | (Float32Array | number[])[];
@@ -124,6 +137,8 @@ export interface WriterContext {
 	listKeys: (manifest: Manifest, prefix: string) => Promise<string[]>;
 	/** The index's embedder for `manifest.embedding` (rows per text), or null when it cannot embed. */
 	embedder?: ((texts: readonly string[], kind: EmbedKind) => Promise<Float32Array[]>) | null;
+	/** The live attrs word of each id with a docs entry in the given (head) revision (a lexical-scoped upsert). */
+	docAttrs?: (manifest: Manifest, ids: readonly number[]) => Promise<Map<number, number>>;
 }
 
 export interface ConfigureLexicalResult {
@@ -582,18 +597,42 @@ async function staleChunkIds(ctx: WriterContext, manifest: Manifest, chunked: Ch
 	return { keys: stale, ids: Uint32Array.from(new Set(found.values())) };
 }
 
+/** Checks the fields a scoped upsert may carry (see `UpsertInput.scope`). */
+function checkScope(input: UpsertInput, scope: UpsertScope): void {
+	if (scope !== "both" && scope !== "dense" && scope !== "lexical") throw new ThreadError(`scope must be "both", "dense" or "lexical"`, 400);
+	if (scope === "both") return;
+	if (input.chunk !== undefined && input.chunk !== false) throw new ThreadError(`chunk needs scope "both" (stale chunks are hidden on both sides)`, 400);
+	if (scope === "lexical") {
+		if (input.vectors !== undefined || input.payloads || input.embed) throw new ThreadError(`scope "lexical" leaves the vectors alone: no vectors, payloads or embed`, 400);
+	} else {
+		if (input.metas) throw new ThreadError(`scope "dense" leaves the docs alone: no metas`, 400);
+		if (input.texts && input.vectors !== undefined) throw new ThreadError(`scope "dense" stores no texts: pass vectors, or texts to embed`, 400);
+	}
+}
+
 export async function upsert(ctx: WriterContext, inputIn: UpsertInput): Promise<UpsertResult> {
 	const t0 = Date.now();
 	const { store, gen, w } = ctx;
 	writable(store);
 	const replace = inputIn.replace ?? true;
+	const scope: UpsertScope = inputIn.scope ?? "both";
+	checkScope(inputIn, scope);
 	return ctx.thread.withRecovery("upsert", async () => {
-		const { input, chunked } = await expandInput(inputIn, ctx.embedder ?? null, await headHasDense(ctx));
-		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number; idsKey: string; idsRev: number; allocated: number; stale: Uint32Array; staleRev: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0, idsKey: "", idsRev: -1, allocated: 0, stale: new Uint32Array(0), staleRev: -1 };
+		const expanded = await expandInput(inputIn, ctx.embedder ?? null, scope !== "lexical" && (await headHasDense(ctx)));
+		const chunked = expanded.chunked;
+		let input = expanded.input;
+		if (scope === "dense") {
+			// The texts were only the embedder's input: a dense-scoped upsert writes no segment.
+			if (input.vectors === undefined) throw new ThreadError(`scope "dense" needs vectors (or texts and an embedder)`, 400);
+			const { texts: _t, ...rest } = input;
+			input = rest;
+		}
+		const st: { batch: Batch | null; delta: EncodedDelta | null; seg: EncodedSegment | null; seq: number; tombKey: string | null; tombBytes: number; idsKey: string; idsRev: number; allocated: number; stale: Uint32Array; staleRev: number; attrsRev: number } = { batch: null, delta: null, seg: null, seq: 0, tombKey: null, tombBytes: 0, idsKey: "", idsRev: -1, allocated: 0, stale: new Uint32Array(0), staleRev: -1, attrsRev: -1 };
 		const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
 			const lex = resolveLexConfig(manifest);
 			const batch = (st.batch ??= prepareBatch(input, hasDense(manifest) ? manifest.dim : 0, lex, manifest.attrs ? validateSchema(manifest.attrs) : null));
-			const wantSeg = lex !== null && (batch.texts !== null || batch.metas !== null || batch.keys !== null);
+			const wantSeg = scope !== "dense" && lex !== null && (batch.texts !== null || batch.metas !== null || batch.keys !== null);
+			if (scope === "lexical" && !lex) throw new ThreadError(`scope "lexical" needs a lexical configuration`, 400);
 			const next = inherit(manifest);
 			const newRev = rev + 1;
 			const filesKey = `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}`;
@@ -610,13 +649,36 @@ export async function upsert(ctx: WriterContext, inputIn: UpsertInput): Promise<
 			let nextId = baseNext;
 			if (!batch.givenIds) {
 				if (st.idsRev !== rev) {
-					const a = await assignIds(ctx, manifest, batch.keys!);
-					batch.ids = a.ids;
-					st.allocated = a.allocated;
+					if (scope === "dense") {
+						// No segment is written, so a key must already name a document.
+						const found = await ctx.resolveKeys(manifest, batch.keys!);
+						const missing = batch.keys!.filter((k) => !found.has(k));
+						if (missing.length) throw new ThreadError(`scope "dense" attaches vectors to existing documents: unknown keys ${missing.slice(0, 5).map((k) => JSON.stringify(k)).join(", ")}${missing.length > 5 ? ", ..." : ""}`, 404);
+						batch.ids = Uint32Array.from(batch.keys!, (k) => found.get(k)!);
+						st.allocated = 0;
+					} else {
+						const a = await assignIds(ctx, manifest, batch.keys!);
+						batch.ids = a.ids;
+						st.allocated = a.allocated;
+					}
 					st.idsRev = rev;
 				}
 				nextId = baseNext + st.allocated; // the allocation took the next ids of this head
 			} else for (const id of batch.ids) if (id >= nextId) nextId = id + 1;
+			if (scope === "lexical" && st.attrsRev !== rev) {
+				// Absent attrs keep the live word; in a dense generation a changed word is refused, since the dense
+				// entry (where vector filters test it) keeps the old one.
+				const live = ctx.docAttrs ? await ctx.docAttrs(manifest, Array.from(batch.ids)) : new Map<number, number>();
+				if (input.attrs !== undefined) {
+					if (hasDense(manifest))
+						batch.ids.forEach((id, i) => {
+							const was = live.get(id);
+							if (was !== undefined && was !== batch.attrs![i]) throw new ThreadError(`id ${id}: scope "lexical" cannot change the attrs word of a document with a dense entry (${was} -> ${batch.attrs![i]}); upsert it with its vector (scope "both")`, 400);
+						});
+				} else batch.attrs = Uint32Array.from(batch.ids, (id) => live.get(id) ?? 0);
+				st.attrsRev = rev;
+				st.seg = null;
+			}
 			if (nextId !== baseNext || manifest.nextId !== undefined) next.nextId = nextId;
 			const idsKey = batch.ids.join(",");
 			if (idsKey !== st.idsKey) {
@@ -627,6 +689,7 @@ export async function upsert(ctx: WriterContext, inputIn: UpsertInput): Promise<
 			// The delta and the segment are reused across retries (unless the means/codebook or the ids changed
 			// under us); the tombstone set is keyed by the rev, so it is rewritten for every attempt.
 			const tombIds = replace ? (st.stale.length ? Uint32Array.from(new Set([...batch.ids, ...st.stale])) : batch.ids) : st.stale;
+			const tombScope: TombScope | undefined = scope === "both" ? undefined : scope;
 			const tb = tombIds.length ? tombBytes(w, tombIds) : null;
 			const [delta, seg, tombKey] = await Promise.all([
 				batch.vectors ? (st.delta && st.delta.filesKey === filesKey ? st.delta : encodeDelta(ctx, manifest, files, batch, st.seq)) : Promise.resolve(null),
@@ -638,12 +701,13 @@ export async function upsert(ctx: WriterContext, inputIn: UpsertInput): Promise<
 			st.tombKey = tombKey;
 			if (tb && tombKey) {
 				st.tombBytes = tb.byteLength;
-				next.tombstones!.push({ rev: newRev, key: tombKey, count: tb.byteLength / 4 });
+				next.tombstones!.push({ rev: newRev, key: tombKey, count: tb.byteLength / 4, ...(tombScope ? { scope: tombScope } : {}) });
+				if (tombScope && !(next.features ?? []).includes(FEATURE_SCOPED_TOMBSTONES)) next.features = [...(next.features ?? []), FEATURE_SCOPED_TOMBSTONES];
 			}
 			if (delta) next.deltas!.push({ seq: delta.seq, key: delta.key, count: batch.ids.length, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
 			if (seg) next.segments = [...(next.segments ?? []), { ...seg.ref, addedRev: newRev }];
 			next.nextSeq = Math.max(next.nextSeq ?? 1, st.seq + 1);
-			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, dense: !!delta, lexical: !!seg, ...(batch.keys ? { keys: batch.keys.length, allocated: st.allocated } : {}), ...(chunked ? { chunk: { words: chunked.words, overlap: chunked.overlap, documents: chunked.parents.length, stale: st.stale.length } } : {}), writer: "thread-sdk" } };
+			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, ...(scope !== "both" ? { scope } : {}), dense: !!delta, lexical: !!seg, ...(batch.keys ? { keys: batch.keys.length, allocated: st.allocated } : {}), ...(chunked ? { chunk: { words: chunked.words, overlap: chunked.overlap, documents: chunked.parents.length, stale: st.stale.length } } : {}), writer: "thread-sdk" } };
 		});
 		const d = st.delta;
 		return {
@@ -753,7 +817,7 @@ export async function compactSegments(ctx: WriterContext, opts: { maxInputBytes?
 				}),
 			);
 			readBytes = parts.reduce((a, b) => a + b.byteLength, 0);
-			const tombSets = await Promise.all(sets.map(async (t) => ({ rev: t.rev, ids: new Uint32Array((await store.get(t.key))!.slice().buffer) })));
+			const tombSets = await Promise.all(sets.map(async (t) => ({ rev: t.rev, ids: new Uint32Array((await store.get(t.key))!.slice().buffer), ...(t.scope ? { scope: t.scope } : {}) })));
 			const tomb = tombSets.length ? buildTombState(tombSets) : null;
 			const concat = new Uint8Array(readBytes);
 			let o = 0;
@@ -778,7 +842,13 @@ export async function compactSegments(ctx: WriterContext, opts: { maxInputBytes?
 		bytes = built.bytes;
 		count = built.count;
 		const ref: SegmentRef = { seq: 0, key: built.key, addedRev: opts.maxInputBytes === undefined ? rev + 1 : Math.max(...segs.map((s) => s.addedRev)), count, bytes, lex: true, docs: lex.docs, text: lex.docs && lex.text, ...(built.keys ? { keys: true } : {}), base: true };
-		return { ...inherit(manifest), segments: [...all.slice(0, start), ref, ...all.slice(start + segs.length)], change: { op: "compact-segments", merged, count, writer: "thread-sdk" } };
+		const segments = [...all.slice(0, start), ref, ...all.slice(start + segs.length)];
+		// Sets that only the lexical side held (scoped "lexical", or any set of a generation without a dense index)
+		// go once no segment predates them; the dense compaction drops the others.
+		const lexOnly = (t: TombRef) => t.scope === "lexical" || (t.scope === undefined && !hasDense(manifest) && !(manifest.deltas ?? []).length && manifest.vectors === 0);
+		const tombstones = sets.filter((t) => !(lexOnly(t) && !segments.some((x) => x.addedRev < t.rev)));
+		const droppedTombstoneSets = sets.length - tombstones.length;
+		return { ...inherit(manifest), segments, tombstones, change: { op: "compact-segments", merged, count, ...(droppedTombstoneSets ? { droppedTombstoneSets } : {}), writer: "thread-sdk" } };
 	});
 	return { gen, rev: c.rev, merged, key, count, bytes, readBytes, conflicts: c.conflicts, currentUpdated: c.currentUpdated, ms: Date.now() - t0 };
 }

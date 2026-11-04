@@ -22,6 +22,13 @@ from source, runs every check and publishes.
   `idx/current.json` to another generation with a compare-and-swap (409 unless the pointer is `expect`);
   `gcGeneration` / `index.gc` is the Worker's `/build/gc` (keep, graceSec, dry run); `dropGeneration` deletes a
   generation the pointer left once the grace period has passed with no write to it. TypeScript only.
+- **Scoped tombstones**: `upsert({ scope: "dense" | "lexical" })` (Python `scope=`) replaces one side of the
+  documents: a vector for existing keys without touching their docs, texts and keys, or new texts and metas without
+  the vector (attrs cannot drift between the sides). `TombRef.scope`; dense reads and the dense compaction use the
+  dense view, segments, docs and keys the lexical view; sets drop per side, and segment compaction now drops the
+  lexical-only ones. Manifests with scoped sets carry `features: ["scoped-tombstones"]`; readers refuse features
+  they do not know (readers before 0.2.1 ignore `features` and would over-hide). The Worker reads the dense view,
+  compacts per scope and takes `scope: "dense"` on `/upsert`.
 - `BlobStore.delete` and `BlobStore.listObjects` (key, size, upload time), optional; implemented by the R2, S3,
   memory, file, prefixed and cached stores.
 - `sdk/ts/package-lock.json` names the package `@aiuitech/thread-sdk`.
