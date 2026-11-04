@@ -378,3 +378,28 @@ def test_segment_paging():
     assert got[2][1] == "meta 2999"
     assert d.rounds <= 2
     assert seg.held_bytes > opened
+
+
+def test_compact_segments_bounded_input_keeps_newer_replacements():
+    store = MemoryBlobStore()
+    create_lexical_generation(store, "bounded", {"docs": True, "text": True})
+    with open_index(store, cache=False, refresh_interval=0) as index:
+        index.upsert(keys=["a"], texts=["old apple"])
+        index.upsert(keys=["b"], texts=["banana"])
+        index.upsert(keys=["a"], texts=["new apple"])
+        index.upsert(keys=["c"], texts=["cherry"])
+        before = index.segments
+        tomb = sum(t["count"] * 4 for t in index.manifest.get("tombstones") or [])
+        budget = before[0]["bytes"] + before[1]["bytes"] + tomb
+        r = index.compact_segments(max_input_bytes=budget)
+        assert r.merged == 2 and r.read_bytes <= budget
+        assert len(index.segments) == 3
+        assert [s["key"] for s in index.segments[1:]] == [s["key"] for s in before[2:]]
+        assert index.segments[0]["addedRev"] == before[1]["addedRev"]
+    with open_index(store, cache=False, refresh_interval=0) as cold:
+        got = cold.get(["a", "b", "c"], text=True)
+        assert (got["a"].text, got["b"].text, got["c"].text) == ("new apple", "banana", "cherry")
+        assert [h.id for h in cold.search(text="apple", top_k=5).hits] == [got["a"].id]
+        assert cold.compact_segments(max_input_bytes=1).merged == 0
+        with pytest.raises(ThreadError):
+            cold.compact_segments(max_input_bytes=0)

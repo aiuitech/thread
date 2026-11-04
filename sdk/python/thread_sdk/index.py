@@ -1298,10 +1298,12 @@ class ThreadIndex:
         self.use_revision(r.gen, r.rev)
         return r
 
-    def compact_segments(self) -> CompactSegmentsResult:
+    def compact_segments(self, max_input_bytes: int | None = None) -> CompactSegmentsResult:
         """Merges every lexical/docs segment of the head revision into one base segment (tombstoned documents
-        dropped, replaced ids resolved to their newest copy) and commits a revision listing only it."""
-        r = compact_segments(self._writer())
+        dropped, replaced ids resolved to their newest copy) and commits a revision listing only it. By default
+        reads every segment whole; `max_input_bytes` bounds segment and tombstone bytes to a contiguous run (it
+        can merge nothing, `merged` 0, when no two adjacent segments fit). Allow extra memory for the output."""
+        r = compact_segments(self._writer(), max_input_bytes)
         self.use_revision(r.gen, r.rev)
         return r
 

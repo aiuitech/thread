@@ -302,6 +302,7 @@ index.delete_keys(["s3://b/c.bin"])     # DeleteResult with .missing
 index.upsert(keys=["docs/a.md"], texts=[long_text], metas=["A"], chunk={"words": 200, "overlap": 20}, embed=embed_all)
 chunk_text(long_text, words=200, overlap=20)   # [Chunk(index, text, start, end, words), ...], the same windows
 index.compact_segments()                # merge the lexical/docs segments into one base segment
+index.compact_segments(max_input_bytes=4 << 20)   # or one contiguous run that fits 4 MB (memory-limited writers)
 create_lexical_generation(store, "docs1", {"text": True})               # a text-only generation (no dense index)
 # a dense generation from nothing, for an embedding model (one empty cell; grows by the Worker's compaction and cell splits)
 create_generation(store, "docs2", embedding={"provider": "openai", "model": "text-embedding-3-small", "dim": 1536}, lex={"text": True})

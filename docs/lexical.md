@@ -202,6 +202,14 @@ rule now also keeps a set while any segment predates it (`tombDroppable` in the 
 every segment a kept revision lists. Compaction reads the segments whole, so it runs where memory allows (a build
 slot or a laptop with the CLI, `thread seg merge`), not in a query isolate, for large bases.
 
+`compactSegments({ maxInputBytes })` / `compact_segments(max_input_bytes=)` bounds one call for a memory-limited
+writer (a Durable Object): it merges the first contiguous run of at least two segments whose bytes, plus 4 bytes per
+tombstoned id (every set is read), fit the budget, and leaves the segments before and after it in place. The merged
+segment takes the run's newest `addedRev`, so tombstone sets newer than the run still hide it and the copies in later
+segments still win. No pair fits: nothing is written (`merged` 0). Peak memory is about three times the budget (the
+parts, their concatenation, its copy in wasm memory) plus the merged output; repeated calls with the same budget fold
+small segments together until no two adjacent ones fit.
+
 ## Tuning: size or query speed
 
 Every knob is a build parameter in `manifest.lex` (or a flag of `thread seg build`); segments record what they were

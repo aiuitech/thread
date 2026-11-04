@@ -356,6 +356,7 @@ await index.deleteKeys(["s3://b/c.bin"]);                                // { co
 await index.upsert({ keys: ["docs/a.md"], texts: [longText], metas: ["A"], chunk: { words: 200, overlap: 20 }, embed: async (texts) => embedAll(texts) });
 chunkText(longText, { words: 200, overlap: 20 });                       // [{ index, text, start, end, words }, ...], the same windows
 await index.compactSegments();        // merge the lexical/docs segments into one base segment (a revision)
+await index.compactSegments({ maxInputBytes: 4 << 20 });   // or merge one contiguous run that fits 4 MB (memory-limited writers)
 await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only generation (no dense index)
 // a dense generation from nothing, for an embedding model (one empty cell; grows by compaction and cell splits)
 await thread.createGeneration({ store, gen: "docs2", embedding: { provider: "openai", model: "text-embedding-3-small", dim: 1536 }, lex: { text: true } });

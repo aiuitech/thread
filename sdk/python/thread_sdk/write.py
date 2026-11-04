@@ -815,9 +815,15 @@ def configure_attrs(ctx: WriterContext, spec: Mapping[str, Any]) -> ConfigureAtt
     return ConfigureAttrsResult(gen, c.rev, out["schema"], c.conflicts, c.current_updated)
 
 
-def compact_segments(ctx: WriterContext) -> CompactSegmentsResult:
+def compact_segments(ctx: WriterContext, max_input_bytes: int | None = None) -> CompactSegmentsResult:
     """Merges every segment of the head into one base segment and commits a revision listing only it. Reads the
-    segments whole. Nothing is written when the head has at most one segment and no tombstone set newer than it."""
+    segments whole. Nothing is written when the head has at most one segment and no tombstone set newer than it.
+
+    `max_input_bytes` bounds what one call reads (segment bytes plus 4 bytes per tombstoned id): it merges the
+    first contiguous run of at least two segments that fits, in place, so unmerged newer copies keep their
+    precedence, and merges nothing (`merged` 0) when no two adjacent segments fit."""
+    if max_input_bytes is not None and (not math.isfinite(max_input_bytes) or max_input_bytes <= 0):
+        raise ThreadError("max_input_bytes must be positive and finite", 400)
     t0 = time.perf_counter()
     store, gen = ctx.store, ctx.gen
     _writable(store)
@@ -827,8 +833,22 @@ def compact_segments(ctx: WriterContext) -> CompactSegmentsResult:
         lex = resolve_lex_config(manifest)
         if lex is None:
             raise ThreadError("this generation has no lexical configuration", 400)
-        segs = manifest.get("segments") or []
+        all_segs = manifest.get("segments") or []
         sets = manifest.get("tombstones") or []
+        start, segs = 0, all_segs
+        if max_input_bytes is not None:
+            budget = max_input_bytes - sum(t["count"] * 4 for t in sets)
+            segs = []
+            for start in range(len(all_segs)):
+                used, end = 0, start
+                while end < len(all_segs) and used + all_segs[end]["bytes"] <= budget:
+                    used += all_segs[end]["bytes"]
+                    end += 1
+                if end - start >= 2:
+                    segs = all_segs[start:end]
+                    break
+            if len(segs) < 2:
+                return None
         newest = max([0, *(t["rev"] for t in sets)])
         if not (len(segs) > 1 or (len(segs) == 1 and newest > segs[0]["addedRev"])):
             return None
@@ -857,11 +877,13 @@ def compact_segments(ctx: WriterContext) -> CompactSegmentsResult:
             built = st["built"] = {"for_keys": for_keys, "key": key, "bytes": len(out), "count": count,
                                    "keys": meta.get("keys") is not None}
         st.update(merged=len(segs), key=built["key"], bytes=built["bytes"], count=built["count"])
-        ref = {"seq": 0, "key": built["key"], "addedRev": rev + 1, "count": built["count"], "bytes": built["bytes"],
+        # A partial merge keeps the newest addedRev of its run: tombstone sets newer than that still hide its ids.
+        added = rev + 1 if max_input_bytes is None else max(s["addedRev"] for s in segs)
+        ref = {"seq": 0, "key": built["key"], "addedRev": added, "count": built["count"], "bytes": built["bytes"],
                "lex": True, "docs": lex.docs, "text": lex.docs and lex.text, "base": True}
         if built["keys"]:
             ref["keys"] = True
-        return {**_inherit(manifest), "segments": [ref],
+        return {**_inherit(manifest), "segments": [*all_segs[:start], ref, *all_segs[start + len(segs):]],
                 "change": {"op": "compact-segments", "merged": len(segs), "count": built["count"],
                            "writer": "thread-sdk-python"}}
 
