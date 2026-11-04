@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## 0.2.1 (unreleased)
+## 0.2.1 (2026-11-03)
 
 - **Bounded lexical compaction**: `compactSegments({ maxInputBytes })` / `compact_segments(max_input_bytes=)`
   merges one contiguous run of segments whose bytes (plus 4 bytes per tombstoned id) fit the budget, for writers
