@@ -78,8 +78,11 @@ export interface CompactOptions {
 	force?: boolean;
 	/**
 	 * Estimated peak memory of the call (bytes, default 48 MiB): the folded deltas held for the run, the tombstone
-	 * sets, the fine means of a split, and the cells in flight (each about 4x its new slab, 6x plus its decoded
-	 * vectors when it splits). Deltas that would pass it wait for a later call. See `CompactResult.estimatedPeakBytes`.
+	 * sets, and the cells in flight (a fold about 3x the old slab plus 6x the new one; a split 8x plus its decoded
+	 * vectors), or, when the call splits, the fine means of the commit (3 copies), whichever is more. Deltas that
+	 * would pass it wait for a later call. It also sizes the cells: with a small budget cells are split before
+	 * `maxCellEntries` (`CompactionLimits.cellEntries`), so that every cell stays splittable by a call with the
+	 * same budget. Use one budget for a generation: a smaller one later may find cells it cannot split (413).
 	 */
 	maxBytes?: number;
 	/** Cells one call may rewrite (default `compaction.cellsPerRun`, else 256). */
@@ -92,7 +95,10 @@ export interface CompactOptions {
 	deadlineMs?: number;
 	/** Cells in flight at most (default 4; fewer when `maxBytes` does not hold more). */
 	concurrency?: number;
-	/** Split cap for this call (default `compaction.maxCellEntries`, else 0 = no splits). */
+	/**
+	 * Split cap for this call (default `compaction.maxCellEntries`, else 0 = no splits). Cells split at the smaller
+	 * of this and half the largest cell `maxBytes` can split (`CompactionLimits.cellEntries`).
+	 */
 	maxCellEntries?: number;
 	/** A slice of more cells than this defers its splits (default `compaction.splitCellsPerRun`, else 160). */
 	splitCellsPerRun?: number;
@@ -125,7 +131,10 @@ export interface CompactResult {
 	gen: string;
 	/**
 	 * `committed`: the slice is in a new revision. `partial`: the deadline cut the slice; the finished part is
-	 * committed. `noop`: nothing to do. `blocked`: work remains that these budgets cannot take (see `note`).
+	 * committed. `noop`: nothing to do. `blocked`: deltas wait and nothing else could be done in this call (only when
+	 * a slice's splits are deferred; `more` is true). Input that no call with these budgets can take is not `blocked`:
+	 * the call throws a `ThreadError` with status 413 that names it, before any cell grows past what the budget can
+	 * split (see `CompactionLimits`).
 	 * `locked`: another run holds `compact.lock`. `deadline`: the deadline passed before anything committable was
 	 * done. `conflict`: another writer changed what the slice depends on (a compaction, or a delta in a split cell).
 	 */
@@ -152,8 +161,12 @@ export interface CompactResult {
 	droppedTombstoneSets: number[];
 	readBytes: number;
 	writtenBytes: number;
-	/** The planner's estimate of this call's peak memory (bytes), at most `maxBytes` unless `outcome` is `blocked`. */
+	/** The planner's estimate of this call's peak memory (bytes), at most `maxBytes`. */
 	estimatedPeakBytes: number;
+	/** Cells split on their own (no delta folded into them) because they kept a delta from folding. */
+	presplit: number[];
+	/** What a call with this budget can process in the generation (absent when the call did not plan). */
+	limits?: CompactionLimits;
 	/** Cells that ran in parallel. */
 	concurrency: number;
 	/** Thresholds the base exceeded when the call started. */
@@ -180,10 +193,111 @@ const COMMIT_RESERVE_MS = 2_500;
 const SPLIT_COMMIT_RESERVE_MS = 7_000;
 /** A compact.lock older than this is abandoned (the Worker's rule). */
 export const COMPACT_LOCK_STALE_MS = 10 * 60 * 1000;
-/** Peak memory of a cell in flight, in multiples of its new slab: old slab, records, the job's copy, the output. */
-const CELL_FACTOR = 4;
-/** A split also holds the merged slab and the re-encoded halves (and `split_slab`'s decoded vectors, counted apart). */
-const SPLIT_FACTOR = 6;
+/**
+ * Peak memory of a cell in flight (measured in Node at dim 1024, format 2, with the wasm memory growth counted; see
+ * docs/update-path.md "Memory of a call"). A fold holds the old slab and its records, the merged records in the slab
+ * job (whose buffers grow by doubling), the new slab in wasm and its copy in JS: `3 x old + 6 x new` covered every
+ * measured fold (6.1-6.4 x new from an empty cell, 8.4 x new when the old slab was 95% of it).
+ */
+const FOLD_OLD_FACTOR = 3;
+const FOLD_NEW_FACTOR = 6;
+/**
+ * A split also holds the merged slab, the re-encoded halves and their two slab jobs (8 x the merged slab, measured
+ * 9.4-10.8 x with the folded deltas), plus `split_slab`'s decoded vectors (`entries x dim x 4`), counted apart.
+ */
+const SPLIT_FACTOR = 8;
+/** Manifests, delta entry tables, JSON and small typed arrays: a constant beside the terms that scale. */
+const CALL_OVERHEAD = 1024 * 1024;
+/** Tombstone ids the limits leave room for when the policy names none (the profiles' `maxTombstones`). */
+const LIMIT_TOMBSTONES = 50_000;
+
+/** Estimated peak of folding a cell: `old` bytes of its current slab, `bytes` of the new one. */
+const foldPeak = (old: number, bytes: number): number => FOLD_OLD_FACTOR * old + FOLD_NEW_FACTOR * bytes;
+/**
+ * Estimated peak of splitting a cell of `entries` entries and `bytes` bytes, taken as if the whole cell were already
+ * in its slab (a split on its own, the most a later call needs for it): a cell admitted with this cost can always be
+ * split again by a call with the same budget.
+ */
+const splitPeak = (dim: number, bytes: number, entries: number): number => Math.max(foldPeak(bytes, bytes), SPLIT_FACTOR * bytes + entries * dim * 4);
+
+/** Bytes of one entry in a slab of this format (no payload): the entry row, the scan tier and the int8 tier. */
+function entryBytesFor(m: Manifest): number {
+	const dim = m.dim;
+	const format = m.format ?? 1;
+	if (format === 1) return 16 + dim + 4;
+	if (format === 3) return 16 + Math.max(1, Math.floor(dim / 8)) + 4 + dim;
+	return 16 + dim / 2 + 4 + 4 + dim;
+}
+
+/** What one `compact({ maxBytes })` call can process in a generation (`compactionLimits`, `CompactResult.limits`). */
+export interface CompactionLimits {
+	/** The budget the limits are for (bytes). */
+	maxBytes: number;
+	/** Bytes per entry the limits assume (the largest seen in the slabs and deltas, else the format's). */
+	bytesPerEntry: number;
+	/**
+	 * The largest cell (entries) a call can split on its own. No compaction lets a cell grow past it: a fold that
+	 * would is not taken, and the cell is split first. 0 when the generation cannot split (no `maxCellEntries`, or two
+	 * levels).
+	 */
+	splitEntries: number;
+	/**
+	 * The largest cell a call can rewrite without splitting it. Without splits this is the limit: a delta that would
+	 * take a cell past it cannot be folded (an error says so, before the cell grows).
+	 */
+	foldEntries: number;
+	/** Cells are split once they pass this many entries: `min(maxCellEntries, splitEntries / 2)`; 0 = no splits. */
+	cellEntries: number;
+	/**
+	 * Vectors one upsert (one delta segment) may carry and always be foldable with this budget, wherever they land:
+	 * into a cell at `cellEntries`, with the split that follows. Larger upserts may still fold, or wait for a split.
+	 */
+	upsertVectors: number;
+	/** The most cells a split commit can hold the fine means of (old, new and the tree build's copy). */
+	splitCommitCells: number;
+}
+
+/** Largest n with `fixed + cost(n) <= maxBytes` (cost increasing in n), 0 when even one does not fit. */
+function largest(maxBytes: number, fixed: number, cost: (n: number) => number): number {
+	if (fixed + cost(1) > maxBytes) return 0;
+	let lo = 1;
+	let hi = 2;
+	while (fixed + cost(hi) <= maxBytes && hi < 1 << 30) hi *= 2;
+	while (hi - lo > 1) {
+		const mid = (lo + hi) >>> 1;
+		if (fixed + cost(mid) <= maxBytes) lo = mid;
+		else hi = mid;
+	}
+	return lo;
+}
+
+function limitsFor(m: Manifest, maxBytes: number, cap: number, bytesPerEntry: number): CompactionLimits {
+	const dim = m.dim;
+	const B = bytesPerEntry;
+	// What every call holds besides its cells, at the policy's tombstone threshold (so the limits do not shrink as
+	// tombstones accumulate up to it): the sets and their unions, the slabs table and its successor, the rest.
+	const reserve = CALL_OVERHEAD + 12 * (m.compaction?.maxTombstones ?? LIMIT_TOMBSTONES) + 2 * 64 * (m.k1 * m.k2 + 1);
+	const canSplit = cap > 0 && m.k1 === 1;
+	const foldEntries = largest(maxBytes, reserve, (n) => foldPeak(n * B, n * B));
+	const splitEntries = canSplit ? largest(maxBytes, reserve, (n) => splitPeak(dim, n * B, n)) : 0;
+	const cellEntries = canSplit ? Math.max(2, Math.min(cap, Math.floor(splitEntries / 2))) : 0;
+	// An upsert of n vectors held whole (n x B) while it folds into a cell at cellEntries that then splits.
+	const upsertVectors = canSplit ? largest(maxBytes, reserve, (n) => 2 * n * B + splitPeak(dim, (cellEntries + n) * B, cellEntries + n)) : largest(maxBytes, reserve, (n) => 2 * n * B + foldPeak(n * B, n * B));
+	const splitCommitCells = Math.max(0, Math.floor((maxBytes - reserve) / (dim * 4 * 3)));
+	return { maxBytes, bytesPerEntry: B, splitEntries, foldEntries, cellEntries, upsertVectors, splitCommitCells };
+}
+
+/**
+ * What `compact({ maxBytes })` can process in this generation (no I/O): the cell size it splits at, the largest cell
+ * it can split, and the largest upsert that is always foldable. Bytes per entry come from the manifest's deltas
+ * when it has any, else from the slab format (pass `bytesPerEntry` for payloads). See `CompactionLimits`.
+ */
+export function compactionLimits(m: Manifest, opts: { maxBytes?: number; maxCellEntries?: number; bytesPerEntry?: number } = {}): CompactionLimits {
+	const deltas = (m.deltas ?? []).filter((d) => d.count > 0);
+	const seen = deltas.reduce((a, d) => Math.max(a, Math.ceil(d.bytes / d.count)), 0);
+	const B = opts.bytesPerEntry ?? Math.max(entryBytesFor(m), seen);
+	return limitsFor(m, opts.maxBytes ?? COMPACT_DEFAULT_MAX_BYTES, opts.maxCellEntries ?? m.compaction?.maxCellEntries ?? 0, B);
+}
 
 // ---------- the lock ----------
 
@@ -331,10 +445,15 @@ interface Plan {
 	pinned: Set<number>;
 	/** Oversized cells that cannot split (a two-level generation, k1 > 1). */
 	splitBlocked: number[];
+	/** Cells split on their own (no delta folded into them) because they kept a delta from folding. */
+	presplit: number[];
 	concurrency: number;
 	estimatedPeakBytes: number;
 	/** The cells each folded delta has entries in. */
 	deltaCells: Map<string, number[]>;
+	limits: CompactionLimits;
+	/** Input these budgets can never process (a delta too large, a cell past what they can split): why. */
+	impossible: string[];
 	note?: string;
 }
 
@@ -349,25 +468,52 @@ interface Base {
 	dcells: DeltaCells[];
 }
 
+const MB = (b: number): string => `${(b / 1048576).toFixed(1)} MiB`;
+
 /**
  * The slice: whole deltas, oldest first, while their cells fit in `cellsPerRun` and the estimated peak fits in
- * `maxBytes`; then (purge) the cells that keep tombstone sets alive and (force) oversized cells, while the budgets
- * allow; then the splits of the rewritten cells over the cap.
+ * `maxBytes`; then the cells that keep a delta from folding, split on their own; then (purge) the cells that keep
+ * tombstone sets alive and (force) oversized cells, while the budgets allow; then the splits of the rewritten cells
+ * over the cap.
+ *
+ * The guarantee (docs/update-path.md "Memory of a call"): a cell over `limits.cellEntries` is split in the call that
+ * makes it so, and a fold is only taken when the cell it makes could still be split on its own by a call with the
+ * same budget (`limits.splitEntries`). So no cell grows past what a later call can process; a delta that would take
+ * a cell past it waits while that cell is split first. Input that no call with this budget can take (a delta whose
+ * entries in one cell pass `splitEntries`, a cell past it from an older writer) is reported in `impossible`.
  */
 function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurrency: number; cap: number; splitCellsPerRun: number; purge: boolean; force: boolean }): Plan {
 	const m = b.manifest;
 	const dim = m.dim;
 	const k = m.k1 * m.k2;
+	const canSplit = o.cap > 0 && m.k1 === 1;
 	const tombIds = b.tombs.reduce((a, t) => a + t.ids.length, 0);
-	// Held for the whole run: tombstone sets (and their unions), the slabs table (and the new one), the fine means
-	// of a split commit (old, new, and the tree build's copy).
-	const fixed = tombIds * 4 * 3 + b.slabsBytes * 2 + (o.cap > 0 && m.k1 === 1 ? k * dim * 4 * 3 : 0);
-	const est = new Map<number, { bytes: number; entries: number }>();
-	const cellOf = (c: number) => est.get(c) ?? { bytes: b.slabs[c]?.[3] ?? 0, entries: b.slabs[c]?.[2] ?? 0 };
-	const peak = (e: { bytes: number; entries: number }) => {
-		const split = o.cap > 0 && e.entries > o.cap;
-		return split ? SPLIT_FACTOR * e.bytes + e.entries * dim * 4 : CELL_FACTOR * e.bytes;
-	};
+	// Held for the whole run: tombstone sets (and their unions), the slabs table (and the new one), the rest. The fine
+	// means of a split commit (old, new, the tree build's copy) are held only once the cells are done: a phase apart.
+	const fixed = CALL_OVERHEAD + tombIds * 4 * 3 + b.slabsBytes * 2;
+	const commitPeak = (splits: number) => fixed + (splits > 0 ? (k + splits) * dim * 4 * 3 : 0);
+	// Bytes per entry: the largest seen in a non-empty slab or a delta (payloads make entries larger), else the format's.
+	let B = entryBytesFor(m);
+	for (const row of b.slabs) if (row[2] > 0) B = Math.max(B, Math.ceil(row[3] / row[2]));
+	for (const d of b.dcells) if (d.ref.count > 0) B = Math.max(B, Math.ceil(d.ref.bytes / d.ref.count));
+	const limits = limitsFor(m, o.maxBytes, o.cap, B);
+	const capEff = limits.cellEntries;
+	interface Est {
+		/** Bytes of the cell's current slab. */
+		old: number;
+		bytes: number;
+		entries: number;
+		/** Entries of the cell's current slab. */
+		was: number;
+	}
+	const est = new Map<number, Est>();
+	const baseOf = (c: number): Est => ({ old: b.slabs[c]?.[3] ?? 0, bytes: b.slabs[c]?.[3] ?? 0, entries: b.slabs[c]?.[2] ?? 0, was: b.slabs[c]?.[2] ?? 0 });
+	const cellOf = (c: number) => est.get(c) ?? baseOf(c);
+	const splits = (e: Est) => canSplit && e.entries > capEff;
+	// A cell this call would leave past what a call with this budget can always process (splitEntries, or without
+	// splits foldEntries) is not taken, even when this call's own (smaller) state would hold it.
+	const past = (e: Est) => e.entries > e.was && e.entries > (canSplit ? limits.splitEntries : limits.foldEntries);
+	const peak = (e: Est) => (past(e) ? Infinity : splits(e) ? splitPeak(dim, e.bytes, e.entries) : foldPeak(e.old, e.bytes));
 	let held = 0;
 	let maxDelta = 0;
 	let maxPeak = 0;
@@ -375,26 +521,48 @@ function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurre
 	const folded: DeltaRef[] = [];
 	const skipped: DeltaRef[] = [];
 	const deltaCells = new Map<string, number[]>();
+	const impossible: string[] = [];
+	/** Cells that alone keep a skipped delta from folding (their entries plus the delta's do not fit). */
+	const blockers = new Map<number, number>();
 	const order = [...b.dcells].sort((x, y) => x.ref.addedRev - y.ref.addedRev || x.ref.seq - y.ref.seq);
 	for (const d of order) {
 		const own = [...d.counts.keys()];
+		const per = d.ref.bytes / Math.max(1, d.ref.count);
+		if (own.length > o.cellsPerRun) {
+			impossible.push(`delta ${d.ref.key} has entries in ${own.length} cells, more than cellsPerRun ${o.cellsPerRun} (raise it, or compact with the Worker)`);
+			skipped.push(d.ref);
+			continue;
+		}
+		// Can this delta ever fold with this budget? Only if each of its cells could take it starting from nothing.
+		const alone = own.find((c) => {
+			const n = d.counts.get(c)!;
+			const e = { old: 0, bytes: n * per, entries: n, was: 0 };
+			return need(d.ref.bytes, d.ref.bytes, peak(e)) > o.maxBytes;
+		});
+		if (alone !== undefined) {
+			const n = d.counts.get(alone)!;
+			impossible.push(`delta ${d.ref.key} puts ${n} entries (${MB(n * per)}) into cell ${alone}, more than one call with maxBytes ${MB(o.maxBytes)} can fold (${canSplit ? `cells split at ${capEff} entries; an upsert of up to ${limits.upsertVectors} vectors always folds` : `${limits.foldEntries} entries per cell without splits`}): raise maxBytes, or compact with the Worker`);
+			skipped.push(d.ref);
+			continue;
+		}
 		const add = own.filter((c) => !est.has(c));
 		if (est.size + add.length > o.cellsPerRun) {
 			skipped.push(d.ref);
 			continue;
 		}
-		const per = d.ref.bytes / Math.max(1, d.ref.count);
-		const next = new Map<number, { bytes: number; entries: number }>();
+		const next = new Map<number, Est>();
 		let mp = maxPeak;
 		for (const c of own) {
 			const e = cellOf(c);
 			const n = d.counts.get(c)!;
-			const ne = { bytes: e.bytes + n * per, entries: e.entries + n };
+			const ne = { old: e.old, bytes: e.bytes + n * per, entries: e.entries + n, was: e.was };
 			next.set(c, ne);
 			mp = Math.max(mp, peak(ne));
 		}
 		if (need(held + d.ref.bytes, Math.max(maxDelta, d.ref.bytes), mp) > o.maxBytes) {
 			skipped.push(d.ref);
+			// A cell that cannot take this delta even in a slice of its own must shrink first.
+			for (const [c, ne] of next) if (need(d.ref.bytes, d.ref.bytes, peak(ne)) > o.maxBytes) blockers.set(c, Math.max(blockers.get(c) ?? 0, d.counts.get(c)!));
 			continue;
 		}
 		for (const [c, e] of next) est.set(c, e);
@@ -404,72 +572,111 @@ function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurre
 		folded.push(d.ref);
 		deltaCells.set(d.ref.key, own);
 	}
-	// Extra cells without deltas: the ones that keep tombstone sets alive, oldest slab revision first, then (force)
-	// the cells over the cap, largest first.
-	const extra = (cells: number[]): number => {
-		let n = 0;
+	// Extra cells without deltas, while the budgets allow: `cost` is the cell's peak when rewritten.
+	const extra = (cells: number[], cost: (e: Est) => number = peak): number[] => {
+		const took: number[] = [];
 		for (const c of cells) {
 			if (est.has(c) || est.size >= o.cellsPerRun) continue;
 			const e = cellOf(c);
-			const mp = Math.max(maxPeak, peak(e));
+			const mp = Math.max(maxPeak, cost(e));
 			if (need(held, maxDelta, mp) > o.maxBytes) continue;
 			est.set(c, e);
 			maxPeak = mp;
-			n++;
+			took.push(c);
 		}
-		return n;
+		return took;
 	};
+	// Cells that keep a delta from folding are split on their own (their mean pinned: the delta was encoded against
+	// it), largest first; one the budget cannot split is past what these budgets can process.
+	const presplit: number[] = [];
+	if (blockers.size) {
+		const cand = [...blockers.keys()].filter((c) => !est.has(c)).sort((x, y) => cellOf(y).entries - cellOf(x).entries || x - y);
+		for (const c of cand) {
+			const e = cellOf(c);
+			if (!canSplit || e.entries < 2 || fixed + splitPeak(dim, e.bytes, e.entries) > o.maxBytes) {
+				if (!canSplit) impossible.push(`cell ${c} holds ${e.entries} entries (${MB(e.bytes)}): folding ${blockers.get(c)} more needs more than maxBytes ${MB(o.maxBytes)} allows without splits (${limits.foldEntries} entries per cell): raise maxBytes, set maxCellEntries, or rebuild the generation`);
+				else if (e.entries >= 2) impossible.push(`cell ${c} holds ${e.entries} entries (${MB(e.bytes)}); splitting it needs about ${MB(fixed + splitPeak(dim, e.bytes, e.entries))}, more than maxBytes ${MB(o.maxBytes)} (this budget splits cells of up to ${limits.splitEntries} entries): run one compaction with a larger maxBytes (or the Worker's), or rebuild the generation`);
+				continue;
+			}
+			presplit.push(...extra([c], (x) => splitPeak(dim, x.bytes, x.entries)));
+		}
+	}
 	let purgeCells = 0;
 	if (o.purge && b.tombs.length) {
 		// Only dense-side sets wait for slabs; of those, only sets without build ids can ever be dropped.
 		const purgeable = b.tombs.filter((t) => hidesDense(t) && !t.ids.some((id) => id < m.vectors));
 		const maxRev = purgeable.reduce((a, t) => Math.max(a, t.rev), 0);
-		const blockers = b.slabs
+		const blocking = b.slabs
 			.map((row, cell) => ({ cell, r: slabRevOf(row) }))
 			.filter(({ r }) => r > 0 && r <= maxRev)
 			.sort((x, y) => x.r - y.r || x.cell - y.cell)
 			.map((x) => x.cell);
-		purgeCells = extra(blockers);
+		purgeCells = extra(blocking).length;
 	}
-	if (o.force && o.cap > 0 && m.k1 === 1) {
+	if (o.force && canSplit) {
 		const unfolded = new Set(b.dcells.filter((d) => !deltaCells.has(d.ref.key)).flatMap((d) => [...d.counts.keys()]));
 		const over = b.slabs
 			.map((row, cell) => ({ cell, n: row[2] }))
-			.filter(({ cell, n }) => n > o.cap && !unfolded.has(cell))
+			.filter(({ cell, n }) => n > capEff && !unfolded.has(cell))
 			.sort((x, y) => y.n - x.n || x.cell - y.cell)
 			.map((x) => x.cell);
 		extra(over);
 	}
-	const cells = [...est.keys()].sort((x, y) => x - y);
+	let cells = [...est.keys()].sort((x, y) => x - y);
 	// Splits (the Worker's planSplits), except that a cell an unfolded delta has entries in still splits, with its
 	// mean pinned (those entries were encoded against it); the Worker leaves such a cell unsplit. Without that, a
 	// backlog larger than the budget would keep a cell from ever splitting. No splits in a two-level generation.
-	const splits: [number, number][] = [];
+	const splitList: [number, number][] = [];
 	const pinned = new Set<number>();
 	const candidates: number[] = [];
 	const splitBlocked: number[] = [];
+	const pre = new Set(presplit);
 	if (o.cap > 0) {
 		const foldedKeys = new Set(folded.map((d) => d.key));
-		let next = k;
+		let nextCell = k;
 		for (const cell of cells) {
-			if (est.get(cell)!.entries <= o.cap) continue;
+			const e = est.get(cell)!;
+			if (!(e.entries > capEff || (pre.has(cell) && e.entries >= 2))) continue;
 			if (m.k1 !== 1) {
 				splitBlocked.push(cell);
 				continue;
 			}
 			if (b.dcells.some((d) => !foldedKeys.has(d.ref.key) && d.counts.has(cell))) pinned.add(cell);
-			splits.push([cell, next++]);
+			splitList.push([cell, nextCell++]);
 			candidates.push(cell);
 		}
 	}
-	const deferred = splits.length && cells.length > o.splitCellsPerRun ? candidates : [];
+	let deferred = splitList.length && cells.length > o.splitCellsPerRun ? candidates : [];
+	// The split commit holds the fine means three times: with too many cells for the budget, no split can commit.
+	if (splitList.length && !deferred.length && commitPeak(splitList.length) > o.maxBytes) {
+		impossible.push(`a split commit at ${k} cells holds about ${MB(commitPeak(splitList.length))} of fine means, more than maxBytes ${MB(o.maxBytes)} (${limits.splitCommitCells} cells at most): raise maxBytes, or rebuild the generation`);
+		deferred = candidates;
+	}
+	if (deferred.length) {
+		// Without the splits, the cells taken only to be split would be rewritten unchanged.
+		cells = cells.filter((c) => !pre.has(c));
+		for (const c of pre) est.delete(c);
+	}
 	const free = o.maxBytes - need(held, maxDelta, 0);
 	const concurrency = cells.length ? Math.max(1, Math.min(o.concurrency, cells.length, maxPeak > 0 ? Math.floor(free / maxPeak) : o.concurrency)) : 0;
-	const plan: Plan = { cells, folded, skipped, purgeCells, splits: deferred.length ? [] : splits, pinned: deferred.length ? new Set() : pinned, splitsDeferred: deferred, splitBlocked, concurrency, estimatedPeakBytes: need(held, maxDelta, concurrency * maxPeak), deltaCells };
-	if (!cells.length && skipped.length) {
-		const d = skipped[0];
-		plan.note = `delta ${d.key} (${d.count} entries, ${d.bytes} bytes in ${b.dcells.find((x) => x.ref.key === d.key)?.counts.size ?? "?"} cells) does not fit cellsPerRun ${o.cellsPerRun} / maxBytes ${o.maxBytes}: raise them, or compact with the Worker (bench/compact.mjs)`;
-	}
+	const doneSplits = deferred.length ? [] : splitList;
+	const plan: Plan = {
+		cells,
+		folded,
+		skipped,
+		purgeCells,
+		splits: doneSplits,
+		pinned: deferred.length ? new Set() : pinned,
+		splitsDeferred: deferred,
+		splitBlocked,
+		presplit: deferred.length ? [] : presplit,
+		concurrency,
+		estimatedPeakBytes: cells.length ? Math.max(need(held, maxDelta, concurrency * maxPeak), commitPeak(doneSplits.length)) : fixed,
+		deltaCells,
+		limits,
+		impossible,
+	};
+	if (impossible.length) plan.note = impossible[0];
 	return plan;
 }
 
@@ -491,7 +698,7 @@ export async function compactDeltas(ctx: WriterContext, opts: CompactOptions = {
 	const rctx: WriterContext = { ...ctx, store };
 	const owner = opts.owner ?? crypto.randomUUID();
 	const guard = `${prefixOf(store)}|${gen}`;
-	const result: CompactResult = { gen, outcome: "noop", rev: -1, baseRev: null, cells: 0, folded: 0, remainingDeltas: 0, skippedDeltas: 0, purgeCells: 0, splits: [], splitsDeferred: [], k: 0, droppedTombstoneSets: [], readBytes: 0, writtenBytes: 0, estimatedPeakBytes: 0, concurrency: 0, reasons: [], more: false, conflicts: 0, currentUpdated: false, staleLockTaken: false, ms: 0 };
+	const result: CompactResult = { gen, outcome: "noop", rev: -1, baseRev: null, cells: 0, folded: 0, remainingDeltas: 0, skippedDeltas: 0, purgeCells: 0, splits: [], splitsDeferred: [], presplit: [], k: 0, droppedTombstoneSets: [], readBytes: 0, writtenBytes: 0, estimatedPeakBytes: 0, concurrency: 0, reasons: [], more: false, conflicts: 0, currentUpdated: false, staleLockTaken: false, ms: 0 };
 	const finish = () => ((result.ms = Date.now() - t0), result);
 	if (active.has(guard)) {
 		result.outcome = "locked";
@@ -606,17 +813,21 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 			force: opts.force === true,
 		},
 	);
-	Object.assign(result, { skippedDeltas: plan.skipped.length, purgeCells: plan.purgeCells, splitsDeferred: plan.splitsDeferred, estimatedPeakBytes: plan.estimatedPeakBytes, concurrency: plan.concurrency });
+	Object.assign(result, { skippedDeltas: plan.skipped.length, purgeCells: plan.purgeCells, splitsDeferred: plan.splitsDeferred, presplit: plan.presplit, estimatedPeakBytes: plan.estimatedPeakBytes, concurrency: plan.concurrency, limits: plan.limits });
 	if (!plan.cells.length) {
+		if (plan.impossible.length) {
+			const more = plan.impossible.length > 1 ? ` (and ${plan.impossible.length - 1} more)` : "";
+			throw new ThreadError(`compaction of ${gen} rev ${baseRev} cannot proceed with these budgets: ${plan.impossible[0]}${more}`, 413);
+		}
 		result.outcome = plan.skipped.length ? "blocked" : "noop";
-		result.note = plan.note ?? (tombs.length ? "nothing to rewrite (tombstone sets held by build ids, lexical segments or no blocking slabs)" : "nothing to rewrite");
+		result.more = plan.skipped.length > 0;
+		result.note = plan.note ?? (plan.skipped.length ? `${plan.skipped.length} deltas wait (splits deferred: the slice has more than ${opts.splitCellsPerRun ?? policy?.splitCellsPerRun ?? DEFAULT_SPLIT_CELLS_PER_RUN} cells)` : undefined) ?? (tombs.length ? "nothing to rewrite (tombstone sets held by build ids, lexical segments or no blocking slabs)" : "nothing to rewrite");
 		// Tombstone sets may still be droppable without rewriting anything (e.g. after a segment compaction).
 		if (!plan.skipped.length && tombs.some((t) => tombDroppable(t, manifest.deltas ?? [], slabs, manifest.vectors, manifest.segments ?? []))) {
 			await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombs, slabRev, rows: [], folded: [], splits: [], means: new Map(), deltaCells: plan.deltaCells, cap, pinned: new Set() }, result);
 			result.outcome = "committed";
 			result.note = "dropped tombstone sets nothing references";
 		}
-		result.more = false;
 		return record();
 	}
 
@@ -716,10 +927,21 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		}
 		const packed = w.split_slab_records(merged, new Uint8Array(0), means2, codebook);
 		const la = new DataView(packed.buffer, packed.byteOffset, 4).getUint32(0, true);
-		const meanA = means2.slice(0, dim);
-		const meanB = means2.slice(dim);
-		const a = await writeSlab(cell, meanA, [packed.subarray(4, 4 + la)]);
-		const bn = await writeSlab(newCell, meanB, [packed.subarray(4 + la)]);
+		let meanA = means2.slice(0, dim);
+		let meanB = means2.slice(dim);
+		let recA = packed.subarray(4, 4 + la);
+		let recB = packed.subarray(4 + la);
+		// 2-means found no two groups (identical vectors): halve the entries under one mean, so the cell still shrinks.
+		// Not when a pinned cell gave everything away: it keeps its mean and is empty, which lets its deltas fold.
+		if (n >= 2 && (recB.byteLength === 0 || (recA.byteLength === 0 && !plan.pinned.has(cell)))) {
+			const all = recB.byteLength === 0 ? recA : recB;
+			const mean1 = recB.byteLength === 0 ? meanA : meanB;
+			[recA, recB] = halveRecords(all, dim);
+			meanA = mean1;
+			meanB = mean1.slice();
+		}
+		const a = await writeSlab(cell, meanA, [recA]);
+		const bn = await writeSlab(newCell, meanB, [recB]);
 		means.set(cell, meanA);
 		means.set(newCell, meanB);
 		splitsDone.push({ cell, newCell, entries: n, a, b: bn });
@@ -790,7 +1012,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		if (nc !== undefined) commitRows.push([nc, rows.get(nc)!]);
 	}
 	commitRows.sort((x, y) => x[0] - y[0]);
-	const head = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombs, slabRev, rows: commitRows, folded: commitFolded, splits: commitSplits, means, deltaCells: plan.deltaCells, cap, pinned: plan.pinned }, result);
+	const head = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombs, slabRev, rows: commitRows, folded: commitFolded, splits: commitSplits, means, deltaCells: plan.deltaCells, cap: plan.limits.cellEntries, pinned: plan.pinned }, result);
 	result.splits = splitsDone.filter((s) => commitSplits.some(([c]) => c === s.cell)).sort((x, y) => x.cell - y.cell);
 	result.outcome = stopped ? "partial" : "committed";
 	// More splitting only helps while splits move entries (a split with an empty half would repeat forever).
@@ -962,6 +1184,23 @@ async function slabsChangedAfter(store: BlobStore, gen: string, baseRev: number,
 		if (b && manifestFiles(parseManifest(b, gen, rev)).slabs !== files.slabs) return true;
 	}
 	return false;
+}
+
+/**
+ * Splits a run of part records (thread-core part.rs: a 24-byte header with `payload_len` at 16 and `pq_m` at 20,
+ * then `dim / 2` 4-bit codes, `dim` int8 codes, the PQ codes and the payload) into its first half and the rest.
+ */
+export function halveRecords(records: Uint8Array, dim: number): [Uint8Array, Uint8Array] {
+	const dv = new DataView(records.buffer, records.byteOffset, records.byteLength);
+	const ends: number[] = [];
+	for (let pos = 0; pos < records.byteLength; ) {
+		if (pos + 24 > records.byteLength) throw new ThreadError("truncated part record", 500);
+		pos += 24 + dim / 2 + dim + dv.getUint16(pos + 20, true) + dv.getUint32(pos + 16, true);
+		ends.push(pos);
+	}
+	if (ends[ends.length - 1] !== records.byteLength) throw new ThreadError("part records overrun their buffer", 500);
+	const cut = ends.length >= 2 ? ends[Math.ceil(ends.length / 2) - 1] : records.byteLength;
+	return [records.subarray(0, cut), records.subarray(cut)];
 }
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {

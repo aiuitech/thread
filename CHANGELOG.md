@@ -4,6 +4,29 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## 0.2.3 (unreleased)
+
+- **Dense compaction keeps every cell processable by its budget** (TypeScript `index.compact` / `compactDeltas`).
+  Before, at dim 1024 a 32 MiB call folded a one-cell generation up to just under `maxCellEntries` (3000, profile
+  `edge`) and then could never split it (a split of 3000 entries needs about 46 MiB), so every later call was
+  `blocked` and the deltas piled up (inseam's `e1`, 2026-11-04). Now `maxBytes` also sizes the cells: they split at
+  `min(maxCellEntries, splitEntries / 2)`, where `splitEntries` is the largest cell the budget can split on its
+  own; no fold takes a cell past `splitEntries`, and a cell that keeps a delta out is split first (`r.presplit`).
+  `compactionLimits(manifest, { maxBytes })` / `index.compactionLimits(maxBytes)` give `cellEntries`,
+  `splitEntries`, `foldEntries`, `upsertVectors` (an upsert of that many vectors always folds) and
+  `splitCommitCells` without I/O; `r.limits` has them too.
+- **Input a budget cannot process is an error, not `blocked`**: a delta with more entries in one cell than one call
+  can fold, a cell an older writer let grow past `splitEntries`, a delta over `cellsPerRun` cells, or a split commit
+  whose fine means pass the budget throw a `ThreadError` with status 413 that names it and what it needs. `blocked`
+  is left only for a slice whose splits were deferred (`more` is true).
+- **`estimatedPeakBytes` is an upper bound again**: measured with the wasm memory growth counted
+  (`bench/compact_memory.mjs`), a fold holds about 3x the old slab plus 6x the new one (the model said 4x the new
+  one: inseam's 16:57 fold was planned at 18.2 MB and measured 38.9 MB), a split 8x plus the decoded vectors, and
+  1 MiB is fixed; the fine means of a split commit are a phase of their own after the cells. Details in
+  docs/update-path.md "Memory of a call".
+- A split whose 2-means leaves one half empty (identical vectors) halves the entries under the one mean, so such a
+  cell still shrinks.
+
 ## 0.2.2 (2026-11-04)
 
 - **Committing a segment merged elsewhere**: `index.commitMergedSegment({ run, readRev, key, bytes, count, keys })` /

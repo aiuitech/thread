@@ -15,6 +15,7 @@ prep/             dataset -> data/prep/ -> R2 ingest/ (run once)
   update_bench.mjs  upsert / delete / compaction latency and self-retrieval
   split_bench.mjs   splits the largest cells, recall and latency before and after
   edge_cold.mjs     first-query latency against a cold edge cache: one fresh query vector at a time, spaced apart
+  compact_memory.mjs  (local, no Worker) measured peak memory of one SDK dense compaction against its estimate
 
 cold/             cold-start benches of both SDKs against S3 (no Worker): fake_s3.mjs proxy with a network
                   model, cold_bench.mjs / cold_bench.py, warm-up, packs, run_baseline.sh, the routing / base-pack

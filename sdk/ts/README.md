@@ -370,9 +370,10 @@ await gcGeneration(store, { gen: "dense", keep: 2, graceSec: 300, dryRun: false 
 await dropGeneration(store, { gen: "lex", graceSec: 300, dryRun: false });          // a whole generation the pointer left
 if (index.compactionDue().due) {                            // no I/O: the open revision against manifest.compaction
 	let r;
-	do r = await index.compact({ maxBytes: 48 << 20 });      // { outcome, rev, cells, folded, splits, k, more, estimatedPeakBytes, ... }
+	do r = await index.compact({ maxBytes: 48 << 20 });      // { outcome, rev, cells, folded, splits, k, more, estimatedPeakBytes, limits, ... }
 	while (r.more);
 }
+index.compactionLimits(32 << 20);                           // { cellEntries, splitEntries, upsertVectors, ... }: what that budget can process
 await createLexicalGeneration({ store, gen: "docs1", lex: { text: true } });   // a text-only generation (no dense index)
 // a dense generation from nothing, for an embedding model (one empty cell; grows by compaction and cell splits)
 await thread.createGeneration({ store, gen: "docs2", embedding: { provider: "openai", model: "text-embedding-3-small", dim: 1536 }, lex: { text: true } });
@@ -403,12 +404,20 @@ what that generation lacks compared with a k-means build is in [docs/embedding.m
 one call folds a slice of delta segments (whole segments, oldest first) into new slab revisions, splits the
 rewritten cells over `maxCellEntries` (2-means; new fine means, `k2` + splits, the centroid tree rebuilt when the
 head has one) and drops the tombstone sets nothing references. A call is bounded by `maxBytes` (estimated peak
-memory, default 48 MiB; `r.estimatedPeakBytes` is the plan's figure), `cellsPerRun` (default the policy's, 256) and
-`deadlineMs` (default the policy's, 27 s: no cell starts after `deadline - 2.5 s`, 7 s with splits; the finished
-cells whose deltas are complete are committed, `outcome: "partial"`). `r.more` says whether another call has work;
-`r.outcome` is `committed`, `partial`, `noop`, `blocked` (a delta that alone does not fit the budgets; `r.note`),
-`locked` (another run holds `idx/{gen}/compact.lock`), `deadline` or `conflict` (another writer changed what the
-slice depends on; call again). Without `force` a head below every threshold is a `noop`, as in the Worker's
+memory, default 48 MiB; `r.estimatedPeakBytes` is the plan's figure, an upper bound of what was measured),
+`cellsPerRun` (default the policy's, 256) and `deadlineMs` (default the policy's, 27 s: no cell starts after
+`deadline - 2.5 s`, 7 s with splits; the finished cells whose deltas are complete are committed, `outcome:
+"partial"`). `maxBytes` also sizes the cells: they split at `min(maxCellEntries, splitEntries / 2)`, where
+`splitEntries` is the largest cell the budget can split on its own, and no fold takes a cell past `splitEntries` (a
+cell in the way of a delta is split first, `r.presplit`). So every cell stays processable by a later call with the
+same budget; `index.compactionLimits(maxBytes)` / `compactionLimits(manifest, { maxBytes })` tells the numbers
+without I/O (at dim 1024 and 32 MiB: cells split at ~960 entries, an upsert of up to ~800 vectors always folds).
+Keep one budget per generation. Input no call with the budget can take (a delta with more entries in one cell than
+it can fold, a cell an older writer let grow past it, a delta over `cellsPerRun` cells) is a `ThreadError` with
+status 413 that names it and what it needs, not an outcome. `r.more` says whether another call has work;
+`r.outcome` is `committed`, `partial`, `noop`, `blocked` (only when a slice's splits were deferred and nothing
+else could be done; `more` is true), `locked` (another run holds `idx/{gen}/compact.lock`), `deadline` or
+`conflict` (another writer changed what the slice depends on; call again). Without `force` a head below every threshold is a `noop`, as in the Worker's
 automatic runs; `force: true` folds everything the budgets allow and also splits oversized cells. Other options:
 `concurrency` (cells in flight, default 4), `maxCellEntries`, `splitCellsPerRun`, `purge` (rewrite the cells that
 keep tombstone sets alive; default when the tombstone threshold is exceeded), `lock` (default true), `owner` (a
@@ -576,10 +585,12 @@ directory or a bucket to write on top of it. Format and rationale: [docs/portabi
   lists before they are evicted. The wasm module is ~750 KB with the tokenizer, stemmer and lexical kernels.
 - Payloads: `returnPayload` reads them with one (multi-)range request per slab; keep payloads small or store
   them elsewhere keyed by id.
-- `index.compact()`: the planner keeps its estimate under `maxBytes` (48 MiB by default): the folded deltas held
-  for the run, the tombstone sets (x3), the slabs table (x2), the fine means of a split commit (x3), the largest
-  folded delta again (its copy in wasm) and, per cell in flight, about 4x its new slab (6x plus 4 B x entries x dim
-  of decoded vectors when it splits). Reads and writes go under the caches. The wasm memory keeps its high-water
+- `index.compact()`: the planner keeps its estimate under `maxBytes` (48 MiB by default): 1 MiB fixed, the folded
+  deltas held for the run, the tombstone sets (x3), the slabs table (x2), the largest folded delta again (its copy
+  in wasm) and, per cell in flight, 3x its old slab plus 6x the new one (a split: 8x plus 4 B x entries x dim of
+  decoded vectors); or, when it splits, the fine means of the commit (x3), whichever phase is larger. The factors
+  are measured, wasm memory growth included ([docs/update-path.md](../../docs/update-path.md#memory-of-a-call)).
+  Reads and writes go under the caches. The wasm memory keeps its high-water
   mark afterwards, so run it in the isolate that writes (a Durable Object), not one that serves many queries.
 
 ## Vectorize mapping

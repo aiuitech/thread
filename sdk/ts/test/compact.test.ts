@@ -11,7 +11,7 @@ const DIM = 16;
 
 /** A generation from nothing with a policy that triggers early and splits small cells. */
 async function fresh(store: BlobStore, gen = "d1", cap = 60) {
-	await thread.createGeneration({ store, gen, dim: DIM, lex: { text: true }, compaction: { maxDeltas: 2, maxCellEntries: cap } });
+	await thread.createGeneration({ store, gen, dim: DIM, lex: { text: true }, compaction: { maxDeltas: 2, maxCellEntries: cap, maxTombstones: 1000 } });
 	return thread.open({ store, cache: false, refreshInterval: 0 });
 }
 
@@ -111,12 +111,13 @@ describe("dense compaction in the SDK", () => {
 
 	it("bounds a call by memory and cells, and finishes in several calls", async () => {
 		const store = new MemoryBlobStore();
-		// Cells split at 40 entries, so they stay small; the budget holds about four 20-vector deltas and their cell.
+		// Cells split at 40 entries, so they stay small; past the fixed 1 MiB the budget holds a few 20-vector deltas
+		// and their cell.
 		const ix = await fresh(store, "d3", 40);
 		const n = 200;
 		const v = data(n, 11);
 		await upsertAll(ix, v, n, 20); // 10 deltas
-		const maxBytes = 40_000;
+		const maxBytes = 1024 * 1024 + 60_000;
 		const outcomes: string[] = [];
 		for (let i = 0; i < 20; i++) {
 			const r = await ix.compact({ force: true, maxBytes });
@@ -127,12 +128,9 @@ describe("dense compaction in the SDK", () => {
 		expect(outcomes.length).toBeGreaterThan(2);
 		expect(ix.manifest.deltas).toEqual([]);
 		expect(await selfTop(ix, v, [0, 50, 199])).toEqual([0, 50, 199]);
-		// A budget too small for the first delta blocks (and says why) instead of passing it.
+		// A budget too small for the first delta is an error that names it, not a `blocked` outcome to retry forever.
 		await upsertAll(ix, data(30, 12), 30, 30, 1000);
-		const b = await ix.compact({ force: true, maxBytes: 1000 });
-		expect(b.outcome).toBe("blocked");
-		expect(b.more).toBe(false);
-		expect(b.note).toMatch(/does not fit/);
+		await expect(ix.compact({ force: true, maxBytes: 1000 })).rejects.toMatchObject({ status: 413, message: expect.stringMatching(/delta idx\/d3\/delta\/\d+\.vibd puts \d+ entries .* into cell \d+/) });
 		ix.close();
 	});
 
@@ -230,6 +228,72 @@ describe("dense compaction in the SDK", () => {
 		expect(r.outcome).toBe("committed");
 		expect(r.baseRev).toBe(base);
 		expect(await selfTop(ix, v, [0, 75, 149])).toEqual([0, 75, 149]);
+		ix.close();
+	});
+
+	it("splits a cell first when folding a delta would take it past what the budget can split, then folds the delta", async () => {
+		const store = new MemoryBlobStore();
+		await thread.createGeneration({ store, gen: "d8", dim: DIM, lex: null, compaction: { maxDeltas: 0, maxCellEntries: 10_000, maxTombstones: 1000 } });
+		const ix = await thread.open({ store, cache: false, refreshInterval: 0 });
+		const v = data(400, 41);
+		await upsertAll(ix, v, 300, 50);
+		// One cell of 300 entries, as an older writer (or a larger budget without splits) leaves it.
+		while ((await ix.compact({ force: true, maxCellEntries: 0 })).more);
+		const row = parseSlabsTable((await store.get(ix.manifest.files!.slabs!))!, 1, "slabs")[0];
+		expect(row[2]).toBe(300);
+		// A budget that splits that cell on its own, but not with 50 more entries in it.
+		await ix.upsert({ ids: Array.from({ length: 50 }, (_, i) => 300 + i), vectors: v.subarray(300 * DIM, 350 * DIM) });
+		let maxBytes = 1024 * 1024;
+		while (ix.compactionLimits(maxBytes).splitEntries < 310) maxBytes += 1024;
+		expect(ix.compactionLimits(maxBytes).splitEntries).toBeLessThan(350);
+		const r1 = await ix.compact({ maxBytes });
+		expect(r1.outcome).toBe("committed");
+		expect(r1.presplit).toEqual([0]);
+		expect(r1.folded).toBe(0);
+		expect(r1.splits.length).toBe(1);
+		expect(r1.estimatedPeakBytes).toBeLessThanOrEqual(maxBytes);
+		expect(r1.more).toBe(true);
+		const r2 = await ix.compact({ maxBytes });
+		expect(r2.outcome).toBe("committed");
+		expect(r2.folded).toBe(1);
+		expect(r2.estimatedPeakBytes).toBeLessThanOrEqual(maxBytes);
+		expect(ix.manifest.deltas).toEqual([]);
+		const ids = [0, 120, 299, 300, 349];
+		expect(await selfTop(ix, v, ids)).toEqual(ids);
+		ix.close();
+	});
+
+	it("says which cell a budget cannot split (413) instead of reporting blocked forever", async () => {
+		const store = new MemoryBlobStore();
+		await thread.createGeneration({ store, gen: "d9", dim: DIM, lex: null, compaction: { maxDeltas: 0, maxCellEntries: 100, maxTombstones: 1000 } });
+		const ix = await thread.open({ store, cache: false, refreshInterval: 0 });
+		const v = data(350, 43);
+		await upsertAll(ix, v, 300, 50);
+		while ((await ix.compact({ force: true, maxCellEntries: 0 })).more);
+		await ix.upsert({ ids: Array.from({ length: 50 }, (_, i) => 300 + i), vectors: v.subarray(300 * DIM, 350 * DIM) });
+		let maxBytes = 1024 * 1024;
+		while (ix.compactionLimits(maxBytes).splitEntries < 200) maxBytes += 1024;
+		await expect(ix.compact({ maxBytes })).rejects.toMatchObject({ status: 413, message: expect.stringMatching(/cell 0 holds 300 entries .* more than maxBytes/) });
+		// A budget that can split it proceeds.
+		const r = await ix.compact({ maxBytes: maxBytes * 2 });
+		expect(r.outcome).toBe("committed");
+		ix.close();
+	});
+
+	it("splits a cell of identical vectors by halving it, so it never outgrows the budget", async () => {
+		const store = new MemoryBlobStore();
+		const ix = await fresh(store, "d10", 40);
+		const one = data(1, 51);
+		const v = new Float32Array(400 * DIM);
+		for (let i = 0; i < 400; i++) v.set(one, i * DIM);
+		await upsertAll(ix, v, 400, 50);
+		for (let i = 0; i < 40; i++) if (!(await ix.compact({ force: true })).more) break;
+		const m = ix.manifest;
+		expect(m.deltas).toEqual([]);
+		const table = parseSlabsTable((await store.get(m.files!.slabs!))!, m.k1 * m.k2, "slabs");
+		expect(table.reduce((a, r) => a + r[2], 0)).toBe(400);
+		expect(Math.max(...table.map((r) => r[2]))).toBeLessThanOrEqual(40);
+		expect((await ix.query(one, { topK: 400, nprobe: 1 << 20 })).hits.length).toBe(400);
 		ix.close();
 	});
 });

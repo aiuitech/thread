@@ -19,7 +19,7 @@ import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { dropGeneration, gcGeneration, setCurrent, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
-import { compactDeltas, compactionStatus, type CompactionStatus, type CompactOptions, type CompactResult } from "./compact.js";
+import { compactDeltas, compactionLimits, compactionStatus, type CompactionLimits, type CompactionStatus, type CompactOptions, type CompactResult } from "./compact.js";
 import { commitMergedSegment, compactSegments, configureAttrs, configureLexical, createGeneration, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateGenerationOptions, type CreateGenerationResult, type CreateLexicalOptions, type DeleteResult, type MergedSegmentInput, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { normalizeRows, resolveEmbedder, splitRows, type EmbedKind, type EmbedOptions, type EmbeddingConfig, type TextEmbedder } from "./embed.js";
 import { compileFilter, packAttrs, unpackAttrs, validateSchema, type AttrFieldSpec, type AttrFilterExpr, type AttrSchema, type AttrValues } from "./attrs.js";
@@ -45,7 +45,7 @@ export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryP
 export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
 export { dropGeneration, gcGeneration, setCurrent, supersededKey, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
-export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionPressure, compactionStatus, tombDroppable, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
+export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionLimits, compactionPressure, compactionStatus, tombDroppable, type CompactionLimits, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
 export type { UpsertScope, CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, MergedSegmentInput, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
 export { CREATE_DEFAULTS, commitMergedSegment, createGeneration, createLexicalGeneration } from "./write.js";
 
@@ -987,6 +987,15 @@ export class ThreadIndex {
 	 */
 	compactionDue(): CompactionStatus {
 		return compactionStatus(this.revState.manifest);
+	}
+
+	/**
+	 * What `compact({ maxBytes })` can process in this generation (no I/O): cells split at `cellEntries`, no cell grows
+	 * past `splitEntries`, and an upsert of up to `upsertVectors` vectors always folds. A writer with a fixed budget
+	 * sizes its upserts with it; see `CompactionLimits`.
+	 */
+	compactionLimits(maxBytes?: number): CompactionLimits {
+		return compactionLimits(this.revState.manifest, maxBytes === undefined ? {} : { maxBytes });
 	}
 
 	/**

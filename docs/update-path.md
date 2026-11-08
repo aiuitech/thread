@@ -303,14 +303,19 @@ rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
    the lock released (`ms: 0`), which the Worker treats as stale.
 2. **Plan** on the newest manifest (listed): unless `force`, nothing happens below every threshold. The delta
    segments' cells come from their entry tables only (two small range reads each). Whole deltas, oldest first, join
-   the slice while their cells fit `cellsPerRun` and the estimated peak fits `maxBytes` (the folded deltas, the
-   tombstone sets, the slabs table, the fine means of a split, and per cell in flight 4x its new slab, 6x plus the
-   decoded vectors when it splits); the cells in flight are as many as the rest of the budget holds (at most
-   `concurrency`). A delta that does not fit waits; when none fits, the call is `blocked` and says which. With the
-   tombstone threshold exceeded (or `purge`, or `force`) purge cells follow, and with `force` the cells over the
-   cap, while the budgets allow. Splits as in the Worker, except that a cell an unfolded delta has entries in is
-   split with its mean kept (the new cell takes the 2-means centre farther from it, and the entries nearer that
-   centre): those entries stay valid, and a backlog larger than the budget cannot keep a cell from splitting.
+   the slice while their cells fit `cellsPerRun` and the estimated peak fits `maxBytes` (see
+   [Memory of a call](#memory-of-a-call)); the cells in flight are as many as the rest of the budget holds (at most
+   `concurrency`). Cells split once they pass `cellEntries = min(maxCellEntries, splitEntries / 2)`, and a delta is
+   only taken when no cell it lands in passes `splitEntries`, the largest cell the budget splits on its own. A
+   delta that does not fit waits; a cell that alone keeps a delta out is split first, on its own and with its mean
+   kept (`r.presplit`), and the delta folds in a later call. Input that no call with the budget can take (a delta
+   with more entries in one cell than it can fold, a cell already past `splitEntries`, a delta over `cellsPerRun`
+   cells) is a `ThreadError` with status 413 naming it. With the tombstone threshold exceeded (or `purge`, or
+   `force`) purge cells follow, and with `force` the cells over the cap, while the budgets allow. Splits as in the
+   Worker, except that a cell an unfolded delta has entries in is split with its mean kept (the new cell takes the
+   2-means centre farther from it, and the entries nearer that centre): those entries stay valid, and a backlog
+   larger than the budget cannot keep a cell from splitting. When 2-means leaves one half empty (identical
+   vectors), the entries are halved under the one mean, so such a cell still shrinks.
 3. **Cells** under the caches (whole slabs would only fill them), split cells first, then each delta's cells, oldest
    delta first. Slab objects are written create-only: the same bytes already there (a rerun on the same base after a
    crash) are reused; other bytes are overwritten only while no revision after the base changed the slabs table (so
@@ -333,6 +338,51 @@ if (ix.compactionDue().due) for (let c = await ix.compact({ owner: state.id.toSt
 
 Tombstone sets also wait for the lexical segments that predate them: run `compactSegments` (a full merge, or
 bounded runs) too, or the sets stay. The Python SDK does not compact.
+
+### Memory of a call
+
+What a call holds at its peak, as the planner estimates it (`r.estimatedPeakBytes`, at most `maxBytes`):
+
+- **always**: 1 MiB (manifests, delta entry tables, JSON), the tombstone sets x3 (the ids, their dense and lexical
+  unions), the slabs table x2;
+- **cells phase**: the folded deltas (held for the run) plus the largest of them again (its copy in wasm), and per
+  cell in flight `3 x old slab + 6 x new slab` for a fold, `max(9, 8 + 4 x dim / bytesPerEntry) x new slab` for a
+  split (the merged slab, the re-encoded halves, their two slab jobs, `split_slab`'s decoded vectors);
+- **commit phase** (only with splits, after the cells are released): the fine means x3 (old, new, the tree build's
+  copy), `k x dim x 12` bytes.
+
+The factors come from measurements in Node with the wasm memory growth counted (the wasm memory never shrinks, so
+its growth over a call is part of the isolate's cost for good): `bench/compact_memory.mjs` samples the JS
+ArrayBuffers and the wasm memory after every wasm call and store read or write, in a fresh process per call (`all`
+runs the table below; `measure` takes any generation directory, such as a copy of an R2 index). Dim 1024, format 2
+(1560 B per entry):
+
+| call | estimate | measured | before 0.2.3: estimate |
+|---|---:|---:|---:|
+| fold of 1000 entries into an empty cell | 11.8 MB | 9.4 MB | 7.8 MB |
+| fold of 3000 entries into an empty cell | 32.8 MB | 28.6 MB | 22.8 MB |
+| fold of 6000 entries into an empty cell | 64.2 MB | 54.8 MB | 45.3 MB |
+| split of 1000 / 3000 / 6000 entries | 18.7 / 53.5 / 105.6 MB | 16.3 / 47.6 / 96.2 MB | 14.7 / 43.5 / 86.7 MB |
+| fold of 111 entries into a cell of 2869 (inseam's e1, rev 206) | - (now a 413) | 38.9 MB | 18.2 MB |
+
+The old model (4x the new slab for a fold) undercounted the slab job's buffer growth and the old slab's records:
+the e1 fold above was planned at 18.2 MB under a 32 MiB budget and measured 38.9 MB.
+
+**Cell sizes follow the budget.** A split costs about `8 x bytes + 4 x dim x entries`, so at dim 1024 one call of
+32 MiB splits cells of up to about 1900 entries, fewer than the `edge` profile's 3000. Before 0.2.3 the planner
+folded deltas into a cell up to `maxCellEntries` without splitting (a cell under the cap needs none), and then no
+delta could join it: the fold would pass the cap, the split that then follows did not fit the budget, so every
+call was `blocked` and the deltas piled up. That is what happened to inseam's `e1` on 2026-11-04 (one cell, 2980
+entries, 32 MiB calls, 47 deltas and growing). Now `compactionLimits(manifest, { maxBytes })` derives
+`splitEntries` (the largest cell a call splits on its own, with room for the policy's `maxTombstones`),
+`cellEntries = min(maxCellEntries, splitEntries / 2)` where cells split, and `upsertVectors` (an upsert of that many
+vectors always folds, even into a cell at `cellEntries`); at dim 1024 and 32 MiB they are about 1920, 960 and 810.
+The invariant is that no compaction leaves a cell past `splitEntries`, so every later call with the same budget can
+fold into it after splitting it. A smaller budget later may find cells it cannot split: the call then fails with a
+413 that names the cell and the budget it needs (one call with that budget, or the Worker, repairs it).
+`sdk/ts/test/compact-bulk.test.ts` replays the bulk copy: 20,000 vectors of dim 1024 in upserts of 200, a 32 MiB
+compaction after each one that is due; k grows to 32, the deltas never pass 17, no cell passes `splitEntries`, no
+estimate passes the budget, and the wasm memory grows by 15 MB over the whole run.
 
 ## Automatic compaction
 
