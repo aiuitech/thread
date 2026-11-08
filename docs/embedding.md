@@ -156,8 +156,9 @@ const b = await thread.bulkBuild({ store, gen: "e2", embedding, lex, attrs, maxB
 await b.add({ keys, metas, texts, attrs, vectors });       // any number of calls, at most ~800 vectors each at dim 1024
 await b.seal();                                            // no more adds; k, the cell size and the sample size are fixed
 // one per alarm:
-const r = await b.step({ deadlineMs: 10_000 });            // { phase, done, worked, estimatedPeakBytes, progress, ms }
+const r = await b.step({ deadlineMs: 10_000 });            // { phase, done, worked, progressed, estimatedPeakBytes, progress, ms }
 if (r.done) { await setCurrent(store, { gen: "e2", expect }); await b.cleanup(); }
+// dropping the handle without finishing (a failed step, an evicted object): b.close(); reopen with thread.bulkBuild
 ```
 
 `thread.bulkBuild` resumes the build in `build/{gen}/state.json` when there is one (the options then only matter
@@ -177,7 +178,21 @@ Sizes from `maxBytes` (`bulkBuildPlan(n, dim, { maxBytes })` computes them): cel
 can grow to twice its size before it splits; an `add` may carry at most `upsertVectors` vectors (810 at dim 1024
 and 32 MiB) and an eighth of `maxBytes`, so every replay folds within the budget (413 otherwise: split the add). A
 step keeps its estimate under `maxBytes` (`r.estimatedPeakBytes`) and stops starting work at `deadlineMs` (a
-replay is not started within 4 s of it, which the compaction after it uses).
+replay is not started within 4 s of it, or 40% of `deadlineMs` when that is less, which the compaction after it
+uses).
+
+A step also ends as soon as a pass over its phase commits nothing, and reports `progressed: false` when its
+first pass did not: the index opened too close to the deadline to start a replay, another run holds
+`compact.lock`, or the deadline had passed. It never runs a phase again without progress, so it does not depend on
+the clock moving: in Workers `Date.now()` stands still between I/O, and in 0.2.3 a `load` step whose index open
+left less than the reserve called the phase again and again until the CPU limit (inseam, 2026-11-08). The next
+step continues. Keep the handle between steps where you can, since a new handle opens the index again; if that
+open alone takes more than `deadlineMs` minus the reserve on every call, raise `deadlineMs`.
+
+`b.close()` releases the index the handle opened (its caches and wasm objects) and writes or deletes nothing: the
+staging objects, the state and the generation stay, and `thread.bulkBuild` on the same `gen` resumes the build. A
+later `step` on the same handle opens the index again. Close a handle you drop before `done`, for example after a
+failed step, whose state's ETag may be stale (open the build again). `cleanup()` closes it too.
 
 Each piece commits its own progress through a compare-and-swap of the state, so a step that crashed is run again:
 a sample chunk or a means iteration is written again; a replayed stage is an upsert under the same keys (or ids)

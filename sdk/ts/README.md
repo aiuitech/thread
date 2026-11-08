@@ -409,8 +409,9 @@ what that generation lacks compared with a k-means build is in [docs/embedding.m
 `means` (`k x dim` floats) gives rev 0 `k` empty cells instead of one. For a large load, `thread.bulkBuild({ store,
 gen, embedding, lex, attrs, maxBytes })` (`@experimental`) stages documents with `b.add({ keys, metas, texts, attrs,
 vectors })`, and after `b.seal()` each `b.step({ deadlineMs })` advances sample, k-means, create, load and
-compaction within `maxBytes`, resuming from `build/{gen}/state.json`, until `done`; then `setCurrent` and
-`b.cleanup()` ([docs/embedding.md](../../docs/embedding.md#a-bulk-build-in-bounded-steps)).
+compaction within `maxBytes`, resuming from `build/{gen}/state.json`, until `done` (a step that could commit nothing
+returns at once with `progressed: false`); then `setCurrent` and `b.cleanup()`. `b.close()` releases the handle's
+index and keeps the build, which `thread.bulkBuild` resumes ([docs/embedding.md](../../docs/embedding.md#a-bulk-build-in-bounded-steps)).
 
 `index.compact(opts)` (also `compactDeltas(writerContext, opts)`) is the Worker's dense compaction in one isolate:
 one call folds a slice of delta segments (whole segments, oldest first) into new slab revisions, splits the

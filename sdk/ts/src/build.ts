@@ -19,7 +19,7 @@
  * again: a sample chunk, a means iteration and a stage replay are idempotent (an upsert under the same keys or ids
  * replaces what an earlier attempt wrote). One step at a time: a second concurrent step fails with 409.
  */
-import { compactionLimits, type CompactionLimits } from "./compact.js";
+import { compactionLimits, type CompactionLimits, type CompactResult } from "./compact.js";
 import type { EmbeddingConfig } from "./embed.js";
 import type { Thread, ThreadIndex } from "./index.js";
 import type { BlobStore } from "./store.js";
@@ -106,8 +106,15 @@ export interface BulkStepResult {
 	/** The phase after the call. */
 	phase: BulkPhase;
 	done: boolean;
-	/** The phases the call worked in. */
+	/** The phases the call made progress in (committed a piece of), in order. */
 	worked: BulkPhase[];
+	/**
+	 * Whether the call committed anything. False when its first pass did nothing: the deadline left too little time
+	 * after the index opened (a `load` replay needs 4 s before it, or 40% of `deadlineMs` when that is less),
+	 * another run holds `compact.lock`, or the deadline had passed. Call again; keep the handle, so that the next
+	 * call does not open the index again.
+	 */
+	progressed: boolean;
 	/** The planner's estimate of the call's peak memory (bytes), at most `maxBytes`. */
 	estimatedPeakBytes: number;
 	progress: { staged: number; vectors: number; k: number | null; sampleRows: number; sampleSize: number | null; iteration: number; iterations: number | null; loaded: number; deltas: number | null; rev: number | null };
@@ -120,12 +127,19 @@ const sampleKey = (gen: string, pos: number) => `build/${gen}/sample/${String(po
 const meansKey = (gen: string, iter: number) => `build/${gen}/means.${iter}.f32`;
 const DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
 const DEFAULT_DEADLINE_MS = 10_000;
-/** Time kept for a compaction after the last replay of a `load` step (ms). */
+/** Time kept for a compaction after the last replay of a `load` step (ms; at most 40% of the step's deadline). */
 const LOAD_COMPACT_RESERVE_MS = 4_000;
+const LOAD_COMPACT_RESERVE_SHARE = 0.4;
 /** Rows a k-means job takes per call (its copy in wasm). */
 const KMEANS_CHUNK = 512;
 /** Accumulator header of a `FlatKmeansJob.partial()` (thread-core kmeans.rs: magic, k, dim, 0). */
 const ACCUM_HEADER = 16;
+
+/** What one pass over a phase did: its peak estimate, and whether it committed anything (a piece, the state). */
+interface Pass {
+	peak: number;
+	progressed: boolean;
+}
 
 interface StageDoc {
 	n: number;
@@ -314,30 +328,35 @@ export class BulkBuild {
 	 * Advances the build within `deadlineMs` (default 10 s) and `maxBytes`: as many phases and pieces of them as fit.
 	 * Call again until `done`. Each piece commits its own progress, so a step cut short (or crashed) loses at most the
 	 * piece in flight.
+	 *
+	 * The call returns as soon as a pass over the current phase commits nothing (`progressed` is false when that is
+	 * the first pass), with the phase it stopped in. It never runs a phase again without progress, so it ends even
+	 * where `Date.now()` does not advance without I/O (Workers): every pass it repeats has written something.
 	 */
 	async step(opts: { deadlineMs?: number } = {}): Promise<BulkStepResult> {
 		const t0 = Date.now();
-		const deadline = t0 + (opts.deadlineMs ?? DEFAULT_DEADLINE_MS);
+		const deadlineMs = opts.deadlineMs ?? DEFAULT_DEADLINE_MS;
+		const deadline = t0 + deadlineMs;
+		const reserve = Math.min(LOAD_COMPACT_RESERVE_MS, Math.floor(deadlineMs * LOAD_COMPACT_RESERVE_SHARE));
 		const worked: BulkPhase[] = [];
 		let peak = 0;
 		if (this.st.phase === "stage") throw new ThreadError(`bulk build ${this.st.gen} is not sealed`, 409);
 		while (this.st.phase !== "done" && Date.now() < deadline) {
 			const phase: BulkPhase = this.st.phase;
+			const pass = phase === "sample" ? await this.sampleStep(deadline) : phase === "kmeans" ? await this.kmeansStep(deadline) : phase === "create" ? await this.createStep() : phase === "load" ? await this.loadStep(deadline, reserve) : await this.compactStep(deadline);
+			peak = Math.max(peak, pass.peak);
+			// No piece done and no state written: calling the phase again would find it as it is (the next step does).
+			if (!pass.progressed) break;
 			if (!worked.includes(phase)) worked.push(phase);
-			if (phase === "sample") peak = Math.max(peak, await this.sampleStep(deadline));
-			else if (phase === "kmeans") peak = Math.max(peak, await this.kmeansStep(deadline));
-			else if (phase === "create") peak = Math.max(peak, await this.createStep());
-			else if (phase === "load") peak = Math.max(peak, await this.loadStep(deadline));
-			else if (phase === "compact") peak = Math.max(peak, await this.compactStep(deadline));
-			if (this.st.phase === phase && Date.now() >= deadline) break;
 		}
-		if (this.st.phase === "done") this.closeIndex();
+		if (this.st.phase === "done") this.close();
 		const s = this.st;
 		return {
 			gen: s.gen,
 			phase: s.phase,
 			done: s.phase === "done",
 			worked,
+			progressed: worked.length > 0,
 			estimatedPeakBytes: peak,
 			progress: { staged: s.staged, vectors: s.vectors, k: s.k ?? null, sampleRows: s.sample?.rows ?? 0, sampleSize: s.sampleSize ?? null, iteration: s.kmeans?.iter ?? 0, iterations: s.iterations ?? null, loaded: s.load?.pos ?? 0, deltas: this.ix ? (this.ix.manifest.deltas?.length ?? 0) : null, rev: s.rev ?? null },
 			ms: Date.now() - t0,
@@ -346,7 +365,7 @@ export class BulkBuild {
 
 	/** Deletes the staging objects and the state (`build/{gen}/`); the generation stays. */
 	async cleanup(): Promise<number> {
-		this.closeIndex();
+		this.close();
 		const store = this.store;
 		if (!store.list || !store.delete) throw new ThreadError("cleanup needs a store with list and delete", 400);
 		const all = await store.list(`build/${this.st.gen}/`);
@@ -354,7 +373,13 @@ export class BulkBuild {
 		return all.length;
 	}
 
-	private closeIndex(): void {
+	/**
+	 * Releases the index this handle opened for the `load` and `compact` phases (its caches and wasm objects). It
+	 * writes and deletes nothing: the staging objects, the state and the generation stay, and `thread.bulkBuild`
+	 * on the same `gen` resumes the build. A later `step` on this handle opens the index again. Use it when dropping
+	 * a handle, e.g. after a step that failed (its state's ETag may be stale: open the build again). Idempotent.
+	 */
+	close(): void {
 		this.ix?.close();
 		this.ix = null;
 	}
@@ -362,7 +387,7 @@ export class BulkBuild {
 	// ---------- phases ----------
 
 	/** Evenly spaced rows: row g is in the sample when floor((g + 1) S / N) > floor(g S / N), S rows in all. */
-	private async sampleStep(deadline: number): Promise<number> {
+	private async sampleStep(deadline: number): Promise<Pass> {
 		const s = this.st;
 		const S = s.sampleSize!;
 		const N = s.vectors;
@@ -383,6 +408,8 @@ export class BulkBuild {
 			}
 			pos++;
 		}
+		const peak = (S - sm.rows) * dim * 4 + 2 * largest + (1 << 20);
+		if (pos === sm.pos) return { peak, progressed: false };
 		const chunks = [...sm.chunks];
 		if (got) {
 			const key = sampleKey(s.gen, sm.pos);
@@ -391,7 +418,7 @@ export class BulkBuild {
 		}
 		const done = pos >= s.staged;
 		await this.save({ ...s, ...(done ? { phase: "kmeans" as const } : {}), sample: { pos, row, rows: sm.rows + got, chunks } });
-		return (S - sm.rows) * dim * 4 + 2 * largest + (1 << 20);
+		return { peak, progressed: true };
 	}
 
 	private async loadSample(): Promise<Float32Array> {
@@ -408,7 +435,7 @@ export class BulkBuild {
 		return out;
 	}
 
-	private async kmeansStep(deadline: number): Promise<number> {
+	private async kmeansStep(deadline: number): Promise<Pass> {
 		const s = this.st;
 		const { dim } = s;
 		const k = s.k!;
@@ -417,6 +444,7 @@ export class BulkBuild {
 		const S = sample.length / dim;
 		let means: Float32Array;
 		let iter: number;
+		let progressed = false;
 		if (!s.kmeans) {
 			// k distinct sample rows, picked by a seeded shuffle.
 			let x = s.seed >>> 0 || 1;
@@ -433,6 +461,7 @@ export class BulkBuild {
 			iter = 0;
 			await writable(this.store).put(meansKey(s.gen, 0), bytesOf(means));
 			await this.save({ ...s, kmeans: { iter: 0, means: meansKey(s.gen, 0) } });
+			progressed = true;
 		} else {
 			const b = await this.store.get(s.kmeans.means);
 			if (!b) throw new ThreadError(`missing ${s.kmeans.means}`, 404);
@@ -460,12 +489,16 @@ export class BulkBuild {
 			const key = meansKey(s.gen, iter);
 			await writable(this.store).put(key, bytesOf(means));
 			await this.save({ ...this.st, ...(iter >= iterations ? { phase: "create" as const } : {}), kmeans: { iter, means: key } });
+			progressed = true;
 		}
-		if (iter >= iterations && this.st.phase === "kmeans") await this.save({ ...this.st, phase: "create" });
-		return S * dim * 4 + KMEANS_CHUNK * dim * 4 + k * dim * 4 * 6 + (1 << 20);
+		if (iter >= iterations && this.st.phase === "kmeans") {
+			await this.save({ ...this.st, phase: "create" });
+			progressed = true;
+		}
+		return { peak: S * dim * 4 + KMEANS_CHUNK * dim * 4 + k * dim * 4 * 6 + (1 << 20), progressed };
 	}
 
-	private async createStep(): Promise<number> {
+	private async createStep(): Promise<Pass> {
 		const s = this.st;
 		const b = await this.store.get(s.kmeans!.means);
 		if (!b) throw new ThreadError(`missing ${s.kmeans!.means}`, 404);
@@ -481,7 +514,7 @@ export class BulkBuild {
 			if (!man || man.k2 !== s.k || man.dim !== s.dim) throw new ThreadError(`generation ${s.gen} exists and is not this build's`, 409);
 		}
 		await this.save({ ...s, phase: "load", load: { pos: 0 } });
-		return means.byteLength * 3 + (1 << 20);
+		return { peak: means.byteLength * 3 + (1 << 20), progressed: true };
 	}
 
 	private async index(): Promise<ThreadIndex> {
@@ -489,27 +522,36 @@ export class BulkBuild {
 		return this.ix;
 	}
 
-	private async compactIfDue(ix: ThreadIndex, deadline: number, force: boolean): Promise<{ more: boolean; locked: boolean; progressed: boolean; peak: number }> {
-		if (!force && !ix.compactionDue().due) return { more: false, locked: false, progressed: false, peak: 0 };
+	private async compactIfDue(ix: ThreadIndex, deadline: number, force: boolean): Promise<{ outcome: CompactResult["outcome"] | null; more: boolean; progressed: boolean; peak: number }> {
+		if (!force && !ix.compactionDue().due) return { outcome: null, more: false, progressed: false, peak: 0 };
 		const r = await ix.compact({ force, maxBytes: this.st.maxBytes, deadlineMs: Math.max(1_000, deadline - Date.now()), ...(this.owner ? { owner: this.owner } : {}) });
-		return { more: r.more, locked: r.outcome === "locked", progressed: r.outcome === "committed" || r.outcome === "partial", peak: r.estimatedPeakBytes };
+		// A noop although the open revision said it was due: that revision is not the head. The next pass opens it.
+		if (r.outcome === "noop" && !force) this.close();
+		return { outcome: r.outcome, more: r.more, progressed: r.outcome === "committed" || r.outcome === "partial", peak: r.estimatedPeakBytes };
 	}
 
-	private async loadStep(deadline: number): Promise<number> {
+	/**
+	 * Replays stages, compacting first whenever that is due. Bounded by progress, not only by the clock: every
+	 * iteration commits a compaction or a replay, or leaves the loop.
+	 */
+	private async loadStep(deadline: number, reserve: number): Promise<Pass> {
 		const ix = await this.index();
 		let peak = 0;
-		while (this.st.phase === "load" && Date.now() < deadline - LOAD_COMPACT_RESERVE_MS) {
+		let progressed = false;
+		while (this.st.phase === "load" && Date.now() < deadline - reserve) {
 			// Compaction first: a replay only while the head is below the thresholds, so the deltas stay few.
 			if (ix.compactionDue().due) {
 				const c = await this.compactIfDue(ix, deadline, false);
 				peak = Math.max(peak, c.peak);
-				if (!c.progressed) break; // locked, or the deadline: the next step continues
+				if (!c.progressed) break; // locked, a stale revision, or the deadline: the next step continues
+				progressed = true;
 				continue;
 			}
 			const s = this.st;
 			const pos = s.load!.pos;
 			if (pos >= s.staged) {
 				await this.save({ ...s, phase: "compact" });
+				progressed = true;
 				break;
 			}
 			const jb = await this.store.get(stageKey(s.gen, pos, "json"));
@@ -527,23 +569,31 @@ export class BulkBuild {
 				await ix.upsert({ ...(doc.keys ? { keys: sel(doc.keys) } : {}), ...(doc.ids ? { ids: sel(doc.ids) } : {}), ...(doc.metas ? { metas: sel(doc.metas) } : {}), ...(doc.texts ? { texts: sel(doc.texts) } : {}), ...(doc.attrs ? { attrs: sel(doc.attrs) } : {}), ...(vectors ? { vectors } : { embed: false }) });
 			}
 			await this.save({ ...s, load: { pos: pos + 1 } });
+			progressed = true;
 		}
-		return peak;
+		return { peak, progressed };
 	}
 
-	private async compactStep(deadline: number): Promise<number> {
+	/**
+	 * Forced compactions until no delta is left; bounded by progress: it repeats only after a committed one. A
+	 * `noop` with no delta left (the last compaction of `load` folded them all) finishes the build too.
+	 */
+	private async compactStep(deadline: number): Promise<Pass> {
 		const ix = await this.index();
 		let peak = 0;
+		let progressed = false;
 		while (Date.now() < deadline) {
 			const c = await this.compactIfDue(ix, deadline, true);
 			peak = Math.max(peak, c.peak);
-			if (!c.progressed) break; // locked, or the deadline: the next step continues
-			if (!c.more && !(ix.manifest.deltas?.length ?? 0)) {
+			if ((c.progressed || c.outcome === "noop") && !c.more && !(ix.manifest.deltas?.length ?? 0)) {
 				await this.save({ ...this.st, phase: "done", rev: ix.rev });
+				progressed = true;
 				break;
 			}
+			if (!c.progressed) break; // locked, blocked, or the deadline: the next step continues
+			progressed = true;
 			if (!c.more) break;
 		}
-		return peak;
+		return { peak, progressed };
 	}
 }

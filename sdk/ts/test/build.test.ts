@@ -2,8 +2,8 @@
  * Bulk build (`thread.bulkBuild`): staged documents with vectors become a dense generation with k cells from
  * k-means, in bounded steps that resume from `build/{gen}/state.json`, every step within `maxBytes`.
  */
-import { describe, expect, it } from "vitest";
-import { bulkBuildPlan, MemoryBlobStore, parseSlabsTable, type BulkBuild, type BulkStepResult } from "../src/index.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { bulkBuildPlan, MemoryBlobStore, parseSlabsTable, type BlobStore, type BulkBuild, type BulkStepResult, type ThreadIndex } from "../src/index.js";
 import { rng, thread, unitRows } from "./helpers.js";
 
 const MiB = 1024 * 1024;
@@ -129,5 +129,172 @@ describe("bulk build of a dense generation", () => {
 		expect(() => bulkBuildPlan(5_000_000, dim, { maxBytes: 32 * MiB })).not.toThrow();
 		const p = bulkBuildPlan(5_000_000, dim, { maxBytes: 32 * MiB });
 		expect(p.k).toBeGreaterThan(p.maxCells);
+	});
+});
+
+/**
+ * `Date.now()` frozen (moved only by `advance`), as in a Worker that does no I/O. It throws after `limit` reads, so a
+ * loop that polls the clock without making progress fails the test instead of hanging it.
+ */
+function frozenClock(limit = 100_000) {
+	const c = {
+		now: Date.now(),
+		reads: 0,
+		advance(ms: number) {
+			c.now += ms;
+		},
+	};
+	vi.spyOn(Date, "now").mockImplementation(() => {
+		if (++c.reads > limit) throw new Error(`Date.now() read ${limit} times: a loop polls the clock without progress`);
+		return c.now;
+	});
+	return c;
+}
+
+/** Counts `thread.open` calls, each first taking `delayMs` on `clock` (a slow first read of the index). */
+function slowOpens(clock: { advance(ms: number): void }, delayMs: number) {
+	const opened: ThreadIndex[] = [];
+	const open = thread.open.bind(thread);
+	vi.spyOn(thread, "open").mockImplementation(async (o) => {
+		clock.advance(delayMs);
+		const ix = await open(o);
+		opened.push(ix);
+		return ix;
+	});
+	return opened;
+}
+
+const DIM = 16;
+const SMALL = 4 * MiB;
+
+/** 2000 vectors of dim 16 in 20 stages, sealed (20 cells of 100). */
+async function sealed(gen: string, store: BlobStore = new MemoryBlobStore()): Promise<BulkBuild> {
+	const r = rng(5);
+	const centers = unitRows(8, DIM, r);
+	const b = await thread.bulkBuild({ store, gen, dim: DIM, lex: {}, maxBytes: SMALL, cellEntries: 100 });
+	for (let a = 0; a < 2000; a += 100) await b.add({ keys: Array.from({ length: 100 }, (_, i) => `k${a + i}`), metas: Array.from({ length: 100 }, () => "m"), vectors: unitRows(100, DIM, r, centers, 0.3) });
+	await b.seal();
+	return b;
+}
+
+async function entries(store: BlobStore, gen: string): Promise<number> {
+	const ix = await thread.open({ store, gen, cache: false, refreshInterval: 0 });
+	try {
+		const table = parseSlabsTable((await store.get(ix.manifest.files!.slabs!))!, ix.manifest.k1 * ix.manifest.k2, "slabs");
+		return table.reduce((acc, row) => acc + row[2], 0);
+	} finally {
+		ix.close();
+	}
+}
+
+describe("bulk build steps end by progress, not by the clock", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("returns at once when opening the index leaves less than the reserve, and the next call replays", async () => {
+		const store = new MemoryBlobStore();
+		const b = await sealed("slow", store);
+		const clock = frozenClock();
+		const opened = slowOpens(clock, 6_500);
+		// sample, kmeans and create commit; load's index then opens in 6.5 s of 10, under its 4 s reserve. In 0.2.3
+		// the step called load again and again with the clock standing still (inseam, 2026-11-08).
+		const r1 = await b.step({ deadlineMs: 10_000 });
+		expect(r1).toMatchObject({ phase: "load", done: false, progressed: true, worked: ["sample", "kmeans", "create"] });
+		expect(b.state.load).toEqual({ pos: 0 });
+		// A new handle (a restarted Durable Object) opens the index again: nothing fits, and it returns at once.
+		const b2 = await thread.bulkBuild({ store, gen: "slow", dim: DIM });
+		const reads = clock.reads;
+		const r2 = await b2.step({ deadlineMs: 10_000 });
+		expect(r2).toMatchObject({ phase: "load", done: false, progressed: false, worked: [] });
+		expect(clock.reads - reads).toBeLessThan(10);
+		expect(b2.state.load).toEqual({ pos: 0 });
+		// The next call keeps the open index and replays.
+		const r3 = await b2.step({ deadlineMs: 10_000 });
+		expect(r3.progressed).toBe(true);
+		expect(r3.worked[0]).toBe("load");
+		expect(r3.progress.loaded).toBeGreaterThan(0);
+		expect(opened.length).toBe(2);
+		await run(b2, SMALL, 10_000);
+		vi.restoreAllMocks();
+		expect(await entries(store, "slow")).toBe(2000);
+	});
+
+	it("ends every loop with a clock that never advances", async () => {
+		const store = new MemoryBlobStore();
+		const b = await sealed("frozen", store);
+		const clock = frozenClock();
+		// A deadline already passed: nothing, at once.
+		expect(await b.step({ deadlineMs: 0 })).toMatchObject({ phase: "sample", done: false, progressed: false, worked: [] });
+		// Another run holds compact.lock: the build stops at the first compaction, and a step that cannot take it
+		// returns without progress instead of trying again until a deadline that never comes.
+		await store.put("idx/frozen/compact.lock", JSON.stringify({ owner: "other", ms: clock.now, at: new Date(clock.now).toISOString() }));
+		const r1 = await b.step({ deadlineMs: 10_000 });
+		expect(r1.progressed).toBe(true);
+		expect(r1.done).toBe(false);
+		expect(["load", "compact"]).toContain(r1.phase);
+		const r2 = await b.step({ deadlineMs: 10_000 });
+		expect(r2).toMatchObject({ phase: r1.phase, done: false, progressed: false, worked: [] });
+		await store.delete("idx/frozen/compact.lock");
+		// Then one step of a clock that stands still does the rest: each loop ends when its work does.
+		const r3 = await b.step({ deadlineMs: 10_000 });
+		expect(r3).toMatchObject({ phase: "done", done: true, progressed: true });
+		expect(r3.worked).toContain("compact");
+		vi.restoreAllMocks();
+		expect(await entries(store, "frozen")).toBe(2000);
+	});
+
+	it("finishes a compact phase that has no delta left", async () => {
+		const store = new MemoryBlobStore();
+		const b = await sealed("nodelta", store);
+		await run(b, SMALL, 10_000);
+		// As if the last compaction of load had folded every delta: a forced compaction is a noop. In 0.2.3 the
+		// build stayed in compact.
+		await store.put("build/nodelta/state.json", JSON.stringify({ ...b.state, phase: "compact" }));
+		const again = await thread.bulkBuild({ store, gen: "nodelta", dim: DIM });
+		frozenClock();
+		expect(await again.step({ deadlineMs: 10_000 })).toMatchObject({ phase: "done", done: true, progressed: true, worked: ["compact"] });
+	});
+
+	it("close() releases the index and keeps the build; reopening resumes it", async () => {
+		const clock = frozenClock();
+		// Each stage replay takes 1 s: a 10 s step replays about six stages before its 4 s reserve.
+		const mem = new MemoryBlobStore();
+		const store = new Proxy(mem, {
+			get(t, p) {
+				const v = Reflect.get(t, p, t);
+				if (p === "get")
+					return (key: string, ...rest: unknown[]) => {
+						if (/\/stage\/\d+\.json$/.test(key)) clock.advance(1_000);
+						return (v as (...a: unknown[]) => unknown).call(t, key, ...rest);
+					};
+				return typeof v === "function" ? v.bind(t) : v;
+			},
+		}) as BlobStore;
+		const b = await sealed("closed", store);
+		const opened = slowOpens(clock, 0);
+		const r1 = await b.step({ deadlineMs: 10_000 });
+		expect(r1).toMatchObject({ phase: "load", done: false, progressed: true });
+		const pos = b.state.load!.pos;
+		expect(pos).toBeGreaterThan(0);
+		expect(pos).toBeLessThan(20);
+		const closes = vi.spyOn(opened[0], "close");
+		const before = await mem.list("build/closed/");
+		b.close();
+		b.close();
+		expect(closes).toHaveBeenCalledTimes(1);
+		expect(await mem.list("build/closed/")).toEqual(before);
+		// The handle stays usable: its next step opens the index again.
+		const r2 = await b.step({ deadlineMs: 10_000 });
+		expect(r2.progressed).toBe(true);
+		expect(opened.length).toBe(2);
+		b.close();
+		// A new handle on the same gen resumes where the closed one stopped.
+		const b2 = await thread.bulkBuild({ store, gen: "closed", dim: DIM });
+		expect(b2.state).toEqual(b.state);
+		const steps = await run(b2, SMALL, 10_000);
+		expect(steps.at(-1)!.done).toBe(true);
+		vi.restoreAllMocks();
+		expect(await entries(mem, "closed")).toBe(2000);
 	});
 });

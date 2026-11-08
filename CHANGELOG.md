@@ -4,6 +4,28 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## 0.2.4 (unreleased)
+
+- **A bulk build step ends by progress, not only by the clock** (TypeScript `BulkBuild.step`). A `load` pass
+  starts no replay within 4 s of the deadline; when opening the build's index left less than that, `step()` called
+  the phase again and again, and in Workers `Date.now()` does not move without I/O, so the deadline never came and
+  the invocation ran until its CPU limit (inseam, 2026-11-08: a rebuild alarm killed at 32 s of CPU in the load of
+  a 23,594-document, 40-cell build). Now `step()` returns as soon as a pass over its phase commits nothing (no
+  piece done, no state written), with `done: false` and the phase it stopped in; every pass it repeats has
+  written something. The same holds in the other phases: a `sample` pass with no time left writes nothing (it
+  used to write the state unchanged), and a held `compact.lock` in `load` or `compact` ends the step instead of
+  being retried until the deadline.
+- `BulkStepResult.progressed`: false when the call committed nothing (call again; keep the handle, so that the
+  next call does not open the index again). `worked` now lists only the phases the call made progress in.
+- The `load` reserve is at most 40% of `deadlineMs`: with a deadline of 4 s or less, `load` could never start a
+  replay.
+- A `compact` phase with no delta left (the last compaction of `load` folded them all) finishes the build: the
+  forced compaction is a `noop`, and the build used to stay in `compact`. A `noop` of a due compaction in `load`
+  drops the handle's index, so the next pass opens the head.
+- **`BulkBuild.close()`**: releases the index the handle opened for `load` and `compact`, and writes or deletes
+  nothing; `thread.bulkBuild` on the same `gen` resumes the build, and a later `step` on the handle opens the
+  index again. For a handle dropped before `done`, e.g. after a failed step whose state ETag may be stale.
+
 ## 0.2.3 (2026-11-08)
 
 - **Dense compaction keeps every cell processable by its budget** (TypeScript `index.compact` / `compactDeltas`).
