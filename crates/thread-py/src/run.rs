@@ -16,6 +16,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
+use std::time::Instant;
 use thread_core::delta::DeltaView;
 use thread_core::filter::AttrFilter;
 use thread_core::search::{rerank_records, scan_delta, scan_slab, scan_slab_pq};
@@ -78,6 +79,24 @@ struct RunState {
     rerank_local: u64,
     spec_used: u64,
     spec_records: u64,
+    /// Entries pushed into a scan's top-T heap (slabs and deltas).
+    pushed: u64,
+    /// CPU spent in the kernels, measured natively (the GIL is released around them): calls and nanoseconds.
+    kernels: Kernels,
+}
+
+/// Calls and nanoseconds per kernel of one query (`stats()["kernels"]`, the trace envelope's `kernels`).
+#[derive(Default)]
+struct Kernels {
+    scan: (u64, u64),
+    delta_scan: (u64, u64),
+    merge: (u64, u64),
+    rerank: (u64, u64),
+}
+
+fn add_kernel(k: &mut (u64, u64), calls: u64, t: Instant) {
+    k.0 += calls;
+    k.1 += t.elapsed().as_nanos() as u64;
 }
 
 fn tombs(bytes: &[u8]) -> Result<Option<Tombstones>, String> {
@@ -173,6 +192,7 @@ impl QueryRun {
             let skip = tombs(tomb)?;
             let filter = self.filter.as_ref();
             let mut top = TopK::new(t);
+            let t_scan = Instant::now();
             let st = if view.is_v3() {
                 let table = q
                     .table
@@ -184,6 +204,7 @@ impl QueryRun {
                 scan_slab(&view, &q.q, &mut top, skip.as_ref(), filter)
             };
             let hits = top.into_sorted();
+            let scan_ns = t_scan.elapsed().as_nanos() as u64;
             let h = view.header;
             let rerankable = do_rerank && h.version >= 2;
             if rerankable && h.rerank_record_len != 4 + dim {
@@ -227,6 +248,9 @@ impl QueryRun {
             s.scan_bytes += prefix.len() as u64;
             s.tomb_dropped += st.skipped as u64;
             s.filter_dropped += st.filtered as u64;
+            s.pushed += st.pushed as u64;
+            s.kernels.scan.0 += 1;
+            s.kernels.scan.1 += scan_ns;
             s.scanned += h.count as u64;
             s.versions.insert(h.version);
             s.packed.extend_from_slice(&hits);
@@ -304,8 +328,10 @@ impl QueryRun {
             let v = DeltaView::parse(delta).map_err(|e| e.to_string())?;
             let skip = tombs(tomb)?;
             let mut top = TopK::new(t);
+            let t_scan = Instant::now();
             let st = scan_delta(&v, &q.q, qc, &mut top, skip.as_ref(), self.filter.as_ref())
                 .map_err(|e| e.to_string())?;
+            let scan_ns = t_scan.elapsed().as_nanos() as u64;
             let hits: Vec<DeltaHit> = top
                 .into_sorted()
                 .into_iter()
@@ -321,6 +347,9 @@ impl QueryRun {
             s.delta_scanned += v.count as u64;
             s.delta_dropped += st.skipped as u64;
             s.filter_dropped += st.filtered as u64;
+            s.pushed += st.pushed as u64;
+            s.kernels.delta_scan.0 += 1;
+            s.kernels.delta_scan.1 += scan_ns;
             s.delta_hits.extend(hits);
             Ok::<_, String>(())
         })
@@ -364,7 +393,9 @@ impl QueryRun {
     /// records still to read: `[(cell, rerank_off, rec_len, [idx...])]`, idx ascending (empty without phase 2).
     fn plan(&self) -> PyResult<Vec<RecordReads>> {
         let mut s = self.lock();
+        let t_merge = Instant::now();
         let merged = merge_dedup(std::mem::take(&mut s.packed), self.t);
+        add_kernel(&mut s.kernels.merge, 1, t_merge);
         let mut out = Vec::new();
         let rerank = self.do_rerank && (s.versions.contains(&2) || s.versions.contains(&3));
         let mut plan: Vec<(u32, Vec<(u32, u32)>)> = Vec::new();
@@ -449,8 +480,10 @@ impl QueryRun {
                                 ));
                             }
                         }
+                        let t_rerank = Instant::now();
                         let scores = rerank_records(&q.q, &info.centroid, &recs, ws.len())
                             .map_err(|e| e.to_string())?;
+                        add_kernel(&mut s.kernels.rerank, 1, t_rerank);
                         slab_results.extend(ws.iter().zip(scores).map(|(&(id, _), sc)| (id, sc)));
                     }
                 }
@@ -530,7 +563,8 @@ impl QueryRun {
         Ok((hits, reads))
     }
 
-    /// The query's counters: scanned entries and bytes, phase 2, deltas, tombstoned entries skipped.
+    /// The query's counters: scanned entries and bytes, phase 2, deltas, tombstoned entries skipped, heap pushes,
+    /// and the CPU of each kernel (`kernels`: `{name: {calls, ms}}`, only kernels that ran).
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let s = self.lock();
         let d = PyDict::new(py);
@@ -553,6 +587,25 @@ impl QueryRun {
         d.set_item("delta_dropped", s.delta_dropped)?;
         d.set_item("tomb_dropped", s.tomb_dropped)?;
         d.set_item("filter_dropped", s.filter_dropped)?;
+        d.set_item("pushed", s.pushed)?;
+        // Kernel CPU, measured natively: {name: {calls, ms}} under the trace envelope's kernel names.
+        let kernels = PyDict::new(py);
+        let k = &s.kernels;
+        for (name, (calls, ns)) in [
+            ("scan", k.scan),
+            ("deltaScan", k.delta_scan),
+            ("merge", k.merge),
+            ("rerank", k.rerank),
+        ] {
+            if calls == 0 {
+                continue;
+            }
+            let e = PyDict::new(py);
+            e.set_item("calls", calls)?;
+            e.set_item("ms", (ns as f64 / 1e3).round() / 1e3)?;
+            kernels.set_item(name, e)?;
+        }
+        d.set_item("kernels", kernels)?;
         Ok(d)
     }
 }

@@ -101,18 +101,34 @@ const WORDS = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", 
 const textOf = (i) => `${WORDS[i % 12]} ${WORDS[(i * 7) % 12]} ${WORDS[(i * 5 + 3) % 12]} item${i % 40} deployments ${i % 3 ? "budget" : "review"}`;
 
 /** Runs one request against an index; the shape Python compares. */
+// The trace envelope's shape (docs/observability.md), compared across SDKs: span names (search: top-level sorted, its
+// lists run concurrently), the counters that depend on neither caching nor timing, and the kernel and attrs keys.
+const DETERMINISTIC = {
+	query: ["hits", "cells", "scanned", "scanBytes", "slabBytes", "pushed", "candidates", "filterDropped", "tombDropped", "rerankCandidates", "rerankSlabs", "deltas", "deltaBytes", "deltaScanned", "deltaHits", "deltaDropped", "deltaTop", "tombstones", "tombSets"],
+	lexical: ["hits", "segments", "numDocs", "tokens", "distinct", "found", "depth", "filterDropped", "passes"],
+	listKeys: ["entries", "more"],
+};
+function traceShape(t) {
+	const names = (spans) => spans.map((s) => (s.children ? [s.name, names(s.children)] : s.name));
+	let spans = names(t.spans);
+	if (t.op === "search") spans = spans.map((s) => JSON.stringify(s)).sort().map((s) => JSON.parse(s));
+	const pick = (op, prefix) => Object.fromEntries(DETERMINISTIC[op].filter((k) => prefix + k in t.counters).map((k) => [prefix + k, t.counters[prefix + k]]));
+	const counters = t.op === "search" ? { hits: t.counters.hits, ...pick("query", "dense."), ...pick("lexical", "lexical.") } : pick(t.op, "");
+	return { v: t.v, op: t.op, spans, counters, kernels: Object.keys(t.kernels).sort(), attrs: Object.keys(t.attrs).sort() };
+}
+
 async function answer(index, req) {
 	if (req.kind === "query") {
 		const r = await index.query(Float32Array.from(req.vector), { topK: req.topK, nprobe: req.nprobe, rerank: req.rerank, returnPayload: true, filter: req.filter ?? undefined, maxNprobe: req.maxNprobe ?? undefined });
-		return { hits: r.hits.map((h) => [h.id, h.score, h.attrs, h.source, new TextDecoder().decode(h.payload)]), cells: r.stats.cells };
+		return { hits: r.hits.map((h) => [h.id, h.score, h.attrs, h.source, new TextDecoder().decode(h.payload)]), cells: r.stats.cells, trace: traceShape(r.stats.trace) };
 	}
 	if (req.kind === "search") {
 		const r = await index.search({ text: req.text ?? undefined, vector: req.vector ? Float32Array.from(req.vector) : undefined, topK: req.topK, dense: { nprobe: req.nprobe }, docs: "text", filter: req.filter ?? undefined });
-		return { mode: r.mode, hits: r.hits.map((h) => [h.id, h.score, h.doc ? [h.doc.meta, h.doc.text ?? null, h.doc.attrs] : null]) };
+		return { mode: r.mode, hits: r.hits.map((h) => [h.id, h.score, h.doc ? [h.doc.meta, h.doc.text ?? null, h.doc.attrs] : null]), trace: traceShape(r.stats.trace) };
 	}
 	if (req.kind === "lexical") {
 		const r = await index.lexicalSearch(req.text, req.topK, req.filter ? { filter: index.compileFilter(req.filter) } : {});
-		return { tokens: r.tokens, hits: r.hits.map((h) => [h.id, h.score]), numDocs: r.stats.numDocs };
+		return { tokens: r.tokens, hits: r.hits.map((h) => [h.id, h.score]), numDocs: r.stats.numDocs, trace: traceShape(r.stats.trace) };
 	}
 	if (req.kind === "compile") {
 		return Array.from(index.compileFilter(req.filter));
@@ -123,7 +139,7 @@ async function answer(index, req) {
 	}
 	if (req.kind === "listKeys") {
 		const r = await index.listKeys({ prefix: req.prefix, after: req.after ?? undefined, limit: req.limit });
-		return { entries: r.entries.map((e) => [e.key, e.id]), more: r.more, next: r.next ?? null };
+		return { entries: r.entries.map((e) => [e.key, e.id]), more: r.more, next: r.next ?? null, trace: traceShape(r.trace) };
 	}
 	throw new Error(`unknown request ${req.kind}`);
 }

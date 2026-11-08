@@ -25,7 +25,8 @@ from typing import Any, Callable, Iterable, Sequence, TypeVar
 from . import _native
 from ._native import MissingRanges
 from .attrs import filter_matches
-from .store import BlobRange, BlobStore, BlobTrace
+from .store import BlobRange, BlobStore, BlobTrace, phase_stat
+from .trace import Kernels, envelope, io_of, merge_kernels, phase_span, shift_spans
 from .wire import ResolvedLexConfig, TombState, ThreadError, parse_hits, tomb_for_segment, tomb_hides
 
 __all__ = ["LexIo", "LexSegment", "LexIndex", "LexHit", "LexSearchResult", "DocRecord", "KeyPage", "coalesce",
@@ -205,6 +206,8 @@ class KeyPage:
     entries: list[tuple[str, int]]
     more: bool
     next: str | None = None
+    #: The listing's trace envelope (`ThreadIndex.list_keys`; docs/observability.md).
+    trace: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -267,22 +270,45 @@ class LexIndex:
         if not filter:
             return self._search(text, k, trace)
         t0 = time.perf_counter()
+        at = time.time()
+        trace = trace if trace is not None else BlobTrace()
+        spans: list[dict[str, Any]] = []
+        pass_kernels: list[dict[str, Any]] = []
+        rounds = ranges = 0
         attrs_of: dict[int, int] = {}
         depth = max(filter_depth if filter_depth is not None else max(4 * k, 32), k)
         max_d = max(max_depth if max_depth is not None else 1 << 16, depth)
         while True:
+            t_pass = (time.perf_counter() - t0) * 1000
             raw = self._search(text, depth, trace)
+            pt = raw.stats["trace"]
+            spans.append({"name": "pass", "start": round(t_pass, 3), "ms": pt["ms"], "io": pt["io"],
+                          "children": shift_spans(pt["spans"], t_pass)})
+            pass_kernels.append(pt["kernels"])
             unknown = [h.id for h in raw.hits if h.id not in attrs_of]
             if unknown:
+                t_a = time.perf_counter()
+                tr_a = trace.as_dict()
                 found, io = self.docs(unknown, trace=trace)
                 raw.stats["io"] = {k_: raw.stats["io"][k_] + v for k_, v in io.as_dict().items()}
                 for i in unknown:
                     attrs_of[i] = found[i].attrs if i in found else 0
+                spans.append(phase_span("attrs", (t_a - t0) * 1000,
+                                        phase_stat((time.perf_counter() - t_a) * 1000, trace, tr_a)))
+            rounds += raw.stats["io"]["rounds"]
+            ranges += raw.stats["io"]["ranges"]
             hits = [h for h in raw.hits if filter_matches(filter, attrs_of[h.id])]
             if len(hits) >= k or len(raw.hits) < depth or depth >= max_d:
-                raw.stats.update(depth=depth, filter_dropped=len(raw.hits) - len(hits),
-                                 ms=round((time.perf_counter() - t0) * 1000, 3))
-                return LexSearchResult(hits[:k], raw.tokens, raw.found, raw.stats)
+                out = hits[:k]
+                dropped = len(raw.hits) - len(hits)
+                env = envelope("lexical", t0, at, attrs={**pt["attrs"], "filtered": True}, io=io_of(trace),
+                               spans=spans, counters={**pt["counters"], "hits": len(out), "rounds": rounds,
+                                                      "ranges": ranges, "depth": depth, "filterDropped": dropped,
+                                                      "passes": len(pass_kernels)},
+                               kernels=merge_kernels(*pass_kernels))
+                raw.stats.update(depth=depth, filter_dropped=dropped,
+                                 ms=round((time.perf_counter() - t0) * 1000, 3), trace=env)
+                return LexSearchResult(out, raw.tokens, raw.found, raw.stats)
             depth = min(max_d, depth * 4)
 
     def attrs(self, ids: Iterable[int], trace: BlobTrace | None = None) -> dict[int, int]:
@@ -292,8 +318,12 @@ class LexIndex:
 
     def _search(self, text: str, k: int, trace: BlobTrace | None = None) -> LexSearchResult:
         t0 = time.perf_counter()
+        at = time.time()
+        trace = trace if trace is not None else BlobTrace()
+        kern = Kernels()
+        spans: list[dict[str, Any]] = []
         io = LexIo()
-        tokens = self.tokenize(text)
+        tokens = kern.time("tokenize", lambda: self.tokenize(text))
         weights: dict[str, int] = {}
         for t in tokens:
             weights[t] = weights.get(t, 0) + 1
@@ -302,13 +332,24 @@ class LexIndex:
         num_docs, total_len = self.stats()
 
         def result(hits: list[LexHit], found: int, df: dict[str, float]) -> LexSearchResult:
+            lio = io.as_dict()
+            env = envelope("lexical", t0, at, attrs={"topK": k, "filtered": False}, io=io_of(trace), spans=spans,
+                           counters={"hits": len(hits), "segments": len(lex_segs), "numDocs": num_docs,
+                                     "tokens": len(tokens), "distinct": len(distinct), "found": found,
+                                     "rounds": lio["rounds"], "ranges": lio["ranges"]},
+                           kernels=kern.done())
             return LexSearchResult(hits, tokens, found, {"segments": len(lex_segs), "num_docs": num_docs,
-                                                         "total_len": total_len, "df": df, "io": io.as_dict(),
-                                                         "ms": round((time.perf_counter() - t0) * 1000, 3)})
+                                                         "total_len": total_len, "df": df, "io": lio,
+                                                         "ms": round((time.perf_counter() - t0) * 1000, 3),
+                                                         "trace": env})
 
         if not distinct or not lex_segs or k < 1:
             return result([], 0, {})
-        infos = self._each(lex_segs, lambda s: s.run(lambda: s.reader.lookup(distinct), io, trace))
+        t_l = time.perf_counter()
+        tr_l = trace.as_dict()
+        infos = self._each(lex_segs, lambda s: s.run(lambda: kern.time("bm25Lookup", lambda: s.reader.lookup(distinct)),
+                                                     io, trace))
+        spans.append(phase_span("lookup", (t_l - t0) * 1000, phase_stat((time.perf_counter() - t_l) * 1000, trace, tr_l)))
         dfs = [0.0] * len(distinct)
         for inf in infos:
             for i, (df, _, _) in enumerate(inf):
@@ -320,15 +361,19 @@ class LexIndex:
             return result([], 0, df_record)
         w = [float(weights[t]) for t in distinct]
         cfg = self.config
+        t_s = time.perf_counter()
+        tr_s = trace.as_dict()
 
         def score(i: int) -> bytes | None:
             seg, inf = lex_segs[i], infos[i]
             if not any(df >= 0 for df, _, _ in inf):
                 return None
             tomb = tomb_for_segment(self.tomb, seg.ref["addedRev"]) if self.tomb else b""
-            return seg.run(lambda: seg.reader.search(inf, dfs, w, num_docs, total_len, cfg.k1, cfg.b, k, tomb), io, trace)
+            return seg.run(lambda: kern.time("bm25Score", lambda: seg.reader.search(inf, dfs, w, num_docs, total_len,
+                                                                                   cfg.k1, cfg.b, k, tomb)), io, trace)
 
         packed = self._each(list(range(len(lex_segs))), score)  # type: ignore[arg-type]
+        spans.append(phase_span("score", (t_s - t0) * 1000, phase_stat((time.perf_counter() - t_s) * 1000, trace, tr_s)))
         # Ids are unique across live segments (older copies of a replaced id are tombstoned); keep the best anyway.
         best: dict[int, float] = {}
         for p in packed:

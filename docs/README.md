@@ -21,6 +21,7 @@ if you want to use it.
 | [filtering.md](filtering.md) | attribute filters: the 32-bit word and its schema, filter expressions and their compiled clauses, pre-filtering inside the scan with probe widening, post-filtering of text queries |
 | [build-pipeline.md](build-pipeline.md) | the build stages, build slots (Worker Loader), PQ codebook training, incremental k-means, finalize |
 | [build-flags.md](build-flags.md) | every `bench/driver.mjs` flag, and the commands that built g1 and g2 |
+| [observability.md](observability.md) | trace envelopes (one JSON schema for every operation in both SDKs and the Worker: spans, store work, counters, kernel CPU, per-read events), sinks and sampling, the Worker's `TRACE_SAMPLE` logs and Analytics Engine points, Criterion kernel benches and flamegraphs, `bench/scenarios.mjs`, how to find a bottleneck, first readings |
 | [operations.md](operations.md) | dataset prep, wasm build, deploy, build a generation, benchmarks, compaction, checks before a commit, releasing (the `v*` tag workflow, npm and PyPI credentials, moving a tag) |
 | [worker-loader.md](worker-loader.md) | the spike that showed dynamic Workers give each build slot its own isolate |
 

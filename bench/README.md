@@ -17,6 +17,11 @@ prep/             dataset -> data/prep/ -> R2 ingest/ (run once)
   edge_cold.mjs     first-query latency against a cold edge cache: one fresh query vector at a time, spaced apart
   compact_memory.mjs  (local, no Worker) measured peak memory of one SDK dense compaction against its estimate
 
+scenarios.mjs     workload scenarios in this process over the built TS SDK (dense, filtered, lexical, hybrid, get,
+                  listKeys, open, upsert) on a synthetic index or one on disk: per-span breakdown, store work,
+                  kernel CPU and counters from the trace envelopes (docs/observability.md)
+lib/trace.mjs     summaries of trace envelopes, shared by scenarios.mjs and query_bench.mjs
+
 cold/             cold-start benches of both SDKs against S3 (no Worker): fake_s3.mjs proxy with a network
                   model, cold_bench.mjs / cold_bench.py, warm-up, packs, run_baseline.sh, the routing / base-pack
                   tools (make_routing, make_base_pack, routing_agreement, routing_recall, run_base.sh); see cold/README.md

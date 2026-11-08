@@ -43,20 +43,51 @@ def node(cmd: str, d: Path, *extra: str) -> str:
     return r.stdout
 
 
+# The trace envelope's shape (docs/observability.md), compared across SDKs: span names (search: top-level sorted, its
+# lists run concurrently), the counters that depend on neither caching nor timing, and the kernel and attrs keys.
+DETERMINISTIC = {
+    "query": ["hits", "cells", "scanned", "scanBytes", "slabBytes", "pushed", "candidates", "filterDropped",
+              "tombDropped", "rerankCandidates", "rerankSlabs", "deltas", "deltaBytes", "deltaScanned", "deltaHits",
+              "deltaDropped", "deltaTop", "tombstones", "tombSets"],
+    "lexical": ["hits", "segments", "numDocs", "tokens", "distinct", "found", "depth", "filterDropped", "passes"],
+    "listKeys": ["entries", "more"],
+}
+
+
+def trace_shape(t: dict) -> dict:
+    def names(spans):
+        return [[s["name"], names(s["children"])] if "children" in s else s["name"] for s in spans]
+
+    spans = names(t["spans"])
+    if t["op"] == "search":
+        spans = [json.loads(x) for x in sorted(json.dumps(s, separators=(",", ":")) for s in spans)]
+
+    def pick(op, prefix):
+        return {prefix + k: t["counters"][prefix + k] for k in DETERMINISTIC[op] if prefix + k in t["counters"]}
+
+    counters = {"hits": t["counters"]["hits"], **pick("query", "dense."), **pick("lexical", "lexical.")} \
+        if t["op"] == "search" else pick(t["op"], "")
+    return {"v": t["v"], "op": t["op"], "spans": spans, "counters": counters, "kernels": sorted(t["kernels"]),
+            "attrs": sorted(t["attrs"])}
+
+
 def answer(index, req: dict):
     """The Python side of ts_side.mjs `answer`, in the same JSON shape."""
     if req["kind"] == "query":
         r = index.query(req["vector"], top_k=req["topK"], nprobe=req["nprobe"], rerank=req["rerank"],
                         return_payload=True, filter=req.get("filter"), max_nprobe=req.get("maxNprobe"))
-        return {"hits": [[h.id, h.score, h.attrs, h.source, h.payload.decode()] for h in r.hits], "cells": r.stats["cells"]}
+        return {"hits": [[h.id, h.score, h.attrs, h.source, h.payload.decode()] for h in r.hits], "cells": r.stats["cells"],
+                "trace": trace_shape(r.stats["trace"])}
     if req["kind"] == "search":
         r = index.search(text=req.get("text"), vector=req.get("vector"), top_k=req["topK"],
                          dense={"nprobe": req["nprobe"]}, docs="text", filter=req.get("filter"))
         return {"mode": r.mode,
-                "hits": [[h.id, h.score, [h.doc.meta, h.doc.text, h.doc.attrs] if h.doc else None] for h in r.hits]}
+                "hits": [[h.id, h.score, [h.doc.meta, h.doc.text, h.doc.attrs] if h.doc else None] for h in r.hits],
+                "trace": trace_shape(r.stats["trace"])}
     if req["kind"] == "lexical":
         r = index.lexical_search(req["text"], req["topK"], filter=req.get("filter"))
-        return {"tokens": r.tokens, "hits": [[h.id, h.score] for h in r.hits], "numDocs": r.stats["num_docs"]}
+        return {"tokens": r.tokens, "hits": [[h.id, h.score] for h in r.hits], "numDocs": r.stats["num_docs"],
+                "trace": trace_shape(r.stats["trace"])}
     if req["kind"] == "compile":
         return list(index.compile_filter(req["filter"]))
     if req["kind"] == "get":
@@ -64,7 +95,7 @@ def answer(index, req: dict):
         return [[k, r[k].id, r[k].meta, r[k].text, r[k].attrs] if k in r else None for k in req["keys"]]
     if req["kind"] == "listKeys":
         p = index.list_keys(req["prefix"], after=req.get("after"), limit=req["limit"])
-        return {"entries": [list(e) for e in p.entries], "more": p.more, "next": p.next}
+        return {"entries": [list(e) for e in p.entries], "more": p.more, "next": p.next, "trace": trace_shape(p.trace)}
     raise AssertionError(req["kind"])
 
 

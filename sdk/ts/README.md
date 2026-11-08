@@ -217,6 +217,13 @@ when this query (re)loaded the routing table (after a wasm reset or a switch of 
 Scores are cosine similarities: reranked slab hits and delta hits are on the int8 scale and merge directly;
 with `rerank: 0` they are scan-tier (4-bit or PQ) estimates.
 
+`stats.trace` is the query's trace envelope, the same JSON in this SDK, the Python SDK and the Worker: spans (the
+phases above), store work, counters (`pushed`: entries that entered a scan's heap), and the CPU of each wasm kernel
+(`route`, `scan`, `deltaScan`, `merge`, `rerank`; 0 inside Workers, whose clock stops during CPU work).
+`traceEvents: true` adds one event per store read. `search`, `lexicalSearch`, `get`, `listKeys`, `upsert` and
+`delete` return one too, `index.openTrace` is the open's, and `open({ onTrace, traceSample })` hands a sampled share
+of them to a function. See [docs/observability.md](../../docs/observability.md).
+
 `index.queryMany(vectors, options)` runs the queries concurrently against the same snapshot and routing table.
 
 ### `index.search(request): Promise<SearchResult>`

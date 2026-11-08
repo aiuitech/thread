@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import time
 from array import array
@@ -22,6 +23,8 @@ from .store import BlobCache, BlobStore, BlobTrace, CachedBlobStore, MemoryCache
 from .pack import PackedBlobStore, PrefetchStore, is_pack_header, store_at
 from .revision import base_keys_of, get_required, head_revision, load_rev_state, resolve_target, snapshot_keys
 from .warm import WarmPrefixStore, WarmPackStats, fetch_warm_pack, revision_slab_keys, seed_warm_pack
+from .trace import (TraceSink, add_io, emit_trace, envelope, io_of, merge_kernels, numeric_fields, phase_span,
+                    prefix_counters, shift_spans, zero_io)
 from .wire import (
     LEGACY_DEFAULTS,
     BytesLike,
@@ -286,8 +289,13 @@ class ThreadIndex:
                  delta_cache_bytes: int, lex_transient_bytes: int, io_workers: int, job_workers: int,
                  cold_policy: dict[str, Any] | None = None, prefetch_bytes: int = DEFAULT_PREFETCH_BYTES,
                  routing: str = "f32", cold_routing: str = "off", cold_beam: int | None = None,
-                 embed: Callable[[list[str], str], Any] | Mapping[str, Any] | None = None) -> None:
+                 embed: Callable[[list[str], str], Any] | Mapping[str, Any] | None = None,
+                 on_trace: TraceSink | None = None, trace_sample: float = 1.0) -> None:
         self.store = store
+        self._on_trace = on_trace
+        self._trace_sample = trace_sample
+        #: The open's trace envelope (the `open_stats` steps as spans).
+        self.open_trace: dict[str, Any] = {}
         self._embed_opt = embed
         #: The embedder resolved for the current `manifest.embedding` (keyed by its JSON); None = cannot embed.
         self._embedder_for: tuple[str, Callable[[Sequence[str], str], Rows] | None] | None = None
@@ -358,6 +366,8 @@ class ThreadIndex:
         base_pack: bool = True,
         warm_pack: str | None = None,
         embed: Callable[[list[str], str], Any] | Mapping[str, Any] | None = None,
+        on_trace: TraceSink | None = None,
+        trace_sample: float = 1.0,
     ) -> "ThreadIndex":
         """Opens the index under `store` (see `open_index`)."""
         if not isinstance(store, BlobStore):
@@ -375,6 +385,7 @@ class ThreadIndex:
             store = CachedBlobStore(store, cache, miss_policy=miss_policy,  # type: ignore[arg-type]
                                     warm_concurrency=warm_concurrency)
         t0 = time.perf_counter()
+        at = time.time()
         warm: tuple[Any, WarmPrefixStore | None, Future] | None = None
         if warm_pack:
             # The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it. Its
@@ -403,7 +414,7 @@ class ThreadIndex:
                  lex_transient_bytes=lex_transient_bytes, io_workers=io_workers,
                  job_workers=job_workers or max(4, min(16, os.cpu_count() or 4)), cold_policy=cold_policy,
                  prefetch_bytes=prefetch_bytes, routing=routing, cold_routing=cold_routing, cold_beam=cold_beam,
-                 embed=embed)
+                 embed=embed, on_trace=on_trace, trace_sample=trace_sample)
         try:
             # Connection warm-up: HEADs on the I/O pool's threads (each keeps its own connection), overlapping the
             # open's own sequential reads (current.json, manifest, base files).
@@ -424,14 +435,18 @@ class ThreadIndex:
                 if base_pack else None
             # A manifest inlined in current.json saves its GET (and the base files start right after current.json).
             inline: dict[str, Any] = {}
+            t_current = (time.perf_counter() - t0) * 1000
             g, r = resolve_target(pre if from_pack else store, gen, rev, timeline, inline)
+            t_prefetch = (time.perf_counter() - t0) * 1000
             m0 = inline.get("manifest")
             if from_pack is not None and (m0 is not None or pre.has(keys.manifest(g, r))):
                 prefetch = from_pack
             else:
                 prefetch = _prefetch_open(store, pre, g, r, packed is not None, base_pack, cold_routing == "tree",
                                           routing, ix._io, m0)
+            t_rev = (time.perf_counter() - t0) * 1000
             state = load_rev_state(pre, g, r, timeline, m0)
+            t_base = (time.perf_counter() - t0) * 1000
         except BaseException:
             ix.close()
             raise
@@ -458,7 +473,14 @@ class ThreadIndex:
                          "base": loaded.get("stat")}
         if pack is not None:
             ix.open_stats["pack"] = pack
+        ix.open_trace = _open_envelope(ix.open_stats, at, {"current": t_current,
+                                                           "prefetch": 0 if from_pack is not None else t_prefetch,
+                                                           "revision": t_rev, "base": t_base}, state)
+        ix._emit(ix.open_trace)
         return ix
+
+    def _emit(self, t: dict[str, Any] | None) -> None:
+        emit_trace(self._on_trace, self._trace_sample, t)
 
     # ---- properties ----
 
@@ -944,6 +966,7 @@ class ThreadIndex:
         span_bytes: int | None = None,
         cold_policy: dict[str, Any] | Literal[False] | None = None,
         beam: int | None = None,
+        trace_events: bool = False,
     ) -> QueryResult:
         """Nearest neighbours of `vector` (any norm; normalized): a list of floats, an `array('f')`, a numpy array or
         raw f32 bytes of `dim` values. `nprobe` slabs are scanned, the best `rerank` scan-tier candidates re-scored
@@ -955,7 +978,17 @@ class ThreadIndex:
         12), `coalesce_bytes` / `span_bytes` (phase-2 range merging) and `cold_policy` (`{"nprobe", "rerank",
         "threshold"}`, applied when more than `threshold` of the probed slabs are not cached; `False` disables an
         index-wide one) tune the I/O. `beam`: groups ranked by a cold-routed query (`cold_routing="tree"`, before the
-        full routing table has loaded; default `cold_beam`)."""
+        full routing table has loaded; default `cold_beam`). `trace_events`: record every store read in
+        `stats["trace"]["events"]` (the trace envelope, docs/observability.md, is always in `stats["trace"]`)."""
+        r = self._query(vector, top_k=top_k, nprobe=nprobe, rerank=rerank, pc=pc, return_payload=return_payload,
+                        inflight=inflight, speculate=speculate, filter=filter, max_nprobe=max_nprobe,
+                        coalesce_bytes=coalesce_bytes, span_bytes=span_bytes, cold_policy=cold_policy, beam=beam,
+                        trace_events=trace_events)
+        self._emit(r.stats["trace"])
+        return r
+
+    def _query(self, vector: Any, **opts: Any) -> QueryResult:
+        """`query` without handing the envelope to the sink (a search's dense list)."""
         self._check_open()
         if not self.has_dense:
             raise ThreadError("this generation has no dense index (lexical only): use search(text=...)", 400)
@@ -964,14 +997,13 @@ class ThreadIndex:
         loaded: dict[str, Any] = {}
         base = self._acquire_query_base(rev, loaded)
         ctx = QueryContext(self.store, rev, base, self._io, self._get_delta, self._cold_policy)
+        filter = opts.pop("filter", None)
         words = filter if filter is None or not isinstance(filter, Mapping) else compile_filter(
             validate_schema(rev.manifest["attrs"]) if rev.manifest.get("attrs") else None, filter)
-        r = execute_query(ctx, vector, top_k=top_k, nprobe=nprobe, rerank=rerank, pc=pc,
-                          return_payload=return_payload, inflight=inflight, speculate=speculate, filter=words,
-                          max_nprobe=max_nprobe, coalesce_bytes=coalesce_bytes, span_bytes=span_bytes,
-                          cold_policy=cold_policy, beam=beam)
+        r = execute_query(ctx, vector, filter=words, **opts)
         if "stat" in loaded:  # this query (re)loaded the routing table (a switch to another generation)
             r.stats["timeline"]["base"] = loaded["stat"]
+            r.stats["trace"] = _with_base_span(r.stats["trace"], loaded["stat"])
         return r
 
     def query_many(self, vectors: Iterable[Any], **opts: Any) -> list[QueryResult]:
@@ -1030,6 +1062,13 @@ class ThreadIndex:
     def lexical_search(self, text: str, k: int = 10, *, filter: Any = None) -> LexSearchResult:
         """BM25 top `k` for `text` over the revision's lexical segments; `filter` is an attribute filter expression
         or its compiled words (see `LexIndex.search`)."""
+        r = self._lexical(text, k, filter=filter)
+        r.stats["trace"]["attrs"].update(gen=self._rev.gen, rev=self._rev.rev)
+        self._emit(r.stats["trace"])
+        return r
+
+    def _lexical(self, text: str, k: int, *, filter: Any = None) -> LexSearchResult:
+        """`lexical_search` without handing the envelope to the sink (a search's lexical list)."""
         self._check_open()
         words = compile_filter(self.attr_schema, filter) if isinstance(filter, Mapping) else filter
         return self._lex_index().search(text, k, filter=words)
@@ -1042,11 +1081,12 @@ class ThreadIndex:
         """Resolves ids through the `docs` store (newest live copy of each id); ids without an entry are absent."""
         return self._docs(ids, text=text)[0]
 
-    def _docs(self, ids: Iterable[int], *, text: bool) -> tuple[dict[int, DocRecord], LexIo]:
+    def _docs(self, ids: Iterable[int], *, text: bool, trace: BlobTrace | None = None
+              ) -> tuple[dict[int, DocRecord], LexIo]:
         self._check_open()
         if self.lex_config is None:
             return {}, LexIo()
-        return self._lex_index().docs(ids, text=text)
+        return self._lex_index().docs(ids, text=text, trace=trace)
 
     # ---- keys ----
 
@@ -1060,27 +1100,61 @@ class ThreadIndex:
 
     def get(self, keys_: Iterable[str], *, text: bool = False) -> dict[str, KeyRecord]:
         """Fetches documents by key: each key's id (`resolve_keys`) and its `docs` entry (`docs`), two rounds against
-        cached objects. Keys with no live document are absent; with `text`, the stored text comes along."""
+        cached objects. Keys with no live document are absent; with `text`, the stored text comes along. Its trace
+        envelope goes to `on_trace` only (the result is a plain dict)."""
         self._check_open()
-        if self.lex_config is None:
-            return {}
-        lex = self._lex_index()
-        ids, _ = lex.resolve_keys(keys_)
-        if not ids:
-            return {}
-        docs, _ = lex.docs(ids.values(), text=text)
+        t0 = time.perf_counter()
+        at = time.time()
+        keys_ = list(keys_)
+        spans: list[dict[str, Any]] = []
+        rounds = ranges = 0
         out: dict[str, KeyRecord] = {}
+
+        def finish() -> dict[str, KeyRecord]:
+            self._emit(envelope("get", t0, at, attrs={"gen": self._rev.gen, "rev": self._rev.rev}, spans=spans,
+                                counters={"keys": len(keys_), "found": len(out), "rounds": rounds, "ranges": ranges}))
+            return out
+
+        if self.lex_config is None:
+            return finish()
+        lex = self._lex_index()
+        t_k = time.perf_counter()
+        kt = BlobTrace()
+        ids, kio = lex.resolve_keys(keys_, trace=kt)
+        spans.append({"name": "keys", "start": round((t_k - t0) * 1000, 3),
+                      "ms": round((time.perf_counter() - t_k) * 1000, 3), "io": io_of(kt)})
+        rounds, ranges = kio.rounds, kio.ranges
+        if not ids:
+            return finish()
+        t_d = time.perf_counter()
+        dt = BlobTrace()
+        docs, dio = lex.docs(ids.values(), text=text, trace=dt)
+        spans.append({"name": "docs", "start": round((t_d - t0) * 1000, 3),
+                      "ms": round((time.perf_counter() - t_d) * 1000, 3), "io": io_of(dt)})
+        rounds, ranges = rounds + dio.rounds, ranges + dio.ranges
         for key, id in ids.items():
             d = docs.get(id)
             out[key] = KeyRecord(id, d.meta, d.text, d.attrs, key) if d is not None else KeyRecord(id, "", None, 0, key)
-        return out
+        return finish()
 
     def list_keys(self, prefix: str = "", *, after: str | None = None, limit: int = 100) -> KeyPage:
-        """Lists keys with a prefix in key order, paged: continue with `after=page.next` while `page.more`."""
+        """Lists keys with a prefix in key order, paged: continue with `after=page.next` while `page.more`. The page's
+        `trace` is its trace envelope."""
         self._check_open()
+        t0 = time.perf_counter()
+        at = time.time()
+        kt = BlobTrace()
         if self.lex_config is None:
-            return KeyPage([], False)
-        return self._lex_index().list_keys(prefix, after, limit)[0]
+            page, lio = KeyPage([], False), LexIo()
+        else:
+            page, lio = self._lex_index().list_keys(prefix, after, limit, trace=kt)
+        page.trace = envelope("listKeys", t0, at, attrs={"gen": self._rev.gen, "rev": self._rev.rev, "limit": limit},
+                              spans=[{"name": "keys", "start": 0, "ms": round((time.perf_counter() - t0) * 1000, 3),
+                                      "io": io_of(kt)}],
+                              counters={"entries": len(page.entries), "more": 1 if page.more else 0,
+                                        "rounds": lio.rounds, "ranges": lio.ranges})
+        self._emit(page.trace)
+        return page
 
     def delete_keys(self, keys_: Iterable[str]) -> DeleteResult:
         """Deletes documents by key (their vectors, texts, docs entries and keys): one tombstone set in a new manifest
@@ -1146,13 +1220,19 @@ class ThreadIndex:
         (`embed=False` keeps it lexical-only; `embed=True` fails when the index cannot embed)."""
         self._check_open()
         t0 = time.perf_counter()
+        at = time.time()
+        spans: list[dict[str, Any]] = []
+        spans_lock = threading.Lock()
         if isinstance(top_k, bool) or not isinstance(top_k, int):
             raise ThreadError("top_k must be an integer >= 1", 400)
         has_text = isinstance(text, str) and text.strip() != ""
         self._maybe_refresh()
         # The query text is embedded for the dense list when the index can (and no vector was given).
         if has_text and vector is None and embed is not False and self.has_dense and (embed or self.can_embed):
+            t_e = time.perf_counter()
             vector = self.embed([text], "query")[0]  # type: ignore[list-item]
+            spans.append({"name": "embed", "start": round((t_e - t0) * 1000, 3),
+                          "ms": round((time.perf_counter() - t_e) * 1000, 3)})
         has_vector = vector is not None
         lex_cfg = self._rev.manifest.get("lex")
         # A text the index embedded is a dense query; it is also a BM25 query when the generation has a lexical index.
@@ -1173,10 +1253,17 @@ class ThreadIndex:
         # The filter is compiled once and applied to both lists.
         words = compile_filter(self.attr_schema, filter) if filter else None
 
+        def nested(name: str, start: float, e: dict[str, Any]) -> None:
+            s0 = (start - t0) * 1000
+            with spans_lock:
+                spans.append({"name": name, "start": round(s0, 3), "ms": e["ms"], "io": e["io"],
+                              "children": shift_spans(e["spans"], s0)})
+
         def run_lex() -> LexSearchResult:
             t = time.perf_counter()
-            r = self.lexical_search(text, depth, filter=words)  # type: ignore[arg-type]
+            r = self._lexical(text, depth, filter=words)  # type: ignore[arg-type]
             timing["lexical"] = round((time.perf_counter() - t) * 1000, 3)
+            nested("lexical", t, r.stats["trace"])
             return r
 
         lex_fut = self._jobs.submit(run_lex) if lex_text and has_vector else None
@@ -1184,8 +1271,9 @@ class ThreadIndex:
         lex_r: LexSearchResult | None = None
         if has_vector:
             t = time.perf_counter()
-            dense_r = self.query(vector, **{**(dense or {}), "top_k": depth, **({"filter": words} if words else {})})
+            dense_r = self._query(vector, **{**(dense or {}), "top_k": depth, **({"filter": words} if words else {})})
             timing["dense"] = round((time.perf_counter() - t) * 1000, 3)
+            nested("dense", t, dense_r.stats["trace"])
         if lex_fut is not None:
             lex_r = lex_fut.result()
         elif lex_text:
@@ -1194,19 +1282,41 @@ class ThreadIndex:
         def ranked(hits: Any) -> tuple[list[int], list[float]] | None:
             return None if hits is None else ([h.id for h in hits], [h.score for h in hits])
 
+        t_f = time.perf_counter()
         fused = _native.fuse_search(plan, ranked(dense_r.hits if dense_r else None), ranked(lex_r.hits if lex_r else None))
         hits = [SearchHit(i, s, Rank(*d) if d else None, Rank(*lx) if lx else None) for i, s, d, lx in fused]
+        spans.append({"name": "fuse", "start": round((t_f - t0) * 1000, 3),
+                      "ms": round((time.perf_counter() - t_f) * 1000, 3)})
         stats: dict[str, Any] = {}
+        counters: dict[str, int] = {"hits": len(hits)}
         if docs and hits:
             t = time.perf_counter()
-            found, io = self._docs([h.id for h in hits], text=docs == "text")
+            dt = BlobTrace()
+            found, io = self._docs([h.id for h in hits], text=docs == "text", trace=dt)
             for h in hits:
                 h.doc = found.get(h.id)
             stats["docs_io"] = io.as_dict()
             timing["docs"] = round((time.perf_counter() - t) * 1000, 3)
+            spans.append({"name": "docs", "start": round((t - t0) * 1000, 3), "ms": timing["docs"], "io": io_of(dt)})
+            counters.update({"docs.rounds": io.rounds, "docs.ranges": io.ranges})
         stats["timing"] = {"total": round((time.perf_counter() - t0) * 1000, 3), **timing}
         params = {"top_k": plan.top_k, "recall_k": depth, "rrf_k": plan.rrf_k,
                   "weights": {"dense": plan.dense_weight, "lexical": plan.lexical_weight}}
+        spans.sort(key=lambda s_: s_.get("start", 0))
+        dense_t = dense_r.stats["trace"] if dense_r else None
+        lex_t = lex_r.stats["trace"] if lex_r else None
+        stats["trace"] = envelope(
+            "search", t0, at,
+            attrs={"mode": plan.mode, "gen": self._rev.gen, "rev": self._rev.rev, "topK": plan.top_k, "recallK": depth,
+                   "rrfK": plan.rrf_k, "filtered": words is not None, "docs": str(docs).lower() if docs else "none"},
+            spans=spans,
+            counters={"hits": len(hits), **prefix_counters("dense", dense_t["counters"] if dense_t else None),
+                      **prefix_counters("lexical", lex_t["counters"] if lex_t else None),
+                      **{k_: v for k_, v in counters.items() if k_ != "hits"}},
+            kernels=merge_kernels(dense_t["kernels"] if dense_t else None, lex_t["kernels"] if lex_t else None),
+            events=[{**e, "start": round(e["start"] + next(s_["start"] for s_ in spans if s_["name"] == "dense"), 3)}
+                    for e in dense_t["events"]] if dense_t and "events" in dense_t else None)
+        self._emit(stats["trace"])
         return SearchResult(hits, plan.mode, params, dense_r, lex_r, stats)
 
     # ---- writes ----
@@ -1281,16 +1391,34 @@ class ThreadIndex:
         generation a different word is refused. "dense": writes the delta and a tombstone set that hides only older
         dense copies; docs, texts and keys stay; keys must already exist; `texts` are only the embedder's input; no
         `metas` or `chunk`. Deletes stay unscoped."""
+        t0 = time.perf_counter()
+        at = time.time()
         r = upsert(self._writer(), ids, vectors, attrs=attrs, payloads=payloads, texts=texts, metas=metas,
                    keys_=keys, replace=replace, chunk=chunk, embed=embed, scope=scope)
+        t_use = time.perf_counter()
         self.use_revision(r.gen, r.rev)
+        r.trace = self._write_envelope("upsert", r, t0, at, t_use)
         return r
 
     def delete(self, ids: Iterable[int]) -> DeleteResult:
         """Deletes ids (their vectors, texts and docs entries): one tombstone set in a new manifest revision."""
+        t0 = time.perf_counter()
+        at = time.time()
         r = delete_ids(self._writer(), ids)
+        t_use = time.perf_counter()
         self.use_revision(r.gen, r.rev)
+        r.trace = self._write_envelope("delete", r, t0, at, t_use)
         return r
+
+    def _write_envelope(self, op: str, r: Any, t0: float, at: float, t_use: float) -> dict[str, Any]:
+        """A write's envelope: the commit (objects + the manifest CAS) and switching the index to the new revision."""
+        t = envelope(op, t0, at, attrs={"gen": r.gen, "rev": r.rev},
+                     spans=[{"name": "commit", "start": 0, "ms": round((t_use - t0) * 1000, 3)},
+                            {"name": "useRevision", "start": round((t_use - t0) * 1000, 3),
+                             "ms": round((time.perf_counter() - t_use) * 1000, 3)}],
+                     counters=_camel(numeric_fields(r, ("rev", "ms"))))
+        self._emit(t)
+        return t
 
     def configure_lexical(self, config: dict[str, Any] | None = None, **kwargs: Any) -> ConfigureLexicalResult:
         """Gives the generation a lexical index / docs store, or changes its configuration for future segments: a
@@ -1370,6 +1498,8 @@ def open_index(
     base_pack: bool = True,
     warm_pack: str | None = None,
     embed: Callable[[list[str], str], Any] | Mapping[str, Any] | None = None,
+    on_trace: TraceSink | None = None,
+    trace_sample: float = 1.0,
 ) -> ThreadIndex:
     """Opens the index under `store`: a `BlobStore`, or a path to a directory holding an index layout or to a pack
     file (`store_at`).
@@ -1414,11 +1544,57 @@ def open_index(
     - `embed`: how the index embeds texts when the generation names its model (`manifest.embedding`,
       `create_generation(embedding=...)`): a function `(texts, kind) -> vectors` (used for any provider), or
       credentials for the provider: `{"account_id", "api_token"}` for Workers AI (its REST API), `{"api_key"}` for
-      an OpenAI-compatible endpoint. Without it, `search` needs a `vector` and `upsert` needs `vectors` or `embed`.
+      an OpenAI-compatible endpoint. Without it, `search` needs a `vector` and `upsert` needs `vectors` or `embed`;
+    - `on_trace`: called with one trace envelope per operation (open, query, search, lexical_search, get, list_keys,
+      upsert, delete; docs/observability.md), `trace_sample` of them (default 1.0). It runs on the calling thread
+      and must not block; one that raises is ignored.
     """
     return ThreadIndex.open(store, prefix=prefix, gen=gen, rev=rev, cache=cache, refresh_interval=refresh_interval,
                             delta_cache_bytes=delta_cache_bytes, lex_transient_bytes=lex_transient_bytes,
                             io_workers=io_workers, job_workers=job_workers, miss_policy=miss_policy,
                             warm_concurrency=warm_concurrency, warmup=warmup, cold_policy=cold_policy,
                             prefetch_bytes=prefetch_bytes, routing=routing, cold_routing=cold_routing,
-                            cold_beam=cold_beam, base_pack=base_pack, warm_pack=warm_pack, embed=embed)
+                            cold_beam=cold_beam, base_pack=base_pack, warm_pack=warm_pack, embed=embed,
+                            on_trace=on_trace, trace_sample=trace_sample)
+
+
+def _camel(d: Mapping[str, Any]) -> dict[str, Any]:
+    """snake_case keys as camelCase (a write result's fields under the envelope's names)."""
+    return {re.sub(r"_([a-z])", lambda m: m.group(1).upper(), k): v for k, v in d.items()}
+
+
+def _with_base_span(t: dict[str, Any], base: Mapping[str, Any]) -> dict[str, Any]:
+    """A query envelope with the routing-table load that preceded it (`timeline["base"]`) as its first span."""
+    children = [{"name": "fetch", "start": 0, "ms": base["fetch"]},
+                {"name": "build", "start": base["fetch"], "ms": base["build"]}]
+    f = base["files"]
+    return {**t, "at": t["at"] - int(base["ms"]), "ms": round(t["ms"] + base["ms"], 3), "io": add_io(t["io"], io_of(base)),
+            "spans": [phase_span("base", 0, base, children), *shift_spans(t["spans"], base["ms"])],
+            "counters": {**t["counters"], "baseBytes": f["coarse"] + f["fine"] + f["pq"]}}
+
+
+def _open_envelope(st: Mapping[str, Any], at: float, starts: Mapping[str, float], rev: RevState) -> dict[str, Any]:
+    """The open's envelope: its `open_stats` steps as spans, started at the given offsets (ms from the open's start)."""
+    spans = [phase_span("current", starts["current"], st["current"]),
+             phase_span("prefetch", starts["prefetch"], st["prefetch"]),
+             phase_span("manifest", starts["revision"], st["manifest"]),
+             phase_span("slabs", starts["revision"] + st["manifest"]["ms"], st["slabs"])]
+    b = st.get("base")
+    if b:
+        spans.append(phase_span("base", starts["base"], b, [{"name": "fetch", "start": round(starts["base"], 3),
+                                                             "ms": b["fetch"]},
+                                                            {"name": "build",
+                                                             "start": round(starts["base"] + b["fetch"], 3),
+                                                             "ms": b["build"]}]))
+    io = zero_io()
+    for s in spans:
+        io = add_io(io, s["io"])
+    # A PackedBlobStore was opened before `open_index` (its footer and directory): a span without a start.
+    if st.get("pack"):
+        spans.insert(0, phase_span("pack", None, st["pack"]))
+    return envelope("open", 0, at, ms=st["total"],
+                    attrs={"gen": rev.gen, "rev": rev.rev, "format": rev.format, "prefetch": st["prefetch"]["source"],
+                           "base": bool(b)},
+                    io=io, spans=spans,
+                    counters={"wasmInitMs": 0, "slabs": len(rev.slabs or []), "deltas": len(rev.deltas),
+                              "segments": len(rev.segments)})

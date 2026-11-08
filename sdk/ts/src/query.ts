@@ -12,6 +12,7 @@
 import { compileFilter, validateSchema, type AttrFilterExpr } from "./attrs.js";
 import type { BlobRange, BlobStore, BlobTrace, PhaseStat } from "./store.js";
 import { newTrace, nowMs, phaseStat, roundMs, snapTrace } from "./store.js";
+import { addTrace, envelope, ioOf, Kernels, phaseSpan, type TraceEnvelope, type TraceEvent } from "./trace.js";
 import type * as W from "./wasm/thread.js";
 import type { ColdRouting, ColdStat } from "./cold.js";
 import { PackedBlobStore } from "./pack.js";
@@ -73,6 +74,11 @@ export interface QueryOptions {
 	 * tree`, measured with `bench/cold/pack_adjacency.mjs`). Not the phase-2 record merging.
 	 */
 	coalesceAcrossSlabs?: boolean | number;
+	/**
+	 * Record every store read of this query in `stats.trace.events` (kind, key, start, ms, ranges, bytes, cache
+	 * hits/misses). Off by default: the envelope's spans, counters and kernels are always there.
+	 */
+	traceEvents?: boolean;
 }
 
 /**
@@ -203,6 +209,10 @@ export interface QueryStats {
 	timing: { total: number; route: number; phase1: number; phase2: number; payload: number };
 	/** Per-phase wall time and store work (see `QueryTimeline`). */
 	timeline: QueryTimeline;
+	/** Entries pushed into a scan's top-T heap (slabs and deltas): the heap work on top of scoring. */
+	pushed: number;
+	/** The query's trace envelope: phases as spans, counters, kernel CPU (docs/observability.md). */
+	trace: TraceEnvelope;
 }
 
 export interface QueryResult {
@@ -340,6 +350,9 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const { w, store, rev, base } = ctx;
 	const { manifest, gen, format, tomb, deltas } = rev;
 	const tStart = nowMs();
+	const at = Date.now();
+	const kern = new Kernels();
+	const events: TraceEvent[] | null = o.traceEvents ? [] : null;
 	if (qRaw.length !== manifest.dim) throw new ThreadError(`query dim ${qRaw.length} != index dim ${manifest.dim}`, 400);
 	const k = o.topK ?? 10;
 	if (!Number.isInteger(k) || k < 1) throw new ThreadError("topK must be an integer >= 1", 400);
@@ -362,11 +375,24 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const spanBytes = o.spanBytes ?? store.spanBytes ?? 0;
 	const coldPolicy = o.coldPolicy === false ? undefined : (o.coldPolicy ?? ctx.coldPolicy);
 	const dim = manifest.dim;
-	const q = w.normalize_vector(qRaw);
+	const q = kern.time("route", () => w.normalize_vector(qRaw));
 	const flat = pc === 0 || pc >= manifest.k1;
 	const lim = new Limiter(inflight);
 	const trace = newTrace();
 	const trStart = snapTrace(trace);
+	/**
+	 * Runs one store read with the query's trace; with `traceEvents`, with a trace of its own that is added to the
+	 * query's afterwards and recorded as an event (started once the read holds a limiter slot).
+	 */
+	const rd: TracedRead = <T>(kind: string, key: string, ranges: number, fn: (t: BlobTrace) => Promise<T>): Promise<T> => {
+		if (!events) return fn(trace);
+		const t = newTrace();
+		const s0 = nowMs();
+		return fn(t).finally(() => {
+			addTrace(trace, t);
+			events.push({ kind, key, start: roundMs(s0 - tStart), ms: roundMs(nowMs() - s0), ranges, bytes: t.bytes, hits: t.hits, misses: t.misses });
+		});
+	};
 	const epoch = ctx.epoch();
 	// Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
 	const deltaReads = deltas.map((d) => ctx.getDelta(d, trace));
@@ -385,11 +411,13 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		if (!Number.isInteger(beam) || beam < 1) throw new ThreadError("beam must be an integer >= 1", 400);
 		coldStat = coldR.newStat(beam);
 		await coldR.ensureGroups(q, beam, trace, coldStat);
-		cells = Array.from(coldR.router.route_beam(q, beam, routeN));
+		cells = Array.from(kern.time("route", () => coldR.router.route_beam(q, beam, routeN)));
 	} else {
 		const searcher = base.searcher!;
-		cellDots = flat || deltas.length ? searcher.cell_dots(q) : null;
-		cells = Array.from(flat ? searcher.route_from_dots(cellDots!, routeN) : searcher.route(q, pc, routeN));
+		cells = kern.time("route", () => {
+			cellDots = flat || deltas.length ? searcher.cell_dots(q) : null;
+			return Array.from(flat ? searcher.route_from_dots(cellDots!, routeN) : searcher.route(q, pc, routeN));
+		});
 	}
 	// Cold-path policy: fewer probes / a smaller rerank when most probed slabs would come from the origin. Cells are in
 	// routing order (best first), so the cold probe set is the best `coldPolicy.nprobe` of them.
@@ -413,7 +441,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const doRerank = format >= 2 && rev.slabs !== null && rerankParam > 0;
 	const T = doRerank ? Math.max(k, rerankParam) : k;
 	// Format 3: one asymmetric-distance table (m x 256 f32) per query, shared by every probed slab.
-	const table = base.pq ? w.PqTable.from_codebook(q, base.pq) : null;
+	const table = base.pq ? kern.time("route", () => w.PqTable.from_codebook(q, base.pq!)) : null;
 	const tRoute = nowMs();
 	const trRoute = snapTrace(trace);
 
@@ -433,6 +461,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	let specReadN = 0;
 	let tombDropped = 0;
 	let filterDropped = 0;
+	let pushed = 0;
 	let scannedCells = 0;
 	const stats = { rerankLocal: 0, specUsed: 0, specRecords: 0 };
 
@@ -448,7 +477,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		};
 		const rangeOf = (run: (typeof runs)[number]): BlobRange => ({ offset: si.rerankOff + run.a * recLen, length: (run.b - run.a + 1) * recLen });
 		if (runs.length > 1 && store.getRanges) {
-			const got = await lim.read(() => store.getRanges!(si.key, runs.map(rangeOf), { trace }), low);
+			const got = await lim.read(() => rd(low ? "spec" : "records", si.key, runs.length, (t) => store.getRanges!(si.key, runs.map(rangeOf), { trace: t })), low);
 			if (got) {
 				rerankReads++;
 				if (low) specReadN++;
@@ -462,7 +491,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		await Promise.all(
 			runs.map(async (run) => {
 				const r = rangeOf(run);
-				const bytes = await lim.read(() => store.get(si.key, r, { trace }), low);
+				const bytes = await lim.read(() => rd(low ? "spec" : "records", si.key, 1, (t) => store.get(si.key, r, { trace: t })), low);
 				if (!bytes) throw new ThreadError(`missing slab ${si.key}`, 404);
 				rerankReads++;
 				if (low) specReadN++;
@@ -503,7 +532,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			coalesced.reads++;
 			coalesced.slabs += g.members.size;
 			coalesced.bytes += g.range.length;
-			g.read = lim.read(() => g.pack.inner.get(g.pack.key, g.range, { trace })).then((b) => {
+			g.read = lim.read(() => rd("merged", g.pack.key, 1, (t) => g.pack.inner.get(g.pack.key, g.range, { trace: t }))).then((b) => {
 				if (!b) throw new ThreadError(`pack ${g.pack.key} disappeared`, 404);
 				return b;
 			});
@@ -515,7 +544,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 	const readSlab = async (cell: number): Promise<{ prefix: Uint8Array; full: Uint8Array | null; key: string; slabRev: number }> => {
 		if (!rev.slabs) {
 			const key = keys.slab(gen, cell);
-			const buf = await lim.read(() => store.get(key, undefined, { trace }));
+			const buf = await lim.read(() => rd("slab", key, 1, (t) => store.get(key, undefined, { trace: t })));
 			if (!buf) throw new ThreadError(`missing slab ${key}`, 404);
 			return { prefix: buf, full: buf, key, slabRev: 0 };
 		}
@@ -529,7 +558,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			const at = g.members.get(cell)!;
 			return { prefix: (await mergedRead(g)).subarray(at, at + scanLen), full: null, key, slabRev };
 		}
-		const bytes = await lim.read(() => store.get(key, { offset: 0, length: scanLen }, { trace, fill: true }));
+		const bytes = await lim.read(() => rd("prefix", key, 1, (t) => store.get(key, { offset: 0, length: scanLen }, { trace: t, fill: true })));
 		if (!bytes) throw new ThreadError(`missing slab ${key}`, 404);
 		// A store that fetched the whole object (cache miss, or a 200 to a Range request) returns a view into it.
 		const full = bytes.byteOffset === 0 && bytes.buffer.byteLength === meta[3] && meta[3] > scanLen ? new Uint8Array(bytes.buffer) : null;
@@ -545,16 +574,17 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			const hdr = parseSlabHeader(prefix);
 			// Tombstones and the attribute filter are applied inside the scan (before top-k insertion): ids deleted or
 			// replaced at a rev >= this slab's revision (every set for rev-0 slabs), entries whose attrs fail the filter.
-			// scanStats receives [entries scanned, tombstoned skipped, filtered out].
+			// scanStats receives [entries scanned, tombstoned skipped, filtered out, pushed into the heap].
 			const tombs = tomb ? tombFor(tomb, slabRev) : NO_TOMBSTONES;
-			const scanStats = new Uint32Array(3);
+			const scanStats = new Uint32Array(4);
 			let hits: Uint8Array;
 			if (hdr.version === 3) {
 				if (!table) throw new ThreadError(`slab ${cell} is v3 but ${gen} has no PQ codebook`);
-				hits = w.scan_pq(prefix, table, q, T, tombs, filterWords, scanStats);
-			} else hits = w.scan(prefix, q, T, tombs, filterWords, scanStats);
+				hits = kern.time("scan", () => w.scan_pq(prefix, table, q, T, tombs, filterWords, scanStats));
+			} else hits = kern.time("scan", () => w.scan(prefix, q, T, tombs, filterWords, scanStats));
 			tombDropped += scanStats[1];
 			filterDropped += scanStats[2];
+			pushed += scanStats[3];
 			versions.add(hdr.version);
 			scanned += hdr.count;
 			packed.push(hits);
@@ -610,12 +640,13 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			const hdr = parseDeltaHeader(bytes);
 			deltaScanned += hdr.count;
 			// A delta entry is hidden by the sets newer than the rev that added its segment (applied inside the scan).
-			const scanStats = new Uint32Array(3);
+			const scanStats = new Uint32Array(4);
 			// Cold routing: q·mean for just the cells this segment holds entries in (their rows read if needed).
 			const qc = coldR ? await coldR.deltaDots(d.key, bytes, q, trace, coldStat!) : cellDots!;
-			const hits = w.scan_delta(bytes, q, qc, T, tomb ? tombForDelta(tomb, d.addedRev) : NO_TOMBSTONES, filterWords, scanStats);
+			const hits = kern.time("deltaScan", () => w.scan_delta(bytes, q, qc, T, tomb ? tombForDelta(tomb, d.addedRev) : NO_TOMBSTONES, filterWords, scanStats));
 			deltaDropped += scanStats[1];
 			filterDropped += scanStats[2];
+			pushed += scanStats[3];
 			for (const h of parseHits(hits)) {
 				const e = deltaEntry(bytes, hdr, h.idx);
 				deltaHits.push({ id: h.id, score: h.score, attrs: e.attrs, payload: o.returnPayload ? bytes.slice(hdr.payloadOff + e.payloadOff, hdr.payloadOff + e.payloadOff + e.payloadLen) : null });
@@ -632,7 +663,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		await Promise.all([slabPhase, deltaPhase]);
 		const all = concatBytes(packed);
 		packed.length = 0;
-		merged = all.byteLength === 0 ? [] : parseHits(w.merge(all, T));
+		merged = kern.time("merge", () => (all.byteLength === 0 ? [] : parseHits(w.merge(all, T))));
 		tPhase1 = nowMs();
 		trPhase1 = snapTrace(trace);
 
@@ -673,7 +704,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 					});
 					const got = await fetchRecords(cell, remote.map((pos) => ws[pos].idx), false);
 					for (const pos of remote) records.set(got.get(ws[pos].idx)!, pos * recLen);
-					const scores = w.rerank(q, si.centroid, records, ws.length);
+					const scores = kern.time("rerank", () => w.rerank(q, si.centroid, records, ws.length));
 					ws.forEach((wn, i) => rescored.push({ id: wn.id, score: scores[i] }));
 				}),
 			);
@@ -699,9 +730,50 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 		best.set(h.id, { id: h.id, score: h.score, attrs: h.attrs, source: "delta", ...(h.payload ? { payload: h.payload } : {}) });
 	}
 	const top = [...best.values()].sort((a, b) => b.score - a.score).slice(0, k);
-	if (o.returnPayload) await fetchPayloads(top, slabInfo, store, lim, trace);
+	if (o.returnPayload) await fetchPayloads(top, slabInfo, store, lim, rd);
 	const hits: Hit[] = top.map(({ cand: _c, ...h }) => h);
 	const tEnd = nowMs();
+	const timeline: QueryTimeline = { route: phaseStat(tRoute - tStart, trRoute, trStart), phase1: phaseStat(tPhase1 - tRoute, trPhase1, trRoute), phase2: phaseStat(tPhase2 - tPhase1, trPhase2, trPhase1), payload: phaseStat(tEnd - tPhase2, trace, trPhase2) };
+	const deltaTop = hits.filter((h) => h.source === "delta").length;
+	const traceEnv = envelope({
+		op: "query",
+		t0: tStart,
+		at,
+		ms: tEnd - tStart,
+		attrs: { gen, rev: rev.rev, format, routing: coldR ? "cold" : flat ? "flat" : "tree", routingTable: base.routing, topK: k, nprobe: params.nprobe, rerank: params.rerank, pc, filtered, inflight, attempt },
+		io: ioOf(trace),
+		spans: [phaseSpan("route", 0, timeline.route), phaseSpan("phase1", tRoute - tStart, timeline.phase1), phaseSpan("phase2", tPhase1 - tStart, timeline.phase2), phaseSpan("payload", tPhase2 - tStart, timeline.payload)],
+		counters: {
+			hits: hits.length,
+			cells: scannedCells,
+			scanned,
+			scanBytes,
+			slabBytes,
+			pushed,
+			candidates: cand.size,
+			filterDropped,
+			tombDropped,
+			wholeSlabs,
+			rerankCandidates: rerankSlabs ? merged.length : 0,
+			rerankSlabs,
+			rerankReads,
+			rerankBytes,
+			rerankLocal: stats.rerankLocal,
+			specRecords: stats.specRecords,
+			specUsed: stats.specUsed,
+			deltas: deltas.length,
+			deltaBytes,
+			deltaScanned,
+			deltaHits: deltaHits.length,
+			deltaDropped,
+			deltaTop,
+			tombstones: tomb?.total ?? 0,
+			tombSets: tomb?.sets.length ?? 0,
+			warms: trace.warms ?? 0,
+		},
+		kernels: kern.done(),
+		...(events ? { events: events.sort((a, b) => a.start - b.start) } : {}),
+	});
 	return {
 		hits,
 		params,
@@ -731,7 +803,7 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			deltaScanned,
 			deltaHits: deltaHits.length,
 			deltaDropped,
-			deltaTop: hits.filter((h) => h.source === "delta").length,
+			deltaTop,
 			tombstones: tomb?.total ?? 0,
 			tombSets: tomb?.sets.length ?? 0,
 			tombDropped,
@@ -747,7 +819,9 @@ export async function executeQuery(ctx: QueryContext, qRaw: Float32Array, o: Que
 			wasmResets: ctx.wasmResets,
 			wasmMemMB: Math.round(ctx.wasmMemBytes() / 1048576),
 			timing: { total: roundMs(tEnd - tStart), route: roundMs(tRoute - tStart), phase1: roundMs(tPhase1 - tRoute), phase2: roundMs(tPhase2 - tPhase1), payload: roundMs(tEnd - tPhase2) },
-			timeline: { route: phaseStat(tRoute - tStart, trRoute, trStart), phase1: phaseStat(tPhase1 - tRoute, trPhase1, trRoute), phase2: phaseStat(tPhase2 - tPhase1, trPhase2, trPhase1), payload: phaseStat(tEnd - tPhase2, trace, trPhase2) },
+			timeline,
+			pushed,
+			trace: traceEnv,
 		},
 	};
 }
@@ -825,7 +899,10 @@ export function planCrossSlab(store: BlobStore, rev: RevState, gen: string, cell
 }
 
 /** Payloads of slab hits whose slab was not in memory: one (multi-)range read per slab. */
-async function fetchPayloads(top: (Hit & { cand?: Cand })[], slabInfo: Map<number, SlabInfo>, store: BlobStore, lim: Limiter, trace: BlobTrace): Promise<void> {
+/** One store read of a query, run with the trace it should count in (see `rd` in `executeQuery`). */
+type TracedRead = <T>(kind: string, key: string, ranges: number, fn: (t: BlobTrace) => Promise<T>) => Promise<T>;
+
+async function fetchPayloads(top: (Hit & { cand?: Cand })[], slabInfo: Map<number, SlabInfo>, store: BlobStore, lim: Limiter, rd: TracedRead): Promise<void> {
 	const bySlab = new Map<string, { hit: Hit & { cand?: Cand }; range: BlobRange }[]>();
 	for (const h of top) {
 		const c = h.cand;
@@ -847,7 +924,7 @@ async function fetchPayloads(top: (Hit & { cand?: Cand })[], slabInfo: Map<numbe
 	await Promise.all(
 		[...bySlab].map(async ([key, items]) => {
 			const ranges = items.map((i) => i.range);
-			const got = (store.getRanges && items.length > 1 ? await lim.read(() => store.getRanges!(key, ranges, { trace })) : null) ?? (await Promise.all(ranges.map((r) => lim.read(() => store.get(key, r, { trace })))));
+			const got = (store.getRanges && items.length > 1 ? await lim.read(() => rd("payload", key, ranges.length, (trace) => store.getRanges!(key, ranges, { trace }))) : null) ?? (await Promise.all(ranges.map((r) => lim.read(() => rd("payload", key, 1, (trace) => store.get(key, r, { trace }))))));
 			items.forEach((it, i) => {
 				const b = got[i];
 				if (!b) throw new ThreadError(`missing slab ${key}`, 404);

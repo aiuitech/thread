@@ -1048,10 +1048,11 @@ impl Searcher {
     }
 }
 
-/// Writes `[scanned, skipped, filtered]` into the first elements of a scan's
-/// `stats` out-parameter (fewer if it is shorter; an empty array ignores them).
+/// Writes `[scanned, skipped, filtered, pushed]` into the first elements of a
+/// scan's `stats` out-parameter (fewer if it is shorter, so callers that pass
+/// three slots keep working; an empty array ignores them).
 fn write_stats(stats: &mut [u32], st: ScanStats) {
-    for (o, v) in stats.iter_mut().zip([st.scanned, st.skipped, st.filtered]) {
+    for (o, v) in stats.iter_mut().zip([st.scanned, st.skipped, st.filtered, st.pushed]) {
         *o = v as u32;
     }
 }
@@ -1091,7 +1092,8 @@ pub fn filter_matches(filter: &[u32], attrs: &[u32]) -> Result<Vec<u8>, JsValue>
 /// (`Uint32Array`, copied back after the call): `stats[0]` = entries scanned,
 /// `stats[1]` = tombstoned entries skipped, `stats[2]` = entries the filter
 /// dropped (both only among those that scored high enough to enter the top-k
-/// when reached). Pass `new Uint32Array(0)` to ignore them.
+/// when reached), `stats[3]` = entries pushed into the top-k heap (when the
+/// array has a fourth slot). Pass `new Uint32Array(0)` to ignore them.
 #[wasm_bindgen]
 pub fn scan(slab_scan_bytes: &[u8], q: &[f32], k: u32, tombstones: &[u8], filter: &[u32], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
     let view = SlabView::parse(slab_scan_bytes).map_err(js_err)?;
@@ -1349,7 +1351,7 @@ impl PqTable {
 /// `q`. Errors on v1/v2 slabs and on a table whose `m` differs from the slab's.
 /// `tombstones`, `filter` and `stats` as in `scan`: tombstoned and filtered-out
 /// entries are skipped before top-k insertion; `stats` receives
-/// `[scanned, skipped, filtered]`.
+/// `[scanned, skipped, filtered, pushed]`.
 #[wasm_bindgen]
 pub fn scan_pq(slab_scan_bytes: &[u8], table: &PqTable, q: &[f32], k: u32, tombstones: &[u8], filter: &[u32], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
     let view = SlabView::parse(slab_scan_bytes).map_err(js_err)?;
@@ -1507,7 +1509,7 @@ pub fn delta_info(delta_bytes: &[u8]) -> Result<Vec<u32>, JsValue> {
 /// results; no second phase is needed. `tombstones`, `filter` and `stats` as
 /// in `scan`: pass the ids to hide in this segment (for a segment added at rev
 /// `a`, the union of the sets with rev > `a`); `stats` receives
-/// `[scanned, skipped, filtered]`.
+/// `[scanned, skipped, filtered, pushed]`.
 #[wasm_bindgen]
 pub fn scan_delta(delta_bytes: &[u8], q: &[f32], qc: &[f32], k: u32, tombstones: &[u8], filter: &[u32], stats: &mut [u32]) -> Result<Vec<u8>, JsValue> {
     let v = DeltaView::parse(delta_bytes).map_err(js_err)?;

@@ -11,8 +11,8 @@ use crate::slab::{rerank_record_len, SlabView};
 use crate::tomb::Tombstones;
 use crate::topk::TopK;
 
-/// What a scan did: entries scored, and entries left out of the top-k because
-/// their id is in the `skip` set.
+/// What a scan did: entries scored, entries left out of the top-k because their
+/// id is in the `skip` set or their attrs failed the filter, and heap insertions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScanStats {
     pub scanned: usize,
@@ -24,6 +24,10 @@ pub struct ScanStats {
     /// Entries that scored above the heap threshold but failed the attribute
     /// filter (same caveat as `skipped`: only entries that would have entered).
     pub filtered: usize,
+    /// Entries pushed into the top-k heap (they beat its threshold, matched the
+    /// filter and were not tombstoned). `pushed / scanned` is how selective the
+    /// running threshold was: the heap work a scan did on top of scoring.
+    pub pushed: usize,
 }
 
 /// Offers `(id, s, idx)` to `topk`, applying the attribute `filter` and the
@@ -45,6 +49,7 @@ fn offer(topk: &mut TopK, skip: Option<&Tombstones>, filter: Option<&AttrFilter>
                 return;
             }
         }
+        st.pushed += 1;
         topk.push(id, s, idx);
     }
 }
@@ -466,7 +471,9 @@ mod tests {
             normalize(&mut q);
             let qc = router.cell_dots(&q);
             let mut t = TopK::new(top);
-            assert_eq!(scan_delta(&v, &q, &qc, &mut t, None, None).unwrap(), ScanStats { scanned: n, skipped: 0, filtered: 0 });
+            let st = scan_delta(&v, &q, &qc, &mut t, None, None).unwrap();
+            assert_eq!((st.scanned, st.skipped, st.filtered), (n, 0, 0));
+            assert!(st.pushed >= top.min(n) && st.pushed <= n, "pushed {}", st.pushed);
             let hits = t.into_sorted();
             let exact = exact_top(&xs, &q, top);
             // every hit's score is the cosine within int8 error
@@ -656,7 +663,7 @@ mod tests {
     /// input of `n` entries.
     fn check_skip_before_heap(n: usize, run: &dyn Fn(&mut TopK, Option<&Tombstones>) -> ScanStats) {
         let mut all = TopK::new(n);
-        assert_eq!(run(&mut all, None), ScanStats { scanned: n, skipped: 0, filtered: 0 });
+        assert_eq!(run(&mut all, None), ScanStats { scanned: n, skipped: 0, filtered: 0, pushed: n });
         let full = all.into_sorted();
         assert_eq!(full.len(), n);
         assert!(full[0].score > full[1].score);
@@ -747,7 +754,7 @@ mod tests {
     fn check_filter_before_heap(n: usize, run: &dyn Fn(&mut TopK, Option<&AttrFilter>) -> ScanStats, attrs_of: &dyn Fn(u32) -> u32) {
         use crate::filter::{Clause, Op};
         let mut all = TopK::new(n);
-        assert_eq!(run(&mut all, None), ScanStats { scanned: n, skipped: 0, filtered: 0 });
+        assert_eq!(run(&mut all, None), ScanStats { scanned: n, skipped: 0, filtered: 0, pushed: n });
         let full = all.into_sorted();
         assert_eq!(full.len(), n);
         // pick the class the best entry is NOT in, so a post-filter of the top-1 would be empty

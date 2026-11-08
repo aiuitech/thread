@@ -12,6 +12,8 @@
  * score exactly like one index over all documents.
  */
 import type { BlobRange, BlobStore, BlobTrace } from "./store.js";
+import { newTrace, nowMs, phaseStat, snapTrace } from "./store.js";
+import { envelope, ioOf, Kernels, mergeKernels, phaseSpan, shiftSpans, type TraceEnvelope, type TraceSpan } from "./trace.js";
 import type * as W from "./wasm/thread.js";
 import { filterMatches } from "./attrs.js";
 import { parseHits, tombForSegment, tombHides, ThreadError, type ResolvedLexConfig, type SegmentRef, type TombState } from "./wire.js";
@@ -259,6 +261,12 @@ export interface LexSearchResult {
 		/** With a filter: the list depth used and the candidates the filter dropped. */
 		depth?: number;
 		filterDropped?: number;
+		/**
+		 * The search's trace envelope (docs/observability.md): `lookup` (term lookups in every segment) and `score`
+		 * (BM25 over the postings) spans, one `pass` + `attrs` pair per depth of a filtered search. Kernel `calls`
+		 * count attempts: a reader that needs pages it does not hold yet is run again after they are fetched.
+		 */
+		trace: TraceEnvelope;
 	};
 }
 
@@ -344,22 +352,49 @@ export class LexIndex {
 		if (!opts.filter?.length) return this.searchUnfiltered(text, k, opts);
 		// A filtered search: take the list deeper, resolve the candidates' attrs through `docs`, keep the matches.
 		const t0 = Date.now();
-		const filter = opts.filter;
+		const tt0 = nowMs();
+		const trace = opts.trace ?? newTrace();
+		opts = { ...opts, trace };
+		const spans: TraceSpan[] = [];
+		const passKernels: TraceEnvelope["kernels"][] = [];
+		const filter = opts.filter!;
 		const attrsOf = new Map<number, number>();
 		let depth = Math.max(opts.filterDepth ?? Math.max(4 * k, 32), k);
 		const maxDepth = Math.max(opts.maxDepth ?? 1 << 16, depth);
 		let dropped = 0;
+		let rounds = 0;
+		let ranges = 0;
 		for (;;) {
+			const tPass = nowMs() - tt0;
 			const raw = await this.searchUnfiltered(text, depth, opts);
+			const pt = raw.stats.trace;
+			spans.push({ name: "pass", start: tPass, ms: pt.ms, io: pt.io, children: shiftSpans(pt.spans, tPass) });
+			passKernels.push(pt.kernels);
 			const unknown = raw.hits.filter((h) => !attrsOf.has(h.id)).map((h) => h.id);
 			if (unknown.length) {
-				const found = await this.attrs(unknown, opts.trace, raw.stats.io);
+				const tA = nowMs();
+				const trA = snapTrace(trace);
+				const found = await this.attrs(unknown, trace, raw.stats.io);
 				for (const id of unknown) attrsOf.set(id, found.get(id) ?? 0);
+				spans.push(phaseSpan("attrs", tA - tt0, phaseStat(nowMs() - tA, trace, trA)));
 			}
+			rounds += raw.stats.io.rounds;
+			ranges += raw.stats.io.ranges;
 			const hits = raw.hits.filter((h) => filterMatches(filter, attrsOf.get(h.id)!));
 			dropped = raw.hits.length - hits.length;
 			if (hits.length >= k || raw.hits.length < depth || depth >= maxDepth) {
-				return { ...raw, hits: hits.slice(0, k), stats: { ...raw.stats, depth, filterDropped: dropped, ms: Date.now() - t0 } };
+				const out = hits.slice(0, k);
+				const env = envelope({
+					op: "lexical",
+					t0: tt0,
+					at: t0,
+					attrs: { ...pt.attrs, filtered: true },
+					io: ioOf(trace),
+					spans,
+					counters: { ...pt.counters, hits: out.length, rounds, ranges, depth, filterDropped: dropped, passes: passKernels.length },
+					kernels: mergeKernels(...passKernels),
+				});
+				return { ...raw, hits: out, stats: { ...raw.stats, depth, filterDropped: dropped, ms: Date.now() - t0, trace: env } };
 			}
 			depth = Math.min(maxDepth, depth * 4);
 		}
@@ -380,16 +415,34 @@ export class LexIndex {
 
 	private async searchUnfiltered(text: string, k: number, opts: LexSearchOptions = {}): Promise<LexSearchResult> {
 		const t0 = Date.now();
+		const tt0 = nowMs();
+		const trace = opts.trace ?? newTrace();
+		const kern = new Kernels();
+		const spans: TraceSpan[] = [];
 		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
-		const tokens = this.tokenize(text);
+		const tokens = kern.time("tokenize", () => this.tokenize(text));
 		const weights = new Map<string, number>();
 		for (const t of tokens) weights.set(t, (weights.get(t) ?? 0) + 1);
 		const distinct = [...weights.keys()];
 		const lexSegs = this.segments.filter((s) => s.seg.hasLex);
 		const { numDocs, totalLen } = this.stats();
-		const empty = (df: Record<string, number> = {}): LexSearchResult => ({ hits: [], tokens, found: 0, stats: { segments: lexSegs.length, numDocs, totalLen, df, io, ms: Date.now() - t0 } });
+		const traced = (hits: LexHit[], found: number): TraceEnvelope =>
+			envelope({
+				op: "lexical",
+				t0: tt0,
+				at: t0,
+				attrs: { topK: k, filtered: false },
+				io: ioOf(trace),
+				spans,
+				counters: { hits: hits.length, segments: lexSegs.length, numDocs, tokens: tokens.length, distinct: distinct.length, found, rounds: io.rounds, ranges: io.ranges },
+				kernels: kern.done(),
+			});
+		const empty = (df: Record<string, number> = {}): LexSearchResult => ({ hits: [], tokens, found: 0, stats: { segments: lexSegs.length, numDocs, totalLen, df, io, ms: Date.now() - t0, trace: traced([], 0) } });
 		if (!distinct.length || !lexSegs.length || k < 1) return empty();
-		const infos = await Promise.all(lexSegs.map(({ seg }) => seg.run(() => seg.reader.lookup(distinct), io, opts.trace)));
+		const tL = nowMs();
+		const trL = snapTrace(trace);
+		const infos = await Promise.all(lexSegs.map(({ seg }) => seg.run(() => kern.time("bm25Lookup", () => seg.reader.lookup(distinct)), io, trace)));
+		spans.push(phaseSpan("lookup", tL - tt0, phaseStat(nowMs() - tL, trace, trL)));
 		const dfs = new Float64Array(distinct.length);
 		for (const inf of infos) for (let i = 0; i < distinct.length; i++) if (inf[3 * i] >= 0) dfs[i] += inf[3 * i];
 		const dfRecord: Record<string, number> = {};
@@ -397,21 +450,24 @@ export class LexIndex {
 		const found = distinct.filter((_, i) => dfs[i] > 0).length;
 		if (!found) return empty(dfRecord);
 		const w = Float32Array.from(distinct, (t) => weights.get(t)!);
+		const tS = nowMs();
+		const trS = snapTrace(trace);
 		const packed = await Promise.all(
 			lexSegs.map(({ ref, seg }, i) => {
 				const inf = infos[i];
 				if (!inf.some((v, j) => j % 3 === 0 && v >= 0)) return Promise.resolve(null);
 				const tomb = this.tomb ? tombForSegment(this.tomb, ref.addedRev) : new Uint8Array(0);
-				return seg.run(() => seg.reader.search(inf, dfs, w, numDocs, totalLen, this.config.k1, this.config.b, k, tomb), io, opts.trace);
+				return seg.run(() => kern.time("bm25Score", () => seg.reader.search(inf, dfs, w, numDocs, totalLen, this.config.k1, this.config.b, k, tomb)), io, trace);
 			}),
 		);
+		spans.push(phaseSpan("score", tS - tt0, phaseStat(nowMs() - tS, trace, trS)));
 		const all: LexHit[] = [];
 		for (const p of packed) if (p) for (const h of parseHits(p)) all.push({ id: h.id, score: h.score });
 		// Ids are unique across live segments (older copies of a replaced id are tombstoned); keep the best anyway.
 		const best = new Map<number, number>();
 		for (const h of all) if ((best.get(h.id) ?? -Infinity) < h.score) best.set(h.id, h.score);
 		const hits = [...best].map(([id, score]) => ({ id, score })).sort((a, b) => b.score - a.score || a.id - b.id).slice(0, k);
-		return { hits, tokens, found, stats: { segments: lexSegs.length, numDocs, totalLen, df: dfRecord, io, ms: Date.now() - t0 } };
+		return { hits, tokens, found, stats: { segments: lexSegs.length, numDocs, totalLen, df: dfRecord, io, ms: Date.now() - t0, trace: traced(hits, found) } };
 	}
 
 	/**

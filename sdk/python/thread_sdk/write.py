@@ -87,6 +87,8 @@ class UpsertResult:
     #: With `chunk`: `{documents, count, stale}`, the input documents, the chunks written (= `count`) and the stale
     #: chunk keys tombstoned.
     chunks: dict[str, int] | None = None
+    #: The write's trace envelope (`ThreadIndex.upsert` / `delete`; docs/observability.md).
+    trace: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -101,6 +103,8 @@ class DeleteResult:
     ms: float
     #: `delete_keys`: the keys that had no live document (nothing was written if every key was missing).
     missing: list[str] | None = None
+    #: The write's trace envelope (`ThreadIndex.upsert` / `delete`; docs/observability.md).
+    trace: dict[str, Any] | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass

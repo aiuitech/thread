@@ -28,6 +28,7 @@ from typing import Any, Callable, Literal
 from . import _native
 from .cold import ColdRouting, new_cold_stat
 from .store import BlobRange, BlobStore, BlobTrace, Bytes, phase_stat
+from .trace import Kernels, envelope, io_of, phase_span
 from .wire import LEGACY_DEFAULTS, TombState, ThreadError, keys, slab_rev_of, tomb_for, tomb_for_delta
 
 __all__ = ["Hit", "QueryResult", "RevState", "Base", "QUERY_INFLIGHT", "MULTI_COALESCE", "execute_query",
@@ -208,13 +209,19 @@ def execute_query(
     span_bytes: int | None = None,
     cold_policy: dict[str, Any] | Literal[False] | None = None,
     beam: int | None = None,
+    trace_events: bool = False,
 ) -> QueryResult:
     """`filter`: a compiled attribute filter (the words `compile_filter` returns; None or empty = none), applied
     inside every scan before top-k insertion. With one, probing widens past `nprobe` in batches (routing order)
-    until T distinct candidates match or `max_nprobe` cells were scanned (default 4 x nprobe)."""
+    until T distinct candidates match or `max_nprobe` cells were scanned (default 4 x nprobe). `trace_events`:
+    record every store read in `stats["trace"]["events"]`."""
     store, rev, base, io = ctx.store, ctx.rev, ctx.base, ctx.io
     manifest, gen, fmt, tomb, deltas = rev.manifest, rev.gen, rev.format, rev.tomb, rev.deltas
     t_start = time.perf_counter()
+    at = time.time()
+    kern = Kernels()
+    events: list[dict[str, Any]] | None = [] if trace_events else None
+    events_lock = threading.Lock()
     k = _int_param("top_k", top_k, 1)
     defaults = manifest.get("defaults") or LEGACY_DEFAULTS
 
@@ -243,6 +250,25 @@ def execute_query(
     lim = Limiter(inflight_v)
     trace = BlobTrace()
     tr_start = trace.as_dict()
+
+    def traced(kind: str, key: str, n_ranges: int, fn: Callable[[BlobTrace], Any]) -> Any:
+        """One store read with the query's trace; with `trace_events`, with a trace of its own that is added to the
+        query's afterwards and recorded as an event (started once the read holds a limiter slot)."""
+        if events is None:
+            return fn(trace)
+        t = BlobTrace()
+        s0 = time.perf_counter()
+        try:
+            return fn(t)
+        finally:
+            d = t.as_dict()
+            trace.add(**d)
+            ev = {"kind": kind, "key": key, "start": round((s0 - t_start) * 1000, 3),
+                  "ms": round((time.perf_counter() - s0) * 1000, 3), "ranges": n_ranges, "bytes": d["bytes"],
+                  "hits": d["hits"], "misses": d["misses"]}
+            with events_lock:
+                events.append(ev)
+
     # Delta segments are read first (usually from memory) and scanned while the slab reads are in flight.
     delta_reads = [ctx.get_delta(d, trace) for d in deltas]
     cold_r = base.cold
@@ -256,16 +282,17 @@ def execute_query(
             # the cells they hold entries in (those rows read too).
             beam_v = _int_param("beam", beam if beam is not None else cold_r.beam, 1)
             cold_stat = new_cold_stat(beam_v)
-            q0 = cold_r.router.query(q_raw)
+            q0 = kern.time("route", lambda: cold_r.router.query(q_raw))
             cold_r.ensure_groups(q0, beam_v, trace, cold_stat)
             dot_cells = sorted({c for d, f in zip(deltas, delta_reads) for c in cold_r.cells_of(d["key"], f.result())})
             cold_r.ensure_cells(dot_cells, trace, cold_stat)
-            query = cold_r.router.query(q_raw, dot_cells=dot_cells or None, codebook=base.pq)
-            cells = cold_r.router.route_beam(query, beam_v, route_n)
+            query = kern.time("route", lambda: cold_r.router.query(q_raw, dot_cells=dot_cells or None, codebook=base.pq))
+            cells = kern.time("route", lambda: cold_r.router.route_beam(query, beam_v, route_n))
         else:
-            assert base.searcher is not None
-            query = base.searcher.query(q_raw, dots=flat or bool(deltas), codebook=base.pq)
-            cells = base.searcher.route(query, 0 if flat else pc_v, route_n)
+            searcher = base.searcher
+            assert searcher is not None
+            query = kern.time("route", lambda: searcher.query(q_raw, dots=flat or bool(deltas), codebook=base.pq))
+            cells = kern.time("route", lambda: searcher.route(query, 0 if flat else pc_v, route_n))
     except ValueError as e:
         raise ThreadError(str(e), 400) from e
     # Cold-path policy: fewer probes / a smaller rerank when most probed slabs would come from the origin. Cells are in
@@ -313,10 +340,13 @@ def execute_query(
         try:
             key = slab_keys[cell]
             ranges = [BlobRange(rerank_off + r.a * rec_len, (r.b - r.a + 1) * rec_len) for r in runs]
-            got = read(functools.partial(store.get_ranges, key, ranges, trace=trace), low) if multi else None
+            kind = "spec" if low else "records"
+            got = read(lambda: traced(kind, key, len(ranges), lambda t: store.get_ranges(key, ranges, trace=t)),
+                       low) if multi else None
             n_reads = 1
             if got is None:
-                got = [read(functools.partial(store.get, key, r, trace=trace), low) for r in ranges]
+                got = [read(functools.partial(traced, kind, key, 1, functools.partial(_get_traced, store, key, r)),
+                            low) for r in ranges]
                 n_reads = len(ranges)
             for r, b in zip(runs, got):
                 if b is None:
@@ -347,7 +377,7 @@ def execute_query(
         """Phase 1 read: the scan prefix (v2/v3), the whole object on a cache miss; v1 slabs whole."""
         if rev.slabs is None:
             key = slab_keys[cell] = keys.slab(gen, cell)
-            buf = read(lambda: store.get(key, None, trace=trace))
+            buf = read(lambda: traced("slab", key, 1, lambda t: store.get(key, None, trace=t)))
             if buf is None:
                 raise ThreadError(f"missing slab {key}", 404)
             return buf, buf, 0
@@ -357,7 +387,7 @@ def execute_query(
         slab_rev = slab_rev_of(meta)
         key = slab_keys[cell] = keys.slab(gen, cell, slab_rev)
         scan_len = meta[0]
-        b = read(lambda: store.get(key, BlobRange(0, scan_len), trace=trace, fill=True))
+        b = read(lambda: traced("prefix", key, 1, lambda t: store.get(key, BlobRange(0, scan_len), trace=t, fill=True)))
         if b is None:
             raise ThreadError(f"missing slab {key}", 404)
         # A cache store that fetched the whole object returns a view into it.
@@ -436,11 +466,42 @@ def execute_query(
     t_phase2 = time.perf_counter()
     tr_phase2 = trace.as_dict()
     if payload_reads:
-        _fetch_payloads(hits, payload_reads, slab_keys, store, io if parallel else None, read, trace)
+        _fetch_payloads(hits, payload_reads, slab_keys, store, io if parallel else None, read, traced)
     t_end = time.perf_counter()
     tr_end = trace.as_dict()
     rs = run.stats()
     ms = lambda a, b: round((b - a) * 1000, 3)  # noqa: E731
+    timeline = {"route": phase_stat((t_route - t_start) * 1000, tr_route, tr_start),
+                "phase1": phase_stat((t_phase1 - t_route) * 1000, tr_phase1, tr_route),
+                "phase2": phase_stat((t_phase2 - t_phase1) * 1000, tr_phase2, tr_phase1),
+                "payload": phase_stat((t_end - t_phase2) * 1000, tr_end, tr_phase2)}
+    kern.merge(rs["kernels"])
+    delta_top = sum(1 for h in hits if h.source == "delta")
+    routing = "cold" if cold_r is not None else "flat" if flat else "tree"
+    trace_env = envelope(
+        "query", t_start, at, ms=(t_end - t_start) * 1000,
+        attrs={"gen": gen, "rev": rev.rev, "format": fmt, "routing": routing, "routingTable": base.routing,
+               "topK": k, "nprobe": params["nprobe"], "rerank": params["rerank"], "pc": pc_v, "filtered": filtered,
+               "inflight": inflight_v, "attempt": 1},
+        io=io_of(tr_end),
+        spans=[phase_span("route", 0, timeline["route"]),
+               phase_span("phase1", (t_route - t_start) * 1000, timeline["phase1"]),
+               phase_span("phase2", (t_phase1 - t_start) * 1000, timeline["phase2"]),
+               phase_span("payload", (t_phase2 - t_start) * 1000, timeline["payload"])],
+        counters={"hits": len(hits), "cells": scanned_cells, "scanned": rs["scanned"], "scanBytes": rs["scan_bytes"],
+                  "slabBytes": rs["slab_bytes"], "pushed": rs["pushed"], "candidates": run.candidates(),
+                  "filterDropped": rs["filter_dropped"], "tombDropped": rs["tomb_dropped"],
+                  "wholeSlabs": st["whole_slabs"], "rerankCandidates": rs["rerank_candidates"],
+                  "rerankSlabs": rs["rerank_slabs"], "rerankReads": st["rerank_reads"],
+                  "rerankBytes": st["rerank_bytes"], "rerankLocal": rs["rerank_local"],
+                  "specRecords": rs["spec_records"], "specUsed": rs["spec_used"], "deltas": len(deltas),
+                  "deltaBytes": rs["delta_bytes"], "deltaScanned": rs["delta_scanned"], "deltaHits": rs["delta_hits"],
+                  "deltaDropped": rs["delta_dropped"], "deltaTop": delta_top,
+                  "tombstones": tomb.total if tomb else 0, "tombSets": len(tomb.sets) if tomb else 0,
+                  "warms": tr_end["warms"]},
+        kernels=kern.done(),
+        events=sorted(events, key=lambda e: e["start"]) if events is not None else None,
+    )
     return QueryResult(
         hits=hits,
         params=params,
@@ -448,7 +509,7 @@ def execute_query(
             "gen": gen,
             "rev": rev.rev,
             "format": fmt,
-            "routing": "cold" if cold_r is not None else "flat" if flat else "tree",
+            "routing": routing,
             "routing_table": base.routing,
             **({"cold_routing": cold_r.finish_stat(cold_stat)} if cold_r is not None and cold_stat is not None else {}),
             "cells": cells[:scanned_cells],
@@ -470,7 +531,7 @@ def execute_query(
             "delta_scanned": rs["delta_scanned"],
             "delta_hits": rs["delta_hits"],
             "delta_dropped": rs["delta_dropped"],
-            "delta_top": sum(1 for h in hits if h.source == "delta"),
+            "delta_top": delta_top,
             "tombstones": tomb.total if tomb else 0,
             "tomb_sets": len(tomb.sets) if tomb else 0,
             "tomb_dropped": rs["tomb_dropped"],
@@ -483,16 +544,21 @@ def execute_query(
             "timing": {"total": ms(t_start, t_end), "route": ms(t_start, t_route), "phase1": ms(t_route, t_phase1),
                        "phase2": ms(t_phase1, t_phase2), "payload": ms(t_phase2, t_end)},
             # Per-phase wall time and the store work that completed during it (trace snapshots at the boundaries).
-            "timeline": {"route": phase_stat((t_route - t_start) * 1000, tr_route, tr_start),
-                         "phase1": phase_stat((t_phase1 - t_route) * 1000, tr_phase1, tr_route),
-                         "phase2": phase_stat((t_phase2 - t_phase1) * 1000, tr_phase2, tr_phase1),
-                         "payload": phase_stat((t_end - t_phase2) * 1000, tr_end, tr_phase2)},
+            "timeline": timeline,
+            "pushed": rs["pushed"],
+            # The query's trace envelope (docs/observability.md), the same shape as the TypeScript SDK's.
+            "trace": trace_env,
         },
     )
 
 
+def _get_traced(store: BlobStore, key: str, r: BlobRange, t: BlobTrace) -> Any:
+    return store.get(key, r, trace=t)
+
+
 def _fetch_payloads(hits: list[Hit], reads: list[tuple[int, int, int, int]], slab_keys: dict[int, str],
-                    store: BlobStore, io: Executor | None, read: Callable[..., Any], trace: BlobTrace) -> None:
+                    store: BlobStore, io: Executor | None, read: Callable[..., Any],
+                    traced: Callable[..., Any]) -> None:
     """Payloads of slab hits whose slab was not in memory: one (multi-)range read per slab."""
     by_key: dict[str, list[tuple[int, BlobRange]]] = {}
     for pos, cell, off, n in reads:
@@ -500,9 +566,11 @@ def _fetch_payloads(hits: list[Hit], reads: list[tuple[int, int, int, int]], sla
 
     def fetch(key: str, items: list[tuple[int, BlobRange]]) -> None:
         ranges = [r for _, r in items]
-        got = read(functools.partial(store.get_ranges, key, ranges, trace=trace)) if len(items) > 1 else None
+        got = read(lambda: traced("payload", key, len(ranges), lambda t: store.get_ranges(key, ranges, trace=t))) \
+            if len(items) > 1 else None
         if got is None:
-            got = [read(functools.partial(store.get, key, r, trace=trace)) for r in ranges]
+            got = [read(functools.partial(traced, "payload", key, 1, functools.partial(_get_traced, store, key, r)))
+                   for r in ranges]
         for (pos, _), b in zip(items, got):
             if b is None:
                 raise ThreadError(f"missing slab {key}", 404)

@@ -6,3 +6,11 @@ license.workspace = true
 description = "Blob-native IVF vector index: format, quantization, k-means and scan kernels. No I/O."
 
 [dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+# Query kernels (route, scan, rerank, merge, tokenize): `cargo bench -p thread-core`. See benches/kernels.rs.
+[[bench]]
+name = "kernels"
+harness = false

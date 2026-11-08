@@ -30,12 +30,14 @@ import { LexIndex, LexSegment, MAX_LIST_KEYS, type DocRecord, type KeyPage, type
 import { ColdRouting } from "./cold.js";
 import { isPackHeader, PackedBlobStore, PrefetchStore } from "./pack.js";
 import { fetchWarmPack, revisionSlabKeys, seedWarmPack, WarmPrefixStore, type PrefixSeed, type WarmPackStats } from "./warm.js";
+import { addIo, emitTrace, envelope, ioOf, mergeKernels, numericFields, phaseSpan, prefixCounters, shiftSpans, zeroIo, type TraceEnvelope, type TraceSink, type TraceSpan } from "./trace.js";
 
 export * from "./wire.js";
 export * from "./attrs.js";
 export * from "./store.js";
 export * from "./s3.js";
 export * from "./lex.js";
+export * from "./trace.js";
 export * from "./routing.js";
 export * from "./chunk.js";
 export * from "./embed.js";
@@ -111,7 +113,12 @@ export interface SearchResult {
 	dense?: QueryResult;
 	/** The lexical query's result (when a text was given). */
 	lexical?: LexSearchResult;
-	stats: { docsIo?: LexIo; timing: { total: number; dense: number; lexical: number; docs: number } };
+	stats: {
+		docsIo?: LexIo;
+		timing: { total: number; dense: number; lexical: number; docs: number };
+		/** The search's trace envelope: `embed`, `dense` (the query's phases), `lexical`, `fuse`, `docs` spans. */
+		trace: TraceEnvelope;
+	};
 }
 /** The raw wasm-bindgen bindings (advanced use: build jobs, slab tools). */
 export type WasmBindings = typeof W;
@@ -156,7 +163,8 @@ export interface ThreadInitOptions {
 	wasmModule: WebAssembly.Module;
 }
 
-export interface OpenOptions {
+/** `onTrace` / `traceSample` (from `TraceSink`) receive one trace envelope per operation (docs/observability.md). */
+export interface OpenOptions extends TraceSink {
 	/** R2 binding (sugar for `store: new R2BlobStore(bucket)`). */
 	bucket?: R2BucketLike;
 	/** Any BlobStore (`R2BlobStore`, `S3BlobStore`, `MemoryBlobStore`, your own). One of `bucket`/`store` is required. */
@@ -342,6 +350,8 @@ export class ThreadIndex {
 	readonly store: BlobStore;
 	/** Where `open` spent its time and reads (see `OpenStats`). */
 	openStats!: OpenStats;
+	/** The open's trace envelope (the `openStats` steps as spans). */
+	openTrace!: TraceEnvelope;
 	private revState: RevState;
 	private base: BaseSlot | null = null;
 	private basePromise: Promise<BaseSlot> | null = null;
@@ -418,6 +428,7 @@ export class ThreadIndex {
 		const scope = keyPrefix(store).replace(/^\/+/, "");
 		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, scope, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
 		const t0 = nowMs();
+		const at = Date.now();
 		// The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it. Its prefixes
 		// go into the in-process cache when it can hold prefixes (`MemoryCache`), else into a prefix layer in front of
 		// the store.
@@ -447,9 +458,13 @@ export class ThreadIndex {
 		// A manifest inlined in current.json saves its GET (and the base files start right after current.json).
 		const pre = new PrefetchStore(store);
 		const fromPack = await prefetchIndexPack(pre, opts);
+		const tCurrent = nowMs() - t0;
 		const target = await resolveTarget(fromPack ? pre : store, opts.gen, opts.rev, tl);
+		const tPrefetch = nowMs() - t0;
 		const prefetch = fromPack && (target.manifest || pre.has(keys.manifest(target.gen, target.rev))) ? fromPack : await prefetchOpen(store, pre, target.gen, target.rev, opts, target.manifest);
+		const tRev = nowMs() - t0;
 		const rev = await loadRevState(pre, target.gen, target.rev, tl, target.manifest);
+		const tBase = nowMs() - t0;
 		const ix = new ThreadIndex(thread, store, rev, opts);
 		ix.openStore = pre;
 		if (warm) ix.startWarm(warm.target, warm.layer, warm.got, opts.warmPack!, t0);
@@ -465,6 +480,8 @@ export class ThreadIndex {
 		const none = phaseStat(0, newTrace());
 		ix.openStats = { total: roundMs(nowMs() - t0), wasmInit: thread.initMs, current: tl.current ?? none, prefetch, manifest: tl.manifest ?? none, slabs: tl.slabs ?? none, base: loaded.stat ?? null };
 		if (opts.store instanceof PackedBlobStore) ix.openStats.pack = opts.store.openStats;
+		ix.openTrace = openEnvelope(ix.openStats, at, { current: tCurrent, prefetch: fromPack ? 0 : tPrefetch, revision: tRev, base: tBase }, rev);
+		emitTrace(opts, ix.openTrace);
 		return ix;
 	}
 
@@ -734,11 +751,17 @@ export class ThreadIndex {
 	async search(req: SearchRequest): Promise<SearchResult> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		const t0 = Date.now();
+		const tt0 = nowMs();
+		const spans: TraceSpan[] = [];
 		const hasText = typeof req.text === "string" && req.text.trim().length > 0;
 		this.maybeRefresh();
 		// The query text is embedded for the dense list when the index can (and no vector was given).
 		let vector = req.vector;
-		if (hasText && vector === undefined && req.embed !== false && this.hasDense && (req.embed || this.canEmbed)) vector = (await this.embed([req.text!], "query"))[0];
+		if (hasText && vector === undefined && req.embed !== false && this.hasDense && (req.embed || this.canEmbed)) {
+			const tE = nowMs();
+			vector = (await this.embed([req.text!], "query"))[0];
+			spans.push({ name: "embed", start: roundMs(tE - tt0), ms: roundMs(nowMs() - tE) });
+		}
 		const hasVector = vector !== undefined;
 		// Mode, list depth, RRF constant and weights are resolved by the core against `manifest.lex.defaults`.
 		const lexCfg = this.revState.manifest.lex;
@@ -764,25 +787,33 @@ export class ThreadIndex {
 		let dense: QueryResult | undefined;
 		let lexical: LexSearchResult | undefined;
 		let fused: W.SearchHits;
+		let tFuse = 0;
 		try {
 			[dense, lexical] = await Promise.all([
 				hasVector
 					? (async () => {
 							const t = Date.now();
-							const r = await this.query(vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
+							const s0 = nowMs() - tt0;
+							const r = await this.queryInner(vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
 							tDense = Date.now() - t;
+							const e = r.stats.trace;
+							spans.push({ name: "dense", start: roundMs(s0), ms: e.ms, io: e.io, children: shiftSpans(e.spans, s0) });
 							return r;
 						})()
 					: Promise.resolve(undefined),
 				lexText
 					? (async () => {
 							const t = Date.now();
-							const r = await this.lexicalSearch(req.text!, depth, filter ? { filter } : {});
+							const s0 = nowMs() - tt0;
+							const r = await this.lexicalInner(req.text!, depth, filter ? { filter } : {});
 							tLex = Date.now() - t;
+							const e = r.stats.trace;
+							spans.push({ name: "lexical", start: roundMs(s0), ms: e.ms, io: e.io, children: shiftSpans(e.spans, s0) });
 							return r;
 						})()
 					: Promise.resolve(undefined),
 			]);
+			tFuse = nowMs();
 			fused = W.fuse_search(
 				plan,
 				dense && Uint32Array.from(dense.hits, (h) => h.id),
@@ -795,6 +826,7 @@ export class ThreadIndex {
 		}
 		const [ids, scores, dRank, dScore, lRank, lScore] = [fused.ids, fused.scores, fused.dense_rank, fused.dense_score, fused.lexical_rank, fused.lexical_score];
 		safeFree(fused);
+		spans.push({ name: "fuse", start: roundMs(tFuse - tt0), ms: roundMs(nowMs() - tFuse) });
 		const hits: SearchHit[] = Array.from(ids, (id, i) => {
 			const h: SearchHit = { id, score: scores[i] };
 			if (dRank[i]) h.dense = { rank: dRank[i], score: dScore[i] };
@@ -805,26 +837,55 @@ export class ThreadIndex {
 		let tDocs = 0;
 		if (req.docs && hits.length) {
 			const t = Date.now();
-			const r = await this.docs(
+			const s0 = nowMs();
+			const docsTrace = newTrace();
+			const r = await this.docsInner(
 				hits.map((h) => h.id),
-				{ text: req.docs === "text" },
+				{ text: req.docs === "text", trace: docsTrace },
 			);
 			docsIo = r.io;
 			for (const h of hits) h.doc = r.docs.get(h.id) ?? null;
 			tDocs = Date.now() - t;
+			spans.push({ name: "docs", start: roundMs(s0 - tt0), ms: roundMs(nowMs() - s0), io: ioOf(docsTrace) });
 		}
+		spans.sort((a, b) => (a.start ?? 0) - (b.start ?? 0));
+		const trace = envelope({
+			op: "search",
+			t0: tt0,
+			at: t0,
+			attrs: { mode, gen: this.revState.gen, rev: this.revState.rev, topK, recallK: depth, rrfK: params.rrfK, filtered: filter !== undefined, docs: req.docs ? String(req.docs) : "none" },
+			counters: {
+				hits: hits.length,
+				...prefixCounters("dense", dense?.stats.trace.counters),
+				...prefixCounters("lexical", lexical?.stats.trace.counters),
+				...(docsIo ? { "docs.rounds": docsIo.rounds, "docs.ranges": docsIo.ranges } : {}),
+			},
+			kernels: mergeKernels(dense?.stats.trace.kernels, lexical?.stats.trace.kernels),
+			spans,
+			...(dense?.stats.trace.events ? { events: dense.stats.trace.events.map((e) => ({ ...e, start: roundMs(e.start + (spans.find((s) => s.name === "dense")?.start ?? 0)) })) } : {}),
+		});
+		emitTrace(this.opts, trace);
 		return {
 			hits,
 			mode,
 			params,
 			...(dense ? { dense } : {}),
 			...(lexical ? { lexical } : {}),
-			stats: { ...(docsIo ? { docsIo } : {}), timing: { total: Date.now() - t0, dense: tDense, lexical: tLex, docs: tDocs } },
+			stats: { ...(docsIo ? { docsIo } : {}), timing: { total: Date.now() - t0, dense: tDense, lexical: tLex, docs: tDocs }, trace },
 		};
 	}
 
 	/** BM25 top `k` for `text` over the revision's lexical segments (see `LexIndex.search`); `opts.filter` takes compiled words. */
 	async lexicalSearch(text: string, k: number, opts: LexSearchOptions = {}): Promise<LexSearchResult> {
+		const r = await this.lexicalInner(text, k, opts);
+		r.stats.trace.attrs.gen = this.revState.gen;
+		r.stats.trace.attrs.rev = this.revState.rev;
+		emitTrace(this.opts, r.stats.trace);
+		return r;
+	}
+
+	/** `lexicalSearch` without handing the envelope to the sink (a search's lexical list). */
+	private async lexicalInner(text: string, k: number, opts: LexSearchOptions = {}): Promise<LexSearchResult> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		return this.thread.withRecovery("lexicalSearch", async () => (await this.lexIndex()).search(text, k, opts));
 	}
@@ -836,6 +897,10 @@ export class ThreadIndex {
 
 	/** Resolves ids through the `docs` store (newest live copy of each id); ids without an entry are absent. */
 	async docs(ids: readonly number[], opts: { text?: boolean } = {}): Promise<{ docs: Map<number, DocRecord>; io: LexIo }> {
+		return this.docsInner(ids, opts);
+	}
+
+	private async docsInner(ids: readonly number[], opts: { text?: boolean; trace?: BlobTrace } = {}): Promise<{ docs: Map<number, DocRecord>; io: LexIo }> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		if (!this.lexConfig) return { docs: new Map(), io: { rounds: 0, ranges: 0, bytes: 0 } };
 		return this.thread.withRecovery("docs", async () => (await this.lexIndex()).docs(ids, opts));
@@ -857,36 +922,63 @@ export class ThreadIndex {
 	 * Fetches documents by key: each key's id (`resolveKeys`) and its `docs` entry (`docs`), two rounds against
 	 * cached objects. Keys with no live document are absent; with `text`, the stored text comes along.
 	 */
-	async get(keys: readonly string[], opts: { text?: boolean } = {}): Promise<{ records: Map<string, KeyRecord>; io: LexIo }> {
+	async get(keys: readonly string[], opts: { text?: boolean } = {}): Promise<{ records: Map<string, KeyRecord>; io: LexIo; trace: TraceEnvelope }> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
+		const t0 = nowMs();
+		const at = Date.now();
 		const io: LexIo = { rounds: 0, ranges: 0, bytes: 0 };
 		const records = new Map<string, KeyRecord>();
-		if (!this.lexConfig) return { records, io };
+		const spans: TraceSpan[] = [];
+		const finish = () => {
+			const trace = envelope({ op: "get", t0, at, attrs: { gen: this.revState.gen, rev: this.revState.rev }, spans, counters: { keys: keys.length, found: records.size, rounds: io.rounds, ranges: io.ranges } });
+			emitTrace(this.opts, trace);
+			return { records, io, trace };
+		};
+		if (!this.lexConfig) return finish();
 		return this.thread.withRecovery("get", async () => {
+			spans.length = 0;
 			const lex = await this.lexIndex();
-			const r = await lex.resolveKeys(keys);
 			const add = (x: LexIo) => {
 				io.rounds += x.rounds;
 				io.ranges += x.ranges;
 				io.bytes += x.bytes;
 			};
+			const tK = nowMs();
+			const kt = newTrace();
+			const r = await lex.resolveKeys(keys, { trace: kt });
+			spans.push({ name: "keys", start: roundMs(tK - t0), ms: roundMs(nowMs() - tK), io: ioOf(kt) });
 			add(r.io);
-			if (!r.ids.size) return { records, io };
-			const d = await lex.docs([...r.ids.values()], opts);
+			if (!r.ids.size) return finish();
+			const tD = nowMs();
+			const dt = newTrace();
+			const d = await lex.docs([...r.ids.values()], { ...opts, trace: dt });
+			spans.push({ name: "docs", start: roundMs(tD - t0), ms: roundMs(nowMs() - tD), io: ioOf(dt) });
 			add(d.io);
 			for (const [key, id] of r.ids) {
 				const doc = d.docs.get(id);
 				records.set(key, doc ? { ...doc, key } : { key, id, meta: "", attrs: 0 });
 			}
-			return { records, io };
+			return finish();
 		});
 	}
 
 	/** Lists keys with a prefix in key order, paged: continue with `after: page.next` while `page.more`. */
-	async listKeys(opts: ListKeysOptions = {}): Promise<KeyPage & { io: LexIo }> {
+	async listKeys(opts: ListKeysOptions = {}): Promise<KeyPage & { io: LexIo; trace: TraceEnvelope }> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
-		if (!this.lexConfig) return { entries: [], more: false, io: { rounds: 0, ranges: 0, bytes: 0 } };
-		return this.thread.withRecovery("listKeys", async () => (await this.lexIndex()).listKeys(opts));
+		const t0 = nowMs();
+		const at = Date.now();
+		const kt = newTrace();
+		const page: KeyPage & { io: LexIo } = !this.lexConfig ? { entries: [], more: false, io: { rounds: 0, ranges: 0, bytes: 0 } } : await this.thread.withRecovery("listKeys", async () => (await this.lexIndex()).listKeys({ ...opts, trace: kt }));
+		const trace = envelope({
+			op: "listKeys",
+			t0,
+			at,
+			attrs: { gen: this.revState.gen, rev: this.revState.rev, limit: opts.limit ?? 100 },
+			spans: [{ name: "keys", start: 0, ms: roundMs(nowMs() - t0), io: ioOf(kt) }],
+			counters: { entries: page.entries.length, more: page.more ? 1 : 0, rounds: page.io.rounds, ranges: page.io.ranges },
+		});
+		emitTrace(this.opts, trace);
+		return { ...page, trace };
 	}
 
 	/** @experimental Deletes documents by key (their vectors, texts, docs entries and keys): one tombstone set. */
@@ -1071,6 +1163,13 @@ export class ThreadIndex {
 
 	/** Searches for the nearest neighbours of `vector` (any norm; it is normalized). */
 	async query(vector: Float32Array | number[], opts: QueryOptions = {}): Promise<QueryResult> {
+		const r = await this.queryInner(vector, opts);
+		emitTrace(this.opts, r.stats.trace);
+		return r;
+	}
+
+	/** `query` without handing the envelope to the sink (a search's dense list). */
+	private async queryInner(vector: Float32Array | number[], opts: QueryOptions = {}): Promise<QueryResult> {
 		if (this.closed) throw new ThreadError("index is closed", 400);
 		if (!this.hasDense) throw new ThreadError("this generation has no dense index (lexical only): use search({text})", 400);
 		const q = vector instanceof Float32Array ? vector : Float32Array.from(vector);
@@ -1097,7 +1196,10 @@ export class ThreadIndex {
 					attempt,
 				);
 				// This query (re)loaded the routing table (after a reset or a switch to another generation).
-				if (loaded.stat) r.stats.timeline.base = loaded.stat;
+				if (loaded.stat) {
+					r.stats.timeline.base = loaded.stat;
+					r.stats.trace = withBaseSpan(r.stats.trace, loaded.stat);
+				}
 				return r;
 			} finally {
 				this.releaseBase(base);
@@ -1117,17 +1219,40 @@ export class ThreadIndex {
 	 * ids and new ones are allocated (`manifest.nextId`); the result lists the ids. Needs a store with `put`/`head`
 	 * (R2 binding or S3). See README "Write path".
 	 */
-	async upsert(input: UpsertInput): Promise<UpsertResult> {
+	async upsert(input: UpsertInput): Promise<UpsertResult & { trace: TraceEnvelope }> {
+		const t0 = nowMs();
+		const at = Date.now();
 		const r = await upsert(this.writer(), input);
+		const tUse = nowMs();
 		await this.useRevision(r.gen, r.rev);
-		return r;
+		return { ...r, trace: this.writeEnvelope("upsert", r, t0, at, tUse) };
 	}
 
 	/** @experimental Deletes ids: one tombstone set in a new manifest revision; the index then reads that revision. */
-	async delete(ids: ArrayLike<number>): Promise<DeleteResult> {
+	async delete(ids: ArrayLike<number>): Promise<DeleteResult & { trace: TraceEnvelope }> {
+		const t0 = nowMs();
+		const at = Date.now();
 		const r = await deleteIds(this.writer(), ids);
+		const tUse = nowMs();
 		await this.useRevision(r.gen, r.rev);
-		return r;
+		return { ...r, trace: this.writeEnvelope("delete", r, t0, at, tUse) };
+	}
+
+	/** A write's envelope: the commit (writing objects + the manifest CAS) and switching the index to the new revision. */
+	private writeEnvelope(op: "upsert" | "delete", r: UpsertResult | DeleteResult, t0: number, at: number, tUse: number): TraceEnvelope {
+		const trace = envelope({
+			op,
+			t0,
+			at,
+			attrs: { gen: r.gen, rev: r.rev },
+			spans: [
+				{ name: "commit", start: 0, ms: roundMs(tUse - t0) },
+				{ name: "useRevision", start: roundMs(tUse - t0), ms: roundMs(nowMs() - tUse) },
+			],
+			counters: numericFields(r, ["rev", "ms"]),
+		});
+		emitTrace(this.opts, trace);
+		return trace;
 	}
 
 	/** Frees the wasm objects (routing table, PQ codebook, lexical readers). The index cannot be used afterwards. */
@@ -1460,4 +1585,44 @@ export async function loadBase(store: BlobStore, rev: RevState, epoch: number, l
 		if (pq) safeFree(pq);
 		throw e;
 	}
+}
+
+/** A query envelope with the routing-table load that preceded it (`timeline.base`) as its first span. */
+function withBaseSpan(t: TraceEnvelope, base: BaseStat): TraceEnvelope {
+	const children: TraceSpan[] = [
+		{ name: "fetch", start: 0, ms: base.fetch },
+		{ name: "build", start: base.fetch, ms: base.build },
+	];
+	return {
+		...t,
+		at: t.at - base.ms,
+		ms: roundMs(t.ms + base.ms),
+		io: addIo(t.io, ioOf(base)),
+		spans: [phaseSpan("base", 0, base, children), ...shiftSpans(t.spans, base.ms)],
+		counters: { ...t.counters, baseBytes: base.files.coarse + base.files.fine + base.files.pq },
+	};
+}
+
+/** The open's envelope: its `openStats` steps as spans, started at the given offsets (ms from the open's start). */
+function openEnvelope(st: OpenStats, at: number, starts: { current: number; prefetch: number; revision: number; base: number }, rev: RevState): TraceEnvelope {
+	const spans: TraceSpan[] = [
+		phaseSpan("current", starts.current, st.current),
+		phaseSpan("prefetch", starts.prefetch, st.prefetch),
+		phaseSpan("manifest", starts.revision, st.manifest),
+		phaseSpan("slabs", roundMs(starts.revision + st.manifest.ms), st.slabs),
+	];
+	if (st.base) spans.push(phaseSpan("base", starts.base, st.base, [{ name: "fetch", start: starts.base, ms: st.base.fetch }, { name: "build", start: roundMs(starts.base + st.base.fetch), ms: st.base.build }]));
+	const io = spans.reduce((a, sp) => addIo(a, sp.io), zeroIo());
+	// A PackedBlobStore was opened before `open` (its footer and directory): a span without a start, not in `ms`.
+	if (st.pack) spans.unshift(phaseSpan("pack", undefined, st.pack));
+	return envelope({
+		op: "open",
+		t0: 0,
+		at,
+		ms: st.total,
+		attrs: { gen: rev.gen, rev: rev.rev, format: rev.format, prefetch: st.prefetch.source, base: st.base !== null },
+		io,
+		spans,
+		counters: { wasmInitMs: st.wasmInit, slabs: rev.slabs?.length ?? 0, deltas: rev.deltas.length, segments: rev.segments.length },
+	});
 }

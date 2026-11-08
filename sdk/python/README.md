@@ -209,6 +209,14 @@ its wall time and the store work that completed during it (trace snapshots at th
 present when this query (re)loaded the routing table (a switch to another generation). Same fields as the
 TypeScript SDK's `stats.timeline`.
 
+`stats["trace"]` is the query's trace envelope, the same JSON (camelCase keys) as the TypeScript SDK's and the
+Worker's: spans (the phases above), store work, counters (`pushed`: entries that entered a scan's heap) and the CPU
+of each kernel (`route`, `scan`, `deltaScan`, `merge`, `rerank`, timed inside the extension with the GIL released).
+`trace_events=True` adds one event per store read. `search` and `lexical_search` carry one in `stats["trace"]`,
+`list_keys` pages, `upsert` and `delete` results in `.trace`, `index.open_trace` is the open's, and
+`open_index(on_trace=fn, trace_sample=0.1)` hands a sampled share of them (`get`'s too) to `fn`. See
+[docs/observability.md](../../docs/observability.md).
+
 `index.query_many(vectors, **options)` runs the queries concurrently against the same snapshot.
 
 ### `index.search(text=None, vector=None, **options) -> SearchResult`

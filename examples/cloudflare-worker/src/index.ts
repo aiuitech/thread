@@ -54,6 +54,7 @@ import { loadRevState as sdkLoadRevState } from "../../../sdk/ts/src/revision.ts
 import { R2BlobStore } from "../../../sdk/ts/src/store.ts";
 import { createGeneration, type CreateGenerationOptions } from "../../../sdk/ts/src/create.ts";
 import { ThreadError } from "../../../sdk/ts/src/wire.ts";
+import { envelope, type TraceEnvelope } from "../../../sdk/ts/src/trace.ts";
 import { currentBody, groupedTableOf, keys as sdkKeys, type Manifest as SdkManifest, type RoutingElem, type RoutingOption, type RoutingTables } from "../../../sdk/ts/src/wire.ts";
 
 interface Env {
@@ -66,6 +67,10 @@ interface Env {
 	SLOTS?: SlotsRpc;
 	/** The slot this isolate is (absent: the orchestrator / query isolate). */
 	THREAD_SLOT?: string;
+	/** Fraction of /query requests whose trace envelope is logged (Workers Logs) and written to QUERY_METRICS. */
+	TRACE_SAMPLE?: string;
+	/** Analytics Engine dataset: one data point per sampled query (docs/observability.md). */
+	QUERY_METRICS?: AnalyticsEngineDataset;
 }
 
 interface SlotsRpc {
@@ -141,6 +146,86 @@ async function withWasmRecovery<T>(label: string, fn: (attempt: number) => Promi
 class HttpError extends Error {
 	constructor(public status: number, message: string) {
 		super(message);
+	}
+}
+
+/** The /query response's numbers the trace envelope reads (see runQueryOn). */
+interface QueryBody {
+	gen: string;
+	rev: number;
+	ids: number[];
+	cells: number[];
+	stats: Record<string, unknown> & { scanned: number; scanBytes: number; slabBytes: number; cacheHits: number; cacheMisses: number; range: { r206: number; r200: number; miss: number }; nprobe: number; routing: string; format: number; params: { rerank: number }; k: number; filtered: boolean; attempt: number; pushed: number };
+}
+
+/**
+ * The /query trace envelope (sdk "worker", same schema as the SDKs': docs/observability.md). Spans: `gen`
+ * (current.json / revision lookup), `load` (revision state and routing table, when not cached, plus routing),
+ * `phase1` with `fetch` (until the last scan prefix arrived), `delta` and `scanAndMerge`, `phase2`. The Worker's clock
+ * advances only across I/O, so CPU-only spans read 0 and there are no kernel timings: Workers Logs' cpuTimeMs is
+ * the request's CPU.
+ */
+function queryEnvelope(b: QueryBody, t: { tStart: number; tGen: number; tRoute: number; tFetch: number; tLastSlab: number; tDeltaEnd: number; tPhase1: number; tEnd: number }): TraceEnvelope {
+	const s = b.stats;
+	const at = (x: number) => x - t.tStart;
+	const n = (k: string) => (typeof s[k] === "number" ? (s[k] as number) : 0);
+	const io = { reads: s.cacheHits + s.cacheMisses + n("rerankReads") + n("specReads"), hits: s.cacheHits, misses: s.cacheMisses, r206: s.range.r206, r200: s.range.r200, bytes: s.slabBytes + n("rerankBytes") + n("deltaBytes") };
+	return envelope({
+		op: "query",
+		sdk: "worker",
+		t0: t.tStart,
+		at: t.tStart,
+		ms: t.tEnd - t.tStart,
+		attrs: { gen: b.gen, rev: b.rev, format: s.format, routing: s.routing, topK: s.k, nprobe: s.nprobe, rerank: s.params.rerank, filtered: s.filtered, attempt: s.attempt, cache: String(s.cache ?? "") },
+		io,
+		spans: [
+			{ name: "gen", start: 0, ms: at(t.tGen) },
+			{ name: "load", start: at(t.tGen), ms: t.tRoute - t.tGen },
+			{ name: "route", start: at(t.tRoute), ms: t.tFetch - t.tRoute },
+			{
+				name: "phase1",
+				start: at(t.tFetch),
+				ms: t.tPhase1 - t.tFetch,
+				children: [
+					{ name: "fetch", start: at(t.tFetch), ms: t.tLastSlab - t.tFetch },
+					{ name: "delta", start: at(t.tFetch), ms: t.tDeltaEnd - t.tFetch },
+					{ name: "scanAndMerge", start: at(t.tLastSlab), ms: t.tPhase1 - t.tLastSlab },
+				],
+			},
+			{ name: "phase2", start: at(t.tPhase1), ms: t.tEnd - t.tPhase1 },
+		],
+		counters: {
+			hits: b.ids.length,
+			cells: b.cells.length,
+			scanned: s.scanned,
+			scanBytes: s.scanBytes,
+			slabBytes: s.slabBytes,
+			pushed: s.pushed,
+			...Object.fromEntries(["candidates", "filterDropped", "tombDropped", "rerankCandidates", "rerankSlabs", "rerankReads", "rerankBytes", "rerankLocal", "specRecords", "specUsed", "deltas", "deltaBytes", "deltaScanned", "deltaHits", "deltaDropped", "deltaTop", "tombstones", "tombSets", "limiterRetries"].map((k) => [k, n(k)])),
+		},
+	});
+}
+
+/**
+ * Sampled export of a query's envelope (`TRACE_SAMPLE`, default 0): one JSON log line (`{"trace": ...}`, indexed by
+ * Workers Logs) and, with the QUERY_METRICS binding, one Analytics Engine data point. Data point layout (keep it
+ * stable, queries depend on it): index1 = gen; blob1..5 = gen, colo, routing, cache mode, filtered ("1"/"0");
+ * double1..12 = ms, gen ms, load ms, phase1 ms, fetch ms, phase2 ms, scanBytes, rerankBytes, cache misses, scanned,
+ * nprobe, rerank.
+ */
+function traceSampled(env: Env, t: TraceEnvelope, colo: string): void {
+	const rate = Number(env.TRACE_SAMPLE ?? 0);
+	if (!(rate > 0) || (rate < 1 && Math.random() >= rate)) return;
+	try {
+		console.log(JSON.stringify({ trace: t, colo }));
+		const span = (name: string) => t.spans.find((s) => s.name === name);
+		env.QUERY_METRICS?.writeDataPoint({
+			indexes: [String(t.attrs.gen)],
+			blobs: [String(t.attrs.gen), colo, String(t.attrs.routing), String(t.attrs.cache), t.attrs.filtered ? "1" : "0"],
+			doubles: [t.ms, span("gen")?.ms ?? 0, span("load")?.ms ?? 0, span("phase1")?.ms ?? 0, span("phase1")?.children?.[0]?.ms ?? 0, span("phase2")?.ms ?? 0, t.counters.scanBytes, t.counters.rerankBytes, t.io.misses, t.counters.scanned, Number(t.attrs.nprobe), Number(t.attrs.rerank)],
+		});
+	} catch {
+		/* observability must not fail a query */
 	}
 }
 
@@ -2639,10 +2724,11 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	let specReadN = 0;
 	let tombDropped = 0;
 	let filterDropped = 0;
+	let pushed = 0;
 	let scannedCells = 0;
-	// Out-parameter of thread.scan/scan_pq/scan_delta: [scanned, tombstoned entries skipped, filtered out]. Shared:
-	// each scan is synchronous and read right after the call.
-	const scanStats = new Uint32Array(3);
+	// Out-parameter of thread.scan/scan_pq/scan_delta: [scanned, tombstoned entries skipped, filtered out, pushed into
+	// the top-T heap]. Shared: each scan is synchronous and read right after the call.
+	const scanStats = new Uint32Array(4);
 	const noTomb = new Uint8Array(0);
 	/**
 	 * Reads the rerank records `idxs` (ascending) of one slab: one multi-range request (rr=multi), else
@@ -2749,6 +2835,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			}
 			tombDropped += scanStats[1];
 			filterDropped += scanStats[2];
+			pushed += scanStats[3];
 			const centroid = doRerank && info.version >= 2 ? (dbg.copy ? thread.slab_centroid(prefix) : centroidFromBytes(prefix, info)) : null;
 			versions.add(info.version);
 			scanned += info.count;
@@ -2804,6 +2891,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			const hits = thread.scan_delta(bytes, q, deltaQc(d, bytes), T, tomb ? tombFor(tomb, d.addedRev + 1) : noTomb, filterWords, scanStats);
 			deltaDropped += scanStats[1];
 			filterDropped += scanStats[2];
+			pushed += scanStats[3];
 			for (const h of parseHits(hits)) deltaHits.push({ id: h.id, score: h.score, seq: d.seq });
 			tDeltaEnd = Date.now();
 		}),
@@ -2885,7 +2973,7 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 	}
 	const results = [...best.values()].sort((a, b) => b.score - a.score).slice(0, k);
 	const tEnd = Date.now();
-	return json({
+	const body = {
 		gen,
 		rev: rv.rev,
 		ids: results.map((r) => r.id),
@@ -2949,6 +3037,8 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			// candidates, and the widening bound (= nprobe without a filter).
 			filtered,
 			filterDropped,
+			// Entries pushed into a scan's top-T heap (slabs and deltas): the heap work on top of scoring.
+			pushed,
 			candidates: cand.size,
 			maxNprobe,
 			limiterRetries: lim.retries,
@@ -2978,7 +3068,10 @@ async function runQueryOn(rv: RevState, base: LoadedBase, request: Request, env:
 			indexLoadMs: base.loadMs,
 			revLoadMs: rv.loadMs,
 		},
-	});
+	};
+	const trace = queryEnvelope(body, { tStart, tGen, tRoute, tFetch, tLastSlab, tDeltaEnd, tPhase1, tEnd });
+	traceSampled(env, trace, (request.cf as { colo?: string } | undefined)?.colo ?? "");
+	return json({ ...body, trace });
 }
 
 /**

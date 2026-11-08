@@ -14,6 +14,14 @@ codegen-units = 1
 panic = "abort"
 debug = false
 
+# For profilers (samply, perf, Instruments): release code with line tables and symbols, so a flamegraph of the
+# CLI, the benches or the Python extension maps to source lines. `cargo bench -p thread-core --profile profiling`,
+# `cargo build -p thread-cli --profile profiling`; see docs/observability.md.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+
 # The Python extension (crates/thread-py, built by maturin with `--profile python`): a panic must
 # unwind into a Python exception instead of aborting the interpreter.
 [profile.python]

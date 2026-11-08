@@ -19,6 +19,10 @@ export default defineConfig({
 			EMBED_API_KEY: bindings.secret(),
 			LOADER: bindings.workerLoader(),
 			AI: bindings.ai(),
+			// Query traces (docs/observability.md): the share of /query requests whose trace envelope is logged as one
+			// JSON line and written to QUERY_METRICS as one Analytics Engine data point. "0" = off.
+			TRACE_SAMPLE: bindings.text("0"),
+			QUERY_METRICS: bindings.analyticsEngineDataset({ name: "thread_queries" }),
 		},
 	},
 });

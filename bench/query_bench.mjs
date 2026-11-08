@@ -22,9 +22,12 @@
  * (m configs, order rotated per vector), so
  * every config sees the same queries and the same network conditions over time; a per-config summary follows
  * the pass (one JSON line per config with --json). Use "-" for "no extra switches".
+ * Workers that return a trace envelope (`trace`, docs/observability.md) get a per-span breakdown after the summary
+ * (`--trace 0` hides it); the --json row carries it as `trace`.
  */
 import fs from "node:fs";
 import path from "node:path";
+import { printSummary, summarize } from "./lib/trace.mjs";
 
 const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const args = {};
@@ -89,7 +92,7 @@ async function query(i) {
 	const data = await res.json();
 	const gt = truth(qIndex(i));
 	const hit = data.ids.filter((id) => gt.has(id)).length;
-	return { ms, cfg, recall: hit / gt.size, timing: data.timing, stats: data.stats, gen: data.gen, rev: data.rev, cells: data.cells };
+	return { ms, cfg, recall: hit / gt.size, timing: data.timing, stats: data.stats, gen: data.gen, rev: data.rev, cells: data.cells, trace: data.trace ?? null };
 }
 
 async function run(label) {
@@ -150,6 +153,9 @@ async function run(label) {
 	const hits = ok.reduce((a, r) => a + (r.stats.cacheHits ?? 0), 0);
 	const misses = ok.reduce((a, r) => a + (r.stats.cacheMisses ?? 0), 0);
 	const colos = [...new Set(ok.map((r) => r.stats.colo))].join(",");
+	const traced = ok.filter((r) => r.trace);
+	const traceSum = traced.length ? summarize(traced.map((r) => r.trace)) : null;
+	if (traceSum && args.trace !== "0") printSummary(traceSum, { indent: "  trace " });
 	console.log(`  cache: ${cache} slab hit rate ${hits + misses ? ((100 * hits) / (hits + misses)).toFixed(1) : "n/a"}% (${hits} hits / ${misses} misses)  colo ${colos}`);
 	if (errs) {
 		const kinds = {};
@@ -189,6 +195,7 @@ async function run(label) {
 			srvTotal: num((r) => r.timing.total), fetch: num((r) => r.timing.fetch), phase1: num((r) => r.timing.phase1 ?? 0), phase2: num((r) => r.timing.phase2 ?? 0),
 			scanMB: num((r) => (r.stats.scanBytes ?? 0) / 1048576), rerankReads: num((r) => r.stats.rerankReads ?? 0), rerankSlabs: num((r) => r.stats.rerankSlabs ?? 0),
 			rerankKB: num((r) => (r.stats.rerankBytes ?? 0) / 1024), misses: ok.reduce((a, r) => a + (r.stats.cacheMisses ?? 0), 0),
+			...(traceSum ? { trace: traceSum } : {}),
 		}) + "\n");
 	}
 	return { ok, lat };

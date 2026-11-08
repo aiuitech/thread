@@ -37,6 +37,22 @@ from source, runs every check and publishes.
   (about 1000 cells at dim 1024 and 32 MiB; larger builds belong in the Worker's build slots). See
   docs/embedding.md "A bulk build in bounded steps".
 - `createGeneration({ means })` (TypeScript): rev 0 with `k` empty cells with those means.
+- **Trace envelopes** ([docs/observability.md](docs/observability.md)): every SDK operation (query, search,
+  lexical search, open, get, listKeys, upsert, delete) builds one JSON envelope, the same schema in TypeScript,
+  Python and the reference Worker: spans with their start, wall time and store work, counters, the CPU of each
+  kernel (wasm calls timed in Node, the native `QueryRun` timing its scans, merge and rerank with the GIL released)
+  and, opt-in, one event per store read (`traceEvents` / `trace_events`). `stats.trace` / `stats["trace"]`,
+  `r.trace`, `index.openTrace` / `index.open_trace`; `open({ onTrace, traceSample })` /
+  `open_index(on_trace=, trace_sample=)` hand a sampled share to a function. The interop test compares both SDKs'
+  envelopes. Python's `KeyPage`, `UpsertResult` and `DeleteResult` gain a `trace` field (excluded from equality).
+- **`pushed`**: the scan kernels count entries pushed into the top-T heap (`ScanStats.pushed`, the wasm scans'
+  fourth stats slot, `stats.pushed`). Callers passing a three-slot stats array keep working.
+- **Reference Worker**: `/query` returns its envelope (`trace`, `sdk: "worker"`); `TRACE_SAMPLE` (default `"0"`) logs
+  a share of them as JSON lines and writes them to the `QUERY_METRICS` Analytics Engine dataset (`thread_queries`).
+- **Profiling**: Criterion benches of the query kernels at g4's shape (`cargo bench -p thread-core`, real slab and
+  codebook fixtures via `THREAD_BENCH_SLAB` / `THREAD_BENCH_PQ`), a `profiling` cargo profile (release with line
+  tables) for flamegraphs, `bench/scenarios.mjs` (workload scenarios over the SDK), and `bench/query_bench.mjs`
+  prints the Worker's per-span breakdown.
 
 ## 0.2.2 (2026-11-04)
 
