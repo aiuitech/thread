@@ -116,6 +116,9 @@ describe("bulk build of a dense generation", () => {
 		const r = rng(3);
 		// More vectors in one add than a 32 MiB compaction always folds (about 800 at dim 1024).
 		await expect(b.add({ ids: Array.from({ length: 1000 }, (_, i) => i), vectors: unitRows(1000, dim, r) })).rejects.toMatchObject({ status: 413 });
+		// A meta that is not a string is refused when it is added, not when it is replayed after seal.
+		await expect(b.add({ keys: ["m"], metas: [{ path: "m" } as never], vectors: unitRows(1, dim, r) })).rejects.toMatchObject({ status: 400 });
+		expect(b.state.staged).toBe(0);
 		await b.add({ ids: [1, 2], vectors: unitRows(2, dim, r) });
 		await b.seal();
 		await expect(b.add({ ids: [3], vectors: unitRows(1, dim, r) })).rejects.toMatchObject({ status: 409 });

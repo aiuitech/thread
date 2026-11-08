@@ -25,7 +25,7 @@ import type { Thread, ThreadIndex } from "./index.js";
 import type { BlobStore } from "./store.js";
 import type { AttrFieldSpec, AttrSchema, AttrValues } from "./attrs.js";
 import { COMPACTION_PROFILES, decodeJson, keys, ThreadError, type CompactionPolicy, type LexConfig, type Manifest, type QueryDefaults } from "./wire.js";
-import { MAX_UPSERT } from "./write.js";
+import { checkStrings, MAX_UPSERT } from "./write.js";
 
 export interface BulkBuildOptions {
 	store: BlobStore;
@@ -264,6 +264,8 @@ export class BulkBuild {
 		if (n > MAX_UPSERT) throw new ThreadError(`at most ${MAX_UPSERT} documents per add`, 400);
 		if (docs.keys && docs.ids && docs.ids.length !== n) throw new ThreadError(`${docs.ids.length} ids for ${n} keys`, 400);
 		for (const [name, a] of [["metas", docs.metas], ["texts", docs.texts], ["attrs", docs.attrs]] as const) if (a && a.length !== n) throw new ThreadError(`${a.length} ${name} for ${n} documents`, 400);
+		checkStrings("metas", docs.metas);
+		checkStrings("texts", docs.texts);
 		const dim = s.dim;
 		const rows: (Float32Array | number[] | null)[] = docs.vectors instanceof Float32Array ? Array.from({ length: docs.vectors.length / dim }, (_, i) => (docs.vectors as Float32Array).subarray(i * dim, (i + 1) * dim)) : docs.vectors;
 		if (docs.vectors instanceof Float32Array && docs.vectors.length !== n * dim) throw new ThreadError(`vectors hold ${docs.vectors.length} floats, expected ${n} x ${dim}`, 400);

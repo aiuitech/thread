@@ -330,6 +330,18 @@ interface Batch {
 const utf8Len = (s: string): number => new TextEncoder().encode(s).byteLength;
 
 /** Validates the batch and returns ids and unit-normalized vectors (a copy). */
+/**
+ * Texts and metas reach the wasm segment job as strings: anything else (an object passed as a meta) would trap the
+ * instance and reset it for every index in the isolate, so it is refused here.
+ */
+export function checkStrings(name: "texts" | "metas", a: readonly unknown[] | null | undefined): void {
+	if (!a) return;
+	for (let i = 0; i < a.length; i++) {
+		const x = a[i];
+		if (x !== null && x !== undefined && typeof x !== "string") throw new ThreadError(`${name}[${i}] is ${Array.isArray(x) ? "an array" : typeof x}, not a string or null${name === "metas" ? " (JSON.stringify it)" : ""}`, 400);
+	}
+}
+
 function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | null, schema: AttrSchema | null): Batch {
 	const keys = input.keys ? Array.from(input.keys) : null;
 	if (keys) {
@@ -354,6 +366,8 @@ function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | 
 	const metas = input.metas ?? null;
 	if (texts && texts.length !== n) throw new ThreadError(`${texts.length} texts for ${n} ids`, 400);
 	if (metas && metas.length !== n) throw new ThreadError(`${metas.length} metas for ${n} ids`, 400);
+	checkStrings("texts", texts);
+	checkStrings("metas", metas);
 	if ((texts || metas) && !lex) throw new ThreadError("texts/metas need a lexical configuration (index.configureLexical)", 400);
 	if (input.attrs && input.attrs.length !== n) throw new ThreadError(`${input.attrs.length} attrs for ${n} ids`, 400);
 	const attrs = input.attrs ? Uint32Array.from({ length: n }, (_, i) => packAttrs(schema, input.attrs![i])) : null;
@@ -528,6 +542,9 @@ interface Chunked {
  */
 async function expandInput(input: UpsertInput, defaultEmbed: WriterContext["embedder"], dense: boolean): Promise<{ input: UpsertInput; chunked: Chunked | null }> {
 	if (input.embed && input.vectors !== undefined) throw new ThreadError("vectors and embed together: pass one or the other", 400);
+	// Before the chunker and the embedder see them (prepareBatch checks the final batch again).
+	checkStrings("texts", input.texts);
+	checkStrings("metas", input.metas);
 	let out = input;
 	// The generation names its model and the index can call it: texts without vectors are embedded as documents.
 	if (out.embed === undefined && out.vectors === undefined && out.texts && dense && defaultEmbed) out = { ...out, embed: (texts) => defaultEmbed(texts, "document") };

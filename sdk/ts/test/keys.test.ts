@@ -135,6 +135,13 @@ describe("keys", () => {
 		await expect(index.upsert({ keys: ["k".repeat(5000)], metas: ["x"] })).rejects.toThrow(/longer than 4096/);
 		await expect(index.upsert({ metas: ["x"] })).rejects.toThrow(/needs ids or keys/);
 		await expect(index.deleteKeys([])).rejects.toThrow(/no keys/);
+		// metas and texts are strings: anything else is refused before the wasm sees it (it used to trap and reset
+		// the instance), and the instance is not reset
+		const resets = thread.resets;
+		await expect(index.upsert({ keys: ["a", "b"], metas: ["x", { k: 1 } as never] })).rejects.toMatchObject({ status: 400, message: expect.stringMatching(/metas\[1\] is object, not a string or null/) });
+		await expect(index.upsert({ keys: ["a"], texts: [42 as never] })).rejects.toThrow(/texts\[0\] is number/);
+		await expect(index.upsert({ keys: ["a"], texts: [["x"] as never], chunk: true })).rejects.toThrow(/texts\[0\] is an array/);
+		expect(thread.resets).toBe(resets);
 		// a key alone is a document (an empty docs entry): get returns it with an empty meta
 		const only = await index.upsert({ keys: ["just-a-key"] });
 		expect(only.ids).toEqual([0]);

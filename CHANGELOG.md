@@ -37,6 +37,9 @@ from source, runs every check and publishes.
   (about 1000 cells at dim 1024 and 32 MiB; larger builds belong in the Worker's build slots). See
   docs/embedding.md "A bulk build in bounded steps".
 - `createGeneration({ means })` (TypeScript): rev 0 with `k` empty cells with those means.
+- `upsert` (TypeScript) refuses `metas` and `texts` that are not strings or null with a 400 naming the entry, before
+  the chunker, the embedder or the wasm: an object passed as a meta used to trap the wasm instance and reset it
+  for every index in the isolate. `bulkBuild.add` checks the same when staging.
 - **Trace envelopes** ([docs/observability.md](docs/observability.md)): every SDK operation (query, search,
   lexical search, open, get, listKeys, upsert, delete) builds one JSON envelope, the same schema in TypeScript,
   Python and the reference Worker: spans with their start, wall time and store work, counters, the CPU of each
