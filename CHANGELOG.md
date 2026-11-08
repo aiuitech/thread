@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## 0.2.3 (unreleased)
+## 0.2.3 (2026-11-08)
 
 - **Dense compaction keeps every cell processable by its budget** (TypeScript `index.compact` / `compactDeltas`).
   Before, at dim 1024 a 32 MiB call folded a one-cell generation up to just under `maxCellEntries` (3000, profile

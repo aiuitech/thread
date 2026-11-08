@@ -1,6 +1,6 @@
 {
   "name": "@aiuitech/thread-sdk",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Query and update a thread blob-native search index (slabs and segments in R2, any S3-compatible store, a directory or a single pack file) from Cloudflare Workers and Node",
   "type": "module",
   "publishConfig": {
