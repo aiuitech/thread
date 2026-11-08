@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## 0.2.4 (unreleased)
+## 0.2.4 (2026-11-08)
 
 - **A bulk build step ends by progress, not only by the clock** (TypeScript `BulkBuild.step`). A `load` pass
   starts no replay within 4 s of the deadline; when opening the build's index left less than that, `step()` called
