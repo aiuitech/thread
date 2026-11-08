@@ -19,6 +19,7 @@ import init, * as W from "./wasm/thread.js";
 import { CachedBlobStore, inWorkers, MemoryCache, newTrace, nowMs, phaseStat, PrefixedBlobStore, R2BlobStore, roundMs, type BlobCache, type BlobStore, type BlobTrace, type CacheLike, type MissPolicy, type PhaseStat, type R2BucketLike } from "./store.js";
 import { executeQuery, safeFree, type Base, type BaseStat, type ColdPolicy, type QueryOptions, type QueryResult, type RevState } from "./query.js";
 import { dropGeneration, gcGeneration, setCurrent, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
+import { openBulkBuild, type BulkBuild, type BulkBuildOptions } from "./build.js";
 import { compactDeltas, compactionLimits, compactionStatus, type CompactionLimits, type CompactionStatus, type CompactOptions, type CompactResult } from "./compact.js";
 import { commitMergedSegment, compactSegments, configureAttrs, configureLexical, createGeneration, createLexicalGeneration, deleteIds, deleteKeys, upsert, type CompactSegmentsResult, type ConfigureAttrsResult, type ConfigureLexicalResult, type CreateGenerationOptions, type CreateGenerationResult, type CreateLexicalOptions, type DeleteResult, type MergedSegmentInput, type UpsertInput, type UpsertResult, type WriterContext } from "./write.js";
 import { normalizeRows, resolveEmbedder, splitRows, type EmbedKind, type EmbedOptions, type EmbeddingConfig, type TextEmbedder } from "./embed.js";
@@ -48,6 +49,7 @@ export { dropGeneration, gcGeneration, setCurrent, supersededKey, type DropGener
 export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionLimits, compactionPressure, compactionStatus, tombDroppable, type CompactionLimits, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
 export type { UpsertScope, CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, MergedSegmentInput, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
 export { CREATE_DEFAULTS, commitMergedSegment, createGeneration, createLexicalGeneration } from "./write.js";
+export { BulkBuild, bulkBuildPlan, openBulkBuild, type BulkBuildOptions, type BulkBuildState, type BulkDocs, type BulkPhase, type BulkStepResult } from "./build.js";
 
 /** A document fetched by key: its id and `docs` entry. */
 export interface KeyRecord extends DocRecord {
@@ -315,6 +317,15 @@ export class Thread {
 	/** Publishes a dense generation from nothing, for an embedding model or a vector size (see `createGeneration`). */
 	createGeneration(opts: CreateGenerationOptions): Promise<CreateGenerationResult> {
 		return createGeneration(W, opts);
+	}
+
+	/**
+	 * @experimental Starts or resumes a bulk build of a dense generation (`build/{gen}/state.json`): `add` stages
+	 * documents with vectors, `seal` fixes the layout, `step` advances sample, k-means, create, load and compaction in
+	 * bounded calls until `done` (see `BulkBuild`).
+	 */
+	bulkBuild(opts: BulkBuildOptions): Promise<BulkBuild> {
+		return openBulkBuild(this, opts);
 	}
 }
 

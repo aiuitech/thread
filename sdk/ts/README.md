@@ -399,6 +399,11 @@ before 0.2.1 ignore ([docs/update-path.md](../../docs/update-path.md#scoped-tomb
 with one empty cell for `embedding` (or a bare `dim`), `lex` (default `{}`; `null` for ids only), `attrs`, a
 `profile` (`edge` splits cells at 3000 entries, `local` at 1000), `defaults` and the automatic `compaction` policy;
 what that generation lacks compared with a k-means build is in [docs/embedding.md](../../docs/embedding.md).
+`means` (`k x dim` floats) gives rev 0 `k` empty cells instead of one. For a large load, `thread.bulkBuild({ store,
+gen, embedding, lex, attrs, maxBytes })` (`@experimental`) stages documents with `b.add({ keys, metas, texts, attrs,
+vectors })`, and after `b.seal()` each `b.step({ deadlineMs })` advances sample, k-means, create, load and
+compaction within `maxBytes`, resuming from `build/{gen}/state.json`, until `done`; then `setCurrent` and
+`b.cleanup()` ([docs/embedding.md](../../docs/embedding.md#a-bulk-build-in-bounded-steps)).
 
 `index.compact(opts)` (also `compactDeltas(writerContext, opts)`) is the Worker's dense compaction in one isolate:
 one call folds a slice of delta segments (whole segments, oldest first) into new slab revisions, splits the
@@ -406,8 +411,8 @@ rewritten cells over `maxCellEntries` (2-means; new fine means, `k2` + splits, t
 head has one) and drops the tombstone sets nothing references. A call is bounded by `maxBytes` (estimated peak
 memory, default 48 MiB; `r.estimatedPeakBytes` is the plan's figure, an upper bound of what was measured),
 `cellsPerRun` (default the policy's, 256) and `deadlineMs` (default the policy's, 27 s: no cell starts after
-`deadline - 2.5 s`, 7 s with splits; the finished cells whose deltas are complete are committed, `outcome:
-"partial"`). `maxBytes` also sizes the cells: they split at `min(maxCellEntries, splitEntries / 2)`, where
+`deadline - 2.5 s`, up to 7 s with splits by the size of the fine means; the finished cells whose deltas are
+complete are committed, `outcome: "partial"`). `maxBytes` also sizes the cells: they split at `min(maxCellEntries, splitEntries / 2)`, where
 `splitEntries` is the largest cell the budget can split on its own, and no fold takes a cell past `splitEntries` (a
 cell in the way of a delta is split first, `r.presplit`). So every cell stays processable by a later call with the
 same budget; `index.compactionLimits(maxBytes)` / `compactionLimits(manifest, { maxBytes })` tells the numbers

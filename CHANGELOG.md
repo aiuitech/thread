@@ -26,6 +26,17 @@ from source, runs every check and publishes.
   docs/update-path.md "Memory of a call".
 - A split whose 2-means leaves one half empty (identical vectors) halves the entries under the one mean, so such a
   cell still shrinks.
+- With splits, a compaction keeps up to 4.5 s more than the 2.5 s commit reserve, scaled by the fine means' bytes
+  (all of it with a tree): before, it always kept 7 s, so under a deadline under about 8 s a call with splits
+  started no cell.
+- **Bulk build** (TypeScript, `@experimental`): `thread.bulkBuild({ store, gen, embedding | dim, lex, attrs,
+  maxBytes })` stages documents with vectors (`add`) under `build/{gen}/`, then `seal()` and `step({ deadlineMs })`
+  run sample, k-means (wasm), create, load (each stage replayed as an upsert into `k` cells, compacting when due)
+  and compaction, in steps bounded by `maxBytes` and resumable from `build/{gen}/state.json`; `cleanup()` removes
+  the staging objects. `bulkBuildPlan(n, dim, { maxBytes })` gives `k`, the cell and sample sizes and `maxCells`
+  (about 1000 cells at dim 1024 and 32 MiB; larger builds belong in the Worker's build slots). See
+  docs/embedding.md "A bulk build in bounded steps".
+- `createGeneration({ means })` (TypeScript): rev 0 with `k` empty cells with those means.
 
 ## 0.2.2 (2026-11-04)
 

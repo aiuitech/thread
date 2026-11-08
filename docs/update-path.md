@@ -320,7 +320,9 @@ rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
    delta first. Slab objects are written create-only: the same bytes already there (a rerun on the same base after a
    crash) are reused; other bytes are overwritten only while no revision after the base changed the slabs table (so
    none can list them), else the run ends as a `conflict`.
-4. **Deadline**: no cell starts after `deadline - 2.5 s` (7 s with splits). When the deadline cuts the slice, the run
+4. **Deadline**: no cell starts after `deadline - 2.5 s`; with splits up to 4.5 s more, scaled by the fine means'
+   bytes (the 4.5 s were g4's 25 MB table and tree; a head with a tree always keeps them), so a generation with few
+   cells keeps its time for the cells. When the deadline cuts the slice, the run
    commits the finished cells whose deltas are all finished (a cell only with every folded delta in it, splits only
    as a prefix, since new cells are numbered in order; to the fixpoint) as `partial`, so a slice too large for the
    time still makes progress. Nothing committable: `deadline`.

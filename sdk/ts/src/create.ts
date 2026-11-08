@@ -41,6 +41,12 @@ export interface CreateGenerationOptions {
 	lex?: LexConfig | null;
 	/** Attribute schema (`defineAttrs` or a field spec map), optional. */
 	attrs?: AttrSchema | Record<string, AttrFieldSpec>;
+	/**
+	 * The cells' means (`k x dim` floats, e.g. from k-means over a sample; `bulkBuild` passes them): rev 0 then has
+	 * `k` empty cells (`k2 = k`) instead of one, and upserts route to the nearest. Default: one cell with an arbitrary
+	 * unit mean, which compaction splits as the data grows.
+	 */
+	means?: Float32Array;
 	/** Compaction profile: `edge` (split cells at 3000 entries; default) or `local` (1000). */
 	profile?: "edge" | "local";
 	/** Query defaults (default nprobe 32, rerank 150, pc 0; nprobe is clamped to the cell count). */
@@ -94,17 +100,27 @@ export async function createGeneration(w: SlabWasm, opts: CreateGenerationOption
 	const compaction: CompactionPolicy | null = opts.compaction === null ? null : { ...COMPACTION_PROFILES[profile], ...(opts.compaction ?? {}) };
 	const lex: LexConfig | null = opts.lex === undefined ? {} : opts.lex;
 	const attrs = opts.attrs === undefined ? undefined : "fields" in opts.attrs && Array.isArray((opts.attrs as AttrSchema).fields) ? validateSchema(opts.attrs as AttrSchema) : defineAttrs(opts.attrs as Record<string, AttrFieldSpec>);
-	// One cell whose mean is an arbitrary unit vector (the data decides the means once compaction splits the cell).
+	// One cell whose mean is an arbitrary unit vector (the data decides the means once compaction splits the cell),
+	// or one empty cell per given mean.
 	const mean = new Float32Array(dim).fill(1 / Math.sqrt(dim));
-	const job = new w.SlabJob(dim, 0, mean, 2);
-	const slab = job.finish();
-	const info = w.slab_info(slab);
-	const row: SlabRow = [info[5], info[6], 0, slab.byteLength];
+	const means = opts.means ?? mean;
+	if (!(means instanceof Float32Array) || means.length === 0 || means.length % dim !== 0) throw new ThreadError(`means must be a Float32Array of k x ${dim} floats`, 400);
+	if (!means.every(Number.isFinite)) throw new ThreadError("means must be finite", 400);
+	const k = means.length / dim;
+	const slabs: Uint8Array[] = [];
+	const rows: SlabRow[] = [];
+	for (let cell = 0; cell < k; cell++) {
+		const slab = new w.SlabJob(dim, cell, means.subarray(cell * dim, (cell + 1) * dim), 2).finish();
+		const info = w.slab_info(slab);
+		slabs.push(slab);
+		rows.push([info[5], info[6], 0, slab.byteLength]);
+	}
 	const meanBytes = new Uint8Array(mean.buffer, mean.byteOffset, mean.byteLength);
+	const fineBytes = new Uint8Array(means.buffer, means.byteOffset, means.byteLength);
 	const manifest: Manifest = {
 		gen,
 		k1: 1,
-		k2: 1,
+		k2: k,
 		dim,
 		m: 1,
 		probeCoarse: 1,
@@ -125,11 +141,12 @@ export async function createGeneration(w: SlabWasm, opts: CreateGenerationOption
 		nextSeq: 1,
 		nextId: 0,
 	};
-	const written = [keys.manifest(gen, 0), `idx/${gen}/coarse.f32`, `idx/${gen}/fine.f32`, keys.slab(gen, 0), keys.slabsTable(gen, 0)];
+	const written = [keys.manifest(gen, 0), `idx/${gen}/coarse.f32`, `idx/${gen}/fine.f32`, ...rows.map((_, cell) => keys.slab(gen, cell)), keys.slabsTable(gen, 0)];
 	// The manifest is the create-only lock: written first, so two creators of the same name cannot both succeed.
 	if (!(await putIfAbsent(store, keys.manifest(gen, 0), JSON.stringify(manifest), "application/json"))) throw new ThreadError(`generation ${gen} already exists`, 409);
 	const w2 = writable(store);
-	await Promise.all([w2.put(`idx/${gen}/coarse.f32`, meanBytes), w2.put(`idx/${gen}/fine.f32`, meanBytes), w2.put(keys.slab(gen, 0), slab), w2.put(keys.slabsTable(gen, 0), JSON.stringify([row]), { contentType: "application/json" })]);
+	await Promise.all([w2.put(`idx/${gen}/coarse.f32`, meanBytes), w2.put(`idx/${gen}/fine.f32`, fineBytes), w2.put(keys.slabsTable(gen, 0), JSON.stringify(rows), { contentType: "application/json" })]);
+	for (let i = 0; i < slabs.length; i += 16) await Promise.all(slabs.slice(i, i + 16).map((slab, j) => w2.put(keys.slab(gen, i + j), slab)));
 	let currentUpdated = false;
 	if (opts.setCurrent !== false) {
 		const cur = await readCurrent(store);

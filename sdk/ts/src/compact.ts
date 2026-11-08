@@ -89,7 +89,7 @@ export interface CompactOptions {
 	cellsPerRun?: number;
 	/**
 	 * Wall-clock budget of the call (ms, default `compaction.deadlineMs`, else 27,000). No cell starts after
-	 * `deadline - 2.5 s` (7 s with splits); the cells finished by then are committed when their deltas are complete
+	 * `deadline - 2.5 s` (up to 7 s with splits, by the size of the fine means); the cells finished by then are committed when their deltas are complete
 	 * (`outcome: "partial"`), else nothing is (`"deadline"`).
 	 */
 	deadlineMs?: number;
@@ -190,7 +190,14 @@ const DEFAULT_SPLIT_CELLS_PER_RUN = 160;
 const DEFAULT_CONCURRENCY = 4;
 /** Time kept for the commit when deciding whether to start another cell (more with splits: fine means + tree). */
 const COMMIT_RESERVE_MS = 2_500;
-const SPLIT_COMMIT_RESERVE_MS = 7_000;
+/**
+ * With splits, up to 4.5 s more: what g4's split commits took (a 25 MB fine table and a rebuilt tree; 9.4 s for two
+ * splits with the recall check). Scaled by the fine means' bytes when the head has no tree, so a small generation
+ * (a one-cell generation from `createGeneration`, a bulk build's few hundred cells) keeps its time for the cells.
+ */
+const SPLIT_EXTRA_RESERVE_MS = 4_500;
+const SPLIT_RESERVE_FINE_BYTES = 25 * 1024 * 1024;
+const splitReserveMs = (m: Manifest): number => COMMIT_RESERVE_MS + (m.tree ? SPLIT_EXTRA_RESERVE_MS : Math.ceil(SPLIT_EXTRA_RESERVE_MS * Math.min(1, (m.k1 * m.k2 * m.dim * 4) / SPLIT_RESERVE_FINE_BYTES)));
 /** A compact.lock older than this is abandoned (the Worker's rule). */
 export const COMPACT_LOCK_STALE_MS = 10 * 60 * 1000;
 /**
@@ -833,7 +840,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 
 	// ---- cells ----
 	const deadline = t0 + (opts.deadlineMs ?? policy?.deadlineMs ?? DEFAULT_DEADLINE_MS);
-	const cellDeadline = deadline - (plan.splits.length ? SPLIT_COMMIT_RESERVE_MS : COMMIT_RESERVE_MS);
+	const cellDeadline = deadline - (plan.splits.length ? splitReserveMs(manifest) : COMMIT_RESERVE_MS);
 	const splitOf = new Map(plan.splits);
 	const codebook = plan.splits.length && format === 3 ? await getOrThrow(store, files.pq!) : new Uint8Array(0);
 	// The folded deltas, in manifest order (the order the Worker adds their records in: same bytes).

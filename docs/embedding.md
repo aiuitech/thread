@@ -103,8 +103,9 @@ of one unit row, a one-row slabs table, and a manifest with
 Options: `embedding` (sizes the index by its `dim`) or `dim` alone (bring your own vectors); `lex` (default `{}`,
 so keys and texts work; `null` / `False` for ids-only), `attrs` (a schema), `profile` (`edge`: cells split at 3000
 entries, `local`: 1000), `defaults`, `compaction` (overrides, or `null` / `False` for no automatic compaction),
-`setCurrent`, `notes`. The manifest is written first with a create-only put, so two creators of one name cannot
-both succeed.
+`setCurrent`, `notes`, and in TypeScript `means` (`k x dim` floats: rev 0 then has `k` empty cells with those means
+instead of one; the bulk build below passes its k-means result). The manifest is written first with a create-only
+put, so two creators of one name cannot both succeed.
 
 From there the generation grows through the ordinary update path ([update-path.md](update-path.md)):
 
@@ -134,13 +135,69 @@ What this path does not give, and when to care:
 - **No PQ codebook** (format 2, not 3): slabs are ~4x larger per entry in the scan tier than g4's PQ-192, and a
   query reads more bytes per probed cell. Training a codebook needs residuals against stable means: a later
   `publish-rev` with `pq` after a rebuild is the place for it.
-- **Means from successive 2-means splits** route worse than one global k-means over the same vectors. For an index
-  that has grown large (hundreds of thousands of vectors), a rebuild stage that runs the existing pipeline in build
-  slots over the generation's own int8 records (sample, k-means, PQ, assign, finalize, publish as a new generation
-  with the same `embedding` block) is the planned follow-up; the SDKs need nothing new for it.
+- **Means from successive 2-means splits** route worse than one global k-means over the same vectors. A
+  generation loaded in bulk should be built with [the bulk build](#a-bulk-build-in-bounded-steps) instead. For an
+  index that has grown past what one isolate clusters (millions of vectors), a rebuild stage that runs the existing
+  pipeline in build slots over the generation's own int8 records (sample, k-means, PQ, assign, finalize, publish as
+  a new generation with the same `embedding` block) is still the planned follow-up.
 - Only the TypeScript SDK and the Worker compact and split. The Python SDK writes deltas but does not compact
   them: a generation written only from Python accumulates deltas, which still query correctly (every delta is
   scanned) but slower past a few dozen segments; compact it from TypeScript or the Worker.
+
+## A bulk build in bounded steps
+
+Loading tens of thousands of vectors into a one-cell generation through upserts makes every vector pass through
+cell 0 and a chain of 2-means splits. `thread.bulkBuild(opts)` (TypeScript, `sdk/ts/src/build.ts`) builds the
+generation with a layout from k-means instead, in steps small enough for a Durable Object alarm:
+
+```ts
+const b = await thread.bulkBuild({ store, gen: "e2", embedding, lex, attrs, maxBytes: 32 << 20, owner: state.id.toString() });
+// while copying: stage what you would have upserted (vectors may be null: text-only documents)
+await b.add({ keys, metas, texts, attrs, vectors });       // any number of calls, at most ~800 vectors each at dim 1024
+await b.seal();                                            // no more adds; k, the cell size and the sample size are fixed
+// one per alarm:
+const r = await b.step({ deadlineMs: 10_000 });            // { phase, done, worked, estimatedPeakBytes, progress, ms }
+if (r.done) { await setCurrent(store, { gen: "e2", expect }); await b.cleanup(); }
+```
+
+`thread.bulkBuild` resumes the build in `build/{gen}/state.json` when there is one (the options then only matter
+for a new build), so a new handle after a restart continues where the last step left. The phases:
+
+| phase | what a step does | holds at most |
+|---|---|---|
+| `stage` (`add`) | one JSON object (keys, metas, texts, attrs) and one f32 object per call under `build/{gen}/stage/`; the generation does not exist yet | the call's documents |
+| `sample` | reads the f32 objects in order, one at a time, and keeps `S` evenly spaced rows (`S` = 256 per cell, at most a quarter of `maxBytes` of vectors); a chunk per step under `build/{gen}/sample/` | `S x dim x 4` + one f32 object x2 |
+| `kmeans` | Lloyd iterations over the sample in wasm (`FlatKmeansJob`, `Reducer.means_reseed` for empty cells), initialised with `k` sample rows from a seeded shuffle; the means saved after each iteration (default 10) | the sample + 6 copies of the means |
+| `create` | `createGeneration({ means, setCurrent: false })`: rev 0 with `k` empty cells | the means x3 |
+| `load` | replays each stage in order as an ordinary upsert (texts and vectors; the vectors go to deltas of their nearest cell), then `compact({ maxBytes })` when it is due | a stage x5, then the compaction's `maxBytes` |
+| `compact` | `compact({ force: true, maxBytes })` until no delta is left | `maxBytes` |
+
+Sizes from `maxBytes` (`bulkBuildPlan(n, dim, { maxBytes })` computes them): cells of half what the budget splits at
+(`compactionLimits(...).cellEntries / 2`, 481 entries at dim 1024 and 32 MiB), so `k = ceil(n / 481)` and every cell
+can grow to twice its size before it splits; an `add` may carry at most `upsertVectors` vectors (810 at dim 1024
+and 32 MiB) and an eighth of `maxBytes`, so every replay folds within the budget (413 otherwise: split the add). A
+step keeps its estimate under `maxBytes` (`r.estimatedPeakBytes`) and stops starting work at `deadlineMs` (a
+replay is not started within 4 s of it, which the compaction after it uses).
+
+Each piece commits its own progress through a compare-and-swap of the state, so a step that crashed is run again:
+a sample chunk or a means iteration is written again; a replayed stage is an upsert under the same keys (or ids)
+and replaces what the lost attempt wrote; the create phase recognises its own generation. Two steps at once: the
+second fails with 409. Deletes and updates during a build are later `add`s of the same keys (an update) or go to
+the generation after `done`.
+
+Measured in Node against an in-memory store (`sdk/ts/test/build.test.ts`): 20,000 documents of dim 1024 (2%
+text-only, 19,600 vectors), 32 MiB: k-means made 41 cells, 45 after the compactions' splits (7 to 640 entries,
+none past what the budget splits); 5 steps (three cut at 0.3 s, one of 5 s that replayed 68 stages and kept the
+deltas at the trigger, one of 0.4 s), 7.3 s in all; the largest step estimate 30.5 MB, the wasm memory grew by
+6.7 MB. Against R2 every read and write costs a round trip, so a Durable Object will need more steps; that was not
+measured.
+
+What does not fit one isolate: the means are held about six times during k-means and three times in a split
+commit, so one isolate of 32 MiB clusters at most about 1000 cells at dim 1024 (`bulkBuildPlan(...).maxCells`,
+about 480,000 vectors at 481 per cell); a larger build fails at `seal` with a 413. Those belong in the Worker's
+build slots (`bench/driver.mjs`: sample, k-means, PQ, assign and finalize spread over isolates), or on the
+caller's device, as inseam already runs large lexical merges (`commitMergedSegment`): the device runs the same SDK
+calls with a larger `maxBytes` against the same store.
 
 ## Workers AI specifics
 
