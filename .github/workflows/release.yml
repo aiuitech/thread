@@ -95,7 +95,7 @@ jobs:
         include:
           - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: auto }
           - { name: linux-aarch64, os: ubuntu-latest, target: aarch64, manylinux: "2_28" }
-          - { name: macos-universal2, os: macos-14, target: universal2-apple-darwin } # arm64 + x86_64 in one wheel (macos-13 runners are retired)
+          - { name: macos-universal2, os: macos-15, target: universal2-apple-darwin } # arm64 + x86_64 in one wheel (macos-13 and macos-14 runners are retired)
           - { name: windows-x86_64, os: windows-latest, target: x64 }
     steps:
       - uses: actions/checkout@v4
@@ -152,7 +152,9 @@ jobs:
         run: |
           ./scripts/sync-wasm.sh
           npm ci
-          npm publish --access public
+          v=$(node -p "require('./package.json').version")
+          # A rerun after a partial release (npm published, a later job failed) must not fail on the version npm has.
+          if npm view "@aiuitech/thread-sdk@$v" version >/dev/null 2>&1; then echo "@aiuitech/thread-sdk@$v is published already: skipped"; else npm publish --access public; fi
 
   publish-pypi:
     needs: [wheels, sdist]
