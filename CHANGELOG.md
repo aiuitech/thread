@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## 0.2.6 (unreleased)
+## 0.2.6 (2026-11-09)
 
 - **The block cache keeps alive only the bytes a read asked for** (TypeScript, `CachedBlobStore` over the Workers
   Cache API). 0.2.5's block reads returned `subarray` views of the blocks they filled, so every range a caller kept
