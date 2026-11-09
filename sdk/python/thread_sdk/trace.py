@@ -36,11 +36,11 @@ def zero_io() -> dict[str, int]:
 def io_of(t: BlobTrace | Mapping[str, Any]) -> dict[str, int]:
     """The `io` part of a store trace or a phase stat."""
     d = t.as_dict() if isinstance(t, BlobTrace) else t
-    return {k: int(d[k]) for k in TRACE_FIELDS}
+    return {k: int(d.get(k, 0)) for k in TRACE_FIELDS}
 
 
 def add_io(a: Mapping[str, int], b: Mapping[str, int] | None) -> dict[str, int]:
-    return {k: a[k] + (b[k] if b else 0) for k in TRACE_FIELDS}
+    return {k: a.get(k, 0) + (b.get(k, 0) if b else 0) for k in TRACE_FIELDS}
 
 
 def phase_span(name: str, start: float | None, p: Mapping[str, Any],

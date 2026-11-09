@@ -35,9 +35,14 @@ export interface BlobTrace {
 	 * background (not part of `reads`/`bytes`; `CachedBlobStore.warmStats` counts what they transferred).
 	 */
 	warms?: number;
+	/**
+	 * Block fills (`CachedBlobStore` over the Cache API, `blockBytes`): blocks this call read from the origin and put
+	 * in the cache. Each is also one of `reads`, one of `misses`, and its whole block is in `bytes`.
+	 */
+	fills?: number;
 }
 
-export const newTrace = (): BlobTrace => ({ reads: 0, hits: 0, misses: 0, r206: 0, r200: 0, bytes: 0, warms: 0 });
+export const newTrace = (): BlobTrace => ({ reads: 0, hits: 0, misses: 0, r206: 0, r200: 0, bytes: 0, warms: 0, fills: 0 });
 
 /** Whether this runs inside the Cloudflare Workers runtime (6 simultaneous open connections per request). */
 export const inWorkers = (): boolean => (globalThis as { navigator?: { userAgent?: string } }).navigator?.userAgent === "Cloudflare-Workers";
@@ -56,11 +61,11 @@ export const nowMs = (): number => (typeof performance !== "undefined" ? perform
 export const roundMs = (ms: number): number => Math.round(ms * 1000) / 1000;
 
 /** A copy of a trace's counters (to diff later with `phaseStat`). */
-export const snapTrace = (t: BlobTrace): BlobTrace => ({ reads: t.reads, hits: t.hits, misses: t.misses, r206: t.r206, r200: t.r200, bytes: t.bytes });
+export const snapTrace = (t: BlobTrace): BlobTrace => ({ reads: t.reads, hits: t.hits, misses: t.misses, r206: t.r206, r200: t.r200, bytes: t.bytes, fills: t.fills ?? 0 });
 
 /** The phase between two snapshots of a trace (`before` defaults to an empty trace). */
 export function phaseStat(ms: number, after: BlobTrace, before: BlobTrace = newTrace()): PhaseStat {
-	return { ms: roundMs(ms), reads: after.reads - before.reads, hits: after.hits - before.hits, misses: after.misses - before.misses, r206: after.r206 - before.r206, r200: after.r200 - before.r200, bytes: after.bytes - before.bytes };
+	return { ms: roundMs(ms), reads: after.reads - before.reads, hits: after.hits - before.hits, misses: after.misses - before.misses, r206: after.r206 - before.r206, r200: after.r200 - before.r200, bytes: after.bytes - before.bytes, fills: (after.fills ?? 0) - (before.fills ?? 0) };
 }
 
 export interface GetOptions {
@@ -71,6 +76,12 @@ export interface GetOptions {
 	 * just the range from the origin and caches nothing.
 	 */
 	fill?: boolean;
+	/**
+	 * The object's size, when the caller already knows it (a segment ref, a `head`). A `CachedBlobStore` over the
+	 * Cache API then serves a range read that is not a `fill` from cached aligned blocks of the object
+	 * (`CachedBlobStoreOptions.blockBytes`); without it, such a read that misses goes to the origin and caches nothing.
+	 */
+	size?: number;
 }
 
 export interface PutOptions {
@@ -320,7 +331,8 @@ export interface CacheLike {
  *   in-process cache, where the whole-object transfer would otherwise sit inside the first (cold) query.
  *
  * Reads without `fill` (rerank records, lexical postings) never fetch whole objects; whole-object reads (no range)
- * are cached under every policy but `"range"`.
+ * are cached under every policy but `"range"`. Over the Cache API, a range read without `fill` that passes the
+ * object's `size` is served from cached blocks of it instead (`CachedBlobStoreOptions.blockBytes`), under every policy.
  */
 export type MissPolicy = "whole" | "range" | "range+warm";
 export const MISS_POLICIES: readonly MissPolicy[] = ["whole", "range", "range+warm"];
@@ -449,6 +461,61 @@ export class MemoryCache implements BlobCache {
 /** Cache API reads in flight per query (they are not held to the Workers limit of 6 connections). */
 export const CACHE_API_INFLIGHT = 12;
 
+/** Default `blockBytes` of a `CachedBlobStore` over the Cache API (docs/lexical.md "Block cache" has the measurements). */
+export const DEFAULT_BLOCK_BYTES = 1024 * 1024;
+/** Default memory of the blocks a store buffers at once (`blockBuffers` = this / `blockBytes`, at least 2). */
+export const BLOCK_BUFFER_BYTES = 16 * 1024 * 1024;
+/** Smallest and largest `blockBytes` (the Cache API holds at most 512 MB per entry). */
+export const MIN_BLOCK_BYTES = 64 * 1024;
+export const MAX_BLOCK_BYTES = 256 * 1024 * 1024;
+/**
+ * A block slot held this long is given back even if its cache put never settled: a put cancelled with the request
+ * that started it (no `waitUntil`, or past its 30 s) would otherwise hold the slot for the life of the isolate.
+ */
+const BLOCK_SLOT_STALE_MS = 30_000;
+
+/**
+ * A counting semaphore. A holder older than `staleMs` is reclaimed by the next `take` that finds no free slot, and a
+ * waiter looks again every `staleMs`, so a holder whose promise never settles cannot block it forever.
+ */
+class Slots {
+	private readonly holders = new Set<{ since: number }>();
+	private readonly waiters: (() => void)[] = [];
+	constructor(
+		readonly max: number,
+		readonly staleMs: number,
+	) {}
+
+	get used(): number {
+		return this.holders.size;
+	}
+
+	/** Waits for a slot; resolves to its release (idempotent). */
+	async take(): Promise<() => void> {
+		for (;;) {
+			if (this.holders.size >= this.max) {
+				const now = Date.now();
+				for (const h of this.holders) if (now - h.since > this.staleMs) this.holders.delete(h);
+			}
+			if (this.holders.size < this.max) {
+				const h = { since: Date.now() };
+				this.holders.add(h);
+				return () => {
+					if (this.holders.delete(h)) this.waiters.shift()?.();
+				};
+			}
+			await new Promise<void>((resolve) => {
+				const t = setTimeout(resolve, this.staleMs);
+				(t as { unref?: () => void }).unref?.();
+				this.waiters.push(() => {
+					clearTimeout(t);
+					resolve();
+				});
+			});
+		}
+	}
+}
+
 export interface CachedBlobStoreOptions {
 	/** Synthetic origin the cache keys live under (any https URL; objects are keyed `${origin}${scope}${key}`). Cache API only. */
 	origin?: string;
@@ -473,6 +540,30 @@ export interface CachedBlobStoreOptions {
 	/** Phase-2 range merging defaults for queries (default: the inner store's). */
 	coalesceBytes?: number;
 	spanBytes?: number;
+	/**
+	 * Cache API only: the block size for range reads of objects that are not cached whole. A range read without
+	 * `fill` that passes the object's `size` (lexical segments over `LexSegmentOptions.fillBytes`) is served from the
+	 * aligned blocks it covers, `[i * blockBytes, min((i + 1) * blockBytes, size))`, each cached under its own key; a
+	 * block that misses is read from the origin (that block only), serves the read and is put in the cache through
+	 * `waitUntil`. An object already cached whole is still served from that entry. Default `DEFAULT_BLOCK_BYTES`
+	 * (1 MiB); 0 turns blocks off (such reads go to the origin and are not cached, as before 0.2.5).
+	 */
+	blockBytes?: number;
+	/**
+	 * Blocks held in memory at once, from the start of their origin read until their cache put settles; a block miss
+	 * past it waits. Default `BLOCK_BUFFER_BYTES / blockBytes` (16 MiB worth), at least 2. Block reads from the
+	 * origin in flight are also at most `inflight`.
+	 */
+	blockBuffers?: number;
+}
+
+/** What the block cache of a `CachedBlobStore` did since it was created. */
+export interface BlockStats {
+	/** Blocks read from the origin and put in the cache, and their bytes. */
+	fills: number;
+	bytes: number;
+	/** Cache puts of blocks that failed. */
+	failed: number;
 }
 
 /** Background warm fetches of a `CachedBlobStore` (`"range+warm"`). */
@@ -573,6 +664,14 @@ export class CachedBlobStore implements BlobStore {
 	/** The in-process cache, or null for the Cache API. */
 	readonly blobCache: BlobCache | null;
 	readonly warmStats: WarmStats = { queued: 0, fetched: 0, bytes: 0, failed: 0, dropped: 0 };
+	/** Block size of the block cache (0: off, always for an in-process `BlobCache`). */
+	readonly blockBytes: number;
+	readonly blockStats: BlockStats = { fills: 0, bytes: 0, failed: 0 };
+	/** Blocks buffered (origin read until cache put) and block reads from the origin in flight. */
+	private readonly blockBuffers: Slots;
+	private readonly blockReads: Slots;
+	/** Block fills in flight by block id, until their cache put settles (concurrent readers of a block share one). */
+	private readonly blockFills = new Map<string, Promise<Uint8Array | null>>();
 	private readonly waitUntil: ((p: Promise<unknown>) => void) | undefined;
 	private readonly cacheable: (key: string) => boolean;
 	private readonly cacheControl: string;
@@ -610,10 +709,22 @@ export class CachedBlobStore implements BlobStore {
 		this.inflight = opts.inflight ?? (isApi ? CACHE_API_INFLIGHT : inner.inflight);
 		this.coalesceBytes = opts.coalesceBytes ?? inner.coalesceBytes;
 		this.spanBytes = opts.spanBytes ?? inner.spanBytes;
+		const bb = opts.blockBytes ?? DEFAULT_BLOCK_BYTES;
+		if (!Number.isInteger(bb) || (bb !== 0 && (bb < MIN_BLOCK_BYTES || bb > MAX_BLOCK_BYTES))) throw new ThreadError(`blockBytes must be 0 or an integer in [${MIN_BLOCK_BYTES}, ${MAX_BLOCK_BYTES}]`, 400);
+		this.blockBytes = isApi ? bb : 0;
+		const nb = opts.blockBuffers ?? Math.max(2, Math.floor(BLOCK_BUFFER_BYTES / (bb || DEFAULT_BLOCK_BYTES)));
+		if (!Number.isInteger(nb) || nb < 1) throw new ThreadError("blockBuffers must be an integer >= 1", 400);
+		this.blockBuffers = new Slots(nb, BLOCK_SLOT_STALE_MS);
+		this.blockReads = new Slots(Math.max(1, Math.min(nb, this.inflight ?? CACHE_API_INFLIGHT)), BLOCK_SLOT_STALE_MS);
 	}
 
 	request(key: string, range?: string): Request {
 		return new Request(this.origin + this.scope + key.replace(/^\/+/, ""), { method: "GET", headers: range ? { range } : {} });
+	}
+
+	/** The cache request of block `i` of `key` (under the scope, so indexes sharing a cache never share blocks). */
+	blockRequest(key: string, i: number, range?: string): Request {
+		return new Request(`${this.origin}${this.scope}${key.replace(/^\/+/, "")}/~block/${this.blockBytes}/${i}`, { method: "GET", headers: range ? { range } : {} });
 	}
 
 	private note(key: string): void {
@@ -738,15 +849,15 @@ export class CachedBlobStore implements BlobStore {
 	}
 
 	private wakeIdle(): void {
-		if (this.warmActive || this.warmQ.length || this.fills.size) return;
+		if (this.warmActive || this.warmQ.length || this.fills.size || this.blockFills.size) return;
 		const w = this.idleWaiters;
 		this.idleWaiters = [];
 		for (const fn of w) fn();
 	}
 
-	/** Resolves once no background warm fetch or whole-object fill is queued or running (tests, benchmarks). */
+	/** Resolves once no background warm fetch, whole-object fill or block fill is queued or running (tests, benchmarks). */
 	async drain(): Promise<void> {
-		while (this.warmActive || this.warmQ.length || this.fills.size) await new Promise<void>((r) => this.idleWaiters.push(r));
+		while (this.warmActive || this.warmQ.length || this.fills.size || this.blockFills.size) await new Promise<void>((r) => this.idleWaiters.push(r));
 	}
 
 	contains(key: string, range?: BlobRange): boolean | undefined {
@@ -771,8 +882,211 @@ export class CachedBlobStore implements BlobStore {
 		return got;
 	}
 
+	/** Whether a range read goes through the block cache: Cache API, blocks on, not a `fill`, the size known. */
+	private blocked(opts: GetOptions | undefined): opts is GetOptions & { size: number } {
+		return this.blockBytes > 0 && !opts?.fill && typeof opts?.size === "number" && Number.isSafeInteger(opts.size) && opts.size >= 0;
+	}
+
+	private blockId(key: string, i: number): string {
+		return `${key}\n${i}`;
+	}
+
+	/** The Cache API entry of the whole object, answering `ranges`: its parts, or null when it is not cached (not counted). */
+	private async matchWhole(key: string, ranges: BlobRange[], trace?: BlobTrace): Promise<RangePart[] | null> {
+		const r = await this.cacheApi!.match(this.request(key, rangeHeader(ranges)));
+		if (!r) return null;
+		this.note(key);
+		const body = new Uint8Array(await r.arrayBuffer());
+		const { parts, kind } = responseParts(r.status, r.headers.get("content-type"), r.headers.get("content-range"), body);
+		if (trace) {
+			trace.hits++;
+			trace.bytes += body.byteLength;
+			if (kind === "full") trace.r200++;
+			else trace.r206++;
+		}
+		return parts;
+	}
+
+	/**
+	 * `pieces` (absolute, all inside block `i`) from a block fill in flight or the block's cache entry (one request,
+	 * the pieces as its ranges), or null when the block has to be filled (counted as a miss).
+	 */
+	private async lookBlock(key: string, i: number, size: number, pieces: BlobRange[], trace?: BlobTrace): Promise<Uint8Array[] | null> {
+		const start = i * this.blockBytes;
+		const len = Math.min(this.blockBytes, size - start);
+		const rel = pieces.map((p) => ({ offset: p.offset - start, length: p.length }));
+		const pending = this.blockFills.get(this.blockId(key, i));
+		if (pending) {
+			const b = await pending;
+			if (b) return rel.map((p) => b.subarray(p.offset, p.offset + p.length));
+		}
+		const want = mergeRanges(rel);
+		const whole = want.length === 1 && want[0].offset === 0 && want[0].length === len;
+		const r = await this.cacheApi!.match(this.blockRequest(key, i, whole ? undefined : rangeHeader(want)));
+		const body = r ? new Uint8Array(await r.arrayBuffer()) : null;
+		const got = r && body ? responseParts(r.status, r.headers.get("content-type"), r.headers.get("content-range"), body) : null;
+		// A block entry of another length is not this object's block (an entry written under another size): refill it.
+		if (!got || !body || (got.kind === "full" && body.byteLength !== len)) {
+			if (trace) trace.misses++;
+			return null;
+		}
+		if (trace) {
+			trace.hits++;
+			trace.bytes += body.byteLength;
+			if (!whole) {
+				if (got.kind === "full") trace.r200++;
+				else trace.r206++;
+			}
+		}
+		return sliceRanges(got.parts, rel, key);
+	}
+
+	/**
+	 * Block `i` of `key` from the origin (that block's range only), put in the cache through `waitUntil`. Concurrent
+	 * callers share one read until the put settles; at most `blockBuffers` blocks are held at once and `blockReads`
+	 * read at once. Null when the object does not exist.
+	 */
+	private fillBlock(key: string, i: number, size: number, trace?: BlobTrace): Promise<Uint8Array | null> {
+		const id = this.blockId(key, i);
+		const pending = this.blockFills.get(id);
+		if (pending) return pending;
+		const start = i * this.blockBytes;
+		const len = Math.min(this.blockBytes, size - start);
+		const done = () => {
+			if (this.blockFills.get(id) === p) this.blockFills.delete(id);
+			this.wakeIdle();
+		};
+		const p: Promise<Uint8Array | null> = (async () => {
+			const release = await this.blockBuffers.take();
+			let block: Uint8Array | null;
+			try {
+				const read = await this.blockReads.take();
+				try {
+					block = await this.origin_(() => this.inner.get(key, { offset: start, length: len }, trace ? { trace } : undefined));
+				} finally {
+					read();
+				}
+			} catch (e) {
+				release();
+				throw e;
+			}
+			if (!block) {
+				release();
+				queueMicrotask(done);
+				return null;
+			}
+			if (trace) trace.fills = (trace.fills ?? 0) + 1;
+			this.blockStats.fills++;
+			this.blockStats.bytes += block.byteLength;
+			// The fill stays registered (and its slot held) until the cache holds the block, so a concurrent reader
+			// shares these bytes instead of reading the block again.
+			this.putBlock(key, i, block).then(() => {
+				release();
+				done();
+			});
+			return block;
+		})();
+		p.catch(done);
+		this.blockFills.set(id, p);
+		return p;
+	}
+
+	/** Puts a block in the cache (handed to `waitUntil`); never rejects. */
+	private putBlock(key: string, i: number, block: Uint8Array): Promise<void> {
+		// The block is this store's own read; readers only take views of it, so the body need not be a copy.
+		const resp = new Response(block, {
+			headers: { "content-type": "application/octet-stream", "content-length": String(block.byteLength), "cache-control": this.cacheControl, "accept-ranges": "bytes" },
+		});
+		const p = this.cacheApi!.put(this.blockRequest(key, i), resp).catch((e: unknown) => {
+			this.blockStats.failed++;
+			console.error(`thread-sdk: cache put of block ${i} of ${key} failed: ${e instanceof Error ? e.message : String(e)}`);
+		});
+		this.waitUntil?.(p);
+		return p;
+	}
+
+	/**
+	 * `ranges` of `key` (`size` bytes) through the block cache. Each range is cut into one piece per block it covers;
+	 * each block is looked up once (its pieces as one range request), a block being filled is shared, and the blocks
+	 * that missed come from the object's whole entry when it has one (an object cached whole stays served from it),
+	 * else are filled from the origin. Null when the object does not exist.
+	 */
+	private async readBlocks(key: string, ranges: BlobRange[], size: number, trace?: BlobTrace): Promise<Uint8Array[] | null> {
+		for (const r of ranges) if (r.offset < 0 || r.length < 0 || r.offset + r.length > size) throw new ThreadError(`${key} [${r.offset}, +${r.length}) is outside the object (${size} bytes)`);
+		const nonEmpty = ranges.filter((r) => r.length > 0);
+		const cut = (parts: RangePart[], rs: BlobRange[]) => rs.map((r) => (r.length === 0 ? new Uint8Array(0) : sliceRanges(parts, [r], key)[0]));
+		if (!nonEmpty.length) return ranges.map(() => new Uint8Array(0));
+		let wholeTried = false;
+		if (this.known.has(key)) {
+			wholeTried = true;
+			const parts = await this.matchWhole(key, mergeRanges(nonEmpty), trace);
+			if (parts) return cut(parts, ranges);
+		}
+		const B = this.blockBytes;
+		const pieces = new Map<number, BlobRange[]>();
+		const plan = ranges.map((r) => {
+			const refs: [block: number, piece: number][] = [];
+			if (r.length === 0) return refs;
+			const last = Math.floor((r.offset + r.length - 1) / B);
+			for (let i = Math.floor(r.offset / B); i <= last; i++) {
+				const a = Math.max(r.offset, i * B);
+				const e = Math.min(r.offset + r.length, (i + 1) * B);
+				let ps = pieces.get(i);
+				if (!ps) pieces.set(i, (ps = []));
+				refs.push([i, ps.length]);
+				ps.push({ offset: a, length: e - a });
+			}
+			return refs;
+		});
+		const got = new Map<number, Uint8Array[]>();
+		const missed: number[] = [];
+		await Promise.all(
+			[...pieces].map(async ([i, ps]) => {
+				const parts = await this.lookBlock(key, i, size, ps, trace);
+				if (parts) got.set(i, parts);
+				else missed.push(i);
+			}),
+		);
+		if (missed.length && !wholeTried) {
+			const want = missed.flatMap((i) => pieces.get(i)!);
+			const parts = await this.matchWhole(key, mergeRanges(want), trace);
+			if (parts) {
+				for (const i of missed) got.set(i, sliceRanges(parts, pieces.get(i)!, key));
+				missed.length = 0;
+			}
+		}
+		let absent = false;
+		await Promise.all(
+			missed.map(async (i) => {
+				const b = await this.fillBlock(key, i, size, trace);
+				if (!b) {
+					absent = true;
+					return;
+				}
+				got.set(
+					i,
+					pieces.get(i)!.map((p) => b.subarray(p.offset - i * B, p.offset - i * B + p.length)),
+				);
+			}),
+		);
+		if (absent) return null;
+		return plan.map((refs, k) => {
+			if (refs.length === 0) return new Uint8Array(0);
+			if (refs.length === 1) return got.get(refs[0][0])![refs[0][1]];
+			const out = new Uint8Array(ranges[k].length);
+			let o = 0;
+			for (const [i, j] of refs) {
+				const b = got.get(i)![j];
+				out.set(b, o);
+				o += b.byteLength;
+			}
+			return out;
+		});
+	}
+
 	async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
 		if (!this.cacheable(key)) return this.inner.get(key, range, opts);
+		if (range && this.blocked(opts)) return (await this.readBlocks(key, [range], opts.size, opts.trace))?.[0] ?? null;
 		const trace = opts?.trace;
 		if (this.blobCache) {
 			const got = range ? await this.blobCache.getRanges(this.scope + key, [range]) : await this.blobCache.get(this.scope + key).then((b) => (b ? [b] : null));
@@ -815,6 +1129,7 @@ export class CachedBlobStore implements BlobStore {
 	async getRanges(key: string, ranges: BlobRange[], opts?: GetOptions): Promise<Uint8Array[] | null> {
 		if (!ranges.length) return [];
 		if (!this.cacheable(key)) return this.inner.getRanges?.(key, ranges, opts) ?? null;
+		if (this.blocked(opts)) return this.readBlocks(key, ranges, opts.size, opts.trace);
 		const trace = opts?.trace;
 		if (this.blobCache) {
 			const got = await this.blobCache.getRanges(this.scope + key, ranges);
@@ -828,19 +1143,8 @@ export class CachedBlobStore implements BlobStore {
 				return got;
 			}
 		} else {
-			const r = await this.cacheApi!.match(this.request(key, rangeHeader(ranges)));
-			if (r) {
-				this.note(key);
-				const body = new Uint8Array(await r.arrayBuffer());
-				const { parts, kind } = responseParts(r.status, r.headers.get("content-type"), r.headers.get("content-range"), body);
-				if (trace) {
-					trace.hits++;
-					trace.bytes += body.byteLength;
-					if (kind === "full") trace.r200++;
-					else trace.r206++;
-				}
-				return sliceRanges(parts, ranges, key);
-			}
+			const parts = await this.matchWhole(key, ranges, trace);
+			if (parts) return sliceRanges(parts, ranges, key);
 		}
 		if (trace) trace.misses++;
 		if (opts?.fill) return this.missFill(key, ranges, false, opts);
@@ -898,6 +1202,17 @@ export class CachedBlobStore implements BlobStore {
 			if (this.cacheApi?.delete) await this.cacheApi.delete(this.request(key)).catch(() => false);
 		};
 	}
+}
+
+/** Sorts ranges and merges the ones that overlap or touch. */
+function mergeRanges(ranges: readonly BlobRange[]): BlobRange[] {
+	const out: BlobRange[] = [];
+	for (const r of [...ranges].sort((a, b) => a.offset - b.offset)) {
+		const last = out[out.length - 1];
+		if (last && r.offset <= last.offset + last.length) last.length = Math.max(last.length, r.offset + r.length - last.offset);
+		else out.push({ offset: r.offset, length: r.length });
+	}
+	return out;
 }
 
 /** A store with every key prefixed (one bucket holding several indexes, e.g. `tenants/a/`). */

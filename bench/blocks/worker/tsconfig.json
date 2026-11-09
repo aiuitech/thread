@@ -1,0 +1,27 @@
+{
+	"compilerOptions": {
+		"target": "es2024",
+		"lib": [
+			"es2024"
+		],
+		"module": "preserve",
+		"moduleResolution": "bundler",
+		"types": [
+			"@cloudflare/workers-types"
+		],
+		"strict": true,
+		"noEmit": true,
+		"allowImportingTsExtensions": true,
+		"isolatedModules": true,
+		"skipLibCheck": true,
+		"paths": {
+			"thread-sdk": [
+				"../../../sdk/ts/src/index.ts"
+			]
+		}
+	},
+	"include": [
+		"src",
+		"cloudflare.config.ts"
+	]
+}

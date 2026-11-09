@@ -4,6 +4,27 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## 0.2.5 (unreleased)
+
+- **Large lexical segments are cached in blocks** (TypeScript, `CachedBlobStore` over the Workers Cache API).
+  A segment over 2 MiB (`LexSegmentOptions.fillBytes`) was read by range and never cached: a range read without
+  `fill` that missed went to R2 and was not stored, so every search read every large segment from R2 again, and
+  merging segments made search slower (inseam, 2026-11-09: 39 segments of 4 MiB, 293 R2 reads and 4.2 s in the
+  lexical list on a warm cache). Now such reads pass the segment's size (`GetOptions.size`) and the store serves
+  them from aligned blocks of `blockBytes` (default 1 MiB), each cached under its own key in the store's scope; a
+  block that misses is read from R2 (that block only, never the whole object), serves the read and is put in the
+  cache through `waitUntil`. Concurrent readers of a block share one R2 read, at most `blockBuffers` blocks (16 MiB
+  worth) are held from their read until their put settles, and block reads in flight stay within `inflight`. An
+  object already cached whole is still served from that entry; slabs, deltas, manifests and segments up to 2 MiB
+  keep whole-object caching. Measured against R2 (`bench/blocks/`, docs/lexical.md "Block cache"): a warm hybrid
+  search over 8 segments of 4.1 MB went from 4.3 s and 125 R2 reads to 0.2 s and none; over 2 segments of 46 MB,
+  from 1.3 s and 54 reads to 0.1 s and none. Dense-only searches are unchanged.
+- `open({ blockBytes, blockBuffers })` and `CachedBlobStoreOptions.blockBytes` / `blockBuffers`; `blockBytes: 0`
+  turns blocks off. `CachedBlobStore.blockStats` counts fills; `drain()` also waits for block fills.
+- **`fills` in the trace envelope's `io`** (`TraceIo.fills`, `BlobTrace.fills`, `PhaseStat.fills`): the blocks a
+  span read from R2 into the cache. Each fill is also a `read` and a `miss`, and its whole block is in `bytes`; a
+  block lookup is one `hit` or `miss`. Python's envelopes carry `fills: 0`, so both SDKs keep one schema.
+
 ## 0.2.4 (2026-11-08)
 
 - **A bulk build step ends by progress, not only by the clock** (TypeScript `BulkBuild.step`). A `load` pass

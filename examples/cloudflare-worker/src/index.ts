@@ -169,7 +169,7 @@ function queryEnvelope(b: QueryBody, t: { tStart: number; tGen: number; tRoute: 
 	const s = b.stats;
 	const at = (x: number) => x - t.tStart;
 	const n = (k: string) => (typeof s[k] === "number" ? (s[k] as number) : 0);
-	const io = { reads: s.cacheHits + s.cacheMisses + n("rerankReads") + n("specReads"), hits: s.cacheHits, misses: s.cacheMisses, r206: s.range.r206, r200: s.range.r200, bytes: s.slabBytes + n("rerankBytes") + n("deltaBytes") };
+	const io = { reads: s.cacheHits + s.cacheMisses + n("rerankReads") + n("specReads"), hits: s.cacheHits, misses: s.cacheMisses, r206: s.range.r206, r200: s.range.r200, bytes: s.slabBytes + n("rerankBytes") + n("deltaBytes"), fills: 0 };
 	return envelope({
 		op: "query",
 		sdk: "worker",

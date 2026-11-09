@@ -187,6 +187,13 @@ export interface OpenOptions extends TraceSink {
 	missPolicy?: MissPolicy;
 	/** `"range+warm"`: background whole-object fetches at once (default 2). */
 	warmConcurrency?: number;
+	/**
+	 * Cache API only: the block size of the block cache that serves range reads of lexical segments over 2 MiB
+	 * (`CachedBlobStoreOptions.blockBytes`; default 1 MiB, 0 = off: those reads go to the store uncached).
+	 */
+	blockBytes?: number;
+	/** Blocks the block cache holds in memory at once (`CachedBlobStoreOptions.blockBuffers`; default 16 MiB worth). */
+	blockBuffers?: number;
 	/** `ctx.waitUntil`, so background cache fills outlive the response. */
 	waitUntil?: (p: Promise<unknown>) => void;
 	/**
@@ -426,7 +433,7 @@ export class ThreadIndex {
 		// has an `idx/g1/seg/1.thread`. The prefix scopes every cache key (Cache API URL and in-process cache), or
 		// indexes that share a cache would read each other's `current.json`, manifests and segments.
 		const scope = keyPrefix(store).replace(/^\/+/, "");
-		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, scope, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency });
+		if (cache) store = new CachedBlobStore(store, cache, { origin: opts.cacheOrigin, scope, waitUntil: opts.waitUntil, missPolicy: opts.missPolicy, warmConcurrency: opts.warmConcurrency, blockBytes: opts.blockBytes, blockBuffers: opts.blockBuffers });
 		const t0 = nowMs();
 		const at = Date.now();
 		// The warm pack's one GET starts first and runs alongside the whole open; nothing waits for it. Its prefixes

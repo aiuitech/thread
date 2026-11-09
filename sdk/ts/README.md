@@ -119,6 +119,8 @@ once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 | `cacheOrigin` | `https://vib-sdk.cache/` | synthetic origin of the cache keys (`${origin}idx/...`); use one per store |
 | `missPolicy` | `"whole"` (Cache API), `"range+warm"` (`MemoryCache` / `DiskCache`) | what a slab-prefix cache miss reads: the whole slab, the range, or the range now and the whole slab in the background |
 | `warmConcurrency` | 2 | `"range+warm"`: background whole-slab fetches at once (1 while the query's own reads are in flight) |
+| `blockBytes` | 1 MiB | Cache API: block size of the block cache that serves range reads of lexical segments over 2 MiB ([docs/lexical.md](../../docs/lexical.md#block-cache)); `0` = off (those reads go to the store uncached) |
+| `blockBuffers` | 16 MiB worth (16 at 1 MiB) | Cache API: blocks held in memory at once, from their store read until their cache put settles |
 | `waitUntil` | - | `ctx.waitUntil`, keeps background cache writes and warm fetches alive |
 | `warmup` | on for remote stores outside Workers | open connections during `open` (`true` = the store's `inflight`, 32 against S3 from Node; a number; `false`) |
 | `coldPolicy` | off | `{ nprobe?, rerank?, threshold? }` for queries whose probed slabs are mostly not cached (see `query`) |
@@ -481,12 +483,15 @@ interface BlobStore {
   of a cold query for ~45% more bytes). A whole-object GET of an object larger than `chunkBytes` (8 MiB) is split
   into parallel range GETs (`chunkConcurrency` 4 beside the first, started as soon as the first response's headers
   give the size), since one S3 stream is bandwidth-bound and the routing table is 25 MB on g4. `store.warmup(n)` opens `n` connections with one-byte GETs of `idx/current.json` (not HEADs: Node's `fetch` closes a connection after a HEAD answer with a Content-Length); `new S3BlobStore({ ..., warmup: 32 })` starts that at construction, so creating the store before `Thread.init` overlaps the handshakes (and Node's lazy `fetch` globals) with the wasm compile.
-- `CachedBlobStore(inner, cache, { origin, waitUntil, cacheable, missPolicy, warmConcurrency, warmQueue })`: a cache
+- `CachedBlobStore(inner, cache, { origin, waitUntil, cacheable, missPolicy, warmConcurrency, warmQueue, blockBytes, blockBuffers })`: a cache
   in front of any store, either the Workers Cache API or an in-process `BlobCache`. Objects under `idx/` are
   immutable, so they are cached whole (Cache API: for a year under `${origin}${key}`; `current.json` is never
   cached) and ranges are served from them (the Cache API answers a 206, `multipart/byteranges` for several ranges,
-  parsed by the SDK). A phase-1 miss follows `missPolicy` (next section). `store.drain()` resolves once background
-  warms are done; `store.warmStats` counts them.
+  parsed by the SDK). A phase-1 miss follows `missPolicy` (next section). Over the Cache API, a range read that
+  passes the object's `size` and is not a `fill` (a lexical segment over 2 MiB) is served from cached aligned blocks
+  of `blockBytes` instead (a miss reads and caches that block only; `blockBuffers` bounds the blocks in memory;
+  `store.blockStats` counts the fills). `store.drain()` resolves once background warms and block fills are done;
+  `store.warmStats` counts the warms.
 - `MemoryCache(maxBytes = 256 MB)`: an LRU of whole objects in memory (objects over a quarter of it are not kept).
   A hit is a view into the cached slab, so the query also has that slab's rerank records.
 - `MemoryBlobStore()`: a Map, with etags and conditions (tests, tiny local indexes).

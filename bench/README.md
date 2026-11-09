@@ -22,6 +22,9 @@ scenarios.mjs     workload scenarios in this process over the built TS SDK (dens
                   kernel CPU and counters from the trace envelopes (docs/observability.md)
 lib/trace.mjs     summaries of trace envelopes, shared by scenarios.mjs and query_bench.mjs
 
+blocks/           the Cache API block cache for large lexical segments (0.2.5) against R2: a bench Worker built per
+                  SDK version, cold and warm searches, block sizes; see blocks/README.md
+
 cold/             cold-start benches of both SDKs against S3 (no Worker): fake_s3.mjs proxy with a network
                   model, cold_bench.mjs / cold_bench.py, warm-up, packs, run_baseline.sh, the routing / base-pack
                   tools (make_routing, make_base_pack, routing_agreement, routing_recall, run_base.sh); see cold/README.md

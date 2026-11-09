@@ -167,6 +167,46 @@ So a warm isolate answers a text query in **two rounds per segment**, all segmen
 in one or two more, and a `get(key)` in two (keys bucket, docs bucket). Transient bytes are evicted from the wasm reader once they exceed a budget (8 MB by default);
 the resident parts are a few KB per segment (20k documents: 2.5 KB terms directory + 2.5 KB docs directory).
 
+### Block cache
+
+Behind the Workers Cache API (`CachedBlobStore`, what `thread.open` puts in front of an R2 bucket), a segment of up
+to 2 MiB (`LexSegmentOptions.fillBytes`) is read whole on its first miss and cached whole, like a slab. A larger
+segment is read by range with its size (`GetOptions.size`), and the store serves those ranges from **blocks**:
+block `i` is bytes `[i * B, min((i + 1) * B, size))` of the segment, cached under its own key
+(`{origin}{scope}{key}/~block/{B}/{i}`, so indexes under other prefixes never share one). A read looks up each block
+it covers once (its ranges in that block as one range request); a block that misses is read from R2 (that block
+only, never the whole segment), serves the read, and is put in the cache through `waitUntil`. Concurrent readers of
+a block share one R2 read; at most `blockBuffers` blocks (16 MiB worth) are held from their R2 read until their put
+settles, and block reads from R2 in flight are also at most the store's `inflight`. An object already cached whole
+(before 0.2.5, or by `index.warm`) is still served from that entry. Slabs, deltas, manifests and the routing files
+keep whole-object caching: blocks only serve range reads that pass a size and are not a `fill`.
+
+Before 0.2.5 these reads went to R2 on every search: a segment over 2 MiB was never cached (a range read without
+`fill` that missed was read from the origin and not cached), so merging segments made search slower (inseam,
+2026-11-09: 39 segments of 4 MiB, 293 R2 reads and 4.2 s in the lexical list on a warm cache).
+
+Measured with `bench/blocks/` (Workers on workers.dev, R2 `vib-bench`, one `thread.open` per request as inseam does,
+hybrid search with `docs: "text"`, medians of 3; "new terms" is another query on the same warm cache):
+
+| index | SDK, B | cold search | warm search | warm R2 reads | new terms | new terms R2 reads |
+|---|---|---|---|---|---|---|
+| 8 segments of 4.1 MB, 20k docs | 0.2.4 | 4.6 s | 4.3 s | 125 | 3.2 s | 127 |
+| | 256 KiB | 2.2 s | 0.27 s | 0 | 1.5 s | 23 |
+| | 1 MiB | 2.0 s | 0.20 s | 0 | 0.41 s | 1 |
+| | 4 MiB | 1.5 s | 0.18 s | 0 | 0.19 s | 0 |
+| 2 segments of 46 MB, 8k docs | 0.2.4 | 1.9 s | 1.3 s | 54 | 1.9 s | 51 |
+| | 256 KiB | 1.0 s | 0.14 s | 0 | 0.96 s | 23 |
+| | 1 MiB | 1.9 s | 0.10 s | 0 | 0.60 s | 11 |
+| | 2 MiB | 2.4 s | 0.11 s | 0 | 1.1 s | 8 |
+| | 4 MiB | 2.8 s | 0.12 s | 0 | 1.5 s | 5 |
+
+`B` defaults to 1 MiB (`blockBytes`). Large blocks win when a segment is one or two blocks; on large segments each
+miss reads a whole block for a few KB of postings, so 4 MiB read 62 MB from R2 for a cold search of the 46 MB
+segments (1 MiB: 26 MB) and was the slowest cold. 1 MiB was best or close on both shapes for a new query on a
+warm cache, the common case once an index has been searched. A dense-only search is unchanged (the same 16 R2
+reads cold, 18 cache hits and ~20 ms warm, with 0.2.4 and 0.2.5). In the trace envelope a block lookup is a `hit`
+or a `miss`, a fill is also a `read`, its whole block is in `bytes`, and `io.fills` counts the fills.
+
 `search` is planned and fused in the core (`fusion.rs`); the SDKs only fetch the lists in between.
 `plan_search` resolves the request against `lex.defaults` (request value, else manifest value, else `rrfK` 60,
 `recallK` max(topK, 50), weights 1 / 1, `topK` 10), picks the mode and the depth of each list. The dense query

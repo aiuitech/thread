@@ -84,6 +84,9 @@ class BlobTrace:
     #: Cache stores with the "range+warm" miss policy: whole-object fetches this call's misses queued in the
     #: background (not part of `reads` / `bytes`; `CachedBlobStore.warm_stats` counts what they transferred).
     warms: int = 0
+    #: Block fills (the TypeScript SDK's Cache API block cache); always 0 here, kept so the envelope's `io` has the
+    #: same fields in both SDKs.
+    fills: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
     def add(self, **counts: int) -> None:
@@ -93,10 +96,10 @@ class BlobTrace:
 
     def as_dict(self) -> dict[str, int]:
         with self._lock:
-            return {k: getattr(self, k) for k in ("reads", "hits", "misses", "r206", "r200", "bytes", "warms")}
+            return {k: getattr(self, k) for k in ("reads", "hits", "misses", "r206", "r200", "bytes", "warms", "fills")}
 
 
-TRACE_FIELDS = ("reads", "hits", "misses", "r206", "r200", "bytes")
+TRACE_FIELDS = ("reads", "hits", "misses", "r206", "r200", "bytes", "fills")
 
 
 def phase_stat(ms: float, after: dict[str, int] | BlobTrace, before: dict[str, int] | BlobTrace | None = None
@@ -106,7 +109,7 @@ def phase_stat(ms: float, after: dict[str, int] | BlobTrace, before: dict[str, i
     SDK's `PhaseStat` has the same fields."""
     a = after.as_dict() if isinstance(after, BlobTrace) else after
     b = (before.as_dict() if isinstance(before, BlobTrace) else before) if before is not None else None
-    return {"ms": round(ms, 3), **{k: a[k] - (b[k] if b else 0) for k in TRACE_FIELDS}}
+    return {"ms": round(ms, 3), **{k: a.get(k, 0) - (b.get(k, 0) if b else 0) for k in TRACE_FIELDS}}
 
 
 def _trace_read(trace: BlobTrace | None, n: int) -> None:

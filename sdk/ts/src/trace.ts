@@ -20,7 +20,10 @@ export const TRACE_VERSION = 1;
 
 export type TraceOp = "query" | "search" | "lexical" | "open" | "get" | "listKeys" | "upsert" | "delete";
 
-/** Store work: origin/cache reads, cache hits and misses, 206/200 answers to range requests, bytes transferred. */
+/**
+ * Store work: origin/cache reads, cache hits and misses, 206/200 answers to range requests, bytes transferred, and
+ * block fills (blocks read from the origin into the Cache API's block cache; each is also a read and a miss).
+ */
 export interface TraceIo {
 	reads: number;
 	hits: number;
@@ -28,6 +31,7 @@ export interface TraceIo {
 	r206: number;
 	r200: number;
 	bytes: number;
+	fills: number;
 }
 
 export interface TraceSpan {
@@ -90,15 +94,15 @@ export interface TraceSink {
 
 export const clockKind = (): TraceEnvelope["clock"] => (inWorkers() ? "io-only" : "real");
 
-export const zeroIo = (): TraceIo => ({ reads: 0, hits: 0, misses: 0, r206: 0, r200: 0, bytes: 0 });
+export const zeroIo = (): TraceIo => ({ reads: 0, hits: 0, misses: 0, r206: 0, r200: 0, bytes: 0, fills: 0 });
 
 /** The `TraceIo` part of a store trace or a phase stat. */
-export const ioOf = (t: BlobTrace | PhaseStat): TraceIo => ({ reads: t.reads, hits: t.hits, misses: t.misses, r206: t.r206, r200: t.r200, bytes: t.bytes });
+export const ioOf = (t: BlobTrace | PhaseStat): TraceIo => ({ reads: t.reads, hits: t.hits, misses: t.misses, r206: t.r206, r200: t.r200, bytes: t.bytes, fills: t.fills ?? 0 });
 
 /** `a + b`, field by field. */
 export function addIo(a: TraceIo, b: TraceIo | undefined): TraceIo {
 	if (!b) return a;
-	return { reads: a.reads + b.reads, hits: a.hits + b.hits, misses: a.misses + b.misses, r206: a.r206 + b.r206, r200: a.r200 + b.r200, bytes: a.bytes + b.bytes };
+	return { reads: a.reads + b.reads, hits: a.hits + b.hits, misses: a.misses + b.misses, r206: a.r206 + b.r206, r200: a.r200 + b.r200, bytes: a.bytes + b.bytes, fills: a.fills + (b.fills ?? 0) };
 }
 
 /** Adds a store trace's counters into another (a per-read trace into the query's). */
@@ -110,6 +114,7 @@ export function addTrace(into: BlobTrace, t: BlobTrace): void {
 	into.r200 += t.r200;
 	into.bytes += t.bytes;
 	if (t.warms) into.warms = (into.warms ?? 0) + t.warms;
+	if (t.fills) into.fills = (into.fills ?? 0) + t.fills;
 }
 
 /** A span from a phase stat (`timeline.*`, `openStats.*`). */

@@ -32,6 +32,9 @@ export function isMissingRanges(e: unknown): e is MissingRangesError {
 	return e instanceof Error && e.name === "MissingRanges" && Array.isArray((e as MissingRangesError).ranges);
 }
 
+/** Segments up to this size are cached whole on a miss (`LexSegmentOptions.fillBytes`). */
+export const LEX_FILL_BYTES = 2 * 1024 * 1024;
+
 /** Ranges closer than this are fetched as one (the core's `PLAN_GAP`). */
 export const PLAN_GAP = 4096;
 
@@ -80,7 +83,11 @@ export interface LexSegmentOptions {
 	transientBudget?: number;
 	/** Fetch rounds per call before giving up (default 8). */
 	maxRounds?: number;
-	/** Objects up to this size are read whole on a cache miss (`fill`), larger ones by range (default 2 MB). */
+	/**
+	 * Segments up to this size are read whole on a cache miss (`fill`) and cached whole; larger ones are read by range
+	 * with their size, which a Cache API store serves from cached blocks (`CachedBlobStoreOptions.blockBytes`)
+	 * (default `LEX_FILL_BYTES`, 2 MiB).
+	 */
 	fillBytes?: number;
 }
 
@@ -116,7 +123,7 @@ export class LexSegment {
 		this.reader = new w.SegmentReader(size);
 		this.transientBudget = opts.transientBudget ?? 8 * 1024 * 1024;
 		this.maxRounds = opts.maxRounds ?? 8;
-		this.fillBytes = opts.fillBytes ?? 2 * 1024 * 1024;
+		this.fillBytes = opts.fillBytes ?? LEX_FILL_BYTES;
 	}
 
 	/** Opens the segment: container table + meta, section headers, directories (three fetches cold, once). */
@@ -156,13 +163,15 @@ export class LexSegment {
 		const missing = this.reader.missing(new Float64Array(wanted.flatMap((r) => [r.offset, r.len]))) as Range[];
 		if (missing.length === 0) return;
 		const blobRanges: BlobRange[] = missing.map((r) => ({ offset: r.offset, length: r.len }));
-		const fill = this.size <= this.fillBytes;
+		// A small segment is cached whole on its first miss; a larger one is read by range with its size, so a cache
+		// with blocks serves it from them (a block miss reads and caches that block only, never the whole segment).
+		const opts = { trace, fill: this.size <= this.fillBytes, size: this.size };
 		let parts: Uint8Array[] | null = null;
-		if (blobRanges.length > 1 && this.store.getRanges) parts = await this.store.getRanges(this.ref.key, blobRanges, { trace, fill });
+		if (blobRanges.length > 1 && this.store.getRanges) parts = await this.store.getRanges(this.ref.key, blobRanges, opts);
 		if (!parts) {
 			parts = await Promise.all(
 				blobRanges.map(async (r) => {
-					const b = await this.store.get(this.ref.key, r, { trace, fill });
+					const b = await this.store.get(this.ref.key, r, opts);
 					if (!b) throw new ThreadError(`missing segment ${this.ref.key}`, 404);
 					return b;
 				}),

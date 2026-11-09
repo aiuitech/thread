@@ -558,6 +558,7 @@ export class PrefetchStore implements BlobStore {
 		const b = await e.bytes;
 		if (e.trace && trace) {
 			for (const f of ["reads", "hits", "misses", "r206", "r200", "bytes"] as const) trace[f] += e.trace[f];
+			if (e.trace.fills) trace.fills = (trace.fills ?? 0) + e.trace.fills;
 			e.trace = null; // credited once
 		}
 		return b;

@@ -24,7 +24,7 @@ manifest.
   "ms": 3.12,                    // wall time of the operation
   "clock": "real",               // "io-only" inside Cloudflare Workers (below)
   "attrs": { "gen": "g4", "rev": 179, "format": 3, "routing": "flat", "topK": 10, "nprobe": 34, "rerank": 150, "filtered": false, ... },
-  "io": { "reads": 41, "hits": 41, "misses": 0, "r206": 41, "r200": 0, "bytes": 6744000 },
+  "io": { "reads": 41, "hits": 41, "misses": 0, "r206": 41, "r200": 0, "bytes": 6744000, "fills": 0 },
   "spans": [
     { "name": "route",  "start": 0,    "ms": 0.9,  "io": { ... } },
     { "name": "phase1", "start": 0.9,  "ms": 1.8,  "io": { ... } },
@@ -40,6 +40,12 @@ manifest.
 - **spans**: the operation's steps. `start` is ms from the operation's start; a span whose start is not known (a
   pack opened before `open`) has none. `io` is the store work that completed during the span. Nested operations
   are children: a search's `dense` span holds the dense query's phases.
+- **io**: `reads` reached the origin store (R2, S3, disk), `hits` and `misses` are cache lookups, `r206` / `r200`
+  range requests the cache answered with the range or the whole object, `bytes` what came into the process, and
+  `fills` the blocks read from the origin into the Cache API's block cache (TypeScript, 0.2.5: lexical segments over
+  2 MiB, [lexical.md](lexical.md#block-cache); each fill is also a `read` and a `miss`, and its whole block is in
+  `bytes`; always 0 in Python). Segment opens inside a search (container, headers, directories) are not in any
+  span's `io`.
 - **counters**: work done. The query counters are the same numbers `stats` already had, plus `pushed`, the entries
   that entered a scan's top-T heap (a new counter from the Rust kernels; `pushed / scanned` is how selective the
   running threshold was).
