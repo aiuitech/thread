@@ -95,7 +95,9 @@ export interface PutOptions {
 /**
  * Read (and optionally write) access to the objects of an index. Implementations may return views into a
  * larger buffer (for example the whole object fetched on a cache miss); callers must not assume
- * `byteOffset === 0` or `buffer.byteLength === byteLength`.
+ * `byteOffset === 0` or `buffer.byteLength === byteLength`. A view keeps its whole buffer alive, so the SDK's stores
+ * return one only where that buffer is held anyway or wanted: a `fill` read, an in-process cache's object, a pack
+ * or warm pack in memory. Other range reads return the range in a buffer of its own.
  */
 export interface BlobStore {
 	/** The object, or `range` of it; `null` if it does not exist. */
@@ -367,6 +369,12 @@ export interface BlobCache {
 const ownBuffer = (b: Uint8Array): Uint8Array => (b.byteOffset === 0 && b.buffer.byteLength === b.byteLength ? b : b.slice());
 
 /**
+ * `[a, e)` of `b` in a buffer of its own size (`b` itself when it is all of its buffer). A range read that is not a
+ * `fill` returns this, so a range the caller keeps never holds the block, response body or object it was cut from.
+ */
+const copyOut = (b: Uint8Array, a = 0, e = b.byteLength): Uint8Array => (a === 0 && e === b.byteLength ? ownBuffer(b) : b.slice(a, e));
+
+/**
  * An LRU of whole objects in memory (default 256 MB; objects larger than a quarter of it are not kept). Hits are
  * views into the cached object, so a slab prefix served from it carries the slab's rerank records too.
  *
@@ -552,7 +560,8 @@ export interface CachedBlobStoreOptions {
 	/**
 	 * Blocks held in memory at once, from the start of their origin read until their cache put settles; a block miss
 	 * past it waits. Default `BLOCK_BUFFER_BYTES / blockBytes` (16 MiB worth), at least 2. Block reads from the
-	 * origin in flight are also at most `inflight`.
+	 * origin in flight are also at most `inflight`. Ranges are copied out of their blocks before a block's slot is
+	 * given back, so the memory block reads keep alive is the bytes returned plus at most this many blocks.
 	 */
 	blockBuffers?: number;
 }
@@ -918,7 +927,7 @@ export class CachedBlobStore implements BlobStore {
 		const pending = this.blockFills.get(this.blockId(key, i));
 		if (pending) {
 			const b = await pending;
-			if (b) return rel.map((p) => b.subarray(p.offset, p.offset + p.length));
+			if (b) return rel.map((p) => copyOut(b, p.offset, p.offset + p.length));
 		}
 		const want = mergeRanges(rel);
 		const whole = want.length === 1 && want[0].offset === 0 && want[0].length === len;
@@ -938,7 +947,7 @@ export class CachedBlobStore implements BlobStore {
 				else trace.r206++;
 			}
 		}
-		return sliceRanges(got.parts, rel, key);
+		return sliceRanges(got.parts, rel, key).map((b) => copyOut(b));
 	}
 
 	/**
@@ -952,48 +961,45 @@ export class CachedBlobStore implements BlobStore {
 		if (pending) return pending;
 		const start = i * this.blockBytes;
 		const len = Math.min(this.blockBytes, size - start);
+		let release = () => {};
+		let put: Promise<void> = Promise.resolve();
+		const p: Promise<Uint8Array | null> = (async () => {
+			release = await this.blockBuffers.take();
+			const read = await this.blockReads.take();
+			let block: Uint8Array | null;
+			try {
+				block = await this.origin_(() => this.inner.get(key, { offset: start, length: len }, trace ? { trace } : undefined));
+			} finally {
+				read();
+			}
+			if (block) {
+				if (trace) trace.fills = (trace.fills ?? 0) + 1;
+				this.blockStats.fills++;
+				this.blockStats.bytes += block.byteLength;
+				put = this.putBlock(key, i, block);
+			}
+			return block;
+		})();
+		// The fill stays registered and its slot held until the cache holds the block, so a concurrent reader shares
+		// these bytes instead of reading the block again. Each reader copies its pieces out as soon as the fill
+		// resolves: the readers' reactions to `p` are queued with this one and `await put` resumes after them, so once
+		// the slot is given back, nothing the store returned holds the block.
 		const done = () => {
+			release();
 			if (this.blockFills.get(id) === p) this.blockFills.delete(id);
 			this.wakeIdle();
 		};
-		const p: Promise<Uint8Array | null> = (async () => {
-			const release = await this.blockBuffers.take();
-			let block: Uint8Array | null;
-			try {
-				const read = await this.blockReads.take();
-				try {
-					block = await this.origin_(() => this.inner.get(key, { offset: start, length: len }, trace ? { trace } : undefined));
-				} finally {
-					read();
-				}
-			} catch (e) {
-				release();
-				throw e;
-			}
-			if (!block) {
-				release();
-				queueMicrotask(done);
-				return null;
-			}
-			if (trace) trace.fills = (trace.fills ?? 0) + 1;
-			this.blockStats.fills++;
-			this.blockStats.bytes += block.byteLength;
-			// The fill stays registered (and its slot held) until the cache holds the block, so a concurrent reader
-			// shares these bytes instead of reading the block again.
-			this.putBlock(key, i, block).then(() => {
-				release();
-				done();
-			});
-			return block;
-		})();
-		p.catch(done);
+		p.then(async () => {
+			await put;
+			done();
+		}, done);
 		this.blockFills.set(id, p);
 		return p;
 	}
 
 	/** Puts a block in the cache (handed to `waitUntil`); never rejects. */
 	private putBlock(key: string, i: number, block: Uint8Array): Promise<void> {
-		// The block is this store's own read; readers only take views of it, so the body need not be a copy.
+		// The block is this store's own read; readers copy their pieces out of it, so the body need not be a copy.
 		const resp = new Response(block, {
 			headers: { "content-type": "application/octet-stream", "content-length": String(block.byteLength), "cache-control": this.cacheControl, "accept-ranges": "bytes" },
 		});
@@ -1014,7 +1020,7 @@ export class CachedBlobStore implements BlobStore {
 	private async readBlocks(key: string, ranges: BlobRange[], size: number, trace?: BlobTrace): Promise<Uint8Array[] | null> {
 		for (const r of ranges) if (r.offset < 0 || r.length < 0 || r.offset + r.length > size) throw new ThreadError(`${key} [${r.offset}, +${r.length}) is outside the object (${size} bytes)`);
 		const nonEmpty = ranges.filter((r) => r.length > 0);
-		const cut = (parts: RangePart[], rs: BlobRange[]) => rs.map((r) => (r.length === 0 ? new Uint8Array(0) : sliceRanges(parts, [r], key)[0]));
+		const cut = (parts: RangePart[], rs: BlobRange[]) => rs.map((r) => (r.length === 0 ? new Uint8Array(0) : copyOut(sliceRanges(parts, [r], key)[0])));
 		if (!nonEmpty.length) return ranges.map(() => new Uint8Array(0));
 		let wholeTried = false;
 		if (this.known.has(key)) {
@@ -1051,7 +1057,7 @@ export class CachedBlobStore implements BlobStore {
 			const want = missed.flatMap((i) => pieces.get(i)!);
 			const parts = await this.matchWhole(key, mergeRanges(want), trace);
 			if (parts) {
-				for (const i of missed) got.set(i, sliceRanges(parts, pieces.get(i)!, key));
+				for (const i of missed) got.set(i, sliceRanges(parts, pieces.get(i)!, key).map((b) => copyOut(b)));
 				missed.length = 0;
 			}
 		}
@@ -1065,7 +1071,7 @@ export class CachedBlobStore implements BlobStore {
 				}
 				got.set(
 					i,
-					pieces.get(i)!.map((p) => b.subarray(p.offset - i * B, p.offset - i * B + p.length)),
+					pieces.get(i)!.map((p) => copyOut(b, p.offset - i * B, p.offset - i * B + p.length)),
 				);
 			}),
 		);
@@ -1117,7 +1123,9 @@ export class CachedBlobStore implements BlobStore {
 				}
 				if (trace) trace.r200++;
 				if (body.byteLength < range.offset + range.length) throw new ThreadError(`cached ${key} is ${body.byteLength} bytes, need ${range.offset + range.length}`);
-				return body.subarray(range.offset, range.offset + range.length);
+				// A fill read keeps the view (its reader takes the rest of the object from the buffer); any other read
+				// copies its range out, so that it does not hold the whole object.
+				return opts?.fill ? body.subarray(range.offset, range.offset + range.length) : copyOut(body, range.offset, range.offset + range.length);
 			}
 		}
 		if (trace) trace.misses++;
@@ -1144,7 +1152,10 @@ export class CachedBlobStore implements BlobStore {
 			}
 		} else {
 			const parts = await this.matchWhole(key, ranges, trace);
-			if (parts) return sliceRanges(parts, ranges, key);
+			if (parts) {
+				const out = sliceRanges(parts, ranges, key);
+				return opts?.fill ? out : out.map((b) => copyOut(b));
+			}
 		}
 		if (trace) trace.misses++;
 		if (opts?.fill) return this.missFill(key, ranges, false, opts);

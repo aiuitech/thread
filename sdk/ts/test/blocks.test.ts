@@ -3,6 +3,8 @@
  * segments over 2 MiB) are served from cached aligned blocks, a block miss reads and caches that block only, fills
  * are shared and bounded, objects cached whole stay served from their entry, and scopes never share blocks.
  */
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { CachedBlobStore, createLexicalGeneration, MemoryBlobStore, MemoryCache, newTrace, type BlobRange, type GetOptions } from "../src/index.js";
 import { FakeCache, rng, thread } from "./helpers.js";
@@ -275,5 +277,128 @@ describe("CachedBlobStore blocks", () => {
 		expect(urls.length).toBeGreaterThan(0);
 		expect(urls.every((u) => u.includes("/~block/262144/"))).toBe(true);
 		expect(warm.stats.trace.io.fills).toBe(0);
+	});
+});
+
+/**
+ * Memory the block cache keeps alive (inseam, 2026-11-09, on 0.2.5): block reads returned `subarray` views of the
+ * blocks they filled, so every range a caller kept held its whole block after the block's buffer slot was released,
+ * and `blockBuffers` bounded nothing. Here every block buffer the origin store allocates is tracked through a
+ * `WeakRef` and counted after a forced GC.
+ */
+describe("CachedBlobStore blocks: memory kept alive", () => {
+	setFlagsFromString("--expose-gc");
+	const gc = runInNewContext("gc") as () => void;
+	const N = 160;
+	const LEN = 16;
+	const size = N * B;
+	/** A tick of I/O: lets the microtask queue drain, so `WeakRef`s made or read earlier no longer pin their targets. */
+	const tick = () => new Promise((r) => setTimeout(r, 0));
+
+	/** An origin store whose reads take a tick of I/O; it tracks the buffer of every range it returns. */
+	class TrackingStore extends MemoryBlobStore {
+		blocks: WeakRef<ArrayBuffer>[] = [];
+		/** Most block buffers alive when a block read started (counted after a GC). */
+		maxAlive = 0;
+		alive(): number {
+			gc();
+			return this.blocks.filter((w) => w.deref() !== undefined).length;
+		}
+		override async get(key: string, range?: BlobRange, opts?: GetOptions): Promise<Uint8Array | null> {
+			await tick();
+			if (range) this.maxAlive = Math.max(this.maxAlive, this.alive());
+			const b = await super.get(key, range, opts);
+			if (b && range) this.blocks.push(new WeakRef(b.buffer as ArrayBuffer));
+			return b;
+		}
+	}
+
+	/** A cold cache: nothing hits, and a put reads its body after a tick of I/O and keeps nothing. */
+	class ColdCache {
+		async match(): Promise<Response | undefined> {
+			return undefined;
+		}
+		async put(_req: Request, res: Response): Promise<void> {
+			await tick();
+			await res.arrayBuffer();
+		}
+	}
+
+	async function coldStore() {
+		const inner = new TrackingStore();
+		await inner.put(KEY, bytes(size, 3));
+		const pending: Promise<unknown>[] = [];
+		const s = new CachedBlobStore(inner, new ColdCache(), { origin: "https://t.cache", waitUntil: (p) => pending.push(p), blockBytes: B, blockBuffers: 2 });
+		return { inner, s, obj: inner.objects.get(KEY)!.bytes, settle: () => Promise.all(pending) };
+	}
+
+	/** Bytes kept alive by the block buffers still reachable plus the distinct buffers of the ranges returned. */
+	async function retained(inner: TrackingStore, got: Uint8Array[]): Promise<{ blocks: number; bytes: number }> {
+		await tick();
+		const blocks = inner.alive();
+		const own = new Set(got.map((b) => b.buffer));
+		const blockBufs = new Set(inner.blocks.map((w) => w.deref()).filter((b) => b !== undefined));
+		let bytes = blocks * B;
+		for (const b of own) if (!blockBufs.has(b as ArrayBuffer)) bytes += b.byteLength;
+		return { blocks, bytes };
+	}
+
+	// one 16-byte range in each of the 160 blocks, away from the block's start
+	const ranges = Array.from({ length: N }, (_, i) => ({ offset: i * B + 1000 + i, length: LEN }));
+
+	it("160 separate cold get()s keep 2,560 bytes alive, not 160 blocks, and hold at most blockBuffers blocks", async () => {
+		const { inner, s, obj, settle } = await coldStore();
+		const got = (await Promise.all(ranges.map((r) => s.get(KEY, r, { size })))) as Uint8Array[];
+		got.forEach((b, i) => expect(b).toEqual(obj.slice(ranges[i].offset, ranges[i].offset + LEN)));
+		await settle();
+		await s.drain();
+		expect(inner.blocks.length).toBe(N);
+		expect(await retained(inner, got)).toEqual({ blocks: 0, bytes: N * LEN });
+		// a block read starts only once a slot is free: the blocks alive then are the ones still in their slots
+		expect(inner.maxAlive).toBeLessThanOrEqual(2);
+	});
+
+	it("one cold getRanges() of 160 ranges keeps 2,560 bytes alive and holds at most blockBuffers blocks", async () => {
+		const { inner, s, obj, settle } = await coldStore();
+		const got = (await s.getRanges(KEY, ranges, { size }))!;
+		got.forEach((b, i) => expect(b).toEqual(obj.slice(ranges[i].offset, ranges[i].offset + LEN)));
+		await settle();
+		await s.drain();
+		expect(await retained(inner, got)).toEqual({ blocks: 0, bytes: N * LEN });
+		expect(inner.maxAlive).toBeLessThanOrEqual(2);
+	});
+
+	it("ranges served from blocks own their bytes on every path; a fill read still views the whole object", async () => {
+		const own = (b: Uint8Array) => b.byteOffset === 0 && b.buffer.byteLength === b.byteLength;
+		const sz = 4 * B;
+		const { cache, s, obj, settle } = await setup(sz);
+		const rs = [
+			{ offset: 7, length: 9 },
+			{ offset: B + 3, length: 40 },
+			{ offset: 2 * B - 4, length: 8 }, // crosses blocks 1 and 2
+		];
+		// filled from the origin, then from the cached blocks (multipart), then from blocks the cache answers whole (200)
+		for (const step of ["fill", "multipart", "200"]) {
+			if (step === "200") cache.ignoreRange = true;
+			const got = (await s.getRanges(KEY, rs, { size: sz }))!;
+			got.forEach((b, i) => expect(b, step).toEqual(obj.slice(rs[i].offset, rs[i].offset + rs[i].length)));
+			expect(got.every(own), step).toBe(true);
+			expect(own((await s.get(KEY, rs[1], { size: sz }))!), step).toBe(true);
+			await settle();
+		}
+		// an object cached whole: a range read without fill owns its bytes, with or without the size, 206 or 200
+		const w = await setup(sz);
+		w.cache.objects.set(`https://t.cache/${KEY}`, w.obj);
+		for (const ignoreRange of [false, true]) {
+			w.cache.ignoreRange = ignoreRange;
+			expect(own((await w.s.get(KEY, rs[1], { size: sz }))!)).toBe(true);
+			expect(own((await w.s.get(KEY, rs[1]))!)).toBe(true);
+			expect((await w.s.getRanges(KEY, rs, { size: sz }))!.every(own)).toBe(true);
+			expect((await w.s.getRanges(KEY, rs))!.every(own)).toBe(true);
+		}
+		// a fill read of an object cached whole answered with the whole object (200) is still a view into it, so a
+		// slab's reader can take its rerank records from the buffer
+		const f = await w.s.get(KEY, rs[1], { fill: true });
+		expect(f!.buffer.byteLength).toBe(sz);
 	});
 });

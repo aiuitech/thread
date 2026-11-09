@@ -177,7 +177,10 @@ block `i` is bytes `[i * B, min((i + 1) * B, size))` of the segment, cached unde
 it covers once (its ranges in that block as one range request); a block that misses is read from R2 (that block
 only, never the whole segment), serves the read, and is put in the cache through `waitUntil`. Concurrent readers of
 a block share one R2 read; at most `blockBuffers` blocks (16 MiB worth) are held from their R2 read until their put
-settles, and block reads from R2 in flight are also at most the store's `inflight`. An object already cached whole
+settles, and block reads from R2 in flight are also at most the store's `inflight`. Each range is copied out of its
+block before the block's slot is given back, so the memory a read keeps alive is the bytes it asked for plus at most
+`blockBuffers` blocks in flight (0.2.5 returned views into the blocks: 160 ranges of 16 bytes held 160 MiB, whatever
+`blockBuffers` was). An object already cached whole
 (before 0.2.5, or by `index.warm`) is still served from that entry. Slabs, deltas, manifests and the routing files
 keep whole-object caching: blocks only serve range reads that pass a size and are not a `fill`.
 

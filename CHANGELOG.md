@@ -4,6 +4,31 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## 0.2.6 (unreleased)
+
+- **The block cache keeps alive only the bytes a read asked for** (TypeScript, `CachedBlobStore` over the Workers
+  Cache API). 0.2.5's block reads returned `subarray` views of the blocks they filled, so every range a caller kept
+  held its whole block after the block's `blockBuffers` slot was released, and `blockBuffers` bounded nothing: 160
+  ranges of 16 bytes across a large segment, read cold, kept 160 MiB alive with `blockBuffers: 2` (inseam's review,
+  2026-11-09; 0.2.4 kept 2,560 bytes). In a Worker (128 MB isolate) a cold search over sparse ranges of large
+  segments could run out of memory. Now each range is copied out of its block (or out of the cache response it came
+  in) before the block's slot is given back, on every path of `get` and `getRanges`: a block filled from the origin,
+  a block being filled by another reader, a cached block (206 or 200), and an object cached whole read for a range
+  without `fill`. The memory block reads keep alive is the bytes returned plus at most `blockBuffers` blocks in
+  flight. `test/blocks.test.ts` counts the block buffers alive after a forced GC: 160 cold reads of 16 bytes over
+  64 KiB blocks kept 160 blocks (10 MiB) on 0.2.5 and keep none (2,560 bytes) now, and a block read starts with at
+  most one other block alive at `blockBuffers: 2` (159 before). The 0.2.5 workaround `open({ blockBytes: 64 * 1024 })`
+  can go back to the default.
+- Unchanged, on purpose: a `fill` read (a slab's scan prefix) still returns a view into the whole object, so the
+  query takes the slab's rerank records from the buffer (`stats.wholeSlabs`); hits of an in-process cache
+  (`MemoryCache`) are still views into the object it holds (bounded by its per-object cap, a quarter of `maxBytes`;
+  a copy would hold the bytes twice while it is cached); packs and warm packs in memory still serve views into
+  themselves.
+- `S3BlobStore`: a range answered with the whole object (200, Range ignored) returns the range copied out, not a
+  view that holds the whole object.
+- Python: no change. Its `CachedBlobStore` has no block cache (`fills` is always 0); its `memoryview`s are into
+  whole objects held by its in-process caches or read for a `fill`, as in TypeScript.
+
 ## 0.2.5 (2026-11-09)
 
 - **Large lexical segments are cached in blocks** (TypeScript, `CachedBlobStore` over the Workers Cache API).

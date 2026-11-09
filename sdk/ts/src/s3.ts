@@ -285,7 +285,7 @@ export class S3BlobStore implements BlobStore {
 			opts.trace.bytes += b.byteLength;
 		}
 		if (range) {
-			if (r.status === 200) b = b.subarray(range.offset, range.offset + range.length); // Range ignored
+			if (r.status === 200) b = b.slice(range.offset, range.offset + range.length); // Range ignored: copied out, so the range does not hold the whole object
 			if (b.byteLength !== range.length) throw new ThreadError(`${key} [${range.offset}, +${range.length}): got ${b.byteLength} bytes`);
 		}
 		return b;

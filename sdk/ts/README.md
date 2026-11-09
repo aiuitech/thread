@@ -120,7 +120,7 @@ once. `thread.resets` counts resets; `stats.attempt` is 2 on a retried query.
 | `missPolicy` | `"whole"` (Cache API), `"range+warm"` (`MemoryCache` / `DiskCache`) | what a slab-prefix cache miss reads: the whole slab, the range, or the range now and the whole slab in the background |
 | `warmConcurrency` | 2 | `"range+warm"`: background whole-slab fetches at once (1 while the query's own reads are in flight) |
 | `blockBytes` | 1 MiB | Cache API: block size of the block cache that serves range reads of lexical segments over 2 MiB ([docs/lexical.md](../../docs/lexical.md#block-cache)); `0` = off (those reads go to the store uncached) |
-| `blockBuffers` | 16 MiB worth (16 at 1 MiB) | Cache API: blocks held in memory at once, from their store read until their cache put settles |
+| `blockBuffers` | 16 MiB worth (16 at 1 MiB) | Cache API: blocks held in memory at once, from their store read until their cache put settles (ranges are copied out of them, so a range kept does not hold its block) |
 | `waitUntil` | - | `ctx.waitUntil`, keeps background cache writes and warm fetches alive |
 | `warmup` | on for remote stores outside Workers | open connections during `open` (`true` = the store's `inflight`, 32 against S3 from Node; a number; `false`) |
 | `coldPolicy` | off | `{ nprobe?, rerank?, threshold? }` for queries whose probed slabs are mostly not cached (see `query`) |
@@ -559,7 +559,9 @@ queries; `stats.cold` says whether it applied. Off by default. Residency is know
 Cache API only for keys this isolate has seen, and a store without a cache counts as cold when remote.
 
 A store may return views into a larger buffer (the whole object on a miss or a memory-cache hit); the SDK detects
-that for slab prefixes and uses the rest of the object instead of re-reading it (`stats.wholeSlabs`).
+that for slab prefixes and uses the rest of the object instead of re-reading it (`stats.wholeSlabs`). Over the
+Cache API, only `fill` reads return such views: other range reads (blocks, ranges of an object cached whole) return
+the range in a buffer of its own.
 
 ### Snapshots and packs
 
