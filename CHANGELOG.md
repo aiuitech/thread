@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## 0.2.5 (unreleased)
+## 0.2.5 (2026-11-09)
 
 - **Large lexical segments are cached in blocks** (TypeScript, `CachedBlobStore` over the Workers Cache API).
   A segment over 2 MiB (`LexSegmentOptions.fillBytes`) was read by range and never cached: a range read without
