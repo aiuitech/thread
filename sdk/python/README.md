@@ -337,7 +337,10 @@ Commits follow docs/update-path.md, as the TypeScript SDK does: a delta segment 
 tombstone set, then a create-only put of `manifest.{rev+1}.json` (the writer lock; a lost race rebuilds on the new
 head) and a compare-and-swap of `idx/current.json`. Needs a store with conditional puts (`S3BlobStore`,
 `FileBlobStore`, `MemoryBlobStore`); revisions written from Python record `change.writer: "thread-sdk-python"`.
-Compaction of slabs and GC stay Worker-only.
+Each `upsert` or `delete` is one revision with its own delta, segment and tombstone set, so batch at least 64
+documents per call, or what arrived in the last second ([docs/update-path.md](../../docs/update-path.md#small-writes)).
+Compaction of slabs and GC stay with the Worker and the TypeScript SDK; the sets the TypeScript compaction merges
+read like any others ([docs/update-path.md](../../docs/update-path.md#merging-tombstone-sets)).
 
 ### `BlobStore`
 

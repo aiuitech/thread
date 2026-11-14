@@ -5,6 +5,8 @@
 //                                  index at <store> (a directory or a pack file; default <dir>) and prints them
 //   node ts_side.mjs pack <dir> <file>    packs the current revision of the index in <dir> into <file>
 //   node ts_side.mjs basepack <dir> <file> <kind>   writes the base pack (kind base | cold) of the current revision
+//   node ts_side.mjs merged <dir>  many small writes, then compactions that merge the tombstone sets; records the
+//                                  requests and their TS results at the head and before the first compaction
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -230,6 +232,63 @@ if (cmd === "build") {
 	for (const req of requests) results.push(await answer(index, req));
 	process.stdout.write(JSON.stringify({ gen: index.gen, rev: index.rev, results }));
 	index.close();
+} else if (cmd === "merged") {
+	// Many small writes from TS on a fresh generation of many cells (vector upserts, dense- and lexical-scoped re-puts,
+	// keyed upserts with texts, deletes, re-inserts of deleted ids), then dense compactions that merge the tombstone
+	// sets (with a segment compaction between them); records the requests and their TS results at the head (merged
+	// sets) and at the revision before the first compaction (the original sets) in <dir>/ts-results.json.
+	const dim = 16;
+	await thread.createGeneration({ store, gen: "mg", dim, lex: { text: true }, compaction: { maxDeltas: 8, maxCellEntries: 12, maxTombstones: 1_000_000 } });
+	const index = await thread.open({ store, cache: false, refreshInterval: 0 });
+	const r = rng(23);
+	const centers = unitRows(8, dim, r);
+	const rows = (n) => unitRows(n, dim, r, centers, 0.3);
+	const row = (x, i) => x.subarray(i * dim, (i + 1) * dim);
+	const base = rows(300);
+	await index.upsert({ keys: Array.from({ length: 300 }, (_, i) => `doc/${i}`), texts: Array.from({ length: 300 }, (_, i) => `document ${i} word${i % 7}`), vectors: base });
+	while ((await index.compact({ force: true })).more);
+	const [v, w2, w3, nv] = [rows(80), rows(80), rows(80), rows(80)];
+	const deleted = [];
+	for (let i = 0; i < 80; i++) {
+		await index.upsert({ ids: [1000 + i], vectors: row(v, i) });
+		if (i % 2 === 1) await index.upsert({ ids: [1000 + i - 1], vectors: row(w2, i - 1), scope: "dense" });
+		else await index.upsert({ ids: [i % 300], texts: [`retitled ${i} word${i % 7}`], scope: "lexical" });
+		if (i % 10 === 3) await index.upsert({ keys: [`new/${i}`], texts: [`fresh ${i} word${i % 7}`], vectors: row(nv, i) });
+		if (i % 5 === 4) await index.delete([1000 + i - 2]), deleted.push(1000 + i - 2);
+		if (i % 15 === 14) await index.upsert({ ids: [deleted.shift()], vectors: row(w3, i) });
+		for (let j = 0; j < 3; j++) await index.delete([90000 + 3 * i + j]);
+	}
+	const beforeRev = index.rev;
+	const written = index.manifest.tombstones.length;
+	const requests = [];
+	const qr = rng(5);
+	for (let i = 0; i < 6; i++) requests.push({ kind: "query", vector: Array.from(unitRows(1, dim, qr)), topK: 10, nprobe: 64, rerank: 80 });
+	for (const i of [0, 3, 10, 41, 77]) requests.push({ kind: "query", vector: Array.from(row(v, i)), topK: 3, nprobe: 64, rerank: 40 });
+	for (const i of [14, 29, 44, 59, 74]) requests.push({ kind: "query", vector: Array.from(row(w3, i)), topK: 3, nprobe: 64, rerank: 40 });
+	for (const i of [0, 10, 60]) requests.push({ kind: "query", vector: Array.from(row(w2, i)), topK: 3, nprobe: 64, rerank: 40 });
+	for (const t of ["word3", "retitled", "document 7", "fresh", "word5 retitled"]) requests.push({ kind: "lexical", text: t, topK: 50 });
+	requests.push({ kind: "search", text: "fresh word3", vector: Array.from(row(nv, 13)), topK: 8, nprobe: 64 });
+	requests.push({ kind: "get", keys: ["doc/0", "doc/1", "doc/2", "doc/150", "new/3", "new/13", "new/none"] });
+	requests.push({ kind: "listKeys", prefix: "new/", limit: 20, after: null });
+	requests.push({ kind: "listKeys", prefix: "doc/", limit: 40, after: "doc/1" });
+	const answerAll = async (ix) => {
+		const out = [];
+		for (const req of requests) out.push(await answer(ix, req));
+		return out;
+	};
+	const beforeResults = await answerAll(index);
+	const runs = [];
+	const go = async (o) => {
+		const c = await index.compact(o);
+		runs.push({ outcome: c.outcome, folded: c.folded, merged: c.mergedTombstoneSets, sets: c.tombSets });
+		return c;
+	};
+	while (index.compactionDue().due) await go({ deadlineMs: 1 });
+	await index.compactSegments();
+	while ((await go({ force: true, purge: false })).more);
+	const results = await answerAll(index);
+	fs.writeFileSync(path.join(dir, "ts-results.json"), JSON.stringify({ gen: index.gen, rev: index.rev, beforeRev, written, runs, requests, results, beforeResults }));
+	index.close();
 } else if (cmd === "pack") {
 	const r = await packIndexToFile(store, extra);
 	process.stdout.write(JSON.stringify(r));
@@ -238,4 +297,4 @@ if (cmd === "build") {
 	const r = await buildBasePack(store, await loadRevState(store, t.gen, t.rev), process.argv[5] ?? "base");
 	fs.writeFileSync(extra, r.bytes);
 	process.stdout.write(JSON.stringify({ key: r.key, keys: r.keys, routing: r.routing }));
-} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | compact <dir> | scoped <dir> | pack <dir> <file> | basepack <dir> <file> <kind>`);
+} else throw new Error(`usage: ts_side.mjs build <dir> | run <dir> [store] | compact <dir> | scoped <dir> | merged <dir> | pack <dir> <file> | basepack <dir> <file> <kind>`);

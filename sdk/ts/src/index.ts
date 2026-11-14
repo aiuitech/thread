@@ -48,7 +48,7 @@ export type { Base, BaseStat, ColdPolicy, Hit, ParamSource, QueryOptions, QueryP
 export type { RevTimeline } from "./revision.js";
 export { CROSS_SLAB_GAP, FILTER_WIDEN, Limiter, MULTI_COALESCE, QUERY_INFLIGHT, coalesceRuns, executeQuery, planCrossSlab, slabResident } from "./query.js";
 export { dropGeneration, gcGeneration, setCurrent, supersededKey, type DropGenerationOptions, type DropGenerationResult, type GcOptions, type GcResult, type SetCurrentOptions, type SetCurrentResult } from "./generations.js";
-export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionLimits, compactionPressure, compactionStatus, tombDroppable, type CompactionLimits, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
+export { COMPACT_DEFAULT_MAX_BYTES, COMPACT_LOCK_STALE_MS, compactDeltas, compactionExceeded, compactionLimits, compactionPressure, compactionStatus, tombDroppable, tombMergeRuns, type CompactionLimits, type CompactionPressure, type CompactionStatus, type CompactOptions, type CompactResult, type CompactWasm, type SplitDone } from "./compact.js";
 export type { UpsertScope, CompactSegmentsResult, ConfigureAttrsResult, ConfigureLexicalResult, CreateGenerationOptions, CreateGenerationResult, CreateLexicalOptions, DeleteResult, Embedder, MergedSegmentInput, SlabWasm, UpsertInput, UpsertResult } from "./write.js";
 export { CREATE_DEFAULTS, commitMergedSegment, createGeneration, createLexicalGeneration } from "./write.js";
 export { BulkBuild, bulkBuildPlan, openBulkBuild, type BulkBuildOptions, type BulkBuildState, type BulkDocs, type BulkPhase, type BulkStepResult } from "./build.js";
@@ -1080,7 +1080,8 @@ export class ThreadIndex {
 
 	/**
 	 * @experimental One bounded dense compaction of the head (`compactDeltas`): folds delta segments into slab
-	 * revisions, splits cells over `maxCellEntries`, drops tombstone sets nothing references. Bounded by
+	 * revisions, splits cells over `maxCellEntries`, drops tombstone sets nothing references and merges runs of sets
+	 * no data object tells apart (`mergeTombstoneSets`). Bounded by
 	 * `maxBytes` (estimated peak memory, default 48 MiB), `cellsPerRun` and `deadlineMs`; takes
 	 * `idx/{gen}/compact.lock` like the Worker. `r.more` says whether another call has work. Without `force` a head
 	 * below every threshold of `manifest.compaction` is a `noop` (see `compactionDue`).

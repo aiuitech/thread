@@ -2,13 +2,15 @@
  * @experimental Dense compaction in one isolate: the SDK's port of the Worker's compaction (plan, cells, commit,
  * `compact.lock`, docs/update-path.md "Compaction" / "Automatic compaction" / "Cell splitting"). One call folds a
  * bounded slice of delta segments into new slab revisions, splits rewritten cells that pass `maxCellEntries`
- * (2-means, new fine means, a rebuilt centroid tree) and drops the tombstone sets nothing references any more.
+ * (2-means, new fine means, a rebuilt centroid tree), drops the tombstone sets nothing references any more and
+ * merges each run of sets that no data object tells apart into one (`tombMergeRuns`; the Worker does not).
  *
  * The slice is bounded three ways: cells (`cellsPerRun`), time (`deadlineMs`; at the deadline the run commits the
  * cells it finished whose deltas are complete, instead of throwing the work away) and memory (`maxBytes`: whole
  * deltas, oldest first, while the estimated peak fits). The output is the Worker's, object for object: slab
  * revisions `slab/{cell:05}.{baseRev + 1}`, `slabs.{rev}.json`, `fine.{rev}.f32` and `tree.{rev}.bin` after splits,
- * and the same manifest fields, so the Worker and the SDK can compact one index (both take `compact.lock`).
+ * and the same manifest fields (but for merged tombstone sets), so the Worker and the SDK can compact one index
+ * (both take `compact.lock`).
  */
 import { CachedBlobStore, type BlobStore } from "./store.js";
 import { WarmPrefixStore } from "./warm.js";
@@ -125,6 +127,13 @@ export interface CompactOptions {
 	owner?: string;
 	/** Append the run to `idx/{gen}/compact.last.json` (default true; what the Worker's `/index/status` shows). */
 	record?: boolean;
+	/**
+	 * Merge runs of tombstone sets that no data object of the committed revision tells apart into one set each
+	 * (default true; `tombMergeRuns`, docs/update-path.md "Merging tombstone sets"). A run merges once it has 8 sets;
+	 * the sets the call read anyway cost nothing, and up to 256 others are read for it, longest runs first, while
+	 * the deadline allows. Readers see the same documents; they read fewer sets.
+	 */
+	mergeTombstoneSets?: boolean;
 }
 
 /**
@@ -191,6 +200,10 @@ export interface CompactResult {
 	/** Cells of the head after the call. */
 	k: number;
 	droppedTombstoneSets: number[];
+	/** Tombstone sets replaced by merged sets in the committed revision (`tombMergeRuns`); 0 when none. */
+	mergedTombstoneSets: number;
+	/** Tombstone sets of the head after the call. */
+	tombSets: number;
 	readBytes: number;
 	writtenBytes: number;
 	/** The planner's estimate of this call's peak memory (bytes), at most `maxBytes`. */
@@ -484,6 +497,10 @@ class TombIds {
 		}
 		return p;
 	}
+	/** Whether the call has read (or is reading) the set: merging it then costs no get. */
+	has(t: { key: string }): boolean {
+		return this.ids.has(t.key);
+	}
 	/** Sorted unique union of the sets' ids (the `filter_hits` buffer `tombFor` / `tombForDelta` build). */
 	async union(sets: { key: string }[]): Promise<Uint8Array> {
 		return idUnion(await mapLimit(sets, TOMB_READ_CONCURRENCY, (t) => this.of(t)));
@@ -543,6 +560,144 @@ async function droppableSets(sets: TombRef[], deltas: { addedRev: number }[], sl
 	const need = sets.filter((_, i) => pre[i] === "ids");
 	const got = new Map(await mapLimit(need, TOMB_READ_CONCURRENCY, async (t) => [t.key, await ids.of(t)] as const));
 	return pre.map((p, i) => (p === "ids" ? !got.get(sets[i].key)!.some((id) => id < baseIds) : p));
+}
+
+// ---------- merging tombstone sets ----------
+
+/**
+ * A run needs this many members before a call merges it. Fewer wait for more members (or for their drop), so a
+ * merged set is not rewritten for every set a writer adds after it.
+ */
+const MERGE_MIN_SETS = 8;
+/**
+ * Tombstone sets a call reads only to merge them. The sets it read for its cells or its drops cost nothing more;
+ * the others cost a get each, so a backlog of thousands is merged over several calls, the longest runs first.
+ */
+const MERGE_READS = 256;
+/** Merge reads stop this long before the deadline: the time kept for the merged sets' puts and the manifest. */
+const MERGE_RESERVE_MS = 1_000;
+
+/**
+ * The runs of tombstone sets of a revision that no data object of it can tell apart, oldest set first: each run (of
+ * two sets or more) can be replaced by one set `{ rev: newest member's rev, ids: union, scope }`, and every filter
+ * a reader builds stays the same (`tombFor`, `tombForDelta`, `tombForSegment`, `tombHides`), as does the answer of
+ * `tombDroppable` for the run as a whole.
+ *
+ * Members share a scope (absent, `"dense"` or `"lexical"`; sets of different scopes hide different sides, and a set
+ * with an unknown scope never merges). Sets s1 < ... < sn are told apart by a data object of a side they hide:
+ * - dense view (no scope, `"dense"`): a delta with addedRev in [s1, sn) (filtered by the sets with rev > addedRev),
+ *   or a slab with slabRev in (s1, sn] (filtered by the sets with rev >= slabRev; rev-0 slabs by every set, so
+ *   never told apart). Empty slabs count too: `tombDroppable` waits for them.
+ * - lexical view (no scope, `"lexical"`): a lexical/docs segment with addedRev in [s1, sn).
+ * A run is cut wherever such an object lies between two consecutive members; any subset of a run is mergeable too.
+ *
+ * In practice: an unscoped upsert with texts writes a segment at its own set's rev, so its set merges with earlier
+ * sets but not with later ones until a segment compaction has merged that segment; a dense-scoped set merges with
+ * its neighbours once the deltas between them are folded and no slab rev lies between them.
+ *
+ * Not decided here, since it needs the ids: a set with build ids (`id < manifest.vectors`) is never dropped, so the
+ * caller keeps such sets apart from the others (a merge with them would keep the others' ids alive for ever).
+ */
+export function tombMergeRuns(sets: readonly TombRef[], deltas: readonly { addedRev: number }[], slabs: readonly SlabRow[], segments: readonly { addedRev: number }[]): TombRef[][] {
+	const sorted = (xs: number[]) => [...new Set(xs)].sort((a, b) => a - b);
+	const d = sorted(deltas.map((x) => x.addedRev));
+	const s = sorted(slabs.map(slabRevOf).filter((r) => r > 0));
+	const g = sorted(segments.map((x) => x.addedRev));
+	/** Whether the sorted `a` holds a value in [lo, hi). */
+	const anyIn = (a: number[], lo: number, hi: number): boolean => {
+		let l = 0;
+		let h = a.length;
+		while (l < h) {
+			const m = (l + h) >>> 1;
+			if (a[m] < lo) l = m + 1;
+			else h = m;
+		}
+		return l < a.length && a[l] < hi;
+	};
+	const out: TombRef[][] = [];
+	for (const scope of [undefined, "dense", "lexical"] as const) {
+		const view = { scope };
+		const members = sets.filter((t) => t.scope === scope).sort((x, y) => x.rev - y.rev);
+		let run: TombRef[] = [];
+		for (const t of members) {
+			const p = run[run.length - 1];
+			// Revs are integers: (p, t] is [p + 1, t + 1).
+			const apart = p !== undefined && ((hidesDense(view) && (anyIn(d, p.rev, t.rev) || anyIn(s, p.rev + 1, t.rev + 1))) || (hidesLexical(view) && anyIn(g, p.rev, t.rev)));
+			if (apart) {
+				if (run.length >= 2) out.push(run);
+				run = [];
+			}
+			run.push(t);
+		}
+		if (run.length >= 2) out.push(run);
+	}
+	return out;
+}
+
+/** The runs a call merges: those with at least `MERGE_MIN_SETS` members. */
+const mergeableRuns = (sets: readonly TombRef[], deltas: readonly { addedRev: number }[], slabs: readonly SlabRow[], segments: readonly { addedRev: number }[]): TombRef[][] => tombMergeRuns(sets, deltas, slabs, segments).filter((r) => r.length >= MERGE_MIN_SETS);
+
+/** The merge reads a call has left (across commit retries) and when they stop; the merged objects it wrote. */
+interface MergeBudget {
+	reads: number;
+	until: number;
+	/** Member keys -> the merged set's key (a commit retried on a newer head reuses the object). */
+	written: Map<string, Promise<string>>;
+}
+
+/**
+ * Replaces runs of `sets` (the sets a commit keeps) by merged sets: the longest runs first, with the ids the call
+ * has read and as many others as the budget allows. Sets with build ids merge only with each other. The merged set
+ * is `idx/{gen}/tombstones.{rev}.m{fromRev}.u32` (the newest and oldest member's revs; a writer's set is
+ * `tombstones.{rev}.u32` or `tombstones.{rev}.{8 hex}.u32`), written create-only, sorted unique u32 LE like every
+ * set; its `count` is the union's size. The list stays in rev order. Returns the new list and how many sets were
+ * replaced by how many.
+ */
+async function mergeTombSets(store: BlobStore, gen: string, sets: TombRef[], runs: TombRef[][], baseIds: number, ids: TombIds, budget: MergeBudget): Promise<{ tombstones: TombRef[]; merged: number; into: number }> {
+	if (!runs.length) return { tombstones: sets, merged: 0, into: 0 };
+	const order = [...runs].sort((x, y) => y.length - x.length || x[0].rev - y[0].rev);
+	// What the call has read is free; the budget goes to the longest runs, in windows, while there is time.
+	for (const run of order) {
+		const unread = run.filter((t) => !ids.has(t));
+		for (let i = 0; i < unread.length && budget.reads > 0 && Date.now() < budget.until; ) {
+			const win = unread.slice(i, i + Math.min(TOMB_READ_CONCURRENCY, budget.reads));
+			budget.reads -= win.length;
+			i += win.length;
+			await mapLimit(win, TOMB_READ_CONCURRENCY, (t) => ids.of(t));
+		}
+	}
+	const groups: TombRef[][] = [];
+	for (const run of order) {
+		const known = run.filter((t) => ids.has(t));
+		if (known.length < 2) continue;
+		if (run[0].scope === "lexical" || !(baseIds > 0)) {
+			groups.push(known);
+			continue;
+		}
+		const build: TombRef[] = [];
+		const rest: TombRef[] = [];
+		for (const t of known) ((await ids.of(t)).some((id) => id < baseIds) ? build : rest).push(t);
+		for (const g of [build, rest]) if (g.length >= 2) groups.push(g);
+	}
+	if (!groups.length) return { tombstones: sets, merged: 0, into: 0 };
+	// Member key -> the merged set (at its newest member's place in the list), or null (left out).
+	const replaced = new Map<string, TombRef | null>();
+	for (const g of groups) {
+		const first = g[0];
+		const last = g[g.length - 1];
+		const memo = g.map((t) => t.key).join("|");
+		let key = budget.written.get(memo);
+		const union = await ids.union(g);
+		if (!key) budget.written.set(memo, (key = putUnique(store, `idx/${gen}/tombstones.${last.rev}.m${first.rev}.u32`, union.slice())));
+		const ref: TombRef = { rev: last.rev, key: await key, count: union.byteLength / 4, ...(last.scope ? { scope: last.scope } : {}) };
+		for (const t of g) replaced.set(t.key, t === last ? ref : null);
+	}
+	const tombstones: TombRef[] = [];
+	for (const t of sets) {
+		const r = replaced.get(t.key);
+		if (r !== null) tombstones.push(r ?? t);
+	}
+	return { tombstones, merged: groups.reduce((a, g) => a + g.length, 0), into: groups.length };
 }
 
 // ---------- plan ----------
@@ -826,7 +981,7 @@ export async function compactDeltas(ctx: WriterContext, opts: CompactOptions = {
 	const rctx: WriterContext = { ...ctx, store };
 	const owner = opts.owner ?? crypto.randomUUID();
 	const guard = `${prefixOf(store)}|${gen}`;
-	const result: CompactResult = { gen, outcome: "noop", rev: -1, baseRev: null, cells: 0, folded: 0, remainingDeltas: 0, skippedDeltas: 0, reads: { deltas: 0, deltasListed: 0, tombSets: 0, tombSetsListed: 0, ms: 0 }, purgeCells: 0, splits: [], splitsDeferred: [], presplit: [], k: 0, droppedTombstoneSets: [], readBytes: 0, writtenBytes: 0, estimatedPeakBytes: 0, concurrency: 0, reasons: [], more: false, conflicts: 0, currentUpdated: false, staleLockTaken: false, ms: 0 };
+	const result: CompactResult = { gen, outcome: "noop", rev: -1, baseRev: null, cells: 0, folded: 0, remainingDeltas: 0, skippedDeltas: 0, reads: { deltas: 0, deltasListed: 0, tombSets: 0, tombSetsListed: 0, ms: 0 }, purgeCells: 0, splits: [], splitsDeferred: [], presplit: [], k: 0, droppedTombstoneSets: [], mergedTombstoneSets: 0, tombSets: 0, readBytes: 0, writtenBytes: 0, estimatedPeakBytes: 0, concurrency: 0, reasons: [], more: false, conflicts: 0, currentUpdated: false, staleLockTaken: false, ms: 0 };
 	const finish = () => ((result.ms = Date.now() - t0), result);
 	if (active.has(guard)) {
 		result.outcome = "locked";
@@ -842,6 +997,7 @@ export async function compactDeltas(ctx: WriterContext, opts: CompactOptions = {
 		const headM = parseManifest(await getOrThrow(store, keys.manifest(gen, headRev)), gen, headRev);
 		result.rev = headRev;
 		result.k = headM.k1 * headM.k2;
+		result.tombSets = headM.tombstones?.length ?? 0;
 		result.reasons = compactionExceeded(headM);
 		result.remainingDeltas = headM.deltas?.length ?? 0;
 		if (!opts.force && !result.reasons.length) {
@@ -893,7 +1049,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 			}
 	};
 	// ---- base ---- (a retry after a wasm trap starts over)
-	Object.assign(result, { readBytes: 0, writtenBytes: 0, splits: [], cells: 0, folded: 0, droppedTombstoneSets: [], reads: { deltas: 0, deltasListed: 0, tombSets: 0, tombSetsListed: 0, ms: 0 } });
+	Object.assign(result, { readBytes: 0, writtenBytes: 0, splits: [], cells: 0, folded: 0, droppedTombstoneSets: [], mergedTombstoneSets: 0, reads: { deltas: 0, deltasListed: 0, tombSets: 0, tombSetsListed: 0, ms: 0 } });
 	const baseRev = await latestRev(store, gen);
 	const manifest = parseManifest(await getOrThrow(store, keys.manifest(gen, baseRev)), gen, baseRev);
 	const files = manifestFiles(manifest);
@@ -904,11 +1060,12 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 	result.reasons = compactionExceeded(manifest);
 	result.remainingDeltas = manifest.deltas?.length ?? 0;
 	const tombRefs = manifest.tombstones ?? [];
+	result.tombSets = tombRefs.length;
 	const reads = result.reads;
 	const tombIds = new TombIds(store, reads);
 	reads.deltasListed = manifest.deltas?.length ?? 0;
 	reads.tombSetsListed = tombRefs.length;
-	const record = (extra: Record<string, unknown> = {}) => ({ trigger: { rev: baseRev, op: "sdk-compact", reasons: result.reasons }, outcome: result.outcome, ms: Date.now() - t0, baseRev, rev: result.rev, cells: result.cells, folded: result.folded, purgeCells: result.purgeCells, skippedDeltas: result.skippedDeltas, splits: result.splits, splitsDeferred: result.splitsDeferred, k: result.k, remainingDeltas: result.remainingDeltas, droppedTombstoneSets: result.droppedTombstoneSets.length, readMB: +(result.readBytes / 1e6).toFixed(1), writtenMB: +(result.writtenBytes / 1e6).toFixed(1), slots: 1, estimatedPeakMB: +(result.estimatedPeakBytes / 1e6).toFixed(1), reads: { ...reads }, ...(result.note ? { note: result.note } : {}), ...extra });
+	const record = (extra: Record<string, unknown> = {}) => ({ trigger: { rev: baseRev, op: "sdk-compact", reasons: result.reasons }, outcome: result.outcome, ms: Date.now() - t0, baseRev, rev: result.rev, cells: result.cells, folded: result.folded, purgeCells: result.purgeCells, skippedDeltas: result.skippedDeltas, splits: result.splits, splitsDeferred: result.splitsDeferred, k: result.k, remainingDeltas: result.remainingDeltas, droppedTombstoneSets: result.droppedTombstoneSets.length, mergedTombstoneSets: result.mergedTombstoneSets, tombSets: result.tombSets, readMB: +(result.readBytes / 1e6).toFixed(1), writtenMB: +(result.writtenBytes / 1e6).toFixed(1), slots: 1, estimatedPeakMB: +(result.estimatedPeakBytes / 1e6).toFixed(1), reads: { ...reads }, ...(result.note ? { note: result.note } : {}), ...extra });
 	if (!opts.force && !result.reasons.length) {
 		result.outcome = "noop";
 		result.note = `head rev ${baseRev} is below every threshold`;
@@ -933,6 +1090,8 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 	const deadline = t0 + deadlineMs;
 	// Reading more deltas stops here; the first window is read whatever the time (it holds the oldest delta).
 	const readUntil = t0 + READ_SHARE * Math.max(0, deadlineMs - COMMIT_RESERVE_MS);
+	// Merging tombstone sets at the commit: reads for it stop before the deadline (the sets read anyway are free).
+	const merge: MergeBudget | null = opts.mergeTombstoneSets === false ? null : { reads: MERGE_READS, until: deadline - MERGE_RESERVE_MS, written: new Map() };
 	const slabsBytes = await getOrThrow(store, files.slabs);
 	const slabs = parseSlabsTable(slabsBytes, k, files.slabs);
 	const tombThreshold = result.reasons.some((r) => r.startsWith("tombstones"));
@@ -1001,11 +1160,17 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		result.outcome = waiting ? "blocked" : "noop";
 		result.more = waiting > 0;
 		result.note = slice.note ?? (waiting ? `${waiting} deltas wait (${unread ? `${unread} not read; ` : ""}splits deferred: the slice has more than ${planOpts.splitCellsPerRun} cells)` : undefined) ?? (tombRefs.length ? "nothing to rewrite (tombstone sets held by build ids, lexical segments or no blocking slabs)" : "nothing to rewrite");
-		// Tombstone sets may still be droppable without rewriting anything (e.g. after a segment compaction).
-		if (!waiting && (await droppableSets(tombRefs, manifest.deltas ?? [], slabs, manifest.vectors, manifest.segments ?? [], tombIds)).some(Boolean)) {
-			await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombIds, known: dcells, slabRev, rows: [], folded: [], splits: [], means: new Map(), deltaCells: slice.deltaCells, cap, pinned: new Set() }, result);
-			result.outcome = "committed";
-			result.note = "dropped tombstone sets nothing references";
+		// Tombstone sets may still be droppable (e.g. after a segment compaction), or mergeable, without rewriting
+		// anything: a commit of the manifest alone.
+		const droppable = !waiting && (await droppableSets(tombRefs, manifest.deltas ?? [], slabs, manifest.vectors, manifest.segments ?? [], tombIds)).some(Boolean);
+		const mergeable = !waiting && merge !== null && mergeableRuns(tombRefs, manifest.deltas ?? [], slabs, manifest.segments ?? []).length > 0;
+		if (droppable || mergeable) {
+			const c = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombIds, known: dcells, slabRev, rows: [], folded: [], splits: [], means: new Map(), deltaCells: slice.deltaCells, cap, pinned: new Set(), merge }, result);
+			if (c.committed) {
+				result.outcome = "committed";
+				result.note = [result.droppedTombstoneSets.length ? "dropped tombstone sets nothing references" : "", result.mergedTombstoneSets ? `merged ${result.mergedTombstoneSets} tombstone sets` : ""].filter(Boolean).join("; ");
+				result.more = c.mergeMore && (opts.force === true || compactionExceeded(c.manifest).length > 0);
+			}
 		}
 		return record();
 	}
@@ -1053,7 +1218,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		if (!p) deltaBytes.set(d.key, (p = getOrThrow(store, d.key).then((b) => ((result.readBytes += b.byteLength), b))));
 		return p;
 	};
-	// The filters (tombFor / tombForDelta over the dense view: the lexical-scoped sets are never read here), each
+	// The filters (tombFor / tombForDelta over the dense view: the lexical-scoped sets are not read here), each
 	// union built once and each set read once, when the first cell that needs it runs.
 	const unions = new Map<string, Promise<Uint8Array>>();
 	const unionOf = (key: string, pick: (t: TombRef) => boolean) => {
@@ -1233,13 +1398,14 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		if (nc !== undefined) commitRows.push([nc, rows.get(nc)!]);
 	}
 	commitRows.sort((x, y) => x[0] - y[0]);
-	const head = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombIds, known: dcells, slabRev, rows: commitRows, folded: commitFolded, splits: commitSplits, means, deltaCells: slice.deltaCells, cap: slice.limits.cellEntries, pinned: slice.pinned }, result);
+	const head = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombIds, known: dcells, slabRev, rows: commitRows, folded: commitFolded, splits: commitSplits, means, deltaCells: slice.deltaCells, cap: slice.limits.cellEntries, pinned: slice.pinned, merge }, result);
 	result.splits = splitsDone.filter((s) => commitSplits.some(([c]) => c === s.cell)).sort((x, y) => x.cell - y.cell);
 	result.outcome = stopped ? "partial" : "committed";
 	if (readNote) result.note = `${readNote}; the cells the oldest delta needs ran anyway (${commitCells.size} of ${slice.cells.length} cells)`;
 	// More splitting only helps while splits move entries (a split with an empty half would repeat forever).
 	const moved = result.splits.some((x) => x.a > 0 && x.b > 0);
-	result.more = stopped || moreWork(head.manifest, opts.force === true, moved && head.oversized > 0) || result.splitsDeferred.length > 0;
+	// Runs left to merge are more work only for a call that merged (one without the time for it would loop).
+	result.more = stopped || moreWork(head.manifest, opts.force === true, moved && head.oversized > 0) || result.splitsDeferred.length > 0 || (head.mergeMore && opts.force === true);
 	return record();
 }
 
@@ -1265,6 +1431,8 @@ interface Slice {
 	cap: number;
 	/** Split cells that kept their mean. */
 	pinned: Set<number>;
+	/** Merge the tombstone sets the commit keeps (null: `mergeTombstoneSets: false`). */
+	merge: MergeBudget | null;
 }
 
 /**
@@ -1277,7 +1445,7 @@ function moreWork(m: Manifest, force: boolean, splitMore: boolean): boolean {
 }
 
 /** The Worker's compactCommit on the head (which may be newer than the base): rows, folded deltas, splits, tombstones. */
-async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result: CompactResult): Promise<{ manifest: Manifest; oversized: number }> {
+async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result: CompactResult): Promise<{ manifest: Manifest; oversized: number; committed: boolean; mergeMore: boolean }> {
 	const { store, gen } = ctx;
 	const folded = new Set(s.folded.map((d) => d.key));
 	// Cells whose mean changes (a pinned split keeps it): no delta that stays may have entries in them.
@@ -1298,6 +1466,10 @@ async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result:
 	};
 	let routing: { forFine: string; fine: string; k: number; tree?: TreeRef; routing?: RoutingTables } | null = null;
 	let dropped: number[] = [];
+	let merged = { merged: 0, into: 0 };
+	let committedTable: SlabRow[] = s.slabs;
+	/** Whether the last attempt returned a manifest (commitRev returns after the attempt that wrote one, or none). */
+	let wrote = false;
 	let oversized = 0;
 	const c = await commitRev(ctx, async ({ rev, manifest, files }) => {
 		if (files.slabs !== s.files.slabs) throw new ThreadError(`slabs table changed since rev ${s.baseRev} (another compaction committed)`, 409);
@@ -1319,9 +1491,19 @@ async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result:
 		// The sets of the head (a writer may have added some since the base): ids are read only for the build-id test.
 		const tombRefs: TombRef[] = manifest.tombstones ?? [];
 		const drop = await droppableSets(tombRefs, remaining, table, manifest.vectors, manifest.segments ?? [], s.tombIds);
-		const keep = tombRefs.filter((_, i) => !drop[i]);
+		let keep = tombRefs.filter((_, i) => !drop[i]);
 		dropped = tombRefs.filter((_, i) => drop[i]).map((t) => t.rev);
-		if (!s.rows.length && !dropped.length) return null;
+		// Merge on the state this revision commits: the deltas that remain, the new slabs table, the head's segments.
+		merged = { merged: 0, into: 0 };
+		if (s.merge) {
+			const m = await mergeTombSets(store, gen, keep, mergeableRuns(keep, remaining, table, manifest.segments ?? []), manifest.vectors, s.tombIds, s.merge);
+			keep = m.tombstones;
+			merged = { merged: m.merged, into: m.into };
+		}
+		committedTable = table;
+		wrote = false;
+		if (!s.rows.length && !dropped.length && !merged.merged) return null;
+		wrote = true;
 		const next: Manifest = { ...inherit(manifest), deltas: remaining, tombstones: keep.map(({ rev: r, key, count, scope }) => ({ rev: r, key, count, ...(scope ? { scope } : {}) })) };
 		if (s.rows.length) next.files = { ...files, slabs: await putUnique(store, keys.slabsTable(gen, rev + 1), JSON.stringify(table)) };
 		if (s.splits.length) {
@@ -1333,17 +1515,22 @@ async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result:
 			else delete next.routing;
 		}
 		const splitChange = s.splits.length ? { splits: s.splits.map(([cell, newCell]) => [cell, newCell, table[cell][2], table[newCell][2]]), k: { from: s.k, to: kk } } : {};
-		return { ...next, change: { op: "compact", baseRev: s.baseRev, slabRev: s.slabRev, cells: s.rows.length, foldedDeltas: folded.size, droppedTombstoneSets: dropped.length, ...splitChange, writer: "thread-sdk" } };
+		return { ...next, change: { op: "compact", baseRev: s.baseRev, slabRev: s.slabRev, cells: s.rows.length, foldedDeltas: folded.size, droppedTombstoneSets: dropped.length, ...(merged.merged ? { mergedTombstoneSets: merged.merged, mergedInto: merged.into } : {}), ...splitChange, writer: "thread-sdk" } };
 	});
 	result.rev = c.rev;
 	result.cells = s.rows.length;
 	result.folded = folded.size;
 	result.remainingDeltas = c.manifest.deltas?.length ?? 0;
-	result.droppedTombstoneSets = dropped;
+	const committed = wrote;
+	result.droppedTombstoneSets = committed ? dropped : [];
+	result.mergedTombstoneSets = committed ? merged.merged : 0;
+	result.tombSets = c.manifest.tombstones?.length ?? 0;
 	result.k = c.manifest.k1 * c.manifest.k2;
 	result.conflicts = c.conflicts;
 	result.currentUpdated = c.currentUpdated;
-	return { manifest: c.manifest, oversized };
+	// Whether runs are left to merge, after a call that merged some (budget or time cut it).
+	const mergeMore = committed && merged.merged > 0 && mergeableRuns(c.manifest.tombstones ?? [], c.manifest.deltas ?? [], committedTable, c.manifest.segments ?? []).length > 0;
+	return { manifest: c.manifest, oversized, committed, mergeMore };
 }
 
 /**

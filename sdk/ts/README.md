@@ -424,7 +424,7 @@ memory, default 48 MiB; `r.estimatedPeakBytes` is the plan's figure, an upper bo
 `deadline - 2.5 s`, up to 7 s with splits by the size of the fine means; the finished cells whose deltas are
 complete are committed, `outcome: "partial"`). A call reads only what its slice needs: the deltas' cells oldest
 first, until the slice is full or a third of `deadline - 2.5 s` is used (the first 8 always), and a tombstone set's
-ids only when a cell it rewrites or a delta it folds is filtered by it (lexical-scoped sets never); `r.reads` counts
+ids only when a cell it rewrites or a delta it folds is filtered by it (lexical-scoped sets only to merge them); `r.reads` counts
 the deltas and sets read, of those the base lists, and the ms to the plan. The oldest delta folds in every call
 that plans, whatever the deadline: its cells run first and are committed even when that takes longer than
 `deadlineMs` (the note says when the read phase passed the deadline), so a backlog shrinks on every call. `maxBytes` also sizes the cells: they split at `min(maxCellEntries, splitEntries / 2)`, where
@@ -442,7 +442,12 @@ automatic runs; `force: true` folds everything the budgets allow and also splits
 `concurrency` (cells in flight, default 4), `maxCellEntries`, `splitCellsPerRun`, `purge` (rewrite the cells that
 keep tombstone sets alive; default when the tombstone threshold is exceeded), `lock` (default true), `owner` (a
 stable lock owner, e.g. a Durable Object id, takes over its own lock after a crash at once instead of after 10
-minutes), `record` (append the run to `compact.last.json`, default true). The objects are the Worker's, byte for
+minutes), `record` (append the run to `compact.last.json`, default true), `mergeTombstoneSets` (default true: at
+its commit a call replaces each run of 8 or more tombstone sets that no delta, slab or segment tells apart by one
+set of their union, reading at most 256 sets for it; `r.mergedTombstoneSets`, `r.tombSets`; every reader reads the
+result unchanged, see [docs/update-path.md](../../docs/update-path.md#merging-tombstone-sets)). Every write is a
+revision with its own delta, segment and set, so batch at least 64 documents per upsert, or what arrived in the
+last second ([docs/update-path.md](../../docs/update-path.md#small-writes)). The other objects are the Worker's, byte for
 byte (`test/compact-worker.test.ts` compacts one index both ways), so the Worker and the SDK can compact one index;
 a run commits through the manifest create-only put and is safe to repeat after a crash. Details:
 [docs/update-path.md](../../docs/update-path.md#compaction-in-the-sdk).

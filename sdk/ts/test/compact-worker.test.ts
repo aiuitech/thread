@@ -140,6 +140,8 @@ describe.skipIf(!haveWorkerWasm)("SDK compaction against the Worker's", () => {
 			expect(sr.k).toBe(wr.k);
 			expect(sr.folded).toBe(wr.folded);
 			expect(sr.splits.length).toBe(wr.splits);
+			// No run here reaches the 8 sets a merge needs, so `tombstones` compares too (the Worker does not merge).
+			expect(sr.mergedTombstoneSets).toBe(0);
 			const wm = await headOf((k) => bucket.get(k).then(async (o) => (o ? new Uint8Array(await o.arrayBuffer()) : null)), async () => [...bucket.objects.keys()], gen);
 			const sm = await headOf((k) => sdkStore.get(k), () => sdkStore.list(""), gen);
 			for (const f of ["k1", "k2", "dim", "vectors", "deltas", "tombstones", "files", "tree", "routing", "nextSeq"] as const) expect(sm[f], f).toEqual(wm[f]);
@@ -220,5 +222,51 @@ describe.skipIf(!haveWorkerWasm)("scoped tombstones in the Worker", () => {
 		expect((await r2.search({ text: "renamed", topK: 3, embed: false })).hits.map((h) => h.id)).toEqual([a.ids[0]]);
 		expect((await r2.query(v.subarray(3 * DIM, 4 * DIM), { topK: 1 })).hits[0].id).toBe(a.ids[1]);
 		r2.close();
+	});
+});
+
+describe.skipIf(!haveWorkerWasm)("merged tombstone sets in the Worker", () => {
+	it("compacts a generation whose sets the SDK merged, and rolls back to a revision before the merge", async () => {
+		const gen = "mt";
+		const src = new MemoryBlobStore();
+		await thread.createGeneration({ store: src, gen, dim: DIM, lex: null, compaction: { maxDeltas: 4, maxCellEntries: 30, maxTombstones: 1_000_000 } });
+		const r = rng(12);
+		const v = unitRows(200, DIM, r, unitRows(6, DIM, r), 0.3);
+		const ix = await thread.open({ store: src, cache: false, refreshInterval: 0 });
+		await ix.upsert({ ids: Array.from({ length: 160 }, (_, i) => i), vectors: v.subarray(0, 160 * DIM) });
+		while ((await ix.compact({ force: true })).more);
+		expect(ix.manifest.k2).toBeGreaterThan(4);
+		// Small deletes (no delta: the cells keep their slabs, so the sets stay) and re-inserts of deleted ids.
+		for (let i = 0; i < 24; i++) {
+			await ix.delete([i, 5000 + i]);
+			if (i % 6 === 5) await ix.upsert({ ids: [i - 3], vectors: v.subarray((160 + i) * DIM, (161 + i) * DIM) });
+		}
+		const live = async (x: Awaited<ReturnType<typeof thread.open>>) => (await x.query(v.subarray(0, DIM), { topK: 1000, rerank: 1000, nprobe: 1 << 20 })).hits.map((h) => h.id).sort((a, b) => a - b);
+		const before = await live(ix);
+		const beforeRev = ix.rev;
+		const sets = ix.manifest.tombstones!.length;
+		const c = await ix.compact({ force: true, purge: false });
+		expect(c.mergedTombstoneSets).toBeGreaterThan(8);
+		expect(ix.manifest.tombstones!.length).toBeLessThan(sets / 3);
+		expect(await live(ix)).toEqual(before);
+		// More writes, then the Worker compacts on top of the merged sets; the SDK reads its result.
+		const more = [...before.filter((id) => id !== 150), 199].sort((a, b) => a - b);
+		await ix.delete([150]);
+		await ix.upsert({ ids: [199], vectors: v.subarray(199 * DIM, 200 * DIM) });
+		ix.close();
+		const bucket = new FakeR2();
+		copyInto(src, bucket);
+		await workerCompact(bucket, { gen, force: true });
+		const after = await thread.open({ store: asStore(bucket), cache: false });
+		expect(await live(after)).toEqual(more);
+		after.close();
+		// Rolling back past the merge: the head lists the merged set, which the old revision does not, so the Worker
+		// asks for force; with it, the old revision's own sets (still in the bucket) answer as before.
+		await expect(workerPost(bucket, "/build/rollback", { gen, toRev: beforeRev })).rejects.toThrow(/pass force/);
+		const back = await workerPost(bucket, "/build/rollback", { gen, toRev: beforeRev, force: true });
+		const rolled = await thread.open({ store: asStore(bucket), cache: false });
+		expect(rolled.rev).toBe(back.rev);
+		expect(await live(rolled)).toEqual(before);
+		rolled.close();
 	});
 });

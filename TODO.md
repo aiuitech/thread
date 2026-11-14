@@ -136,8 +136,9 @@ minute after writes.
 Done (unreleased, TS SDK): deltas are read oldest first in windows until the slice is full (16 in a row skipped) or
 a third of `deadline - 2.5 s` is used; a tombstone set is read only when a rewritten cell or a folded delta is
 filtered by it, or its drop needs the build-id test; the oldest delta's cells always run and commit
-(`CompactResult.reads`, `test/compact-backlog.test.ts`). Unioning sets is not done here: it belongs to the next
-section.
+(`CompactResult.reads`, `test/compact-backlog.test.ts`). Fewer, larger sets: the commit now merges each run of
+sets that no delta, slab or segment tells apart into one (`tombMergeRuns`, `test/compact-merge.test.ts`; next
+section).
 
 - [x] **Read only what the slice needs.** The plan takes whole deltas, oldest first, while the cells and memory fit.
       Read the deltas' cell counts oldest first, and stop when the slice is full, not after reading all of them.
@@ -165,5 +166,10 @@ tombstone sets at index revision 2,803.
 
 - [ ] **Caller side (inseam).** Write once per crawl page, not once per read batch: keep the extracted text (not the
       bytes) across the page's batches and apply it in one write. Track this in inseam.
-- [ ] **thread side.** Decide whether the SDK should help: coalesce small deltas and tombstone sets in compaction
+- [x] **thread side.** Decide whether the SDK should help: coalesce small deltas and tombstone sets in compaction
       before folding cells, or document a minimum batch size for writers.
+      Decided and done (unreleased, TS SDK): tombstone sets are merged at the dense compaction's commit when no data
+      object tells them apart (runs of 8 or more, at most 256 extra reads per call; docs/update-path.md "Merging
+      tombstone sets"); deltas get no step of their own, since folding already coalesces them (one call folds many
+      tiny deltas per cell); docs/update-path.md "Small writes" gives the cost of a write and the minimum batch (64
+      documents, or what arrived in the last second).

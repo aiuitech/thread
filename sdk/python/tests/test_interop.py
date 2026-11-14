@@ -17,6 +17,7 @@ sums (see thread-core `math.rs`), so they are compared within 1e-5.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -250,3 +251,28 @@ def test_scoped_tombstones_across_sdks(tmp_path):
     assert back["rev"] == rev
     for req, a, b in zip(requests, mine, back["results"]):
         same(a, b, json.dumps(req)[:80])
+
+
+def test_merged_tombstone_sets_across_sdks(tmp_path):
+    """TS writes many small revisions and its dense compaction merges their tombstone sets into fewer, larger ones;
+    Python reads the merged head, and the revision before the merges, and answers what TS answered at each."""
+    node("merged", tmp_path)
+    ts = json.loads((tmp_path / "ts-results.json").read_text())
+    assert sum(r["merged"] for r in ts["runs"]) > ts["written"] / 2
+    store = FileBlobStore(tmp_path)
+    with open_index(store) as index:
+        assert (index.gen, index.rev) == (ts["gen"], ts["rev"])
+        sets = index.manifest["tombstones"]
+        assert len(sets) < ts["written"] / 10
+        assert any(re.search(r"/tombstones\.\d+\.m\d+\.u32$", t["key"]) for t in sets)
+        for req, want in zip(ts["requests"], ts["results"]):
+            same(json.loads(json.dumps(answer(index, req))), want, json.dumps(req)[:80])
+    with open_index(store, gen=ts["gen"], rev=ts["beforeRev"]) as index:
+        assert len(index.manifest["tombstones"]) == ts["written"]
+        for req, want in zip(ts["requests"], ts["beforeResults"]):
+            same(json.loads(json.dumps(answer(index, req))), want, json.dumps(req)[:80])
+    # The documents by key are those of before the compactions (scores, traces and page fills differ: slabs instead
+    # of deltas, one segment instead of many); test/compact-merge.test.ts compares every answer in TS.
+    for req, a, b in zip(ts["requests"], ts["results"], ts["beforeResults"]):
+        if req["kind"] == "get":
+            same(a, b, json.dumps(req)[:80])

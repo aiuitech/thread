@@ -12,8 +12,9 @@ isolate ([Compaction in the SDK](#compaction-in-the-sdk)). Benchmarks: `bench/up
 Every change is a new manifest revision `idx/{gen}/manifest.{rev}.json` (rev 0 = `manifest.json` from `publish`);
 `idx/current.json` is `{gen, rev}`. A revision lists its files (`coarse`, `fine`, `pq`, slabs table), its delta
 segments (`delta/{seq}.vibd`, each with the rev that added it) and its tombstone sets (`tombstones.{rev}.u32`, the
-ids deleted or replaced at that rev). Nothing is overwritten, so every object can stay in the edge cache for a year
-and a query always reads a consistent snapshot.
+ids deleted or replaced at that rev, or a set the SDK's compaction merged from several, see
+[Merging tombstone sets](#merging-tombstone-sets)). Nothing is overwritten, so every object can stay in the edge
+cache for a year and a query always reads a consistent snapshot.
 
 - `POST /upsert` (JSON `{ids, vectors, attrs?, payloads?}` or a binary f32 body with `x-ids`/`?firstId=`, up to
   4096 vectors): one delta segment (`DeltaJob`: primary cell, found through the centroid tree when the manifest has
@@ -76,7 +77,10 @@ idx/{gen}/slab/{cell:05}.{slabRev}      slab written by a compaction that read m
 idx/{gen}/delta/{seq}.vibd              one delta segment per upsert (vectors)
 idx/{gen}/seg/{seq}.thread              one lexical/docs segment per upsert with texts or metadata (docs/lexical.md)
 idx/{gen}/seg/base.{rev}.thread         the merged segment a segment compaction wrote
-idx/{gen}/tombstones.{rev}.u32          sorted unique u32 LE ids deleted/replaced AT rev (one set per rev, not cumulative)
+idx/{gen}/tombstones.{rev}.u32          sorted unique u32 LE ids deleted/replaced AT rev (one set per rev, not cumulative;
+                                        `tombstones.{rev}.{8 hex}.u32` when a lost race left the canonical key taken)
+idx/{gen}/tombstones.{rev}.m{from}.u32  a merged set (the SDK's dense compaction): the union of sets of revs from..rev
+                                        that no data object tells apart, listed with rev = its newest member's
 idx/{gen}/tree.{rev}.bin                centroid tree over the fine means (publish / publish-rev with `tree`, or a
                                         compaction that split cells); inherited
 idx/{gen}/fine.{rev}.f32                fine means of a revision whose compaction split cells (k + splits rows)
@@ -184,6 +188,87 @@ refuse a manifest naming a feature they do not know (TS and Python SDKs from 0.2
 0.2.1 do not check `features`: they would apply a scoped set to both sides, hiding too much (a document's text after
 a vector-only upsert, its vector after a text-only one), never too little. Upgrade readers before writing scoped
 upserts.
+
+### Merging tombstone sets
+
+Every upsert or delete writes a set, however few ids it holds, so a writer of small batches leaves thousands of tiny
+sets (inseam, 2026-11-14: 2,531 sets at rev 2,803), and every cold open and every compaction reads them one get
+each. The SDK's dense compaction (`index.compact`, TypeScript) therefore replaces, at its commit, runs of sets that
+no reader can tell apart by one set with the union of their ids (`tombMergeRuns` in `sdk/ts/src/compact.ts`).
+
+**The rule.** Sets s1 < s2 < ... < sn of one scope (absent, `dense` or `lexical`) can be replaced by
+`{rev: sn, key, count: |union|, scope}` exactly when the revision being committed has no data object of a side they
+hide whose filter picks some of them and not the others:
+
+- dense view (no scope, or `dense`): no remaining delta with addedRev in [s1, sn) (a delta added at a is filtered by
+  the sets with rev > a), and no slab with slabRev in (s1, sn] (a slab of slabRev r by the sets with rev >= r;
+  rev-0 slabs by every set, so they never tell sets apart). Empty slabs count too, since `tombDroppable` waits for
+  them.
+- lexical view (no scope, or `lexical`): no lexical/docs segment with addedRev in [s1, sn).
+
+Then every filter a reader builds (`tombFor`, `tombForDelta`, `tombForSegment`, and `tombHides`, whose `maxRev` per
+id only ever is compared with segment addedRevs) is the same union before and after, so every query, `get`,
+`resolveKeys` and `listKeys` answers the same. Objects written later have revs past the commit, so they never lie
+between members either. `tombDroppable` gives the merged set the answer its members have together: the oldest
+remaining delta, segment and slab rev > 0 cannot fall between s1 and sn, so each member compares with them alike,
+except for the build-id test. A set with build ids (`id < manifest.vectors`) is never dropped, so sets with build ids
+are merged only with each other (a merge with the others would keep their ids alive for ever), which also leaves
+the purge target (the newest dense-view set without build ids) where it was. Sets of different scopes hide
+different sides and never merge, and a set with a scope the SDK does not know never merges. A deleted id that comes
+back in a later delta is the case a wrong merge would break: the delta lies between the delete's set and any later
+set, so they stay apart until it is folded, and the slab it is folded into (slabRev past both) is filtered by
+neither.
+
+In practice: an unscoped upsert with texts writes a segment at its own set's rev, so its set merges with earlier
+sets but not with later ones until a segment compaction has merged that segment (`compactSegments`: the merged
+segment's addedRev is past them, or the newest addedRev of its run). A dense-scoped set (and an unscoped one with
+no segment between) merges with its neighbours once the deltas between them are folded and no slab rev lies
+between them; a compaction of a backlog writes its slabs at a rev past every set it read, so the sets behind the
+oldest remaining delta form one run. Lexical-scoped sets wait for the segments of their own upserts the same way.
+
+**Cost and convergence.** A run merges once it has 8 sets (fewer wait, so a large merged set is not rewritten for
+every set added after it), the longest runs first. The ids the call read for its cells and drops cost nothing; the
+call reads at most 256 other sets for merging, in windows of 8, and none within 1 s of its deadline (a call past its
+deadline, such as the progress guarantee's, merges only what it read anyway). With `force`, `r.more` stays true
+while runs are left after a call that merged some, so `while (r.more)` merges a backlog of thousands over a few
+calls; without `force`, merges ride along with the calls that are due. A call that has nothing to fold or rewrite
+still commits a revision when it can drop or merge sets (`note: "merged n tombstone sets"`). `mergeTombstoneSets:
+false` turns it off.
+
+**The object.** `idx/{gen}/tombstones.{rev}.m{from}.u32` (rev and from: the newest and oldest member's revs), sorted
+unique u32 LE like every set, written create-only through `putUnique` (a taken key gets a random sibling); a writer's
+own set is `tombstones.{rev}.u32` or `tombstones.{rev}.{8 hex}.u32`, so the two never collide. `count` is the
+union's size, so `compactionPressure().tombstones` (the ids over all sets, compared with `maxTombstones`) drops by
+the ids that were in several members: the threshold then counts what a filter holds (`idUnion` removes repeats
+anyway), and a purge triggered by it comes later than with the repeats. The compaction revision's `change` records
+`mergedTombstoneSets` (sets replaced) and `mergedInto` (sets written), `r.mergedTombstoneSets` and `r.tombSets` the
+same for the call, and so does `compact.last.json`.
+
+**Readers, packs, GC, rollback.** Every reader takes a set's key from `TombRef.key` (TS `revision.ts`, Python
+`revision.py`, the Worker's `loadRevState` and compaction), never from its rev, and the writers already wrote
+`{key}.{nonce}` siblings, so a merged manifest is an ordinary manifest with fewer, larger sets: no `features` entry,
+readers of every version read it. Packs and base packs list the sets by key; GC (`gcGeneration`, `/build/gc`) keeps
+what kept revisions list by key and classifies any `tombstones.*` object. Nothing else deletes objects, so a revision
+before the merge still finds its own sets (a pinned reader, or `/build/rollback`, which needs `force` across a merge:
+the head lists the merged set, which the older revision does not). The Worker's compaction does not merge; it reads,
+filters and drops merged sets like any other.
+
+**Measured** (`sdk/ts/test/compact-merge.test.ts`: 78 cells, 805 sets from 150 rounds of small writes: vector
+upserts, dense- and lexical-scoped re-puts, keyed upserts with texts, deletes, re-inserts of deleted ids; the same
+bytes compacted with merging and without, every answer compared with an uncompacted copy):
+
+| step | sets left, merging | sets left, not merging |
+|---|---:|---:|
+| 218 calls of `deadlineMs: 1` while due (fold a backlog of about 250 deltas) | 500 | 805 |
+| `compactSegments`, then `force` calls without purge | 2 | 730 |
+| 50 more rounds (+270 sets), and their calls | 94 | 998 |
+
+The purge that followed read 69 sets with merging and 973 without. A call folding the oldest delta of a backlog
+still needs every dense-view set newer than that delta, and the deltas between those sets keep them apart, so the
+short calls read about as many sets either way (89,430 against 95,852 over the 218 calls), and so do the calls
+after the later writes (243 each). Merging shortens the reads of cold opens and of the calls that rewrite cells
+whose slabs predate the sets (a purge, the first rewrite of a cell in a while), not those of the delta filters while
+the backlog lasts.
 
 ## Write path
 
@@ -295,7 +380,9 @@ one isolate, for a writer that owns its index and has no build slots (a Durable 
 Worker's objects (`slab/{cell:05}.{baseRev + 1}`, `slabs.{rev}.json`, `fine.{rev}.f32`, `tree.{rev}.bin`, the
 routing tables of the new means) and the same manifest fields; `sdk/ts/test/compact-worker.test.ts` compacts one
 index with the Worker's `POST /build/compact` and with the SDK over three rounds (folds, splits from k 1 to 8, a
-rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
+rebuilt tree, dropped tombstone sets) and compares every object byte for byte. One thing the Worker does not do:
+the SDK merges runs of tombstone sets at its commit ([Merging tombstone sets](#merging-tombstone-sets)); the
+cross-check's runs stay below the 8 sets a merge needs, so its `tombstones` compare too.
 
 1. **Lock** `compact.lock` exactly as the automatic runs take it (create-only, stale after 10 minutes, etag
    takeover), so the Worker and the SDK never compact one generation at once. A stable `owner` takes over its own
@@ -313,10 +400,11 @@ rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
    - **Tombstone sets**: the planner's memory term uses the id counts in the manifest (`TombRef.count`), so no set
      is read to plan. A set's ids are read, once per call, when a cell being rewritten or a delta being folded is
      filtered by it: a slab of slabRev r by the dense-view sets with rev >= r (an empty slab by none), a delta added
-     at rev a by the dense-view sets with rev > a. Lexical-scoped sets are never read: dense compaction does not
-     apply them, and they can be dropped or kept without their ids. A dense-view set's ids are also read when its
+     at rev a by the dense-view sets with rev > a. Lexical-scoped sets are not read for this: dense compaction does
+     not apply them, and they can be dropped or kept without their ids. A dense-view set's ids are also read when its
      drop depends on the build-id test only (the base has build ids, `vectors > 0`, and no delta, slab or segment
      holds the set), and for purge in a base with build ids, newest first until a set without build ids is found.
+     The commit may read up to 256 more sets, of any scope, to merge them (step 5).
 
    Whole deltas, oldest first, join the slice while their cells fit `cellsPerRun` and the estimated peak fits
    `maxBytes` (see [Memory of a call](#memory-of-a-call)); the cells in flight are as many as the rest of the budget
@@ -355,8 +443,12 @@ rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
 5. **Commit**: `compactCommit`'s rules on the head (409 if the slabs table or the fine means changed, a folded delta
    left, or a delta that stays has entries in a cell whose mean changed), then `compact.last.json` and the lock
    release. That last check reads only the deltas a writer added after the base: the plan read the others, and
-   while any was unread every split kept its mean, so there is nothing to check. `r.more` is true while a threshold is exceeded (with `force`: while deltas remain, or cells stay over
-   the cap after a split that moved entries), a split was deferred or the slice was cut.
+   while any was unread every split kept its mean, so there is nothing to check. On the state the revision commits
+   (the deltas that remain, the new slabs table, the head's segments, the sets not dropped) the commit then merges
+   the runs of tombstone sets no data object tells apart ([Merging tombstone sets](#merging-tombstone-sets)); a
+   retry on a newer head merges again on that head and reuses the objects it wrote. `r.more` is true while a
+   threshold is exceeded (with `force`: while deltas remain, cells stay over the cap after a split that moved
+   entries, or runs are left to merge after a call that merged), a split was deferred or the slice was cut.
 
 A delta fold and cell split in a Durable Object then looks like:
 
@@ -366,7 +458,41 @@ if (ix.compactionDue().due) for (let c = await ix.compact({ owner: state.id.toSt
 ```
 
 Tombstone sets also wait for the lexical segments that predate them: run `compactSegments` (a full merge, or
-bounded runs) too, or the sets stay. The Python SDK does not compact.
+bounded runs) too, or the sets stay, and the unscoped ones cannot merge across those segments. The Python SDK does
+not compact (it reads merged sets like any others).
+
+### Small writes
+
+What one `upsert` or `delete` costs, whatever its size: a manifest revision (a create-only put of a manifest that
+lists every delta, segment and set of the head, 50 to 120 bytes each, so it grows with the backlog and is rewritten
+whole by every write; a head of 767 deltas and 2,531 sets is a manifest of about 200 KB), the `current.json`
+compare-and-swap (a head, a get and a conditional put; it carries a copy of the manifest only while that is under
+16 KB), one delta segment when it has vectors (1,640 bytes for one vector of dim 1024), one lexical/docs segment
+when it has texts, metas or keys, and one tombstone set unless `replace: false`: about ten requests in all, before
+the writer's own index loads the new revision. Readers then pay per object: every query scans every delta (a get
+each until cached), every text query reads every segment, and a cold open reads every set.
+
+What compaction does about it:
+
+- **Deltas** need no step of their own: folding is the coalescing. A call folds whole deltas oldest first, as many as
+  the slice holds, and many tiny deltas in one cell fold into that cell's one new slab in the same call (in
+  `test/compact-merge.test.ts` one call with the default deadline folds 83 deltas of one vector into 60 cells). But
+  a compaction is due after `maxDeltas` (16) deltas, so the documents a compaction folds are 16 x the batch size,
+  and every cell they land in is rewritten whole (a slab of `cellEntries` entries, 1.5 MB at 1000 entries of dim
+  1024): with writes of one vector, a compaction writes about one slab per vector.
+- **Tombstone sets** are merged at the commit where no data object tells them apart (above), and dropped once nothing
+  holds them. The deltas and segments of the writes themselves keep sets apart until they are folded or merged.
+- **Segments** are merged by `compactSegments` only.
+
+**Batch at least 64 documents per write, or what arrived in the last second when fewer come: never one write per
+document, and one write per logical unit (a crawl page), not per sub-batch.** At 64 documents the requests and
+the manifest of a write cost less than the documents' own bytes (a delta entry is 1,560 bytes at dim
+1024, 64 of them about 100 KB, against ten requests and a manifest of a few KB); the 16 deltas a compaction waits
+for hold about 1,000 documents, so a generation of up to a few hundred cells gets several new entries per rewritten
+slab instead of one; and at one write per second a writer makes at most 3,600 revisions an hour, which a
+compaction every 16 of them keeps to 16 deltas. Merging then keeps about one set per compaction whose slabs are
+still live, instead of one per write (unscoped writes with texts: once their segments are merged). inseam's crawl
+wrote one revision per one or two vectors (767 deltas of about 3 KB).
 
 ### Memory of a call
 

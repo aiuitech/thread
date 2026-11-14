@@ -20,8 +20,9 @@ from source, runs every check and publishes.
     cell keeps its mean and `force` takes no oversized cell on its own.
   - A tombstone set's ids are read once, when a cell being rewritten or a delta being folded is filtered by it (a
     slab of slabRev r by the dense-view sets with rev >= r, an empty slab by none, a delta added at rev a by those
-    with rev > a), or when its drop depends on the build-id test alone. Lexical-scoped sets are never read. The
-    planner's memory estimate uses the counts in the manifest.
+    with rev > a), or when its drop depends on the build-id test alone. Lexical-scoped sets are not read for this
+    (only, within the deadline, to merge them: see the next entry). The planner's memory estimate uses the counts in
+    the manifest.
   - The oldest delta folds in every call that plans: the cells it needs to commit run first, whatever the deadline,
     and are committed. Only the lock, a conflict or a 413 stops it. Such a call can take longer than `deadlineMs`
     when the oldest delta alone needs more; its note then starts `read phase passed the deadline:` with what was
@@ -33,10 +34,37 @@ from source, runs every check and publishes.
     dense-scoped and lexical-scoped re-puts and deletes, then calls `compact({ deadlineMs: 1 })` until nothing is
     due: on 0.2.6 each call made 2,145 gets and ended `deadline` with 0 cells; now 56 calls take the backlog from
     300 deltas to 3, each folds at least one, reads 8 deltas, never reads a lexical-scoped set, and makes at most
-    1,157 gets (615 on average). Every live document, deleted id and replaced vector answers as before. The
-    tombstone sets are most of those gets: a cell whose slab predates a set needs it. Unioning the sets into fewer
-    objects is the next step.
-- Python: no change (it has no dense compaction). The Worker's own compaction is unchanged.
+    1,157 gets (613 on average with the next entry, 615 without). Every live document, deleted id and replaced vector
+    answers as before. The tombstone sets are most of those gets: a delta being folded needs every set newer than
+    it, and a cell whose slab predates a set needs it (the next entry merges what it can).
+- **Dense compaction merges tombstone sets no reader can tell apart** (TypeScript, `compact()`, `tombMergeRuns`).
+  Every upsert or delete writes a set, so small writers leave thousands (inseam: 2,531 at rev 2,803), and every cold
+  open and every purge reads them one get each; before, a set left the manifest only when droppable. Now the commit
+  replaces each run of sets of one scope that no delta (addedRev in [s1, sn)), slab (slabRev in (s1, sn]) or segment
+  (addedRev in [s1, sn)) of the committed revision tells apart by one set `tombstones.{sn}.m{s1}.u32` holding the
+  union, at rev sn: every filter a reader builds stays the same, and the merged set drops exactly when all its
+  members would. Sets with build ids merge only with each other (they never drop). A run merges once it has 8 sets,
+  longest first; the sets the call read anyway are free, at most 256 others are read for it, none within 1 s of the
+  deadline. A call with nothing else to do still commits a merge; with `force`, `more` stays true while runs are left
+  after a call that merged. `CompactResult.mergedTombstoneSets` and `tombSets`, `change.mergedTombstoneSets` and
+  `mergedInto`, and `compact.last.json` record it; `mergeTombstoneSets: false` turns it off. `count` is the union's
+  size, so the `maxTombstones` pressure counts the ids a filter holds, without repeats. No format change: readers of
+  every version take sets by `TombRef.key` (TS, Python, the Worker), packs and GC list them by key, and the old sets
+  stay for the revisions that list them (`/build/rollback` across a merge needs `force`).
+  `test/compact-merge.test.ts` (78 cells, 805 sets from small writes, deletes and re-inserts, compacted with and
+  without merging, every answer compared with an uncompacted copy): 500 sets left instead of 805 after the short
+  calls, 2 instead of 730 after a segment compaction, 94 instead of 998 after more writes; the purge read 69 sets
+  instead of 973. What it cannot change: a call folding the oldest delta of a backlog still needs every set newer
+  than that delta, and the deltas between them keep them apart (89,430 against 95,852 set reads over 218 short
+  calls). `test/tomb-merge.test.ts` checks the rule on 3,000 random histories (every filter and every drop, now
+  and after deltas fold and slabs are rewritten; every cut needed).
+- **Small writes: no delta coalescing, a batch size instead.** Folding is the coalescing: one call folds many tiny
+  deltas (83 deltas of one vector into 60 cells in one call of the test above). docs/update-path.md "Small writes"
+  lists what each write costs (a revision whose manifest lists the whole backlog, about ten requests, a delta, a
+  segment, a set) and recommends at least 64 documents per write, or what arrived in the last second.
+- Python: no change; `tests/test_interop.py` reads a generation whose sets the TS SDK merged, and the revision before
+  the merges, and answers as TS does. The Worker's own compaction is unchanged (it reads, filters and drops merged
+  sets like any other; `test/compact-worker.test.ts` compacts and rolls back such a generation with it).
 
 ## 0.2.6 (2026-11-09)
 
