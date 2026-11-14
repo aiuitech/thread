@@ -115,3 +115,49 @@ over-hide.
 - Done in 0.2.1: dense compaction runs in the TS SDK (`index.compact`, bounded by memory, cells and time), and
   segment compaction takes `maxInputBytes` (bounded partial merges). A streaming segment merge would still help a
   large base whose single segments pass the budget.
+
+## Dense compaction reads the whole backlog before it plans
+
+### Problem
+
+`compact()` (`sdk/ts/src/compact.ts`, around line 804) reads every tombstone set (`Promise.all`, one get each) and
+every delta (`readDeltaCells`, two gets each) before `planSlice`. The deadline (`deadlineMs`) counts from `t0`, the
+start of the call. When the read phase takes longer than the deadline, no cell starts, and the run ends `deadline`
+with 0 cells. The backlog then only grows, and each later run reads more.
+
+Seen in inseam on 2026-11-14 (SDK 0.2.5): a Google account host had 767 deltas and 2,531 tombstone sets. About
+4,000 gets took 20 to 30 s against a 10 s deadline. Every run since at least 04:32 UTC ended `deadline` with 0
+cells, and one Durable Object alarm passed 10,000 R2 reads ("Too many API requests by single Worker invocation").
+inseam now works around it (inseam 73588f0): its deadline grows with the read phase, and it compacts at most once a
+minute after writes.
+
+### Work
+
+- [ ] **Read only what the slice needs.** The plan takes whole deltas, oldest first, while the cells and memory fit.
+      Read the deltas' cell counts oldest first, and stop when the slice is full, not after reading all of them.
+- [ ] **Tombstones.** Read only the sets the slice needs (those newer than the oldest slab or delta it rewrites),
+      or fewer, larger objects: a run that cannot drop sets could still union them into one.
+- [ ] **Deadline during reads.** Check the deadline in the read phase. Return early with a clear outcome (for
+      example `note: "read phase passed the deadline"`), so the caller can see why nothing was done.
+- [ ] **Progress guarantee.** A run with a due compaction always folds at least the oldest delta, whatever the
+      backlog size. Test: a generation with hundreds of deltas and thousands of tombstone sets, a short deadline, and
+      successive calls that bring `deltas` down.
+
+## Many small upserts make many tiny deltas and tombstone sets
+
+### Problem
+
+Each `upsert` writes a new revision: a delta (for vectors) and a tombstone set, however few documents it holds.
+A caller that writes in small batches makes many tiny objects. Every reader and every compaction then pays one or
+two gets for each of them.
+
+Seen in inseam on 2026-11-14: the crawl of a cloud host indexes each page (200 entries) in batches of up to 64 reads,
+and each batch is one upsert. 767 deltas held 2.2 MB in total (about 3 KB each, a few vectors), and there were 2,531
+tombstone sets at index revision 2,803.
+
+### Work
+
+- [ ] **Caller side (inseam).** Write once per crawl page, not once per read batch: keep the extracted text (not the
+      bytes) across the page's batches and apply it in one write. Track this in inseam.
+- [ ] **thread side.** Decide whether the SDK should help: coalesce small deltas and tombstone sets in compaction
+      before folding cells, or document a minimum batch size for writers.
