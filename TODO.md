@@ -1,175 +1,40 @@
 # TODO
 
-## Updates that touch one side of a document
+Nothing in thread is open. Finished work is in `CHANGELOG.md` (scoped tombstones: 0.2.1; the compaction read phase
+and tombstone set merging: Unreleased) and in `docs/update-path.md`.
 
-### Problem
+## Open, outside this repo
 
-An upsert replaces a whole document. Its tombstone set (`tombstones.{rev}.u32`) hides every older copy of its ids
-on both sides: the dense entries in slabs and deltas, and the docs, postings and keys in lexical segments
-(`tombFor`, `tombForDelta`, `tombForSegment` and `tombHides` in `sdk/ts/src/wire.ts` all read one `TombState`).
-So:
+- [ ] **inseam: write once per crawl page, not once per read batch.** The crawl of a cloud host indexes each page
+      (200 entries) in batches of up to 64 reads, and each batch is one upsert. On 2026-11-14 that made 767 deltas of
+      about 3 KB and 2,531 tombstone sets at index revision 2,803. Keep the extracted text (not the bytes) across the
+      page's batches and apply it in one write. `docs/update-path.md` "Small writes" gives the cost of a write and
+      the minimum batch (64 documents, or what arrived in the last second). Track this in inseam.
+- [ ] **inseam: take the next SDK release and drop the workaround** (inseam 73588f0: a deadline that grows with the
+      read phase, at most one compaction a minute). `compact()` now folds at least the oldest delta on every call.
 
-- **Vector-only upsert under a known key or id** (backfilling embeddings after a text-first index): the new delta
-  carries the vector, no segment is written, and the tombstone hides the old docs, postings and keys. The
-  document drops out of text search, `get(key)` stops resolving it, and its meta is lost.
-- **Metadata, tag or text change** (a mail label, a rename, an enrichment pass): the caller has to re-send the
-  vector, or the tombstone hides the old one. The caller usually doesn't have the vector: thread can't return it
-  (slabs hold PQ and int8 residuals, not the f32 input), so it means re-embedding.
+## Check after the release
 
-inseam keeps its catalog and its search index in one thread index per host. It needs both kinds of update:
-text and metadata first, vectors backfilled later, and frequent metadata-only churn. For it this is a
-correctness bug, not an optimisation.
+- The read phase's constants are reasoned, not measured against R2: delta windows of 8, the slice full after 16
+  skipped in a row, a third of `deadline - 2.5 s` for reads, deltas up to 64 KiB read whole. The same goes for the
+  merge: runs of 8 or more sets, at most 256 extra reads a call, none in the last second. Look at
+  `CompactResult.reads` and `mergedTombstoneSets` in inseam's `compact.last.json` and tune if they are off.
+- A call whose reads pass the deadline still runs the oldest delta's cells, so it can run past `deadlineMs`. That
+  is the progress guarantee. Callers with a hard limit (a Durable Object alarm) should leave room for it.
 
-### Design
+## Not worth doing now
 
-A tombstone set gets a **scope**: which side it hides.
-
-- `TombRef` in the manifest gets `scope?: "dense" | "lexical"`. Absent means both: today's behaviour, and every
-  existing manifest stays valid.
-- Dense reads (`tombFor` for slabs, `tombForDelta` for deltas) apply the sets with no scope or `scope: "dense"`.
-  Lexical reads (`tombForSegment`, `tombHides`, key resolution, `listKeys`, docs resolution) apply the sets with no
-  scope or `scope: "lexical"`. In practice that's two `TombState`s per revision, or one with two views.
-- `upsert` takes `scope?: "both" | "dense" | "lexical"` (default `"both"`):
-  - `"lexical"`: write the segment (keys, docs, postings, attrs in docs) and a lexical-scoped tombstone set.
-    Reject `vectors` and `payloads`. Dense entries are untouched.
-  - `"dense"`: write the delta and a dense-scoped tombstone set. Reject `texts` and `metas`. With `keys`, resolve
-    them to ids through the head revision but **write no segment**, so the docs and keys stay where they are.
-    Unknown keys are an error: there is no document to attach a vector to, and allocating an id without storing
-    the key would orphan it.
-  - `"both"`: unchanged.
-- `delete` and `deleteKeys` stay unscoped: a delete hides everything.
-- `replace: false` keeps its meaning (no tombstone set at all) and composes with `scope`.
-
-### Attrs: the hard part
-
-The attribute word is stored twice: in the dense entry (inside the slab scan prefix, where the filter is tested)
-and in the `docs` store (where text queries post-filter). A lexical-scoped upsert that changes attrs on an id
-with a dense entry leaves the dense copy stale, so a filtered vector query would test the old word. Options, to
-decide before building:
-
-1. **Reject it.** In a lexical-scoped upsert, an id whose attrs differ from its live docs copy, and that has a
-   dense entry, is an error. The caller has to re-send the vector with `scope: "both"`. Comparing costs a docs
-   read per id, which keyed upserts already do for id resolution. Simplest. It puts the constraint on the caller:
-   keep frequently changing fields out of attrs in dense indexes.
-2. **Re-encode in place.** Find the id's current dense entry and copy its codes into a new delta with the new
-   attrs. Needs id → cell, which thread doesn't keep. Without it, this is a scan of every slab: too expensive
-   unless an id → cell map is added.
-3. **Attrs overlay.** A small per-revision `attrs.{rev}` map (id → word) that dense scans consult for overlaid ids
-   before the filter. Correct and cheap to write, but it adds a lookup to the hot scan path and needs folding at
-   compaction.
-
-Start with (1). Revisit (3) if callers need cheap attrs changes on dense documents.
-
-### Work
-
-Done for 0.2.1 (TS SDK, Python SDK, reference Worker): the gate is `manifest.features: ["scoped-tombstones"]`; attrs
-use option 1, with every id of a dense generation treated as having a dense entry and absent attrs keeping the live
-word; `chunk` needs scope "both"; `texts` under "dense" feed the embedder only. Rust needed no change (`tomb.rs`
-only sees the buffers it is handed). Readers before 0.2.1 cannot be made to refuse: they ignore `features` and
-over-hide.
-
-- [x] **Format.** Add `scope` to `TombRef` (`sdk/ts/src/wire.ts`, the Worker's copy in
-      `examples/cloudflare-worker/src/index.ts`, `sdk/python/thread_sdk/wire.py`). Gate it: an older reader that
-      ignores `scope` would hide too much. Bump `manifest.format`, or add a `features: ["scoped-tombstones"]` that
-      readers must understand, and have older SDKs refuse such a manifest rather than misread it. Document it in
-      `docs/update-path.md` (manifest example and tombstone rule) and `docs/lexical.md`.
-- [x] **Tombstone state.** Split the views in `buildTombState`: dense unions for `tombFor` and `tombForDelta`,
-      lexical unions and `maxRev` for `tombForSegment` and `tombHides`. Same in Python. Rust (`tomb.rs`) only sees
-      the buffers it's handed, so it shouldn't need changes. Confirm.
-- [x] **Write path, TS SDK** (`sdk/ts/src/write.ts`). Add `scope` to `UpsertInput`. In `prepareBatch`, validate
-      which fields each scope allows. In `upsert`, skip `encodeSegment` for `"dense"` even when `keys` are given
-      (keys only resolve), skip `encodeDelta` for `"lexical"`, write the tombstone set with its scope, and record
-      `change.scope` in the manifest. Error on unknown keys under `"dense"`.
-- [x] **Attrs check** for `scope: "lexical"` on dense generations: option 1 above. Resolve the live docs copy
-      (already read for keyed resolution; read it for id-only batches too) and reject changed attrs on ids that
-      have a dense entry. Knowing whether an id has a dense entry also needs deciding: ids below
-      `manifest.vectors` (the built base) plus ids in live deltas, or treat every id in a dense generation as dense.
-- [x] **Write path, Python SDK** (`sdk/python/thread_sdk/write.py`): the same, keeping wire parity.
-- [x] **Write path, Worker** (`POST /upsert` in the reference Worker): accept `scope` (only `"dense"` and
-      `"both"` apply there; it writes no segments).
-- [x] **Query path.** Worker and both SDKs: slab and delta scans use the dense view. Lexical search, docs
-      resolution, `get`, `resolveKeys` and `listKeys` use the lexical view. `search` fusion needs no change.
-- [x] **Compaction.** Segment compaction (`compactSegments`, `merge_segments`) applies only the lexical view.
-      Dense compaction (folding deltas into slabs, purges) applies only the dense view. The rule for dropping
-      tombstone sets (`tombDroppable` in the Worker) has to be per scope: a lexical set can be dropped once no
-      segment predates it, a dense set once no slab or delta predates it, and an unscoped set only when both hold.
-- [x] **GC and packs.** Tombstone objects stay opaque to both, so check that packs carry `scope` through the
-      manifest and that the pack reader builds both views.
-- [x] **Tests.**
-      - Vector-only upsert by key after a text-only upsert: text search, `get` and `listKeys` still find the
-        document, and dense search finds the vector.
-      - Lexical-only re-put after a dense upsert: the old vector still ranks, the old text no longer matches, and
-        the new text does.
-      - Unscoped delete after both: hidden everywhere.
-      - Attrs change under `"lexical"` on a dense id is rejected.
-      - Compaction of each side keeps the other side's documents.
-      - Rollback across a scoped revision.
-      - Cross-SDK interop: TS writes a scoped upsert and Python reads it identically, and the reverse.
-      - Older-reader refusal on a gated manifest.
-- [x] **Docs.** `docs/keys.md` (keyed vector backfill becomes the documented way to add embeddings to a
-      text-first index), `docs/update-path.md`, both SDK READMEs (the `scope` option and its rules), and the
-      README's write example.
-
-### Related, already known
-
-- Done in 0.2.1: dense compaction runs in the TS SDK (`index.compact`, bounded by memory, cells and time), and
-  segment compaction takes `maxInputBytes` (bounded partial merges). A streaming segment merge would still help a
-  large base whose single segments pass the budget.
-
-## Dense compaction reads the whole backlog before it plans
-
-### Problem
-
-`compact()` (`sdk/ts/src/compact.ts`, around line 804) reads every tombstone set (`Promise.all`, one get each) and
-every delta (`readDeltaCells`, two gets each) before `planSlice`. The deadline (`deadlineMs`) counts from `t0`, the
-start of the call. When the read phase takes longer than the deadline, no cell starts, and the run ends `deadline`
-with 0 cells. The backlog then only grows, and each later run reads more.
-
-Seen in inseam on 2026-11-14 (SDK 0.2.5): a Google account host had 767 deltas and 2,531 tombstone sets. About
-4,000 gets took 20 to 30 s against a 10 s deadline. Every run since at least 04:32 UTC ended `deadline` with 0
-cells, and one Durable Object alarm passed 10,000 R2 reads ("Too many API requests by single Worker invocation").
-inseam now works around it (inseam 73588f0): its deadline grows with the read phase, and it compacts at most once a
-minute after writes.
-
-### Work
-
-Done (unreleased, TS SDK): deltas are read oldest first in windows until the slice is full (16 in a row skipped) or
-a third of `deadline - 2.5 s` is used; a tombstone set is read only when a rewritten cell or a folded delta is
-filtered by it, or its drop needs the build-id test; the oldest delta's cells always run and commit
-(`CompactResult.reads`, `test/compact-backlog.test.ts`). Fewer, larger sets: the commit now merges each run of
-sets that no delta, slab or segment tells apart into one (`tombMergeRuns`, `test/compact-merge.test.ts`; next
-section).
-
-- [x] **Read only what the slice needs.** The plan takes whole deltas, oldest first, while the cells and memory fit.
-      Read the deltas' cell counts oldest first, and stop when the slice is full, not after reading all of them.
-- [x] **Tombstones.** Read only the sets the slice needs (those newer than the oldest slab or delta it rewrites),
-      or fewer, larger objects: a run that cannot drop sets could still union them into one.
-- [x] **Deadline during reads.** Check the deadline in the read phase. Return early with a clear outcome (for
-      example `note: "read phase passed the deadline"`), so the caller can see why nothing was done.
-- [x] **Progress guarantee.** A run with a due compaction always folds at least the oldest delta, whatever the
-      backlog size. Test: a generation with hundreds of deltas and thousands of tombstone sets, a short deadline, and
-      successive calls that bring `deltas` down.
-
-## Many small upserts make many tiny deltas and tombstone sets
-
-### Problem
-
-Each `upsert` writes a new revision: a delta (for vectors) and a tombstone set, however few documents it holds.
-A caller that writes in small batches makes many tiny objects. Every reader and every compaction then pays one or
-two gets for each of them.
-
-Seen in inseam on 2026-11-14: the crawl of a cloud host indexes each page (200 entries) in batches of up to 64 reads,
-and each batch is one upsert. 767 deltas held 2.2 MB in total (about 3 KB each, a few vectors), and there were 2,531
-tombstone sets at index revision 2,803.
-
-### Work
-
-- [ ] **Caller side (inseam).** Write once per crawl page, not once per read batch: keep the extracted text (not the
-      bytes) across the page's batches and apply it in one write. Track this in inseam.
-- [x] **thread side.** Decide whether the SDK should help: coalesce small deltas and tombstone sets in compaction
-      before folding cells, or document a minimum batch size for writers.
-      Decided and done (unreleased, TS SDK): tombstone sets are merged at the dense compaction's commit when no data
-      object tells them apart (runs of 8 or more, at most 256 extra reads per call; docs/update-path.md "Merging
-      tombstone sets"); deltas get no step of their own, since folding already coalesces them (one call folds many
-      tiny deltas per cell); docs/update-path.md "Small writes" gives the cost of a write and the minimum batch (64
-      documents, or what arrived in the last second).
+- **A delta-coalescing step in compaction.** Folding deltas into slabs already coalesces them, and one call folds
+  many tiny deltas per cell (83 one-vector deltas into 60 cells in one call). The cost of small writes is on the
+  writer's side: batch them.
+- **Streaming segment merge.** It would help a large base whose single segments pass `maxInputBytes`. Nobody has
+  hit that. Segment compaction already takes bounded partial merges.
+- **Merging tombstone sets in segment compaction.** It already removes the segment barrier, and the next dense
+  compaction then merges the sets.
+- **Tiering merged tombstone sets.** A large merged set is rewritten each time 7 or more new sets join its run. The
+  sets are small (ids, 4 bytes each) and a purge drops them at `maxTombstones`. Revisit if a merged set grows past
+  a few MB.
+- **Attrs overlay** (cheap attrs changes on dense documents under `scope: "lexical"`). 0.2.1 rejects such a change;
+  the caller re-sends the vector with `scope: "both"`. Revisit if a caller needs it.
+- **Unforced Worker rollback across a merge.** `/build/rollback` to a revision before a tombstone merge needs
+  `force`, because the head lists the merged key and the old revision does not. It works with `force`.
