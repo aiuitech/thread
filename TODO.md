@@ -133,13 +133,19 @@ minute after writes.
 
 ### Work
 
-- [ ] **Read only what the slice needs.** The plan takes whole deltas, oldest first, while the cells and memory fit.
+Done (unreleased, TS SDK): deltas are read oldest first in windows until the slice is full (16 in a row skipped) or
+a third of `deadline - 2.5 s` is used; a tombstone set is read only when a rewritten cell or a folded delta is
+filtered by it, or its drop needs the build-id test; the oldest delta's cells always run and commit
+(`CompactResult.reads`, `test/compact-backlog.test.ts`). Unioning sets is not done here: it belongs to the next
+section.
+
+- [x] **Read only what the slice needs.** The plan takes whole deltas, oldest first, while the cells and memory fit.
       Read the deltas' cell counts oldest first, and stop when the slice is full, not after reading all of them.
-- [ ] **Tombstones.** Read only the sets the slice needs (those newer than the oldest slab or delta it rewrites),
+- [x] **Tombstones.** Read only the sets the slice needs (those newer than the oldest slab or delta it rewrites),
       or fewer, larger objects: a run that cannot drop sets could still union them into one.
-- [ ] **Deadline during reads.** Check the deadline in the read phase. Return early with a clear outcome (for
+- [x] **Deadline during reads.** Check the deadline in the read phase. Return early with a clear outcome (for
       example `note: "read phase passed the deadline"`), so the caller can see why nothing was done.
-- [ ] **Progress guarantee.** A run with a due compaction always folds at least the oldest delta, whatever the
+- [x] **Progress guarantee.** A run with a due compaction always folds at least the oldest delta, whatever the
       backlog size. Test: a generation with hundreds of deltas and thousands of tombstone sets, a short deadline, and
       successive calls that bring `deltas` down.
 

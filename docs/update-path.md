@@ -301,13 +301,30 @@ rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
    takeover), so the Worker and the SDK never compact one generation at once. A stable `owner` takes over its own
    lock (a crash left it); an isolate never runs two compactions of one generation. A store without `delete` marks
    the lock released (`ms: 0`), which the Worker treats as stale.
-2. **Plan** on the newest manifest (listed): unless `force`, nothing happens below every threshold. The delta
-   segments' cells come from their entry tables only (two small range reads each). Whole deltas, oldest first, join
-   the slice while their cells fit `cellsPerRun` and the estimated peak fits `maxBytes` (see
-   [Memory of a call](#memory-of-a-call)); the cells in flight are as many as the rest of the budget holds (at most
-   `concurrency`). Cells split once they pass `cellEntries = min(maxCellEntries, splitEntries / 2)`, and a delta is
-   only taken when no cell it lands in passes `splitEntries`, the largest cell the budget splits on its own. A
-   delta that does not fit waits; a cell that alone keeps a delta out is split first, on its own and with its mean
+2. **Read phase and plan** on the newest manifest (listed): unless `force`, nothing happens below every threshold.
+   The call reads only what the slice needs, not the whole backlog:
+   - **Deltas**: their cells come from their entry tables, read oldest first (`addedRev`, then `seq`) in windows of
+     8. A delta up to 64 KiB is read whole (one get; the fold uses the bytes), a larger one by two range reads.
+     After each window the call plans the deltas read so far. That plan is the plan of the whole backlog cut there,
+     since a delta's place in the slice depends only on the deltas before it. Reading stops when every delta is
+     read, when the last 16 deltas could not join the slice (its cells or its memory are taken: the slice is full),
+     or when reading has used a third of `deadline - 2.5 s`. The first window is always read. The deltas not read
+     wait for a later call, which starts from them.
+   - **Tombstone sets**: the planner's memory term uses the id counts in the manifest (`TombRef.count`), so no set
+     is read to plan. A set's ids are read, once per call, when a cell being rewritten or a delta being folded is
+     filtered by it: a slab of slabRev r by the dense-view sets with rev >= r (an empty slab by none), a delta added
+     at rev a by the dense-view sets with rev > a. Lexical-scoped sets are never read: dense compaction does not
+     apply them, and they can be dropped or kept without their ids. A dense-view set's ids are also read when its
+     drop depends on the build-id test only (the base has build ids, `vectors > 0`, and no delta, slab or segment
+     holds the set), and for purge in a base with build ids, newest first until a set without build ids is found.
+
+   Whole deltas, oldest first, join the slice while their cells fit `cellsPerRun` and the estimated peak fits
+   `maxBytes` (see [Memory of a call](#memory-of-a-call)); the cells in flight are as many as the rest of the budget
+   holds (at most `concurrency`). While some deltas are unread, every split keeps its mean (an unread delta may have
+   entries in the cell), and `force` takes no oversized cell on its own. `r.reads` gives the deltas and tombstone
+   sets read, of those the base lists, and the ms to the plan. Cells split once they pass
+   `cellEntries = min(maxCellEntries, splitEntries / 2)`, and a delta is only taken when no cell it lands in passes
+   `splitEntries`, the largest cell the budget splits on its own. A delta that does not fit waits; a cell that alone keeps a delta out is split first, on its own and with its mean
    kept (`r.presplit`), and the delta folds in a later call. Input that no call with the budget can take (a delta
    with more entries in one cell than it can fold, a cell already past `splitEntries`, a delta over `cellsPerRun`
    cells) is a `ThreadError` with status 413 naming it. With the tombstone threshold exceeded (or `purge`, or
@@ -320,15 +337,25 @@ rebuilt tree, dropped tombstone sets) and compares every object byte for byte.
    delta first. Slab objects are written create-only: the same bytes already there (a rerun on the same base after a
    crash) are reused; other bytes are overwritten only while no revision after the base changed the slabs table (so
    none can list them), else the run ends as a `conflict`.
-4. **Deadline**: no cell starts after `deadline - 2.5 s`; with splits up to 4.5 s more, scaled by the fine means'
-   bytes (the 4.5 s were g4's 25 MB table and tree; a head with a tree always keeps them), so a generation with few
-   cells keeps its time for the cells. When the deadline cuts the slice, the run
-   commits the finished cells whose deltas are all finished (a cell only with every folded delta in it, splits only
-   as a prefix, since new cells are numbered in order; to the fixpoint) as `partial`, so a slice too large for the
-   time still makes progress. Nothing committable: `deadline`.
+4. **Deadline**: counted from the start of the call. No cell starts after `deadline - 2.5 s`; with splits up to
+   4.5 s more, scaled by the fine means' bytes (the 4.5 s were g4's 25 MB table and tree; a head with a tree always
+   keeps them), so a generation with few cells keeps its time for the cells. When the deadline cuts the slice, the
+   run commits the finished cells whose deltas are all finished (a cell only with every folded delta in it, splits
+   only as a prefix, since new cells are numbered in order; to the fixpoint) as `partial`, so a slice too large for
+   the time still makes progress. Nothing committable: `deadline`.
+
+   **The oldest delta always folds.** The cells it needs to commit (its own, the cells of the folded deltas that
+   share them, and every split numbered before one of them, to the same fixpoint) run first, and they start
+   whatever the time. When a cell keeps the oldest delta out, that cell's split takes its place. So a call that
+   plans folds at least the oldest delta, however large the backlog and however short the deadline; only the lock,
+   a conflict or a 413 stops it. Such a call can take longer than `deadlineMs` when the oldest delta alone needs
+   more (a slow store, many tombstone sets); when the read phase alone passed the cell deadline, the note says
+   `read phase passed the deadline: ...` with what was read. A call with no delta to fold (purge or `force` only)
+   whose read phase passed the deadline starts no cell and ends `deadline` with that note.
 5. **Commit**: `compactCommit`'s rules on the head (409 if the slabs table or the fine means changed, a folded delta
    left, or a delta that stays has entries in a cell whose mean changed), then `compact.last.json` and the lock
-   release. `r.more` is true while a threshold is exceeded (with `force`: while deltas remain, or cells stay over
+   release. That last check reads only the deltas a writer added after the base: the plan read the others, and
+   while any was unread every split kept its mean, so there is nothing to check. `r.more` is true while a threshold is exceeded (with `force`: while deltas remain, or cells stay over
    the cap after a split that moved entries), a split was deferred or the slice was cut.
 
 A delta fold and cell split in a Durable Object then looks like:
@@ -346,7 +373,8 @@ bounded runs) too, or the sets stay. The Python SDK does not compact.
 What a call holds at its peak, as the planner estimates it (`r.estimatedPeakBytes`, at most `maxBytes`):
 
 - **always**: 1 MiB (manifests, delta entry tables, JSON), the tombstone sets x3 (the ids, their dense and lexical
-  unions), the slabs table x2;
+  unions; counted from the manifest's `count`s, an upper bound since a call reads only the sets it needs), the
+  slabs table x2;
 - **cells phase**: the folded deltas (held for the run) plus the largest of them again (its copy in wasm), and per
   cell in flight `3 x old slab + 6 x new slab` for a fold, `max(9, 8 + 4 x dim / bytesPerEntry) x new slab` for a
   split (the merged slab, the re-encoded halves, their two slab jobs, `split_slab`'s decoded vectors);

@@ -14,7 +14,7 @@ import { CachedBlobStore, type BlobStore } from "./store.js";
 import { WarmPrefixStore } from "./warm.js";
 import type * as W from "./wasm/thread.js";
 import { buildRoutingObjects } from "./routing.js";
-import { buildTombState, hidesDense, hidesLexical, type TombScope, decodeJson, DELTA_ENTRY_BYTES, keys, manifestFiles, parseDeltaHeader, parseManifest, parseSlabsTable, ThreadError, tombFor, tombForDelta, type CompactionPolicy, type DeltaRef, type IndexFiles, type Manifest, type RoutingTables, type SlabRow, type TombRef, type TreeRef } from "./wire.js";
+import { hidesDense, hidesLexical, idUnion, NO_TOMBSTONES, type TombScope, decodeJson, DELTA_ENTRY_BYTES, keys, manifestFiles, parseDeltaHeader, parseManifest, parseSlabsTable, ThreadError, type CompactionPolicy, type DeltaRef, type IndexFiles, type Manifest, type RoutingTables, type SlabRow, type TombRef, type TreeRef } from "./wire.js";
 import { commitRev, inherit, latestRev, putIfAbsent, putUnique, writable, type WriterContext } from "./write.js";
 
 // ---------- policy and pressure ----------
@@ -88,9 +88,18 @@ export interface CompactOptions {
 	/** Cells one call may rewrite (default `compaction.cellsPerRun`, else 256). */
 	cellsPerRun?: number;
 	/**
-	 * Wall-clock budget of the call (ms, default `compaction.deadlineMs`, else 27,000). No cell starts after
-	 * `deadline - 2.5 s` (up to 7 s with splits, by the size of the fine means); the cells finished by then are committed when their deltas are complete
-	 * (`outcome: "partial"`), else nothing is (`"deadline"`).
+	 * Wall-clock budget of the call (ms, default `compaction.deadlineMs`, else 27,000), counted from the start of the
+	 * call. The read phase reads the deltas' cells oldest first and stops at a third of `deadline - 2.5 s` (the first
+	 * 8 deltas are always read); the slice is planned with what was read. No cell starts after `deadline - 2.5 s` (up
+	 * to 7 s with splits, by the size of the fine means); the cells finished by then are committed when their deltas
+	 * are complete (`outcome: "partial"`), else nothing is (`"deadline"`).
+	 *
+	 * The oldest delta is not bound by the deadline (the progress guarantee): the cells it needs to commit (its own,
+	 * those of the folded deltas that share them, and the splits numbered before any of them) run first, with the
+	 * tombstone sets they need, whatever the time, and are committed. So a call that plans always folds at least the
+	 * oldest delta (or splits the cell that keeps it out, `presplit`), however large the backlog and however short
+	 * the deadline; only the lock, a conflict or a 413 stops it. Such a call can take longer than `deadlineMs` when
+	 * the oldest delta alone needs more (a slow store, thousands of tombstone sets); its note then says so.
 	 */
 	deadlineMs?: number;
 	/** Cells in flight at most (default 4; fewer when `maxBytes` does not hold more). */
@@ -116,6 +125,24 @@ export interface CompactOptions {
 	owner?: string;
 	/** Append the run to `idx/{gen}/compact.last.json` (default true; what the Worker's `/index/status` shows). */
 	record?: boolean;
+}
+
+/**
+ * The read phase of a call (`CompactResult.reads`). The deltas' cells are read oldest first only until the slice is
+ * full (or the read phase has used its share of the deadline); a tombstone set's ids are read only when a cell the
+ * call rewrites or a delta it folds is filtered by it, or a drop decision depends on them.
+ */
+export interface CompactReads {
+	/** Delta segments whose cells were read (one get each when small, which is also the fold's input; else two range gets). */
+	deltas: number;
+	/** Delta segments the base lists (0 when the call did not plan: locked, or below every threshold). */
+	deltasListed: number;
+	/** Tombstone sets whose ids were read (each once, in the whole call). */
+	tombSets: number;
+	/** Tombstone sets the base lists. */
+	tombSetsListed: number;
+	/** From the start of the call to the plan (lock, manifests, slabs table, deltas' cells), ms. */
+	ms: number;
 }
 
 /** One executed split: entries before, and in the two halves. */
@@ -149,8 +176,13 @@ export interface CompactResult {
 	folded: number;
 	/** Delta segments left in the head. */
 	remainingDeltas: number;
-	/** Deltas the slice could not take (cells or memory). */
+	/**
+	 * Deltas the slice could not take (cells or memory), of those the call read. The deltas it did not read wait too
+	 * (`reads.deltasListed - reads.deltas`).
+	 */
 	skippedDeltas: number;
+	/** What the call read of the base's backlog. */
+	reads: CompactReads;
 	/** Cells rewritten only to let tombstone sets go. */
 	purgeCells: number;
 	splits: SplitDone[];
@@ -198,6 +230,23 @@ const COMMIT_RESERVE_MS = 2_500;
 const SPLIT_EXTRA_RESERVE_MS = 4_500;
 const SPLIT_RESERVE_FINE_BYTES = 25 * 1024 * 1024;
 const splitReserveMs = (m: Manifest): number => COMMIT_RESERVE_MS + (m.tree ? SPLIT_EXTRA_RESERVE_MS : Math.ceil(SPLIT_EXTRA_RESERVE_MS * Math.min(1, (m.k1 * m.k2 * m.dim * 4) / SPLIT_RESERVE_FINE_BYTES)));
+/**
+ * The read phase reads the deltas' cells in windows of this many (concurrently), oldest first, and plans the prefix
+ * after each window to see whether the slice is full. The first window is always read: it holds the oldest delta.
+ */
+const DELTA_READ_WINDOW = 8;
+/**
+ * The slice is full once this many deltas in a row (in plan order) could not join it: its cells (`cellsPerRun`) or
+ * its memory (`maxBytes`) are taken. A later delta that would still fit (all its cells in the slice, small enough)
+ * waits for the next call, which starts from the deltas this one left.
+ */
+const SLICE_FULL_SKIPS = 16;
+/** Deltas up to this size are read whole (one get, and the fold needs the bytes) instead of by two range gets. */
+const DELTA_WHOLE_BYTES = 64 * 1024;
+/** Share of the time before `deadline - 2.5 s` that reading more deltas may take; the cells and their tombstone sets get the rest. */
+const READ_SHARE = 1 / 3;
+/** Tombstone sets read at once. */
+const TOMB_READ_CONCURRENCY = 8;
 /** A compact.lock older than this is abandoned (the Worker's rule). */
 export const COMPACT_LOCK_STALE_MS = 10 * 60 * 1000;
 /**
@@ -394,22 +443,51 @@ interface DeltaCells {
 	counts: Map<number, number>;
 }
 
-/** Entries per cell of a delta segment from its entry table only (two small range reads, not the segment). */
-async function readDeltaCells(store: BlobStore, ref: DeltaRef): Promise<DeltaCells> {
-	const hb = await store.get(ref.key, { offset: 0, length: 64 });
+/**
+ * Entries per cell of a delta segment from its entry table: two small range reads, or with `whole` one read of the
+ * whole segment, which is then returned too (a small delta costs one get, and its fold needs the bytes anyway).
+ */
+async function readDeltaCells(store: BlobStore, ref: DeltaRef, whole = false): Promise<DeltaCells & { bytes?: Uint8Array }> {
+	const all = whole ? await store.get(ref.key) : null;
+	const hb = all ?? (await store.get(ref.key, { offset: 0, length: 64 }));
 	if (!hb) throw new ThreadError(`missing ${ref.key}`, 404);
 	const h = parseDeltaHeader(hb);
 	const counts = new Map<number, number>();
 	if (h.count > 0) {
-		const t = await store.get(ref.key, { offset: h.entriesOff, length: h.count * DELTA_ENTRY_BYTES });
-		if (!t) throw new ThreadError(`missing ${ref.key}`, 404);
+		const len = h.count * DELTA_ENTRY_BYTES;
+		const t = all ? all.subarray(h.entriesOff, h.entriesOff + len) : await store.get(ref.key, { offset: h.entriesOff, length: len });
+		if (!t || t.byteLength < len) throw new ThreadError(`missing ${ref.key}`, 404);
 		const dv = new DataView(t.buffer, t.byteOffset, t.byteLength);
 		for (let i = 0; i < h.count; i++) {
 			const cell = dv.getUint32(i * DELTA_ENTRY_BYTES + 4, true);
 			counts.set(cell, (counts.get(cell) ?? 0) + 1);
 		}
 	}
-	return { ref, counts };
+	return all ? { ref, counts, bytes: all } : { ref, counts };
+}
+
+/**
+ * The ids of tombstone sets, read when first asked for and kept for the call (a commit retried on a newer head asks
+ * again). `reads.tombSets` counts the sets read.
+ */
+class TombIds {
+	private readonly ids = new Map<string, Promise<Uint32Array>>();
+	constructor(
+		private readonly store: BlobStore,
+		private readonly reads: CompactReads,
+	) {}
+	of(t: { key: string }): Promise<Uint32Array> {
+		let p = this.ids.get(t.key);
+		if (!p) {
+			this.reads.tombSets++;
+			this.ids.set(t.key, (p = getOrThrow(this.store, t.key).then(u32View)));
+		}
+		return p;
+	}
+	/** Sorted unique union of the sets' ids (the `filter_hits` buffer `tombFor` / `tombForDelta` build). */
+	async union(sets: { key: string }[]): Promise<Uint8Array> {
+		return idUnion(await mapLimit(sets, TOMB_READ_CONCURRENCY, (t) => this.of(t)));
+	}
 }
 
 async function getOrThrow(store: BlobStore, key: string): Promise<Uint8Array> {
@@ -427,12 +505,44 @@ const slabRevOf = (row: SlabRow | undefined): number => (row && row.length > 4 ?
  * an unscoped one both.
  */
 export function tombDroppable(t: { rev: number; ids: Uint32Array; scope?: TombScope }, deltas: { addedRev: number }[], slabs: SlabRow[], baseIds: number, segments: { addedRev: number }[] = []): boolean {
-	if (hidesLexical(t) && segments.some((s) => s.addedRev < t.rev)) return false;
-	if (!hidesDense(t)) return true;
-	if (deltas.some((d) => d.addedRev < t.rev)) return false;
-	if (slabs.some((row) => slabRevOf(row) > 0 && slabRevOf(row) <= t.rev)) return false;
+	const d = droppableByRefs(t, dropFloors(deltas, slabs, segments), baseIds);
+	if (d !== "ids") return d;
 	for (const id of t.ids) if (id < baseIds) return false;
 	return true;
+}
+
+/** What `tombDroppable` compares a set's rev with: the oldest remaining delta and segment, the oldest slab rev > 0. */
+interface DropFloors {
+	delta: number;
+	segment: number;
+	slab: number;
+}
+
+function dropFloors(deltas: { addedRev: number }[], slabs: SlabRow[], segments: { addedRev: number }[]): DropFloors {
+	let slab = Infinity;
+	for (const row of slabs) if (slabRevOf(row) > 0) slab = Math.min(slab, slabRevOf(row));
+	return { delta: deltas.reduce((a, d) => Math.min(a, d.addedRev), Infinity), segment: segments.reduce((a, s) => Math.min(a, s.addedRev), Infinity), slab };
+}
+
+/**
+ * `tombDroppable` without the ids: true or false when the rest decides, `"ids"` when only the build-id test is
+ * left. A lexical-scoped set never needs its ids, and a dense-side one needs them only when the base has build ids.
+ */
+function droppableByRefs(t: { rev: number; scope?: TombScope }, f: DropFloors, baseIds: number): boolean | "ids" {
+	if (hidesLexical(t) && f.segment < t.rev) return false;
+	if (!hidesDense(t)) return true;
+	if (f.delta < t.rev) return false;
+	if (f.slab <= t.rev) return false;
+	return baseIds > 0 ? "ids" : true;
+}
+
+/** `tombDroppable` for each set, reading the ids only of the sets whose drop depends on the build-id test. */
+async function droppableSets(sets: TombRef[], deltas: { addedRev: number }[], slabs: SlabRow[], baseIds: number, segments: { addedRev: number }[], ids: TombIds): Promise<boolean[]> {
+	const f = dropFloors(deltas, slabs, segments);
+	const pre = sets.map((t) => droppableByRefs(t, f, baseIds));
+	const need = sets.filter((_, i) => pre[i] === "ids");
+	const got = new Map(await mapLimit(need, TOMB_READ_CONCURRENCY, async (t) => [t.key, await ids.of(t)] as const));
+	return pre.map((p, i) => (p === "ids" ? !got.get(sets[i].key)!.some((id) => id < baseIds) : p));
 }
 
 // ---------- plan ----------
@@ -471,8 +581,12 @@ interface Base {
 	files: IndexFiles;
 	slabs: SlabRow[];
 	slabsBytes: number;
-	tombs: { rev: number; key: string; ids: Uint32Array; scope?: TombScope }[];
+	/** The deltas whose cells were read: the oldest of the manifest's, in plan order (`addedRev`, then `seq`). */
 	dcells: DeltaCells[];
+	/** Deltas of the base not read (all after `dcells`): they wait, and may have entries in any cell. */
+	unread: number;
+	/** The rev of the newest dense-side tombstone set without build ids (purge rewrites the slabs up to it); 0: none. */
+	purgeMaxRev: number;
 }
 
 const MB = (b: number): string => `${(b / 1048576).toFixed(1)} MiB`;
@@ -488,13 +602,19 @@ const MB = (b: number): string => `${(b / 1048576).toFixed(1)} MiB`;
  * same budget (`limits.splitEntries`). So no cell grows past what a later call can process; a delta that would take
  * a cell past it waits while that cell is split first. Input that no call with this budget can take (a delta whose
  * entries in one cell pass `splitEntries`, a cell past it from an older writer) is reported in `impossible`.
+ *
+ * The plan of the deltas read so far is the plan of the whole backlog cut there: a delta's place in the slice
+ * depends only on the deltas before it, and nothing else the planner uses comes from the deltas' cells (the bytes
+ * per entry come from the manifest). The deltas not read are treated as waiting with entries anywhere: a split cell
+ * keeps its mean, and `force` takes no oversized cell on its own.
  */
 function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurrency: number; cap: number; splitCellsPerRun: number; purge: boolean; force: boolean }): Plan {
 	const m = b.manifest;
 	const dim = m.dim;
 	const k = m.k1 * m.k2;
 	const canSplit = o.cap > 0 && m.k1 === 1;
-	const tombIds = b.tombs.reduce((a, t) => a + t.ids.length, 0);
+	// The ids over all sets, from the manifest (`TombRef.count`): the sets are read only when a cell needs them.
+	const tombIds = (m.tombstones ?? []).reduce((a, t) => a + t.count, 0);
 	// Held for the whole run: tombstone sets (and their unions), the slabs table (and the new one), the rest. The fine
 	// means of a split commit (old, new, the tree build's copy) are held only once the cells are done: a phase apart.
 	const fixed = CALL_OVERHEAD + tombIds * 4 * 3 + b.slabsBytes * 2;
@@ -502,7 +622,7 @@ function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurre
 	// Bytes per entry: the largest seen in a non-empty slab or a delta (payloads make entries larger), else the format's.
 	let B = entryBytesFor(m);
 	for (const row of b.slabs) if (row[2] > 0) B = Math.max(B, Math.ceil(row[3] / row[2]));
-	for (const d of b.dcells) if (d.ref.count > 0) B = Math.max(B, Math.ceil(d.ref.bytes / d.ref.count));
+	for (const d of m.deltas ?? []) if (d.count > 0) B = Math.max(B, Math.ceil(d.bytes / d.count));
 	const limits = limitsFor(m, o.maxBytes, o.cap, B);
 	const capEff = limits.cellEntries;
 	interface Est {
@@ -609,10 +729,9 @@ function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurre
 		}
 	}
 	let purgeCells = 0;
-	if (o.purge && b.tombs.length) {
-		// Only dense-side sets wait for slabs; of those, only sets without build ids can ever be dropped.
-		const purgeable = b.tombs.filter((t) => hidesDense(t) && !t.ids.some((id) => id < m.vectors));
-		const maxRev = purgeable.reduce((a, t) => Math.max(a, t.rev), 0);
+	if (o.purge && b.purgeMaxRev > 0) {
+		// Only dense-side sets wait for slabs; of those, only sets without build ids can ever be dropped (`purgeMaxRev`).
+		const maxRev = b.purgeMaxRev;
 		const blocking = b.slabs
 			.map((row, cell) => ({ cell, r: slabRevOf(row) }))
 			.filter(({ r }) => r > 0 && r <= maxRev)
@@ -620,7 +739,8 @@ function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurre
 			.map((x) => x.cell);
 		purgeCells = extra(blocking).length;
 	}
-	if (o.force && canSplit) {
+	// Not while deltas are unread: any of them may have entries in an oversized cell.
+	if (o.force && canSplit && !b.unread) {
 		const unfolded = new Set(b.dcells.filter((d) => !deltaCells.has(d.ref.key)).flatMap((d) => [...d.counts.keys()]));
 		const over = b.slabs
 			.map((row, cell) => ({ cell, n: row[2] }))
@@ -648,7 +768,8 @@ function planSlice(b: Base, o: { cellsPerRun: number; maxBytes: number; concurre
 				splitBlocked.push(cell);
 				continue;
 			}
-			if (b.dcells.some((d) => !foldedKeys.has(d.ref.key) && d.counts.has(cell))) pinned.add(cell);
+			// An unread delta may have entries in the cell: with any unread, every split keeps its mean.
+			if (b.unread > 0 || b.dcells.some((d) => !foldedKeys.has(d.ref.key) && d.counts.has(cell))) pinned.add(cell);
 			splitList.push([cell, nextCell++]);
 			candidates.push(cell);
 		}
@@ -705,7 +826,7 @@ export async function compactDeltas(ctx: WriterContext, opts: CompactOptions = {
 	const rctx: WriterContext = { ...ctx, store };
 	const owner = opts.owner ?? crypto.randomUUID();
 	const guard = `${prefixOf(store)}|${gen}`;
-	const result: CompactResult = { gen, outcome: "noop", rev: -1, baseRev: null, cells: 0, folded: 0, remainingDeltas: 0, skippedDeltas: 0, purgeCells: 0, splits: [], splitsDeferred: [], presplit: [], k: 0, droppedTombstoneSets: [], readBytes: 0, writtenBytes: 0, estimatedPeakBytes: 0, concurrency: 0, reasons: [], more: false, conflicts: 0, currentUpdated: false, staleLockTaken: false, ms: 0 };
+	const result: CompactResult = { gen, outcome: "noop", rev: -1, baseRev: null, cells: 0, folded: 0, remainingDeltas: 0, skippedDeltas: 0, reads: { deltas: 0, deltasListed: 0, tombSets: 0, tombSetsListed: 0, ms: 0 }, purgeCells: 0, splits: [], splitsDeferred: [], presplit: [], k: 0, droppedTombstoneSets: [], readBytes: 0, writtenBytes: 0, estimatedPeakBytes: 0, concurrency: 0, reasons: [], more: false, conflicts: 0, currentUpdated: false, staleLockTaken: false, ms: 0 };
 	const finish = () => ((result.ms = Date.now() - t0), result);
 	if (active.has(guard)) {
 		result.outcome = "locked";
@@ -772,7 +893,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 			}
 	};
 	// ---- base ---- (a retry after a wasm trap starts over)
-	Object.assign(result, { readBytes: 0, writtenBytes: 0, splits: [], cells: 0, folded: 0, droppedTombstoneSets: [] });
+	Object.assign(result, { readBytes: 0, writtenBytes: 0, splits: [], cells: 0, folded: 0, droppedTombstoneSets: [], reads: { deltas: 0, deltasListed: 0, tombSets: 0, tombSetsListed: 0, ms: 0 } });
 	const baseRev = await latestRev(store, gen);
 	const manifest = parseManifest(await getOrThrow(store, keys.manifest(gen, baseRev)), gen, baseRev);
 	const files = manifestFiles(manifest);
@@ -782,7 +903,12 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 	result.k = manifest.k1 * manifest.k2;
 	result.reasons = compactionExceeded(manifest);
 	result.remainingDeltas = manifest.deltas?.length ?? 0;
-	const record = (extra: Record<string, unknown> = {}) => ({ trigger: { rev: baseRev, op: "sdk-compact", reasons: result.reasons }, outcome: result.outcome, ms: Date.now() - t0, baseRev, rev: result.rev, cells: result.cells, folded: result.folded, purgeCells: result.purgeCells, skippedDeltas: result.skippedDeltas, splits: result.splits, splitsDeferred: result.splitsDeferred, k: result.k, remainingDeltas: result.remainingDeltas, droppedTombstoneSets: result.droppedTombstoneSets.length, readMB: +(result.readBytes / 1e6).toFixed(1), writtenMB: +(result.writtenBytes / 1e6).toFixed(1), slots: 1, estimatedPeakMB: +(result.estimatedPeakBytes / 1e6).toFixed(1), ...(result.note ? { note: result.note } : {}), ...extra });
+	const tombRefs = manifest.tombstones ?? [];
+	const reads = result.reads;
+	const tombIds = new TombIds(store, reads);
+	reads.deltasListed = manifest.deltas?.length ?? 0;
+	reads.tombSetsListed = tombRefs.length;
+	const record = (extra: Record<string, unknown> = {}) => ({ trigger: { rev: baseRev, op: "sdk-compact", reasons: result.reasons }, outcome: result.outcome, ms: Date.now() - t0, baseRev, rev: result.rev, cells: result.cells, folded: result.folded, purgeCells: result.purgeCells, skippedDeltas: result.skippedDeltas, splits: result.splits, splitsDeferred: result.splitsDeferred, k: result.k, remainingDeltas: result.remainingDeltas, droppedTombstoneSets: result.droppedTombstoneSets.length, readMB: +(result.readBytes / 1e6).toFixed(1), writtenMB: +(result.writtenBytes / 1e6).toFixed(1), slots: 1, estimatedPeakMB: +(result.estimatedPeakBytes / 1e6).toFixed(1), reads: { ...reads }, ...(result.note ? { note: result.note } : {}), ...extra });
 	if (!opts.force && !result.reasons.length) {
 		result.outcome = "noop";
 		result.note = `head rev ${baseRev} is below every threshold`;
@@ -795,43 +921,89 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 	}
 	if (!files.slabs) throw new ThreadError(`${gen} has no slabs table`, 400);
 	if ((manifest.format ?? 1) < 2) throw new ThreadError("compaction needs a format 2 or 3 generation", 400);
-	const k = manifest.k1 * manifest.k2;
-	const dim = manifest.dim;
-	const format = manifest.format ?? 1;
-	const slabRev = baseRev + 1;
-	const slabsBytes = await getOrThrow(store, files.slabs);
-	const slabs = parseSlabsTable(slabsBytes, k, files.slabs);
-	const tombs = await Promise.all((manifest.tombstones ?? []).map(async (t) => ({ rev: t.rev, key: t.key, ids: u32View(await getOrThrow(store, t.key)), ...(t.scope ? { scope: t.scope } : {}) })));
-	const dcells = await mapLimit(manifest.deltas ?? [], 6, (d) => readDeltaCells(store, d));
 	const maxBytes = opts.maxBytes ?? COMPACT_DEFAULT_MAX_BYTES;
 	if (!(maxBytes > 0)) throw new ThreadError("maxBytes must be positive", 400);
 	const cap = opts.maxCellEntries ?? policy?.maxCellEntries ?? 0;
 	if (!Number.isInteger(cap) || cap < 0 || cap === 1) throw new ThreadError("maxCellEntries must be 0 (no splits) or an integer >= 2", 400);
+	const k = manifest.k1 * manifest.k2;
+	const dim = manifest.dim;
+	const format = manifest.format ?? 1;
+	const slabRev = baseRev + 1;
+	const deadlineMs = opts.deadlineMs ?? policy?.deadlineMs ?? DEFAULT_DEADLINE_MS;
+	const deadline = t0 + deadlineMs;
+	// Reading more deltas stops here; the first window is read whatever the time (it holds the oldest delta).
+	const readUntil = t0 + READ_SHARE * Math.max(0, deadlineMs - COMMIT_RESERVE_MS);
+	const slabsBytes = await getOrThrow(store, files.slabs);
+	const slabs = parseSlabsTable(slabsBytes, k, files.slabs);
 	const tombThreshold = result.reasons.some((r) => r.startsWith("tombstones"));
-	const plan = planSlice(
-		{ gen, baseRev, manifest, files, slabs, slabsBytes: slabsBytes.byteLength, tombs, dcells },
-		{
-			cellsPerRun: opts.cellsPerRun ?? policy?.cellsPerRun ?? DEFAULT_CELLS_PER_RUN,
-			maxBytes,
-			concurrency: Math.max(1, opts.concurrency ?? DEFAULT_CONCURRENCY),
-			cap,
-			splitCellsPerRun: opts.splitCellsPerRun ?? policy?.splitCellsPerRun ?? DEFAULT_SPLIT_CELLS_PER_RUN,
-			purge: opts.purge ?? (tombThreshold || opts.force === true),
-			force: opts.force === true,
-		},
-	);
-	Object.assign(result, { skippedDeltas: plan.skipped.length, purgeCells: plan.purgeCells, splitsDeferred: plan.splitsDeferred, presplit: plan.presplit, estimatedPeakBytes: plan.estimatedPeakBytes, concurrency: plan.concurrency, limits: plan.limits });
-	if (!plan.cells.length) {
-		if (plan.impossible.length) {
-			const more = plan.impossible.length > 1 ? ` (and ${plan.impossible.length - 1} more)` : "";
-			throw new ThreadError(`compaction of ${gen} rev ${baseRev} cannot proceed with these budgets: ${plan.impossible[0]}${more}`, 413);
+	const purge = opts.purge ?? (tombThreshold || opts.force === true);
+	const planOpts = {
+		cellsPerRun: opts.cellsPerRun ?? policy?.cellsPerRun ?? DEFAULT_CELLS_PER_RUN,
+		maxBytes,
+		concurrency: Math.max(1, opts.concurrency ?? DEFAULT_CONCURRENCY),
+		cap,
+		splitCellsPerRun: opts.splitCellsPerRun ?? policy?.splitCellsPerRun ?? DEFAULT_SPLIT_CELLS_PER_RUN,
+		purge,
+		force: opts.force === true,
+	};
+
+	// ---- read phase ----
+	// The deltas' cells, oldest first (the plan's order), a window at a time, until the slice is full or the read phase
+	// has used its share of the deadline: the plan of a prefix is the plan of the backlog cut there (see planSlice).
+	// Small deltas are read whole; the bytes of those the slice takes are kept for the fold, the others dropped.
+	const order = [...(manifest.deltas ?? [])].sort((x, y) => x.addedRev - y.addedRev || x.seq - y.seq);
+	const dcells: DeltaCells[] = [];
+	const wholeDeltas = new Map<string, Uint8Array>();
+	const plan = (purgeMaxRev: number) => planSlice({ gen, baseRev, manifest, files, slabs, slabsBytes: slabsBytes.byteLength, dcells, unread: order.length - dcells.length, purgeMaxRev }, planOpts);
+	for (;;) {
+		const win = order.slice(dcells.length, dcells.length + DELTA_READ_WINDOW);
+		for (const d of await mapLimit(win, DELTA_READ_WINDOW, (d) => readDeltaCells(store, d, d.bytes <= DELTA_WHOLE_BYTES))) {
+			dcells.push({ ref: d.ref, counts: d.counts });
+			if (d.bytes) {
+				wholeDeltas.set(d.ref.key, d.bytes);
+				result.readBytes += d.bytes.byteLength;
+			}
 		}
-		result.outcome = plan.skipped.length ? "blocked" : "noop";
-		result.more = plan.skipped.length > 0;
-		result.note = plan.note ?? (plan.skipped.length ? `${plan.skipped.length} deltas wait (splits deferred: the slice has more than ${opts.splitCellsPerRun ?? policy?.splitCellsPerRun ?? DEFAULT_SPLIT_CELLS_PER_RUN} cells)` : undefined) ?? (tombs.length ? "nothing to rewrite (tombstone sets held by build ids, lexical segments or no blocking slabs)" : "nothing to rewrite");
+		if (dcells.length === order.length || Date.now() >= readUntil) break;
+		const skipped = new Set(plan(0).skipped.map((d) => d.key));
+		for (const key of skipped) wholeDeltas.delete(key);
+		let run = 0;
+		while (run < dcells.length && skipped.has(dcells[dcells.length - 1 - run].ref.key)) run++;
+		if (run >= SLICE_FULL_SKIPS) break;
+	}
+	reads.deltas = dcells.length;
+	// Purge rewrites the slabs up to the newest dense-side set without build ids. With build ids in the base the sets
+	// are read newest first until one has none (while the read phase has time; fewer purge cells otherwise).
+	let purgeMaxRev = 0;
+	if (purge) {
+		const dense = tombRefs.filter(hidesDense).sort((x, y) => y.rev - x.rev);
+		if (!(manifest.vectors > 0)) purgeMaxRev = dense[0]?.rev ?? 0;
+		else
+			for (let i = 0; i < dense.length && !purgeMaxRev && Date.now() < readUntil; i += TOMB_READ_CONCURRENCY) {
+				const win = dense.slice(i, i + TOMB_READ_CONCURRENCY);
+				const ids = await mapLimit(win, TOMB_READ_CONCURRENCY, (t) => tombIds.of(t));
+				const j = ids.findIndex((x) => !x.some((id) => id < manifest.vectors));
+				if (j >= 0) purgeMaxRev = win[j].rev;
+			}
+	}
+	const slice = plan(purgeMaxRev);
+	for (const key of [...wholeDeltas.keys()]) if (!slice.deltaCells.has(key)) wholeDeltas.delete(key);
+	reads.ms = Date.now() - t0;
+	const unread = order.length - dcells.length;
+	const waiting = slice.skipped.length + unread;
+	const readSummary = `${reads.ms} ms for ${dcells.length} of ${order.length} deltas and ${reads.tombSets} of ${tombRefs.length} tombstone sets (deadlineMs ${deadlineMs})`;
+	Object.assign(result, { skippedDeltas: slice.skipped.length, purgeCells: slice.purgeCells, splitsDeferred: slice.splitsDeferred, presplit: slice.presplit, estimatedPeakBytes: slice.estimatedPeakBytes, concurrency: slice.concurrency, limits: slice.limits });
+	if (!slice.cells.length) {
+		if (slice.impossible.length) {
+			const more = slice.impossible.length > 1 ? ` (and ${slice.impossible.length - 1} more)` : "";
+			throw new ThreadError(`compaction of ${gen} rev ${baseRev} cannot proceed with these budgets: ${slice.impossible[0]}${more}`, 413);
+		}
+		result.outcome = waiting ? "blocked" : "noop";
+		result.more = waiting > 0;
+		result.note = slice.note ?? (waiting ? `${waiting} deltas wait (${unread ? `${unread} not read; ` : ""}splits deferred: the slice has more than ${planOpts.splitCellsPerRun} cells)` : undefined) ?? (tombRefs.length ? "nothing to rewrite (tombstone sets held by build ids, lexical segments or no blocking slabs)" : "nothing to rewrite");
 		// Tombstone sets may still be droppable without rewriting anything (e.g. after a segment compaction).
-		if (!plan.skipped.length && tombs.some((t) => tombDroppable(t, manifest.deltas ?? [], slabs, manifest.vectors, manifest.segments ?? []))) {
-			await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombs, slabRev, rows: [], folded: [], splits: [], means: new Map(), deltaCells: plan.deltaCells, cap, pinned: new Set() }, result);
+		if (!waiting && (await droppableSets(tombRefs, manifest.deltas ?? [], slabs, manifest.vectors, manifest.segments ?? [], tombIds)).some(Boolean)) {
+			await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombIds, known: dcells, slabRev, rows: [], folded: [], splits: [], means: new Map(), deltaCells: slice.deltaCells, cap, pinned: new Set() }, result);
 			result.outcome = "committed";
 			result.note = "dropped tombstone sets nothing references";
 		}
@@ -839,23 +1011,58 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 	}
 
 	// ---- cells ----
-	const deadline = t0 + (opts.deadlineMs ?? policy?.deadlineMs ?? DEFAULT_DEADLINE_MS);
-	const cellDeadline = deadline - (plan.splits.length ? splitReserveMs(manifest) : COMMIT_RESERVE_MS);
-	const splitOf = new Map(plan.splits);
-	const codebook = plan.splits.length && format === 3 ? await getOrThrow(store, files.pq!) : new Uint8Array(0);
+	const cellDeadline = deadline - (slice.splits.length ? splitReserveMs(manifest) : COMMIT_RESERVE_MS);
+	const splitOf = new Map(slice.splits);
 	// The folded deltas, in manifest order (the order the Worker adds their records in: same bytes).
-	const foldedKeys = new Set(plan.folded.map((d) => d.key));
+	const foldedKeys = new Set(slice.folded.map((d) => d.key));
 	const foldedRefs = (manifest.deltas ?? []).filter((d) => foldedKeys.has(d.key));
-	const deltaBytes = new Map<string, Uint8Array>();
-	await mapLimit(foldedRefs, 6, async (d) => {
-		const b = await getOrThrow(store, d.key);
-		deltaBytes.set(d.key, b);
-		result.readBytes += b.byteLength;
-	});
-	// The dense view (tombFor / tombForDelta skip the lexical-scoped sets).
-	const ts = buildTombState(tombs.map((t) => ({ rev: t.rev, ids: t.ids, ...(t.scope ? { scope: t.scope } : {}) })));
 	const cellDeltas = new Map<number, DeltaRef[]>();
-	for (const d of foldedRefs) for (const c of plan.deltaCells.get(d.key)!) (cellDeltas.get(c) ?? cellDeltas.set(c, []).get(c)!).push(d);
+	for (const d of foldedRefs) for (const c of slice.deltaCells.get(d.key)!) (cellDeltas.get(c) ?? cellDeltas.set(c, []).get(c)!).push(d);
+	// The progress guarantee: the cells the oldest delta needs to commit run first and whatever the deadline. They are
+	// its own cells (or, when a cell keeps it out, that cell's split), with every folded delta in them and that
+	// delta's cells, and every split numbered before one of them (new cells are numbered in order), to the fixpoint:
+	// exactly what the commit of a cut slice (below) accepts.
+	const must = new Set<number>();
+	if (order.length) {
+		const queue: number[] = [];
+		const take = (c: number) => {
+			if (!must.has(c) && slice.cells.includes(c)) (must.add(c), queue.push(c));
+		};
+		(slice.deltaCells.get(order[0].key) ?? slice.presplit.filter((c) => dcells[0].counts.has(c))).forEach(take);
+		while (queue.length) {
+			const c = queue.pop()!;
+			for (const d of cellDeltas.get(c) ?? []) slice.deltaCells.get(d.key)!.forEach(take);
+			const i = slice.splits.findIndex(([x]) => x === c);
+			for (let j = 0; j < i; j++) take(slice.splits[j][0]);
+		}
+	}
+	// The read phase used the whole time: only the cells the oldest delta needs run; with none, nothing does.
+	const readNote = Date.now() > cellDeadline ? `read phase passed the deadline: ${readSummary}` : null;
+	if (readNote && !must.size) {
+		result.outcome = "deadline";
+		result.more = true;
+		result.note = `${readNote}; no cell started`;
+		return record();
+	}
+	const codebook = slice.splits.length && format === 3 ? await getOrThrow(store, files.pq!) : new Uint8Array(0);
+	// The folded deltas' bytes: the small ones were read whole above, the others are read when a cell needs them.
+	const deltaBytes = new Map<string, Promise<Uint8Array>>([...wholeDeltas].map(([key, b]) => [key, Promise.resolve(b)]));
+	wholeDeltas.clear();
+	const deltaOf = (d: DeltaRef): Promise<Uint8Array> => {
+		let p = deltaBytes.get(d.key);
+		if (!p) deltaBytes.set(d.key, (p = getOrThrow(store, d.key).then((b) => ((result.readBytes += b.byteLength), b))));
+		return p;
+	};
+	// The filters (tombFor / tombForDelta over the dense view: the lexical-scoped sets are never read here), each
+	// union built once and each set read once, when the first cell that needs it runs.
+	const unions = new Map<string, Promise<Uint8Array>>();
+	const unionOf = (key: string, pick: (t: TombRef) => boolean) => {
+		let u = unions.get(key);
+		if (!u) unions.set(key, (u = tombIds.union(tombRefs.filter((t) => hidesDense(t) && pick(t)))));
+		return u;
+	};
+	const slabFilter = (rev: number) => unionOf(`slab ${rev}`, (t) => t.rev >= rev);
+	const deltaFilter = (addedRev: number) => unionOf(`delta ${addedRev}`, (t) => t.rev > addedRev);
 	const rows = new Map<number, SlabRow>();
 	const means = new Map<number, Float32Array>();
 	const done = new Set<number>();
@@ -890,9 +1097,13 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		const info = w.slab_info(old);
 		if (info[2] !== cell) throw new ThreadError(`slab ${oldKey} is for cell ${info[2]}`, 500);
 		const mean = w.slab_centroid(old);
-		const records = [w.slab_to_records(old, tombFor(ts, oldRev))];
+		// An empty slab has nothing to filter (a rev-0 cell is hidden by every set, which it then need not read).
+		const records = [w.slab_to_records(old, info[1] > 0 ? await slabFilter(oldRev) : NO_TOMBSTONES)];
 		old = null;
-		for (const d of cellDeltas.get(cell) ?? []) records.push(w.delta_records_for_cell(deltaBytes.get(d.key)!, cell, tombForDelta(ts, d.addedRev)));
+		const ds = cellDeltas.get(cell) ?? [];
+		const inputs = await Promise.all(ds.map(async (d) => [await deltaOf(d), await deltaFilter(d.addedRev)] as const));
+		for (const [bytes, filter] of inputs) records.push(w.delta_records_for_cell(bytes, cell, filter));
+		inputs.length = 0;
 		const newCell = splitOf.get(cell);
 		if (newCell === undefined) {
 			await writeSlab(cell, mean, records);
@@ -920,7 +1131,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 			means2.set(mean);
 			means2.set(mean, dim);
 		}
-		if (plan.pinned.has(cell)) {
+		if (slice.pinned.has(cell)) {
 			// The cell keeps its mean; the new cell takes the centre farther from it.
 			const dotMean = (o: number) => {
 				let d = 0;
@@ -940,7 +1151,7 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		let recB = packed.subarray(4 + la);
 		// 2-means found no two groups (identical vectors): halve the entries under one mean, so the cell still shrinks.
 		// Not when a pinned cell gave everything away: it keeps its mean and is empty, which lets its deltas fold.
-		if (n >= 2 && (recB.byteLength === 0 || (recA.byteLength === 0 && !plan.pinned.has(cell)))) {
+		if (n >= 2 && (recB.byteLength === 0 || (recA.byteLength === 0 && !slice.pinned.has(cell)))) {
 			const all = recB.byteLength === 0 ? recA : recB;
 			const mean1 = recB.byteLength === 0 ? meanA : meanB;
 			[recA, recB] = halveRecords(all, dim);
@@ -953,24 +1164,27 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		means.set(newCell, meanB);
 		splitsDone.push({ cell, newCell, entries: n, a, b: bn });
 	};
-	// Split cells first (their new cells are numbered in order, so a cut keeps a prefix of them), then the cells of
-	// each delta, oldest delta first (a cut then completes as many deltas as it can), then the extra cells.
-	const ordered: number[] = [];
+	// The cells the oldest delta needs first (the guarantee), then split cells (their new cells are numbered in order,
+	// so a cut keeps a prefix of them), then the cells of each delta, oldest delta first (a cut then completes as many
+	// deltas as it can), then the extra cells. The order changes no bytes: each cell's slab is built on its own.
+	const ranked: number[] = [];
 	const seen = new Set<number>();
 	const push = (c: number) => {
 		if (!seen.has(c)) {
 			seen.add(c);
-			ordered.push(c);
+			ranked.push(c);
 		}
 	};
-	for (const [c] of plan.splits) push(c);
-	for (const d of [...foldedRefs].sort((x, y) => x.addedRev - y.addedRev || x.seq - y.seq)) for (const c of plan.deltaCells.get(d.key)!) push(c);
-	for (const c of plan.cells) push(c);
+	for (const [c] of slice.splits) push(c);
+	for (const d of [...foldedRefs].sort((x, y) => x.addedRev - y.addedRev || x.seq - y.seq)) for (const c of slice.deltaCells.get(d.key)!) push(c);
+	for (const c of slice.cells) push(c);
+	const ordered = [...ranked.filter((c) => must.has(c)), ...ranked.filter((c) => !must.has(c))];
 	let next = 0;
 	await Promise.all(
-		Array.from({ length: plan.concurrency }, async () => {
+		Array.from({ length: slice.concurrency }, async () => {
 			while (next < ordered.length && !stopped) {
-				if (Date.now() > cellDeadline) {
+				// The cells the oldest delta needs start whatever the time; the others not after the cell deadline.
+				if (next >= must.size && Date.now() > cellDeadline) {
 					stopped = true;
 					break;
 				}
@@ -984,22 +1198,22 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 
 	// ---- what can be committed ----
 	let commitCells = new Set(done);
-	let prefix = plan.splits.length;
+	let prefix = slice.splits.length;
 	let commitFolded = foldedRefs;
 	if (stopped) {
 		// A split counts only with every split before it (new cells are numbered in order); a delta only when every
 		// cell it has entries in is committed; a cell only when every folded delta in it is (else its new slab would
 		// hold entries the delta still serves). Iterate to the fixpoint.
 		prefix = 0;
-		while (prefix < plan.splits.length && done.has(plan.splits[prefix][0])) prefix++;
-		for (const [c] of plan.splits.slice(prefix)) commitCells.delete(c);
+		while (prefix < slice.splits.length && done.has(slice.splits[prefix][0])) prefix++;
+		for (const [c] of slice.splits.slice(prefix)) commitCells.delete(c);
 		for (;;) {
-			commitFolded = foldedRefs.filter((d) => plan.deltaCells.get(d.key)!.every((c) => commitCells.has(c)));
+			commitFolded = foldedRefs.filter((d) => slice.deltaCells.get(d.key)!.every((c) => commitCells.has(c)));
 			const fk = new Set(commitFolded.map((d) => d.key));
 			const cc = new Set([...commitCells].filter((c) => (cellDeltas.get(c) ?? []).every((d) => fk.has(d.key))));
 			let p = 0;
-			while (p < prefix && cc.has(plan.splits[p][0])) p++;
-			for (const [c] of plan.splits.slice(p, prefix)) cc.delete(c);
+			while (p < prefix && cc.has(slice.splits[p][0])) p++;
+			for (const [c] of slice.splits.slice(p, prefix)) cc.delete(c);
 			prefix = p;
 			if (cc.size === commitCells.size) break;
 			commitCells = cc;
@@ -1007,11 +1221,11 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		if (!commitCells.size) {
 			result.outcome = "deadline";
 			result.more = true;
-			result.note = `deadline: ${done.size} of ${plan.cells.length} cells done, none committable`;
+			result.note = `deadline: ${done.size} of ${slice.cells.length} cells done, none committable`;
 			return record();
 		}
 	}
-	const commitSplits = plan.splits.slice(0, prefix);
+	const commitSplits = slice.splits.slice(0, prefix);
 	const commitRows: [number, SlabRow][] = [];
 	for (const c of [...commitCells].sort((x, y) => x - y)) {
 		commitRows.push([c, rows.get(c)!]);
@@ -1019,9 +1233,10 @@ async function runCompaction(ctx: WriterContext, w: CompactWasm, opts: CompactOp
 		if (nc !== undefined) commitRows.push([nc, rows.get(nc)!]);
 	}
 	commitRows.sort((x, y) => x[0] - y[0]);
-	const head = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombs, slabRev, rows: commitRows, folded: commitFolded, splits: commitSplits, means, deltaCells: plan.deltaCells, cap: plan.limits.cellEntries, pinned: plan.pinned }, result);
+	const head = await commitSlice(ctx, w, { baseRev, manifest, files, slabs, k, dim, tombIds, known: dcells, slabRev, rows: commitRows, folded: commitFolded, splits: commitSplits, means, deltaCells: slice.deltaCells, cap: slice.limits.cellEntries, pinned: slice.pinned }, result);
 	result.splits = splitsDone.filter((s) => commitSplits.some(([c]) => c === s.cell)).sort((x, y) => x.cell - y.cell);
 	result.outcome = stopped ? "partial" : "committed";
+	if (readNote) result.note = `${readNote}; the cells the oldest delta needs ran anyway (${commitCells.size} of ${slice.cells.length} cells)`;
 	// More splitting only helps while splits move entries (a split with an empty half would repeat forever).
 	const moved = result.splits.some((x) => x.a > 0 && x.b > 0);
 	result.more = stopped || moreWork(head.manifest, opts.force === true, moved && head.oversized > 0) || result.splitsDeferred.length > 0;
@@ -1035,7 +1250,10 @@ interface Slice {
 	slabs: SlabRow[];
 	k: number;
 	dim: number;
-	tombs: { rev: number; key: string; ids: Uint32Array; scope?: TombScope }[];
+	/** The ids of the tombstone sets, read when a drop decision needs them (shared with the cells). */
+	tombIds: TombIds;
+	/** The deltas whose cells the plan read (the split check needs no second read of them). */
+	known: DeltaCells[];
 	slabRev: number;
 	rows: [number, SlabRow][];
 	folded: DeltaRef[];
@@ -1069,13 +1287,15 @@ async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result:
 		if (newCell !== s.k + i || !rowCells.has(cell) || !rowCells.has(newCell)) throw new ThreadError(`split ${i} of cell ${cell} -> ${newCell} is inconsistent`, 500);
 	});
 	for (const d of s.folded) for (const c of s.deltaCells.get(d.key)!) if (!rowCells.has(c)) throw new ThreadError(`folded delta ${d.key} has entries in cell ${c}, which is not among the rewritten rows`, 500);
-	const cellsMemo = new Map<string, Promise<DeltaCells>>();
+	// The split check below needs the cells of every delta that stays. While any delta of the base was unread every
+	// split is pinned (planSlice), so `splitCells` is empty and nothing is read; otherwise the plan read them all, and
+	// only the deltas a writer added after the base are read here.
+	const cellsMemo = new Map<string, Promise<DeltaCells>>(s.known.map((d) => [d.ref.key, Promise.resolve(d)]));
 	const cellsOf = (d: DeltaRef) => {
 		let p = cellsMemo.get(d.key);
-		if (!p) cellsMemo.set(d.key, (p = readDeltaCells(store, d)));
+		if (!p) cellsMemo.set(d.key, (p = readDeltaCells(store, d, d.bytes <= DELTA_WHOLE_BYTES).then(({ ref, counts }) => ({ ref, counts }))));
 		return p;
 	};
-	const tombIds = new Map(s.tombs.map((t) => [t.key, t.ids]));
 	let routing: { forFine: string; fine: string; k: number; tree?: TreeRef; routing?: RoutingTables } | null = null;
 	let dropped: number[] = [];
 	let oversized = 0;
@@ -1096,10 +1316,11 @@ async function commitSlice(ctx: WriterContext, w: CompactWasm, s: Slice, result:
 		for (const [cell, row] of s.rows) table[cell] = row;
 		if (table.length !== kk || table.some((r) => !r)) throw new ThreadError(`slabs table would have ${table.length} rows, expected ${kk}`, 500);
 		oversized = s.cap > 0 ? table.filter((r) => r[2] > s.cap).length : 0;
+		// The sets of the head (a writer may have added some since the base): ids are read only for the build-id test.
 		const tombRefs: TombRef[] = manifest.tombstones ?? [];
-		const sets = await Promise.all(tombRefs.map(async (t) => ({ ...t, ids: tombIds.get(t.key) ?? u32View(await getOrThrow(store, t.key)) })));
-		const keep = sets.filter((t) => !tombDroppable(t, remaining, table, manifest.vectors, manifest.segments ?? []));
-		dropped = sets.filter((t) => !keep.includes(t)).map((t) => t.rev);
+		const drop = await droppableSets(tombRefs, remaining, table, manifest.vectors, manifest.segments ?? [], s.tombIds);
+		const keep = tombRefs.filter((_, i) => !drop[i]);
+		dropped = tombRefs.filter((_, i) => drop[i]).map((t) => t.rev);
 		if (!s.rows.length && !dropped.length) return null;
 		const next: Manifest = { ...inherit(manifest), deltas: remaining, tombstones: keep.map(({ rev: r, key, count, scope }) => ({ rev: r, key, count, ...(scope ? { scope } : {}) })) };
 		if (s.rows.length) next.files = { ...files, slabs: await putUnique(store, keys.slabsTable(gen, rev + 1), JSON.stringify(table)) };

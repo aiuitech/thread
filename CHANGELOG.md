@@ -4,6 +4,40 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## Unreleased
+
+- **Dense compaction reads what its slice needs, not the whole backlog, and the oldest delta always folds**
+  (TypeScript, `compact()` / `compactDeltas`). Before it planned, a call read every tombstone set (one get each)
+  and every delta's entry table (two range gets each), and the deadline counted from the start of the call. When
+  that read phase took longer than the deadline, no cell started, the run ended `deadline` with 0 cells, and the
+  backlog only grew (inseam, 2026-11-14, SDK 0.2.5: 767 deltas of about 3 KB and 2,531 tombstone sets, about 4,000
+  gets taking 20 to 30 s against a 10 s deadline; every run ended `deadline` with 0 cells, and one Durable Object
+  alarm passed its limit of 10,000 R2 reads). Now:
+  - The deltas' cells are read oldest first in windows of 8, and the call plans after each window. Reading stops
+    when the slice is full (16 deltas in a row could not join it), or when reading has used a third of
+    `deadline - 2.5 s`; the first window is always read. A delta up to 64 KiB is read whole, one get that is also
+    the fold's input (before: two range gets, then the whole delta again). While some deltas are unread, a split
+    cell keeps its mean and `force` takes no oversized cell on its own.
+  - A tombstone set's ids are read once, when a cell being rewritten or a delta being folded is filtered by it (a
+    slab of slabRev r by the dense-view sets with rev >= r, an empty slab by none, a delta added at rev a by those
+    with rev > a), or when its drop depends on the build-id test alone. Lexical-scoped sets are never read. The
+    planner's memory estimate uses the counts in the manifest.
+  - The oldest delta folds in every call that plans: the cells it needs to commit run first, whatever the deadline,
+    and are committed. Only the lock, a conflict or a 413 stops it. Such a call can take longer than `deadlineMs`
+    when the oldest delta alone needs more; its note then starts `read phase passed the deadline:` with what was
+    read. A purge- or `force`-only call whose read phase passed the deadline ends `deadline` with that note.
+  - `CompactResult.reads` (also in `compact.last.json`): deltas and tombstone sets read, of those the base lists,
+    and the ms to the plan.
+  - The objects a compaction writes are unchanged (`test/compact-worker.test.ts` still matches the Worker byte for
+    byte). `test/compact-backlog.test.ts` builds 300 deltas and 1,240 tombstone sets from small upserts,
+    dense-scoped and lexical-scoped re-puts and deletes, then calls `compact({ deadlineMs: 1 })` until nothing is
+    due: on 0.2.6 each call made 2,145 gets and ended `deadline` with 0 cells; now 56 calls take the backlog from
+    300 deltas to 3, each folds at least one, reads 8 deltas, never reads a lexical-scoped set, and makes at most
+    1,157 gets (615 on average). Every live document, deleted id and replaced vector answers as before. The
+    tombstone sets are most of those gets: a cell whose slab predates a set needs it. Unioning the sets into fewer
+    objects is the next step.
+- Python: no change (it has no dense compaction). The Worker's own compaction is unchanged.
+
 ## 0.2.6 (2026-11-09)
 
 - **The block cache keeps alive only the bytes a read asked for** (TypeScript, `CachedBlobStore` over the Workers

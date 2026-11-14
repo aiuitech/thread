@@ -422,7 +422,12 @@ head has one) and drops the tombstone sets nothing references. A call is bounded
 memory, default 48 MiB; `r.estimatedPeakBytes` is the plan's figure, an upper bound of what was measured),
 `cellsPerRun` (default the policy's, 256) and `deadlineMs` (default the policy's, 27 s: no cell starts after
 `deadline - 2.5 s`, up to 7 s with splits by the size of the fine means; the finished cells whose deltas are
-complete are committed, `outcome: "partial"`). `maxBytes` also sizes the cells: they split at `min(maxCellEntries, splitEntries / 2)`, where
+complete are committed, `outcome: "partial"`). A call reads only what its slice needs: the deltas' cells oldest
+first, until the slice is full or a third of `deadline - 2.5 s` is used (the first 8 always), and a tombstone set's
+ids only when a cell it rewrites or a delta it folds is filtered by it (lexical-scoped sets never); `r.reads` counts
+the deltas and sets read, of those the base lists, and the ms to the plan. The oldest delta folds in every call
+that plans, whatever the deadline: its cells run first and are committed even when that takes longer than
+`deadlineMs` (the note says when the read phase passed the deadline), so a backlog shrinks on every call. `maxBytes` also sizes the cells: they split at `min(maxCellEntries, splitEntries / 2)`, where
 `splitEntries` is the largest cell the budget can split on its own, and no fold takes a cell past `splitEntries` (a
 cell in the way of a delta is split first, `r.presplit`). So every cell stays processable by a later call with the
 same budget; `index.compactionLimits(maxBytes)` / `compactionLimits(manifest, { maxBytes })` tells the numbers
@@ -606,7 +611,7 @@ directory or a bucket to write on top of it. Format and rationale: [docs/portabi
 - Payloads: `returnPayload` reads them with one (multi-)range request per slab; keep payloads small or store
   them elsewhere keyed by id.
 - `index.compact()`: the planner keeps its estimate under `maxBytes` (48 MiB by default): 1 MiB fixed, the folded
-  deltas held for the run, the tombstone sets (x3), the slabs table (x2), the largest folded delta again (its copy
+  deltas held for the run, the tombstone sets (x3, from the manifest's counts; a call reads only those it needs), the slabs table (x2), the largest folded delta again (its copy
   in wasm) and, per cell in flight, 3x its old slab plus 6x the new one (a split: 8x plus 4 B x entries x dim of
   decoded vectors); or, when it splits, the fine means of the commit (x3), whichever phase is larger. The factors
   are measured, wasm memory growth included ([docs/update-path.md](../../docs/update-path.md#memory-of-a-call)).
