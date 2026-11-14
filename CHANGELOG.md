@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## Unreleased
+## 0.2.7 (2026-11-14)
 
 - **Dense compaction reads what its slice needs, not the whole backlog, and the oldest delta always folds**
   (TypeScript, `compact()` / `compactDeltas`). Before it planned, a call read every tombstone set (one get each)
@@ -66,7 +66,7 @@ from source, runs every check and publishes.
   the merges, and answers as TS does. The Worker's own compaction is unchanged (it reads, filters and drops merged
   sets like any other; `test/compact-worker.test.ts` compacts and rolls back such a generation with it).
 
-## 0.2.6 (2026-11-09)
+## 0.2.6 (2026-11-09, not published: it ships in 0.2.7)
 
 - **The block cache keeps alive only the bytes a read asked for** (TypeScript, `CachedBlobStore` over the Workers
   Cache API). 0.2.5's block reads returned `subarray` views of the blocks they filled, so every range a caller kept
