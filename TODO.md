@@ -1,7 +1,7 @@
 # TODO
 
 Nothing in thread is open. Finished work is in `CHANGELOG.md` (scoped tombstones: 0.2.1; the compaction read phase
-and tombstone set merging: 0.2.7) and in `docs/update-path.md`.
+and tombstone set merging: 0.2.7; optional vectors per document: 0.2.8) and in `docs/update-path.md`.
 
 ## Check after the release
 

@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## Unreleased
+## 0.2.8 (2026-11-14)
 
 - **Optional vectors per document in an upsert** (TypeScript and Python). In the one-row-per-document form of
   `vectors`, a row may be `null` / `None`: that document is written without a vector (text, meta, attrs and key in
