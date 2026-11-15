@@ -298,6 +298,7 @@ index.configure_attrs(tenant={"bits": 12}, lang={"values": ["en", "fr"]})       
 r = index.upsert([1000, 1001], [emb_a, emb_b], texts=["...", "..."], metas=["Title A", "Title B"], attrs=[{"tenant": 5, "lang": "en"}, 6])
 # UpsertResult(gen, rev, seq, count, cells, distinct_cells, keys, bytes, conflicts, cas_conflicts, current_updated, ms)
 index.upsert([1002], texts=["text-only document"], metas=["C"])        # no vector: found by text alone
+index.upsert([1003, 1004], [emb_d, None], texts=["...", "..."])          # a None row: that document has no vector (one revision)
 index.delete([1000])                    # hides the vector, the text and the doc
 k = index.upsert(keys=["s3://b/a.bin", "s3://b/c.bin"], metas=["A", "C"], texts=["host:cdn-1", "host:cdn-2"])
 # by key (needs manifest.lex): known keys keep their id, new keys are allocated from manifest.nextId; k.ids lists them

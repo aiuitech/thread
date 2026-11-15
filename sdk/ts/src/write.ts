@@ -27,16 +27,18 @@ export interface UpsertInput {
 	 */
 	keys?: readonly string[];
 	/**
-	 * `n * dim` floats (flat) or one array per vector; any norm (normalized here). Optional when the generation has
-	 * a lexical configuration: documents without a vector are only found by text.
+	 * `n * dim` floats (flat) or one array per document; any norm (normalized here). Optional when the generation
+	 * has a lexical configuration: documents without a vector are only found by text. In the one-array-per-document
+	 * form a row may be `null`: that document is written without a vector (text, meta and key only; an older
+	 * vector of it is hidden, as a whole-document put hides it), the others with theirs, in one revision.
 	 */
-	vectors?: Float32Array | number[] | (Float32Array | number[])[];
+	vectors?: Float32Array | number[] | (Float32Array | number[] | null)[];
 	/**
 	 * One attribute word per document (default 0): field values under the generation's schema (`{tenant: 5, lang:
 	 * "en"}`) or a raw u32. Stored with the vector (slab/delta entry) and in the `docs` store; what `filter` tests.
 	 */
 	attrs?: ArrayLike<AttrValues>;
-	/** One payload per vector (strings are UTF-8 encoded). */
+	/** One payload per document with a vector (strings are UTF-8 encoded); empty for a document whose vector is null. */
 	payloads?: (Uint8Array | string)[];
 	/**
 	 * One text per id, indexed by BM25 (and stored when `manifest.lex.text`) in a lexical segment; needs
@@ -96,7 +98,7 @@ export interface UpsertResult {
 	allocated: number;
 	/** With `chunk`: the input documents, the chunks written (= `count`) and the stale chunk keys tombstoned. */
 	chunks?: { documents: number; count: number; stale: number };
-	/** Primary cell of each vector (empty without vectors). */
+	/** Primary cell of each vector, in input order of the documents that have one (empty without vectors). */
 	cells: number[];
 	distinctCells: number;
 	keys: { delta: string | null; segment: string | null; tombstones: string | null; manifest: string };
@@ -321,6 +323,8 @@ interface Batch {
 	keys: string[] | null;
 	/** Unit-normalized vectors (a copy), or null for a text-only batch. */
 	vectors: Float32Array | null;
+	/** The positions in the batch of the documents with a vector (ascending), or null when every document has one. */
+	vecAt: Uint32Array | null;
 	attrs: Uint32Array | null;
 	payloads: Uint8Array[] | null;
 	texts: (string | null)[] | null;
@@ -374,34 +378,52 @@ function prepareBatch(input: UpsertInput, dim: number, lex: ResolvedLexConfig | 
 	if (input.vectors === undefined) {
 		if (!texts && !metas && !keys) throw new ThreadError("an upsert needs vectors, texts, metas or keys", 400);
 		if (input.payloads) throw new ThreadError("payloads belong to vectors", 400);
-		return { ids, givenIds, keys, vectors: null, attrs, payloads: null, texts, metas };
+		return { ids, givenIds, keys, vectors: null, vecAt: null, attrs, payloads: null, texts, metas };
 	}
 	if (dim === 0) throw new ThreadError("this generation has no dense index: upsert texts/metas only", 400);
 	const v = input.vectors;
 	let vectors: Float32Array;
+	let vecAt: Uint32Array | null = null;
 	if (Array.isArray(v) && v.length && typeof v[0] !== "number") {
-		const rows = v as (Float32Array | number[])[];
+		const rows = v as (Float32Array | number[] | null)[];
 		if (rows.length !== n) throw new ThreadError(`${rows.length} vectors for ${n} ids`, 400);
-		vectors = new Float32Array(n * dim);
+		const at: number[] = [];
 		rows.forEach((r, i) => {
+			if (r === null || r === undefined) return;
 			if (r.length !== dim) throw new ThreadError(`vector ${i} has ${r.length} dims, index dim is ${dim}`, 400);
-			vectors.set(r, i * dim);
+			at.push(i);
 		});
+		if (at.length < n) {
+			// Documents without a vector live in the segment alone: it must be written, and it must hold them.
+			if (!lex) throw new ThreadError("a document without a vector needs a lexical configuration (index.configureLexical)", 400);
+			if (!texts && !metas && !keys) throw new ThreadError(`vector ${rows.findIndex((r) => r == null)} is null: a document without a vector needs texts, metas or keys`, 400);
+			const payloads = input.payloads;
+			if (payloads) for (let i = 0; i < n; i++) if (rows[i] == null && payloads[i] != null && (typeof payloads[i] === "string" ? payloads[i].length : (payloads[i] as Uint8Array).byteLength)) throw new ThreadError(`payloads[${i}] belongs to no vector (vector ${i} is null)`, 400);
+			if (!at.length) {
+				if (payloads && payloads.length !== n) throw new ThreadError(`${payloads.length} payloads for ${n} documents`, 400);
+				return { ids, givenIds, keys, vectors: null, vecAt: null, attrs, payloads: null, texts, metas };
+			}
+			vecAt = Uint32Array.from(at);
+		}
+		vectors = new Float32Array(at.length * dim);
+		at.forEach((i, j) => vectors.set(rows[i]!, j * dim));
 	} else {
 		vectors = Float32Array.from(v as ArrayLike<number>);
 		if (vectors.length !== n * dim) throw new ThreadError(`vectors has ${vectors.length} floats, expected ${n} x ${dim}`, 400);
 	}
-	for (let i = 0; i < n; i++) {
+	const m = vectors.length / dim;
+	for (let r = 0; r < m; r++) {
+		const i = vecAt ? vecAt[r] : r;
 		let ss = 0;
-		for (let j = i * dim; j < (i + 1) * dim; j++) ss += vectors[j] * vectors[j];
+		for (let j = r * dim; j < (r + 1) * dim; j++) ss += vectors[j] * vectors[j];
 		if (!(ss > 0) || !Number.isFinite(ss)) throw new ThreadError(`vector ${i} (id ${ids[i]}) has zero or non-finite norm`, 400);
 		const inv = 1 / Math.sqrt(ss);
-		for (let j = i * dim; j < (i + 1) * dim; j++) vectors[j] *= inv;
+		for (let j = r * dim; j < (r + 1) * dim; j++) vectors[j] *= inv;
 	}
 	const enc = new TextEncoder();
-	const payloads = input.payloads ? input.payloads.map((p) => (typeof p === "string" ? enc.encode(p) : p)) : null;
-	if (payloads && payloads.length !== n) throw new ThreadError(`${payloads.length} payloads for ${n} vectors`, 400);
-	return { ids, givenIds, keys, vectors, attrs, payloads, texts, metas };
+	if (input.payloads && input.payloads.length !== n) throw new ThreadError(`${input.payloads.length} payloads for ${n} ${vecAt ? "documents" : "vectors"}`, 400);
+	const payloads = input.payloads ? (vecAt ? Array.from(vecAt, (i) => input.payloads![i]) : input.payloads).map((p) => (typeof p === "string" ? enc.encode(p) : p)) : null;
+	return { ids, givenIds, keys, vectors, vecAt, attrs, payloads, texts, metas };
 }
 
 /**
@@ -463,6 +485,8 @@ interface EncodedDelta {
 	seq: number;
 	key: string;
 	bytes: number;
+	/** Entries (the documents with a vector). */
+	count: number;
 	cells: Uint32Array;
 	nCells: number;
 	filesKey: string;
@@ -472,6 +496,10 @@ interface EncodedDelta {
 async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b: Batch, seq: number): Promise<EncodedDelta> {
 	const { w, store, gen } = ctx;
 	const vectors = b.vectors!;
+	// The documents with a vector: every one, or those at `vecAt` (the payloads are already theirs alone).
+	const ids = b.vecAt ? Uint32Array.from(b.vecAt, (i) => b.ids[i]) : b.ids;
+	const allAttrs = b.attrs;
+	const attrsOf = allAttrs && b.vecAt ? Uint32Array.from(b.vecAt, (i) => allAttrs[i]) : allAttrs;
 	const format = m.format ?? 1;
 	if (format === 3 && !files.pq) throw new ThreadError(`format 3 generation ${gen} has no PQ codebook`);
 	const baseKey = `${gen}|${files.coarse}|${files.fine}|${files.pq ?? "-"}`;
@@ -491,14 +519,14 @@ async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b
 	const job = new w.DeltaJob(m.dim, k, means, seq); // DeltaJob holds its own copy of the means (~k*dim*4 bytes)
 	let finished = false;
 	let bytes: Uint8Array;
-	const cells = new Uint32Array(b.ids.length);
+	const cells = new Uint32Array(ids.length);
 	try {
 		if (format === 3) job.set_pq_codebook((borrowed ?? ownPq)!);
 		const dim = m.dim;
-		for (let a = 0; a < b.ids.length; a += DELTA_ADD_CHUNK) {
-			const e = Math.min(b.ids.length, a + DELTA_ADD_CHUNK);
+		for (let a = 0; a < ids.length; a += DELTA_ADD_CHUNK) {
+			const e = Math.min(ids.length, a + DELTA_ADD_CHUNK);
 			const v = vectors.subarray(a * dim, e * dim);
-			const attrs = b.attrs ? b.attrs.subarray(a, e) : new Uint32Array(0);
+			const attrs = attrsOf ? attrsOf.subarray(a, e) : new Uint32Array(0);
 			let c: Uint32Array;
 			if (b.payloads) {
 				const ps = b.payloads.slice(a, e);
@@ -509,8 +537,8 @@ async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b
 					cat.set(p, o);
 					o += p.byteLength;
 				}
-				c = job.add_with_payloads(v, b.ids.subarray(a, e), attrs, cat, lens);
-			} else c = job.add(v, b.ids.subarray(a, e), attrs);
+				c = job.add_with_payloads(v, ids.subarray(a, e), attrs, cat, lens);
+			} else c = job.add(v, ids.subarray(a, e), attrs);
 			if (c.length !== e - a) throw new ThreadError(`DeltaJob added ${c.length} of ${e - a} vectors`);
 			cells.set(c, a);
 		}
@@ -522,7 +550,7 @@ async function encodeDelta(ctx: WriterContext, m: Manifest, files: IndexFiles, b
 	}
 	const nCells = w.delta_cells(bytes).length / 2;
 	const key = await putUnique(store, keys.delta(gen, seq), bytes);
-	return { seq, key, bytes: bytes.byteLength, cells, nCells, filesKey: baseKey };
+	return { seq, key, bytes: bytes.byteLength, count: ids.length, cells, nCells, filesKey: baseKey };
 }
 
 /** Sorted unique ids as a tombstone buffer (`tombstones_merge` of the empty set and `ids`). */
@@ -624,6 +652,7 @@ function checkScope(input: UpsertInput, scope: UpsertScope): void {
 	} else {
 		if (input.metas) throw new ThreadError(`scope "dense" leaves the docs alone: no metas`, 400);
 		if (input.texts && input.vectors !== undefined) throw new ThreadError(`scope "dense" stores no texts: pass vectors, or texts to embed`, 400);
+		if (Array.isArray(input.vectors) && (input.vectors as unknown[]).some((r) => r === null || r === undefined)) throw new ThreadError(`scope "dense" needs a vector for every document (a null row would hide the vector, not keep it)`, 400);
 	}
 }
 
@@ -721,7 +750,7 @@ export async function upsert(ctx: WriterContext, inputIn: UpsertInput): Promise<
 				next.tombstones!.push({ rev: newRev, key: tombKey, count: tb.byteLength / 4, ...(tombScope ? { scope: tombScope } : {}) });
 				if (tombScope && !(next.features ?? []).includes(FEATURE_SCOPED_TOMBSTONES)) next.features = [...(next.features ?? []), FEATURE_SCOPED_TOMBSTONES];
 			}
-			if (delta) next.deltas!.push({ seq: delta.seq, key: delta.key, count: batch.ids.length, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
+			if (delta) next.deltas!.push({ seq: delta.seq, key: delta.key, count: delta.count, bytes: delta.bytes, addedRev: newRev, cells: delta.nCells });
 			if (seg) next.segments = [...(next.segments ?? []), { ...seg.ref, addedRev: newRev }];
 			next.nextSeq = Math.max(next.nextSeq ?? 1, st.seq + 1);
 			return { ...next, change: { op: "upsert", seq: st.seq, count: batch.ids.length, replace, ...(scope !== "both" ? { scope } : {}), dense: !!delta, lexical: !!seg, ...(batch.keys ? { keys: batch.keys.length, allocated: st.allocated } : {}), ...(chunked ? { chunk: { words: chunked.words, overlap: chunked.overlap, documents: chunked.parents.length, stale: st.stale.length } } : {}), writer: "thread-sdk" } };

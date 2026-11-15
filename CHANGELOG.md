@@ -4,6 +4,21 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## Unreleased
+
+- **Optional vectors per document in an upsert** (TypeScript and Python). In the one-row-per-document form of
+  `vectors`, a row may be `null` / `None`: that document is written without a vector (text, meta, attrs and key in
+  the segment; an older vector of it is hidden, as by any whole-document put) and the others with theirs, in one
+  revision. Before, a batch was all vectors or none, so a caller with some documents to embed and some not wrote
+  two revisions. The delta holds only the rows given, with their ids, attrs and payloads, and its manifest `count`
+  is the number of rows; `UpsertResult.cells` lists one cell per row given. Every row `null` is a text-only batch
+  (no delta). Refused, with nothing written: a `null` row without a lexical configuration, or in a batch with no
+  texts, metas or keys (the document would be only a tombstone); a non-empty payload at a `null` row; any `null`
+  row under `scope: "dense"`. Given vectors are never embedded over, so in a generation that names its model a
+  `null` row is text-only. The flat `n * dim` form is unchanged.
+- **`BulkBuild` loads each stage with one upsert** (TypeScript): a stage that mixed documents with and without a
+  vector was replayed as two upserts, two revisions; it is now one, with `null` rows.
+
 ## 0.2.7 (2026-11-14)
 
 - **Dense compaction reads what its slice needs, not the whole backlog, and the oldest delta always folds**

@@ -353,6 +353,7 @@ await index.configureAttrs({ tenant: { bits: 12 }, lang: { values: ["en", "fr"] 
 const r = await index.upsert({ ids: [1000, 1001], vectors: [embA, embB], texts: ["...", "..."], metas: ["Title A", "Title B"], attrs: [{ tenant: 5, lang: "en" }, 6] });
 // { gen, rev, seq, count, cells, distinctCells, keys: { delta, segment, tombstones, manifest }, bytes, conflicts, casConflicts, currentUpdated, ms }
 await index.upsert({ ids: [1002], texts: ["text-only document"], metas: ["C"] });   // no vector: found by text alone
+await index.upsert({ ids: [1003, 1004], vectors: [embD, null], texts: ["...", "..."] });   // a null row: that document has no vector (one revision)
 await index.delete([1000]);           // { gen, rev, count, key, conflicts, ... } (hides the vector, the text and the doc)
 // by key (needs manifest.lex): known keys keep their id, new keys are allocated from manifest.nextId; r.ids lists them
 const k = await index.upsert({ keys: ["s3://b/a.bin", "s3://b/c.bin"], metas: ["A", "C"], texts: ["host:cdn-1", "host:cdn-2"] });

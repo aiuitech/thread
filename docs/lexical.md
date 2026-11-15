@@ -232,7 +232,9 @@ the vectors (as before), a lexical/docs/keys segment for the texts, metadata, at
 tokenize, build `terms` + `postings` + `docs` + `keys`), and the tombstone set. With `keys` and no `ids`, the keys are
 resolved through the head revision: known keys keep their ids, new keys take the next ones from `manifest.nextId`
 ([keys.md](keys.md#ids-allocation-and-the-counter)). Vectors are optional when the generation has a lexical configuration
-(text-only documents are found by text alone), texts/metas are optional (dense-only upserts are unchanged). The
+(text-only documents are found by text alone), texts/metas are optional (dense-only upserts are unchanged). In the
+one-row-per-document form a row may be `null`: that document goes to the segment only, the others to the delta too,
+so one batch can mix documents with and without a vector (the delta's `count` is the number of rows given). The
 delta and the segment share the `seq`. `index.delete(ids)` is one tombstone set, as before, and hides both sides.
 
 `index.compactSegments()` reads every segment of the head whole, merges them (`segment::merge`: posting lists

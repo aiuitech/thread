@@ -1367,13 +1367,15 @@ class ThreadIndex:
         scope: Literal["both", "dense", "lexical"] = "both",
     ) -> UpsertResult:
         """Adds or replaces documents: one delta segment (vectors: `n * dim` floats flat, one row per id, or an
-        `(n, dim)` numpy array; any norm), one lexical/docs/keys segment (`texts` indexed by BM25, `metas` stored in
+        `(n, dim)` numpy array; any norm; in the one-row-per-id form a row may be None: that document is written
+        without a vector, text, meta and key only, and an older vector of it is hidden), one lexical/docs/keys segment (`texts` indexed by BM25, `metas` stored in
         the docs store, `keys` unique string keys; needs `configure_lexical`) and, with `replace` (default), a
         tombstone set hiding older copies of the ids, committed as a new manifest revision; the index then reads
         that revision. With `keys` and no `ids`, a known key keeps its id and a new one is allocated the next id
         (`manifest.nextId`); the result lists the ids. `attrs`: one attribute word per document, as field values
         under the schema (`{"tenant": 5, "lang": "en"}`) or a raw u32; stored with the vector and in the docs store,
-        and what `filter` tests. Up to 4096 per call.
+        and what `filter` tests. `payloads`: one per document with a vector (empty for a None row). Up to 4096 per
+        call.
 
         `chunk` (True = the defaults, or `{"words": 200, "overlap": 0}` / `ChunkOptions`) splits each text into flat
         word windows (`chunk_text`) and writes one document per chunk: chunk `i` of the document keyed `k` is stored

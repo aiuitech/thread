@@ -319,6 +319,8 @@ class _Batch:
     keys: list[str] | None = None
     #: Whether the caller gave the ids (else they come from the keys).
     given_ids: bool = True
+    #: The positions in the batch of the documents with a vector (ascending), or None when every document has one.
+    vec_at: list[int] | None = None
 
 
 def _prepare_batch(ids_in: Iterable[int] | None, vectors: Any, attrs: Iterable[Any] | None, payloads: Sequence[bytes | str] | None,
@@ -374,20 +376,44 @@ def _prepare_batch(ids_in: Iterable[int] | None, vectors: Any, attrs: Iterable[A
     if dim == 0:
         raise ThreadError("this generation has no dense index: upsert texts/metas only", 400)
     # A buffer (numpy array of shape (n, dim) or (n * dim,), array('f'), raw f32 bytes) goes to the native side as
-    # is; a list is either flat floats or one row per vector.
+    # is; a list is either flat floats or one row per document, where a row may be None (no vector).
+    vec_at: list[int] | None = None
+    m = n
     if _is_buffer(vectors):
         flat: Any = vectors
     else:
         rows = list(vectors)
-        if rows and not isinstance(rows[0], (int, float)) and not hasattr(rows[0], "__float__"):
+        if rows and (any(r is None for r in rows) or (not isinstance(rows[0], (int, float)) and not hasattr(rows[0], "__float__"))):
             if len(rows) != n:
                 raise ThreadError(f"{len(rows)} vectors for {n} ids", 400)
             flat = array("f")
+            at: list[int] = []
             for i, r in enumerate(rows):
+                if r is None:
+                    continue
                 r = list(r)
                 if len(r) != dim:
                     raise ThreadError(f"vector {i} has {len(r)} dims, index dim is {dim}", 400)
                 flat.extend(r)
+                at.append(i)
+            if len(at) < n:
+                # Documents without a vector live in the segment alone: it must be written, and it must hold them.
+                if lex is None:
+                    raise ThreadError("a document without a vector needs a lexical configuration (index.configure_lexical)", 400)
+                if texts_l is None and metas_l is None and keys_l is None:
+                    first = next(i for i, r in enumerate(rows) if r is None)
+                    raise ThreadError(f"vector {first} is null: a document without a vector needs texts, metas or keys", 400)
+                if payloads is not None:
+                    pl = list(payloads)
+                    for i, r in enumerate(rows):
+                        if r is None and i < len(pl) and pl[i] is not None and len(pl[i]):
+                            raise ThreadError(f"payloads[{i}] belongs to no vector (vector {i} is null)", 400)
+                    if len(pl) != n:
+                        raise ThreadError(f"{len(pl)} payloads for {n} documents", 400)
+                    payloads = [pl[i] for i in at]
+                if not at:
+                    return _Batch(ids, None, attrs_a, None, texts_l, metas_l, keys_l, given_ids)
+                vec_at, m = at, len(at)
         else:
             flat = rows
     try:
@@ -395,13 +421,14 @@ def _prepare_batch(ids_in: Iterable[int] | None, vectors: Any, attrs: Iterable[A
     except (ValueError, TypeError) as e:
         raise ThreadError(f"vectors: {e}", 400) from e
     if bad >= 0:
-        raise ThreadError(f"vector {bad} (id {ids[bad]}) has zero or non-finite norm", 400)
-    if len(unit) != n * dim * 4:
+        i = vec_at[bad] if vec_at is not None else bad
+        raise ThreadError(f"vector {i} (id {ids[i]}) has zero or non-finite norm", 400)
+    if len(unit) != m * dim * 4:
         raise ThreadError(f"vectors has {len(unit) // 4} floats, expected {n} x {dim}", 400)
     payloads_l = [p.encode("utf-8") if isinstance(p, str) else bytes(p) for p in payloads] if payloads is not None else None
-    if payloads_l is not None and len(payloads_l) != n:
+    if payloads_l is not None and len(payloads_l) != m:
         raise ThreadError(f"{len(payloads_l)} payloads for {n} vectors", 400)
-    return _Batch(ids, unit, attrs_a, payloads_l, texts_l, metas_l, keys_l, given_ids)
+    return _Batch(ids, unit, attrs_a, payloads_l, texts_l, metas_l, keys_l, given_ids, vec_at)
 
 
 def _assign_ids(ctx: WriterContext, manifest: dict[str, Any], keys_l: Sequence[str]) -> tuple[array, int]:
@@ -466,6 +493,8 @@ class _EncodedDelta:
     cells: list[int]
     n_cells: int
     files_key: str
+    #: Entries (the documents with a vector).
+    count: int = 0
 
 
 def _base_key(gen: str, files: dict[str, Any]) -> str:
@@ -496,10 +525,13 @@ def _encode_delta(ctx: WriterContext, m: dict[str, Any], files: dict[str, Any], 
         job.set_pq_codebook(pq)
     assert b.vectors is not None
     vec = memoryview(b.vectors)
+    # The documents with a vector: every one, or those at `vec_at` (the payloads are already theirs alone).
+    ids = array("I", (b.ids[i] for i in b.vec_at)) if b.vec_at is not None else b.ids
+    attrs = (array("I", (b.attrs[i] for i in b.vec_at)) if b.vec_at is not None else b.attrs) if b.attrs is not None else None
     cells: list[int] = []
-    for a in range(0, len(b.ids), DELTA_ADD_CHUNK):
-        e = min(len(b.ids), a + DELTA_ADD_CHUNK)
-        c = job.add(vec[a * dim * 4 : e * dim * 4], b.ids[a:e], b.attrs[a:e] if b.attrs is not None else None,
+    for a in range(0, len(ids), DELTA_ADD_CHUNK):
+        e = min(len(ids), a + DELTA_ADD_CHUNK)
+        c = job.add(vec[a * dim * 4 : e * dim * 4], ids[a:e], attrs[a:e] if attrs is not None else None,
                     b.payloads[a:e] if b.payloads is not None else None)
         if len(c) != e - a:
             raise ThreadError(f"DeltaJob added {len(c)} of {e - a} vectors")
@@ -507,7 +539,7 @@ def _encode_delta(ctx: WriterContext, m: dict[str, Any], files: dict[str, Any], 
     data = job.finish()
     n_cells = len(_native.delta_cells(data))
     key = _put_unique(store, keys.delta(gen, seq), data)
-    return _EncodedDelta(seq, key, len(data), cells, n_cells, base_key)
+    return _EncodedDelta(seq, key, len(data), cells, n_cells, base_key, len(ids))
 
 
 def _tomb_bytes(ids: array) -> bytes:
@@ -619,6 +651,9 @@ def _check_scope(scope: str, vectors: Any, payloads: Any, texts: Any, metas: Any
             raise ThreadError('scope "dense" leaves the docs alone: no metas', 400)
         if texts and vectors is not None:
             raise ThreadError('scope "dense" stores no texts: pass vectors, or texts to embed', 400)
+        if isinstance(vectors, (list, tuple)) and any(r is None for r in vectors):
+            raise ThreadError('scope "dense" needs a vector for every document (a null row would hide the vector, '
+                              'not keep it)', 400)
 
 
 def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *, attrs: Iterable[Any] | None = None,
@@ -741,7 +776,7 @@ def upsert(ctx: WriterContext, ids: Iterable[int] | None, vectors: Any = None, *
                     nxt["features"] = [*(nxt.get("features") or []), FEATURE_SCOPED_TOMBSTONES]
             nxt["tombstones"].append(ref)
         if delta is not None:
-            nxt["deltas"].append({"seq": delta.seq, "key": delta.key, "count": len(batch.ids), "bytes": delta.bytes,
+            nxt["deltas"].append({"seq": delta.seq, "key": delta.key, "count": delta.count, "bytes": delta.bytes,
                                   "addedRev": new_rev, "cells": delta.n_cells})
         if seg is not None:
             nxt["segments"] = [*nxt["segments"], {**seg.ref, "addedRev": new_rev}]

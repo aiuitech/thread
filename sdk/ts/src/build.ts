@@ -560,14 +560,9 @@ export class BulkBuild {
 			const fb = doc.vec.some((r) => r >= 0) ? await this.store.get(stageKey(s.gen, pos, "f32")) : null;
 			const f = fb ? f32Of(fb) : new Float32Array(0);
 			peak = Math.max(peak, 5 * (jb.byteLength * 2 + f.byteLength) + (1 << 20));
-			const pick = (want: boolean) => doc.vec.map((r, i) => ((r >= 0) === want ? i : -1)).filter((i) => i >= 0);
-			for (const want of [false, true]) {
-				const at = pick(want);
-				if (!at.length) continue;
-				const sel = <T>(a: T[] | undefined) => (a ? at.map((i) => a[i]) : undefined);
-				const vectors = want ? at.map((i) => f.subarray(doc.vec[i] * s.dim, (doc.vec[i] + 1) * s.dim)) : undefined;
-				await ix.upsert({ ...(doc.keys ? { keys: sel(doc.keys) } : {}), ...(doc.ids ? { ids: sel(doc.ids) } : {}), ...(doc.metas ? { metas: sel(doc.metas) } : {}), ...(doc.texts ? { texts: sel(doc.texts) } : {}), ...(doc.attrs ? { attrs: sel(doc.attrs) } : {}), ...(vectors ? { vectors } : { embed: false }) });
-			}
+			// One upsert per stage: a document staged without a vector is a null row (text, meta and key only).
+			const vectors = doc.vec.map((r) => (r >= 0 ? f.subarray(r * s.dim, (r + 1) * s.dim) : null));
+			await ix.upsert({ ...(doc.keys ? { keys: doc.keys } : {}), ...(doc.ids ? { ids: doc.ids } : {}), ...(doc.metas ? { metas: doc.metas } : {}), ...(doc.texts ? { texts: doc.texts } : {}), ...(doc.attrs ? { attrs: doc.attrs } : {}), vectors });
 			await this.save({ ...s, load: { pos: pos + 1 } });
 			progressed = true;
 		}

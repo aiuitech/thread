@@ -41,7 +41,8 @@ Nothing in thread runs a model. The index is given a way to *call* one, and uses
   index cannot embed. A `vector` given with the text is used as is.
 - **`upsert({ texts })` without `vectors` or `embed`** embeds the texts as `document`s (with `docPrefix`), one per
   chunk when chunking ([chunking.md](chunking.md)). `embed: false` writes text-only documents; an explicit `embed`
-  function overrides the index's.
+  function overrides the index's. Given `vectors` are never embedded over, and a `null` row among them writes that
+  document text-only (`vectors: [embA, null]`).
 
 The index gets its embedder from `open`:
 
@@ -170,7 +171,7 @@ for a new build), so a new handle after a restart continues where the last step 
 | `sample` | reads the f32 objects in order, one at a time, and keeps `S` evenly spaced rows (`S` = 256 per cell, at most a quarter of `maxBytes` of vectors); a chunk per step under `build/{gen}/sample/` | `S x dim x 4` + one f32 object x2 |
 | `kmeans` | Lloyd iterations over the sample in wasm (`FlatKmeansJob`, `Reducer.means_reseed` for empty cells), initialised with `k` sample rows from a seeded shuffle; the means saved after each iteration (default 10) | the sample + 6 copies of the means |
 | `create` | `createGeneration({ means, setCurrent: false })`: rev 0 with `k` empty cells | the means x3 |
-| `load` | replays each stage in order as an ordinary upsert (texts and vectors; the vectors go to deltas of their nearest cell), then `compact({ maxBytes })` when it is due | a stage x5, then the compaction's `maxBytes` |
+| `load` | replays each stage in order as one ordinary upsert (texts and vectors, a null row for a document staged without one; the vectors go to deltas of their nearest cell), then `compact({ maxBytes })` when it is due | a stage x5, then the compaction's `maxBytes` |
 | `compact` | `compact({ force: true, maxBytes })` until no delta is left | `maxBytes` |
 
 Sizes from `maxBytes` (`bulkBuildPlan(n, dim, { maxBytes })` computes them): cells of half what the budget splits at
