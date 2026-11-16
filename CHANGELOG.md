@@ -4,6 +4,15 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## Unreleased
+
+- **A must-clause: `ids` on `search` and `lexicalSearch`** (TypeScript). Only the given document ids may be
+  returned. The BM25 list keeps to them inside each segment's scan (`LexPostings::search_in` in the core; the wasm
+  `search` takes the set as its last argument, `u32` LE sorted unique, empty for none), so the top k is exactly the
+  top k of the set, however many other documents score higher. The dense list keeps them after its scan, at
+  `recallK` depth. An empty list returns nothing. For inseam's guest search (a person shown only the messages they
+  were party to), which ranked the whole host and kept the set, and missed set members below the depth.
+
 ## 0.2.8 (2026-11-14)
 
 - **Optional vectors per document in an upsert** (TypeScript and Python). In the one-row-per-document form of

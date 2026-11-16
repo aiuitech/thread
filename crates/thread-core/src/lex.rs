@@ -922,6 +922,20 @@ impl<S: ByteSource> Postings<S> {
         k: usize,
         skip: Option<&Tombstones>,
     ) -> Result<Vec<Hit>, SourceError> {
+        self.search_in(terms, scoring, k, skip, None)
+    }
+
+    /// [`search`](Self::search) kept to a set of ids: only ids in `allow` take a slot (a must-clause:
+    /// "the text matches, and the document is one of these"). The top `k` is then exactly the top
+    /// `k` of the set, however many documents outside it score higher. `None` allows every id.
+    pub fn search_in(
+        &self,
+        terms: &[QueryTerm],
+        scoring: &Scoring,
+        k: usize,
+        skip: Option<&Tombstones>,
+        allow: Option<&Tombstones>,
+    ) -> Result<Vec<Hit>, SourceError> {
         let live: Vec<&QueryTerm> = terms
             .iter()
             .filter(|t| t.info.df > 0 && t.weight != 0.0)
@@ -977,7 +991,11 @@ impl<S: ByteSource> Postings<S> {
                     c.advance();
                 }
             }
-            if score > 0.0 && score > top.threshold() && !skip.is_some_and(|t| t.contains(d)) {
+            if score > 0.0
+                && score > top.threshold()
+                && !skip.is_some_and(|t| t.contains(d))
+                && allow.is_none_or(|a| a.contains(d))
+            {
                 top.push(d, score, 0);
             }
         }
@@ -1264,6 +1282,31 @@ mod tests {
                     all[2..5].iter().map(|h| h.id).collect::<Vec<_>>()
                 );
                 assert!(postings.search(&qt, &scoring, 0, None).unwrap().is_empty());
+                // only allowed ids take a slot: the top k of the set, however far down the whole
+                // ranking its members are, in the whole ranking's order
+                let low: Vec<u32> = all.iter().rev().take(3).map(|h| h.id).collect();
+                let set = Tombstones::from_ids(&low);
+                let kept = postings
+                    .search_in(&qt, &scoring, 2, None, Some(&set))
+                    .unwrap();
+                let want: Vec<u32> = all
+                    .iter()
+                    .filter(|h| low.contains(&h.id))
+                    .take(2)
+                    .map(|h| h.id)
+                    .collect();
+                assert_eq!(kept.iter().map(|h| h.id).collect::<Vec<_>>(), want);
+                let both = postings
+                    .search_in(
+                        &qt,
+                        &scoring,
+                        5,
+                        Some(&Tombstones::from_ids(&low[..1])),
+                        Some(&set),
+                    )
+                    .unwrap();
+                assert_eq!(both.len(), 2);
+                assert!(!both.iter().any(|h| h.id == low[0]));
             }
         }
     }

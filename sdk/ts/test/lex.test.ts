@@ -400,7 +400,7 @@ describe("LexSegment paging", () => {
 		expect(infos[0]).toBeGreaterThan(0);
 		expect(infos[6]).toBe(-1);
 		expect(q.rounds).toBe(1);
-		const hits = await seg.run(() => seg.reader.search(infos, Float64Array.from([infos[0], infos[3], 0]), Float32Array.from([1, 1, 1]), 3000, seg.info!.totalLen, 1.2, 0.75, 5, new Uint8Array(0)), q, trace);
+		const hits = await seg.run(() => seg.reader.search(infos, Float64Array.from([infos[0], infos[3], 0]), Float32Array.from([1, 1, 1]), 3000, seg.info!.totalLen, 1.2, 0.75, 5, new Uint8Array(0), new Uint8Array(0)), q, trace);
 		expect(q.rounds).toBe(2);
 		expect(new DataView(hits.buffer, hits.byteOffset).getUint32(0, true)).toBe(5);
 		expect(q.bytes).toBeLessThan(bytes.byteLength / 4);

@@ -250,7 +250,19 @@ export interface LexSearchOptions {
 	/** First depth of a filtered search (default `max(4 k, 32)`) and the deepest it goes (default 1 << 16). */
 	filterDepth?: number;
 	maxDepth?: number;
+	/**
+	 * Only these document ids may be returned: a must-clause ("the text matches, and the document is one of these").
+	 * Scored inside each segment's scan, so the top `k` is exactly the top `k` of the set, however many other
+	 * documents score higher. An empty list returns nothing.
+	 */
+	ids?: readonly number[];
 }
+
+/** Ids as the wasm takes an id set: `u32` LE, sorted, unique. */
+const idSetBytes = (ids: readonly number[]): Uint8Array => {
+	const sorted = Uint32Array.from(new Set(ids.filter((i) => Number.isInteger(i) && i >= 0 && i <= 0xffffffff))).sort();
+	return new Uint8Array(sorted.buffer, sorted.byteOffset, sorted.byteLength);
+};
 
 export interface LexSearchResult {
 	hits: LexHit[];
@@ -448,6 +460,9 @@ export class LexIndex {
 			});
 		const empty = (df: Record<string, number> = {}): LexSearchResult => ({ hits: [], tokens, found: 0, stats: { segments: lexSegs.length, numDocs, totalLen, df, io, ms: Date.now() - t0, trace: traced([], 0) } });
 		if (!distinct.length || !lexSegs.length || k < 1) return empty();
+		// A must-clause with no ids allows nothing; with ids, the scan keeps to them (`LexSearchOptions.ids`).
+		if (opts.ids && opts.ids.length === 0) return empty();
+		const allow = opts.ids ? idSetBytes(opts.ids) : new Uint8Array(0);
 		const tL = nowMs();
 		const trL = snapTrace(trace);
 		const infos = await Promise.all(lexSegs.map(({ seg }) => seg.run(() => kern.time("bm25Lookup", () => seg.reader.lookup(distinct)), io, trace)));
@@ -466,7 +481,7 @@ export class LexIndex {
 				const inf = infos[i];
 				if (!inf.some((v, j) => j % 3 === 0 && v >= 0)) return Promise.resolve(null);
 				const tomb = this.tomb ? tombForSegment(this.tomb, ref.addedRev) : new Uint8Array(0);
-				return seg.run(() => kern.time("bm25Score", () => seg.reader.search(inf, dfs, w, numDocs, totalLen, this.config.k1, this.config.b, k, tomb)), io, trace);
+				return seg.run(() => kern.time("bm25Score", () => seg.reader.search(inf, dfs, w, numDocs, totalLen, this.config.k1, this.config.b, k, tomb, allow)), io, trace);
 			}),
 		);
 		spans.push(phaseSpan("score", tS - tt0, phaseStat(nowMs() - tS, trace, trS)));

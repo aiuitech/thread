@@ -92,6 +92,12 @@ export interface SearchRequest {
 	 * the `docs` store (see `LexSearchOptions`).
 	 */
 	filter?: AttrFilterExpr;
+	/**
+	 * Only these document ids may be returned, a must-clause on both lists. The BM25 list keeps to them inside its scan,
+	 * so it is exact for the set. The dense list keeps them after its scan (at `recallK` depth), so a dense-only match
+	 * of the set that ranks below that depth in the whole index is not found. An empty list returns nothing.
+	 */
+	ids?: readonly number[];
 }
 
 export interface SearchHit {
@@ -801,7 +807,9 @@ export class ThreadIndex {
 					? (async () => {
 							const t = Date.now();
 							const s0 = nowMs() - tt0;
-							const r = await this.queryInner(vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
+							const q = await this.queryInner(vector!, { ...req.dense, topK: depth, ...(filter ? { filter } : {}) });
+							const allowed = req.ids ? new Set(req.ids) : null;
+							const r = allowed ? { ...q, hits: q.hits.filter((h) => allowed.has(h.id)) } : q;
 							tDense = Date.now() - t;
 							const e = r.stats.trace;
 							spans.push({ name: "dense", start: roundMs(s0), ms: e.ms, io: e.io, children: shiftSpans(e.spans, s0) });
@@ -812,7 +820,7 @@ export class ThreadIndex {
 					? (async () => {
 							const t = Date.now();
 							const s0 = nowMs() - tt0;
-							const r = await this.lexicalInner(req.text!, depth, filter ? { filter } : {});
+							const r = await this.lexicalInner(req.text!, depth, { ...(filter ? { filter } : {}), ...(req.ids ? { ids: req.ids } : {}) });
 							tLex = Date.now() - t;
 							const e = r.stats.trace;
 							spans.push({ name: "lexical", start: roundMs(s0), ms: e.ms, io: e.io, children: shiftSpans(e.spans, s0) });

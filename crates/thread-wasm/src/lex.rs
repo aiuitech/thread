@@ -870,7 +870,8 @@ impl SegmentReader {
     /// weight (occurrences in the query), `num_docs` / `total_len` the corpus-wide counts
     /// (`stats()` summed over the segments), `k1` / `b` the index's parameters. Returns the top
     /// `k` as packed hits (`[count u32][id u32, score f32, idx u32 = 0]*`), best first, ids in
-    /// `tombstones` (`u32` LE, sorted unique; empty = none) never taking a slot. One round cold.
+    /// `tombstones` (`u32` LE, sorted unique; empty = none) never taking a slot, and, when `allow`
+    /// is not empty (`u32` LE, sorted unique), only its ids taking one. One round cold.
     #[allow(clippy::too_many_arguments)]
     pub fn search(
         &mut self,
@@ -883,6 +884,7 @@ impl SegmentReader {
         b: f64,
         k: u32,
         tombstones: &[u8],
+        allow: &[u8],
     ) -> Result<Vec<u8>, JsValue> {
         let infos = infos_from_flat(infos)?;
         if dfs.len() != infos.len() || weights.len() != infos.len() {
@@ -915,10 +917,17 @@ impl SegmentReader {
         } else {
             Some(Tombstones::from_bytes(tombstones).map_err(|e| arg_error(e.to_string()))?)
         };
+        let allow = if allow.is_empty() {
+            None
+        } else {
+            Some(Tombstones::from_bytes(allow).map_err(|e| arg_error(e.to_string()))?)
+        };
         if !self.seg()?.has_lex() || terms.is_empty() {
             return Ok(pack_hits(&TopK::new(0).into_sorted()));
         }
-        let hits = self.with_postings(|p| p.search(&terms, &scoring, k as usize, skip.as_ref()))?;
+        let hits = self.with_postings(|p| {
+            p.search_in(&terms, &scoring, k as usize, skip.as_ref(), allow.as_ref())
+        })?;
         Ok(pack_hits(&hits))
     }
 
