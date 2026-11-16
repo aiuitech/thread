@@ -4,7 +4,7 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
-## Unreleased
+## 0.2.9 (2026-11-16)
 
 - **A must-clause: `ids` on `search` and `lexicalSearch`** (TypeScript). Only the given document ids may be
   returned. The BM25 list keeps to them inside each segment's scan (`LexPostings::search_in` in the core; the wasm
