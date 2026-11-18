@@ -152,10 +152,10 @@ sed -i 's/^version = "0.2.0"/version = "0.3.0"/' sdk/python/pyproject.toml Cargo
 cargo check --workspace                      # updates Cargo.lock
 (cd sdk/ts/examples/basic && npm install)    # its lock records the SDK version
 $EDITOR CHANGELOG.md
-git commit -am "v0.3.0"     # in the upstream repository, which pushes main and the tag here (see below)
+git commit -am "v0.3.0"     # in the upstream repository (see below), then push it there
 
-# 2. tag: this starts the release
-git tag -a v0.3.0 -m "v0.3.0" && git push origin v0.3.0
+# 2. tag: in the upstream repository, `scripts/dev thread release` pushes main here and then the tag v0.3.0,
+#    which starts the release
 gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --exit-status
 
 # 3. deploy the Workers from the same commit
@@ -186,8 +186,8 @@ This repository is a mirror of the `thread/` folder of inseam's repository, wher
 upstream pushes each change of `thread/` here as a fast-forward of `main`, and a release pushes `main` and then the
 tag, so the tag always names a commit of this history.
 
-If something fails after the tag: fix on main, move the tag (`git tag -d vX && git push origin :refs/tags/vX`,
-then tag again) and push it; a tag pushed in the same moment as a new workflow file may not trigger the workflow,
+If something fails after the tag: fix on main upstream, delete the tag here (`git push origin :refs/tags/vX`), and
+run the upstream release command again; a tag pushed in the same moment as a new workflow file may not trigger the workflow,
 in which case `gh workflow run release.yml --ref vX` runs it on the tag. Published versions are immutable on both
 registries: a broken release is followed by a new patch version, not re-published.
 
