@@ -152,7 +152,7 @@ sed -i 's/^version = "0.2.0"/version = "0.3.0"/' sdk/python/pyproject.toml Cargo
 cargo check --workspace                      # updates Cargo.lock
 (cd sdk/ts/examples/basic && npm install)    # its lock records the SDK version
 $EDITOR CHANGELOG.md
-git commit -am "v0.3.0" && git push origin main
+git commit -am "v0.3.0"     # in the upstream repository, which pushes main and the tag here (see below)
 
 # 2. tag: this starts the release
 git tag -a v0.3.0 -m "v0.3.0" && git push origin v0.3.0
@@ -173,14 +173,18 @@ Credentials and settings the workflow relies on (set once):
   `aiuitech` org with read/write on packages, scoped to `@aiuitech`, with "Bypass two-factor authentication" (the
   publish fails with `EOTP` otherwise; Actions cannot answer a 2FA prompt). Once the package exists, npm trusted
   publishing can be configured on npmjs.com (package settings, GitHub Actions, repository `aiuitech/thread`,
-  workflow `release.yml`, environment `npm`) and the token deleted. The publish runs without `--provenance`: npm
-  only accepts provenance from public source repositories.
+  workflow `release.yml`, environment `npm`) and the token deleted. The publish passes `--provenance`, which needs
+  this repository to stay public.
 - **PyPI**: no secret. The project `thread-sdk` has a trusted publisher: owner `aiuitech`, repository `thread`,
   workflow `release.yml`, environment `pypi`. The publish step passes `skip-existing`, so a rerun after a partial
   publish does not fail on files already uploaded.
 - **GitHub**: environments `npm` and `pypi` exist on the repository (no protection rules; add required reviewers
   there to gate publishing). `wasm-bindgen` is installed at the version pinned in both workflows
   (`WASM_BINDGEN_VERSION`), which must equal the dependency in `crates/thread-wasm/Cargo.toml`.
+
+This repository is a mirror of the `thread/` folder of inseam's repository, where thread is developed. The
+upstream pushes each change of `thread/` here as a fast-forward of `main`, and a release pushes `main` and then the
+tag, so the tag always names a commit of this history.
 
 If something fails after the tag: fix on main, move the tag (`git tag -d vX && git push origin :refs/tags/vX`,
 then tag again) and push it; a tag pushed in the same moment as a new workflow file may not trigger the workflow,

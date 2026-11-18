@@ -208,4 +208,7 @@ The full list of checks, the wasm build, the deploy steps and how a version is r
 `@aiuitech/thread-sdk` and `thread-sdk`) are in [docs/operations.md](docs/operations.md); versions and what changed in
 each are in [CHANGELOG.md](CHANGELOG.md).
 
+thread is developed inside [inseam](https://inseam.io)'s repository, and this repository is a mirror of it. Issues
+and pull requests are welcome here: an accepted pull request is applied there and comes back through the mirror.
+
 MIT licensed.
