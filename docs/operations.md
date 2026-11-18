@@ -155,7 +155,7 @@ $EDITOR CHANGELOG.md
 git commit -am "v0.3.0"     # in the upstream repository (see below), then push it there
 
 # 2. tag: in the upstream repository, this pushes main here and then the tag v0.3.0, which starts the release
-scripts/dev thread release
+../scripts/dev thread release
 gh run watch -R aiuitech/thread --exit-status \
   "$(gh run list -R aiuitech/thread --workflow release.yml --branch v0.3.0 --limit 1 --json databaseId --jq '.[0].databaseId')"
 
@@ -188,7 +188,8 @@ upstream pushes each change of `thread/` here as a fast-forward of `main`, and a
 tag, so the tag always names a commit of this history.
 
 A tag never moves. If a job fails for a reason outside the code (a runner, a token), run the workflow again on the
-same tag (`gh run rerun`, or `gh workflow run release.yml --ref vX` when the tag did not trigger it). If the code
+same tag (`gh run rerun -R aiuitech/thread <run>`, or `gh workflow run release.yml -R aiuitech/thread --ref vX`
+when the tag did not trigger it). If the code
 must change, release a new patch version: npm may already have the version from the first run, and the published
 packages must come from the commit the tag names. Published versions are immutable on both registries.
 
