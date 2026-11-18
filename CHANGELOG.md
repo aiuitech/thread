@@ -4,6 +4,15 @@ Versions are shared by the npm package `@aiuitech/thread-sdk`, the PyPI package 
 (`Cargo.toml` workspace version). A release is a `v<version>` tag; `.github/workflows/release.yml` builds the wasm
 from source, runs every check and publishes.
 
+## 0.2.10 (2026-11-18)
+
+No change to the code, the format or the SDKs' behaviour.
+
+- **Releases publish to npm through trusted publishing.** The release workflow has no npm token: npm's trusted
+  publisher for `@aiuitech/thread-sdk` issues one through OIDC, and the publish passes `--provenance`.
+- **This repository is public**, as a mirror of thread's folder in the repository where it is developed
+  (README, `docs/operations.md`).
+
 ## 0.2.9 (2026-11-16)
 
 - **A must-clause: `ids` on `search` and `lexicalSearch`** (TypeScript). Only the given document ids may be

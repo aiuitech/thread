@@ -3,8 +3,9 @@
 #
 # The tag must equal the version in sdk/ts/package.json, sdk/python/pyproject.toml and Cargo.toml (checked first).
 # npm: no secret. npm trusted publishing (GitHub Actions, aiuitech/thread, workflow release.yml, environment npm,
-#      `npm publish` allowed) issues the token through OIDC, and npm adds provenance on its own because this
-#      repository and the package are public. It needs npm 11.5.1 or later.
+#      `npm publish` allowed) issues the token through OIDC. It needs npm 11.5.1 or later. The publish passes
+#      `--provenance`: npm adds it on its own for a public repository, but with the flag a publish that cannot make
+#      the attestation fails instead of going out without one.
 # PyPI: the `pypi` environment, no secret: PyPI trusted publishing (owner aiuitech, repository thread, workflow
 #       release.yml, environment pypi) issues the token through OIDC.
 name: release
@@ -154,7 +155,7 @@ jobs:
           npm ci
           v=$(node -p "require('./package.json').version")
           # A rerun after a partial release (npm published, a later job failed) must not fail on the version npm has.
-          if npm view "@aiuitech/thread-sdk@$v" version >/dev/null 2>&1; then echo "@aiuitech/thread-sdk@$v is published already: skipped"; else npm publish --access public; fi
+          if npm view "@aiuitech/thread-sdk@$v" version >/dev/null 2>&1; then echo "@aiuitech/thread-sdk@$v is published already: skipped"; else npm publish --access public --provenance; fi
 
   publish-pypi:
     needs: [wheels, sdist]

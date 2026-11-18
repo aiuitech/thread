@@ -173,7 +173,8 @@ Credentials and settings the workflow relies on (set once):
 - **npm**: no secret. The package `@aiuitech/thread-sdk` has a trusted publisher (package settings on npmjs.com):
   GitHub Actions, `aiuitech` / `thread`, workflow `release.yml`, environment `npm`, with `npm publish` allowed.
   The job installs npm 11.5.1 or later, which trusted publishing needs, and sets no `registry-url`, so no token is
-  asked for. npm adds provenance on its own while this repository and the package are public. `repository.url` in
+  asked for. The publish passes `--provenance`, so it fails rather than publish without an attestation; that needs
+this repository and the package to stay public. `repository.url` in
   `sdk/ts/package.json` must name this repository exactly. A new trusted publisher expires unless it publishes
   within 2 days of its creation; after that, delete it and create it again before a release.
 - **PyPI**: no secret. The project `thread-sdk` has a trusted publisher: owner `aiuitech`, repository `thread`,
