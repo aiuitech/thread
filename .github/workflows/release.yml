@@ -2,9 +2,9 @@
 # thread-sdk (abi3 wheels + sdist) to PyPI, and attach the artifacts to a GitHub release.
 #
 # The tag must equal the version in sdk/ts/package.json, sdk/python/pyproject.toml and Cargo.toml (checked first).
-# npm: the `npm` environment needs the secret NPM_TOKEN (a granular token with publish rights on @aiuitech and 2FA
-#      bypass) until the package exists and npm trusted publishing is configured for it. `--provenance` needs this
-#      repository to be public.
+# npm: no secret. npm trusted publishing (GitHub Actions, aiuitech/thread, workflow release.yml, environment npm,
+#      `npm publish` allowed) issues the token through OIDC, and npm adds provenance on its own because this
+#      repository and the package are public. It needs npm 11.5.1 or later.
 # PyPI: the `pypi` environment, no secret: PyPI trusted publishing (owner aiuitech, repository thread, workflow
 #       release.yml, environment pypi) issues the token through OIDC.
 name: release
@@ -134,27 +134,27 @@ jobs:
     environment: npm
     permissions:
       contents: read
-      id-token: write # npm trusted publishing, once configured on npmjs.com
+      id-token: write # npm trusted publishing
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: wasm-pkg
           path: crates/thread-wasm/pkg
+      # No registry-url: setup-node would write an .npmrc that asks for NODE_AUTH_TOKEN, and the publish uses OIDC.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: 24
+      - name: npm 11.5.1 or later (trusted publishing)
+        run: npm install -g npm@^11.5.1 && npm --version
       - name: Publish @aiuitech/thread-sdk
         working-directory: sdk/ts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           ./scripts/sync-wasm.sh
           npm ci
           v=$(node -p "require('./package.json').version")
           # A rerun after a partial release (npm published, a later job failed) must not fail on the version npm has.
-          if npm view "@aiuitech/thread-sdk@$v" version >/dev/null 2>&1; then echo "@aiuitech/thread-sdk@$v is published already: skipped"; else npm publish --access public --provenance; fi
+          if npm view "@aiuitech/thread-sdk@$v" version >/dev/null 2>&1; then echo "@aiuitech/thread-sdk@$v is published already: skipped"; else npm publish --access public; fi
 
   publish-pypi:
     needs: [wheels, sdist]

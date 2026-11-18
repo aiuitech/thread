@@ -170,12 +170,12 @@ holding all of them plus the raw `crates/thread-wasm/pkg` as `thread-wasm-<versi
 
 Credentials and settings the workflow relies on (set once):
 
-- **npm**: the repository environment `npm` holds the secret `NPM_TOKEN`, a granular access token for the
-  `aiuitech` org with read/write on packages, scoped to `@aiuitech`, with "Bypass two-factor authentication" (the
-  publish fails with `EOTP` otherwise; Actions cannot answer a 2FA prompt). Once the package exists, npm trusted
-  publishing can be configured on npmjs.com (package settings, GitHub Actions, repository `aiuitech/thread`,
-  workflow `release.yml`, environment `npm`) and the token deleted. The publish passes `--provenance`, which needs
-  this repository to stay public.
+- **npm**: no secret. The package `@aiuitech/thread-sdk` has a trusted publisher (package settings on npmjs.com):
+  GitHub Actions, `aiuitech` / `thread`, workflow `release.yml`, environment `npm`, with `npm publish` allowed.
+  The job installs npm 11.5.1 or later, which trusted publishing needs, and sets no `registry-url`, so no token is
+  asked for. npm adds provenance on its own while this repository and the package are public. `repository.url` in
+  `sdk/ts/package.json` must name this repository exactly. A new trusted publisher expires unless it publishes
+  within 2 days of its creation; after that, delete it and create it again before a release.
 - **PyPI**: no secret. The project `thread-sdk` has a trusted publisher: owner `aiuitech`, repository `thread`,
   workflow `release.yml`, environment `pypi`. The publish step passes `skip-existing`, so a rerun after a partial
   publish does not fail on files already uploaded.
