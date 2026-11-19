@@ -1,28 +1,79 @@
 # thread docs
 
-Start with [architecture.md](architecture.md) if you want to know how it works, [operations.md](operations.md)
-if you want to run it, [portability.md](portability.md) if you want to move or ship one, and the SDK READMEs ([TypeScript](../sdk/ts/README.md), [Python](../sdk/python/README.md))
-if you want to use it.
+thread is a search index that lives in your bucket: vector search, full-text search, or both, read directly from
+a Cloudflare Worker, Node or Python.
 
-| page | what it covers |
+New here? Read these three, in order: [Quickstart](quickstart.md), [Why thread](why-thread.md),
+[How it works](how-it-works.md).
+
+## Start here
+
+| Page | What you get |
 |---|---|
-| [architecture.md](architecture.md) | the design in one sitting: slabs, two tiers, routing, segments, why it is cheap, where the code lives |
-| [cold-start.md](cold-start.md) | cold-start cost against S3 for both SDKs: a summary of what changed (baseline -> merged defaults, opt-in modes, rejected ideas), the `bench/cold/` harness (fake S3 proxy with a network model, benches, packs), the open/query timeline in the SDK stats, the baseline and where the time goes, store-level options, compact routing / cold tree routing / base packs, warm packs, the inline manifest, options outside the SDK |
-| [benchmarks.md](benchmarks.md) | thread vs Cloudflare Vectorize on dbpedia-openai-1M, generation history, update and compaction numbers, offline diagnostics |
-| [research-hops-experiment.md](research-hops-experiment.md) | proposed Wiper experiment: alternate search and reranker objectives, preserve evidence across hops, and compare answer quality under matched budgets |
-| [query-path.md](query-path.md) | slab formats, the two-phase query (scan, rerank, speculative reads), caching of revisions and bases, the SDKs' cache and miss policies, wasm trap recovery, the centroid tree and beam routing, cold opens (compact routing tables, cold tree routing, base packs) |
-| [profiles.md](profiles.md) | the `edge` and `local` layouts, what each knob trades, manifest query defaults and how to change them |
-| [update-path.md](update-path.md) | manifest revisions, delta segments, tombstones, compaction (manual, automatic, and in the SDK in one isolate), cell splitting, GC |
-| [portability.md](portability.md) | moving an index: copying between stores, snapshotting one revision, packs (one file, queried in place) and their format, base packs, warm packs |
-| [lexical.md](lexical.md) | BM25 segments, the `docs` store, the `keys` section, the tokenizer, fusion, size-vs-speed tuning, the native CLI |
-| [embedding.md](embedding.md) | an index for an embedding model: `manifest.embedding`, how the SDKs and the Worker call the model (Workers AI, OpenAI-compatible, your function) for `search({text})` and `upsert({texts})`, a dense generation created from nothing and grown by compaction and cell splits, what that path lacks |
-| [chunking.md](chunking.md) | flat word-window chunking before embedding (`words` 200, `overlap` 0), `upsert({chunk, embed})` in both SDKs, chunk keys `k#i`, stale chunks on re-put, `thread chunk` / `seg build --chunk-words` |
-| [keys.md](keys.md) | string keys: `get(key)` in two reads, keyed upserts and id allocation (`manifest.nextId`), prefix listings, delete by key, the key-value index case (keys + JSON meta + facet tokens) |
-| [filtering.md](filtering.md) | attribute filters: the 32-bit word and its schema, filter expressions and their compiled clauses, pre-filtering inside the scan with probe widening, post-filtering of text queries |
-| [build-pipeline.md](build-pipeline.md) | the build stages, build slots (Worker Loader), PQ codebook training, incremental k-means, finalize |
-| [build-flags.md](build-flags.md) | every `bench/driver.mjs` flag, and the commands that built g1 and g2 |
-| [observability.md](observability.md) | trace envelopes (one JSON schema for every operation in both SDKs and the Worker: spans, store work, counters, kernel CPU, per-read events), sinks and sampling, the Worker's `TRACE_SAMPLE` logs and Analytics Engine points, Criterion kernel benches and flamegraphs, `bench/scenarios.mjs`, how to find a bottleneck, first readings |
-| [operations.md](operations.md) | dataset prep, wasm build, deploy, build a generation, benchmarks, compaction, checks before a commit, releasing (the `v*` tag workflow, npm and PyPI credentials, moving a tag) |
-| [worker-loader.md](worker-loader.md) | the spike that showed dynamic Workers give each build slot its own isolate |
+| [Quickstart](quickstart.md) | A working index in five minutes: TypeScript, Python, then a Cloudflare Worker |
+| [Why thread](why-thread.md) | The reasons for the design, when to use it, when not to, and a comparison with Vectorize, Pinecone, turbopuffer, S3 Vectors, pgvector and LanceDB |
+| [How it works](how-it-works.md) | The ideas, with pictures: files, cells, the query in three steps, hybrid search, writes |
+| [Limits and status](limits.md) | What thread does not do, the hard limits, and how mature each part is |
 
-Raw measurements live in `data/bench-*.txt` (gitignored) and the SDK's [VERIFICATION.md](../sdk/ts/VERIFICATION.md).
+## Guides
+
+Each guide is a task. It starts with the code and ends with the limits.
+
+| Page | Task |
+|---|---|
+| [Create an index](create-an-index.md) | Choose the kind of index, create it, load a lot of data, change the model |
+| [Connect to storage](storage.md) | R2, S3, a folder, a pack file, memory, and the caches |
+| [Write documents](writing.md) | Add, replace and delete documents, and the rules for cheap writes |
+| [Search](search.md) | Keyword, semantic and hybrid search, the hits, the tokenizer, tuning |
+| [Filter](filtering.md) | Limit a search to a tenant, a language, a date |
+| [Keys](keys.md) | Name documents by a string, fetch and list them, use an index as a key-value store |
+| [Embedding models](embedding.md) | Let the index call Workers AI, OpenAI or your own model |
+| [Chunking](chunking.md) | Split long documents into passages |
+| [Move an index](portability.md) | Copy an index, snapshot one revision, pack it into one file |
+| [Migrate from Vectorize](migrate-from-vectorize.md) | Map every call, and a migration plan |
+| [Run it in production](production.md) | Batching, compaction, garbage collection, freshness, monitoring |
+
+## Reference
+
+| Page | What it covers |
+|---|---|
+| [TypeScript SDK](../sdk/ts/README.md) | Every call, option and result field, the stores and the caches |
+| [Python SDK](../sdk/python/README.md) | The same for Python, and the differences from TypeScript |
+| [The reference Worker](../examples/cloudflare-worker/README.md) | The Worker that serves queries and runs the build pipeline |
+| [Changelog](../CHANGELOG.md) | Every version and what changed |
+
+## Under the hood
+
+These pages are the detail: formats, algorithms and measurements. You do not need them to use thread. Read them
+when you want to know exactly what happens, or when you work on thread itself.
+
+| Page | What it covers |
+|---|---|
+| [Architecture](architecture.md) | The design on one page: slabs, two tiers, routing, segments, and where the code is |
+| [Query path](query-path.md) | Slab formats, the two-phase query, speculative reads, caches, the centroid tree, cold opens |
+| [Update path](update-path.md) | Manifest revisions, delta segments, tombstones, compaction, cell splitting, garbage collection |
+| [Text index](lexical.md) | BM25 segments, the document store, the key section, the tokenizer, fusion, the native CLI |
+| [Profiles](profiles.md) | The `edge` and `local` layouts, what each setting trades, and the query defaults |
+| [Benchmarks](benchmarks.md) | thread against Cloudflare Vectorize on dbpedia-openai-1M, the cost model, update and compaction numbers |
+| [Cold start](cold-start.md) | What the first query of a new process costs against S3, and every option that changes it |
+| [Observability](observability.md) | Trace envelopes, sinks and sampling, kernel benchmarks, how to find a bottleneck |
+
+## Build and operate thread itself
+
+For people who build large indexes with the pipeline, deploy the reference Worker, or release thread.
+
+| Page | What it covers |
+|---|---|
+| [Operations](operations.md) | Dataset preparation, the wasm build, deploy, building a generation, the checks before a commit, releasing |
+| [Build pipeline](build-pipeline.md) | The build stages, build slots, codebook training, incremental k-means |
+| [Build flags](build-flags.md) | Every flag of the build driver |
+
+## Research
+
+| Page | What it covers |
+|---|---|
+| [Worker Loader spike](worker-loader.md) | The experiment that showed dynamic Workers give each build slot its own isolate |
+| [Research across search hops](research-hops-experiment.md) | A proposed experiment on search and reranker objectives across hops |
+
+Raw measurements are in `data/bench-*.txt` (not in the repository) and in the TypeScript SDK's
+[VERIFICATION.md](../sdk/ts/VERIFICATION.md).

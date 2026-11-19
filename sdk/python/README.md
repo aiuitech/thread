@@ -1,5 +1,8 @@
 # thread-sdk (Python)
 
+> This page is the reference: every call, option and result field. To learn thread, start with the
+> [Quickstart](../../docs/quickstart.md) and the [guides](../../docs/README.md).
+
 Query and update a [thread](../../README.md) blob-native search index from Python: dense vectors (the IVF slabs),
 BM25 text (lexical segments), or both fused by rank, with one document store for the hits. The index lives as
 immutable objects in R2, any S3-compatible store or a local directory. It is the same index and wire format the

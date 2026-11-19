@@ -1,5 +1,8 @@
 # Architecture
 
+> This page is the detailed design. For a shorter introduction with pictures, read [How it works](how-it-
+> works.md) first.
+
 thread is a search index that lives in object storage and is queried by range reads. This page is the design in
 one sitting: what the objects are, how a query reads them, how updates avoid rewriting anything, and where the
 code lives. The other pages go deeper: [query-path.md](query-path.md) (slab formats, the two-phase query, caching,

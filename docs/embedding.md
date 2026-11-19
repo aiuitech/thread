@@ -1,13 +1,106 @@
-# Embedding models: an index for a model, filled from texts
+# Embedding models
 
-A dense index only makes sense for one embedding model: every vector in it, and every query against it, must come
-from the same model with the same instructions. Until now thread took vectors and did not care where they came from,
-and a dense generation could only be born through the k-means build pipeline over a large pre-embedded corpus
-([build-pipeline.md](build-pipeline.md)). This page describes the three pieces that make an index *for a model*:
-the manifest names the model, the SDKs and the Worker call it for texts (never running a model themselves), and a
-dense generation can be created from nothing and grown by ordinary upserts.
+thread does not run an embedding model. You tell an index which model it is for, and how to call that model. The
+index then embeds your documents when you write and your query when you search.
 
-## `manifest.embedding`
+```ts
+// Create: name the model
+await thread.createGeneration({
+  store, gen: "docs",
+  embedding: { provider: "openai", model: "text-embedding-3-small", dim: 1536 },
+  lex: { text: true },
+});
+
+// Open: say how to call it
+const index = await thread.open({ store, embed: { apiKey: process.env.OPENAI_API_KEY } });
+
+await index.upsert({ keys: ["a.md"], texts: [text] });        // the text is embedded
+await index.search({ text: "deploy failed", topK: 10 });      // the query is embedded
+```
+
+## Why the model belongs to the index
+
+Every vector in an index, and every query, must come from the same model with the same settings. Vectors from two
+models cannot be compared. So the model is written in the index itself, and every reader and writer uses it. A
+wrong model in one service cannot damage your results without anyone noticing.
+
+Your credentials are not in the index. You give them when you open it.
+
+## Choose a provider
+
+| Provider | Create with | Open with |
+|---|---|---|
+| **Workers AI**, in a Worker | `provider: "workers-ai"` | `embed: { ai: env.AI }` |
+| **Workers AI**, from anywhere | `provider: "workers-ai"` | `embed: { accountId, apiToken }` |
+| **OpenAI**, or any OpenAI-compatible API | `provider: "openai"`, with `baseUrl` for other hosts | `embed: { apiKey }` |
+| **Your own function** | `provider: "custom"` | `embed: (texts, kind) => vectors` |
+
+Examples of the `embedding` block:
+
+```ts
+// Workers AI. Set pooling to "cls" for the bge models.
+{ provider: "workers-ai", model: "@cf/baai/bge-base-en-v1.5", dim: 768, options: { pooling: "cls" } }
+
+// OpenAI, with shorter vectors
+{ provider: "openai", model: "text-embedding-3-small", dim: 256, options: { dimensions: 256 } }
+
+// A self-hosted OpenAI-compatible server, with the prefixes that the model expects
+{ provider: "openai", model: "nomic-embed-text", dim: 768, baseUrl: "https://my-host/v1",
+  queryPrefix: "search_query: ", docPrefix: "search_document: " }
+
+// Your own function
+{ provider: "custom", model: "my-model", dim: 1024 }
+```
+
+In Python:
+
+```python
+create_generation(store, "docs", embedding={"provider": "openai", "model": "text-embedding-3-small", "dim": 1536})
+
+index = open_index(store, embed={"api_key": os.environ["OPENAI_API_KEY"]})          # OpenAI-compatible
+index = open_index(store, embed={"account_id": account, "api_token": token})        # Workers AI
+index = open_index(store, embed=lambda texts, kind: model.encode(texts))            # your own function
+```
+
+A custom function receives the texts and a `kind`, which is `"query"` or `"document"`, and returns one vector for
+each text. thread normalizes the vectors.
+
+## Bring your own vectors
+
+You can always pass vectors yourself. Given vectors are stored as they are, and the model is not called.
+
+```ts
+await index.upsert({ keys, vectors, texts });           // your vectors, and the text for keyword search
+await index.search({ vector: queryVector, text: "deploy failed" });
+```
+
+An index created with `dim` and no `embedding` block takes vectors only.
+
+## Control when the model is called
+
+| Call | Effect |
+|---|---|
+| `search({ text })` | The query is embedded. Keyword search also runs if the index has text. |
+| `search({ text, embed: false })` | Keyword search only. The model is not called. |
+| `upsert({ texts })` | Each text is embedded |
+| `upsert({ texts, embed: false })` | Text-only documents. No vectors. |
+| `upsert({ texts, embed: myFunction })` | Your function is used for this call |
+| `index.canEmbed` | `true` when the index names a model and `open` got a way to call it |
+| `await index.embed(["a query"], "query")` | The vectors, if you want them yourself |
+
+If the provider fails, the call fails with a `ThreadError` of status 502. Nothing is written.
+
+## Change the model
+
+A change of model, or of the vector size, means a new index. Build the new generation beside the live one, fill
+it, then switch: [Change the model, or rebuild](create-an-index.md#change-the-model-or-rebuild).
+
+## Under the hood
+
+The rest of this page is the detail: every field of the `embedding` block, what the reference Worker does, how a
+generation that starts empty grows, and the bulk build.
+
+### `manifest.embedding`
 
 ```json
 "embedding": { "provider": "workers-ai", "model": "@cf/baai/bge-base-en-v1.5", "dim": 768, "options": { "pooling": "cls" } }
@@ -31,7 +124,7 @@ The block is inherited by every revision (like `lex` and `attrs`). It is set whe
 existing generation means a new generation (its vectors would not be comparable). The validation, the prefixing
 rule and the batching are pinned by one fixture both SDKs test against, `sdk/ts/test/fixtures/embedding.json`.
 
-## Calling the model
+### Calling the model
 
 Nothing in thread runs a model. The index is given a way to *call* one, and uses it in two places:
 
@@ -70,7 +163,7 @@ is a 502 too. Missing credentials for the provider make `canEmbed` false rather 
 `resolveEmbedder(config, options)` (TS) / `resolve_embedder(config, ...)` (Python) is the piece behind this, usable
 on its own: it prefixes, batches by `maxBatch`, and returns rows.
 
-## In the Worker
+### In the Worker
 
 The bench Worker (`examples/cloudflare-worker`) has the Workers AI binding (`AI`) and an optional OpenAI-compatible
 key (`EMBED_API_KEY`), and embeds in the orchestrator isolate, which is the only place that holds the bindings (a
@@ -87,7 +180,7 @@ The generation's `embedding` block is read through `/manifest` and cached for 30
 Worker (`sdk/ts/examples/basic`) does the same through the SDK: `POST /search {text}` opens the index with
 `embed: { ai: env.AI, apiKey: env.EMBED_API_KEY }` and calls `index.search`.
 
-## A dense generation from nothing
+### A dense generation from nothing
 
 `createGeneration` (TS: `thread.createGeneration(opts)` or `createGeneration(wasm, opts)`; Python:
 `create_generation(store, gen, ...)`; Worker: `POST /create`) publishes rev 0 of a dense generation with **one
@@ -145,7 +238,7 @@ What this path does not give, and when to care:
   them: a generation written only from Python accumulates deltas, which still query correctly (every delta is
   scanned) but slower past a few dozen segments; compact it from TypeScript or the Worker.
 
-## A bulk build in bounded steps
+### A bulk build in bounded steps
 
 Loading tens of thousands of vectors into a one-cell generation through upserts makes every vector pass through
 cell 0 and a chain of 2-means splits. `thread.bulkBuild(opts)` (TypeScript, `sdk/ts/src/build.ts`) builds the
@@ -215,7 +308,7 @@ build slots (`bench/driver.mjs`: sample, k-means, PQ, assign and finalize spread
 caller's device, as inseam already runs large lexical merges (`commitMergedSegment`): the device runs the same SDK
 calls with a larger `maxBytes` against the same store.
 
-## Workers AI specifics
+### Workers AI specifics
 
 - `@cf/baai/bge-small-en-v1.5` (384), `@cf/baai/bge-base-en-v1.5` (768), `@cf/baai/bge-large-en-v1.5` (1024),
   `@cf/baai/bge-m3` (1024): 100 texts per call; put `{"pooling": "cls"}` in `options` for the bge-en models (the
@@ -227,7 +320,7 @@ calls with a larger `maxBytes` against the same store.
   would have to come from R2 at isolate start, and compete with the routing tables for the 128 MB; the quality of a
   model small enough to try is below bge-base through the binding.
 
-## Files
+### Files
 
 | | |
 |---|---|

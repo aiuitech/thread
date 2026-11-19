@@ -1,10 +1,135 @@
-# Attribute filtering
+# Filter
 
-How a query is restricted to the documents that match a condition on their metadata, without the index reading
-anything it does not read already. The API is in the SDK READMEs ([TypeScript](../sdk/ts/README.md#filtering),
-[Python](../sdk/python/README.md#filtering)); this page is the design and the knobs.
+A filter limits a search to the documents that match a condition: one tenant, one language, public documents
+only, a range of years. thread applies the filter inside the search, so you still get `topK` results.
 
-## The attribute word
+```ts
+const { hits } = await index.search({
+  text: "deploy failed",
+  topK: 10,
+  filter: { tenant: 42, lang: { $in: ["en", "fr"] }, year: { $gte: 2024 } },
+});
+```
+
+## The idea in one minute
+
+Every document has one 32-bit number, its **attributes**. You divide those 32 bits into named fields. A filter
+tests the fields.
+
+32 bits is small, and that is deliberate. The number is stored inside the bytes that a query reads anyway, so a
+filter costs no extra reads. It is enough for a tenant id, a language, a few flags and a coarse date. It is not a
+place for arbitrary metadata: that goes in `metas`, which is returned with a hit but cannot be filtered.
+
+## 1. Define the fields
+
+Do this once for each index. You can add fields later, but you cannot change a field that exists.
+
+```ts
+await index.configureAttrs({
+  tenant: { bits: 12 },                        // an integer from 0 to 4,095
+  lang: { values: ["en", "fr", "de"] },        // one of a list
+  public: "bool",                              // true or false
+  year: { bits: 7, min: 1970 },                // an integer from 1970 to 2097
+});
+```
+
+```python
+index.configure_attrs(
+    tenant={"bits": 12},
+    lang={"values": ["en", "fr", "de"]},
+    public="bool",
+    year={"bits": 7, "min": 1970},
+)
+```
+
+| Field type | You write | Bits used |
+|---|---|---|
+| Integer | `{ bits: n }`, with an optional `min` | `n`. It holds values from `min` to `min + 2^n - 1`. |
+| One of a list | `{ values: [...] }` | Enough for the list: 2 bits for 3 values, 4 bits for 15 |
+| Boolean | `"bool"` | 1 |
+
+The fields above use 12 + 2 + 1 + 7 = 22 of the 32 bits.
+
+## 2. Set the fields when you write
+
+```ts
+await index.upsert({
+  keys: ["notes/deploy.md", "notes/billing.md"],
+  texts: [deployText, billingText],
+  attrs: [
+    { tenant: 42, lang: "en", public: true, year: 2025 },
+    { tenant: 7, lang: "fr" },                 // fields you leave out are unset
+  ],
+});
+```
+
+## 3. Filter when you search
+
+`filter` works the same way on `search` and on `query`.
+
+```ts
+await index.search({ text: "deploy failed", filter: { tenant: 42 } });
+await index.query(vector, { topK: 10, filter: { public: true, year: { $gte: 2020, $lt: 2025 } } });
+```
+
+```python
+index.search(text="deploy failed", filter={"tenant": 42})
+index.query(vector, top_k=10, filter={"public": True, "year": {"$gte": 2020, "$lt": 2025}})
+```
+
+| Operator | Works on | Meaning |
+|---|---|---|
+| `field: value`, `{ $eq: value }` | All fields | Equal |
+| `{ $ne: value }` | All fields | Not equal |
+| `{ $in: [...] }`, `{ $nin: [...] }` | All fields | In the list, not in the list |
+| `{ $lt, $lte, $gt, $gte }` | Integers | A range |
+| `{ $any, $all, $none }` with a bit mask | Integers | Some, every, or no bit of the mask is set. Use an integer field as a set of flags. |
+
+Conditions on different fields are joined with "and". There is no `$or`. For "one of several values" of the same
+field, use `$in`.
+
+To read the fields of a hit: `index.unpackAttrs(hit.attrs)` (Python: `index.unpack_attrs`) gives
+`{ tenant: 42, lang: "en", public: true, year: 2025 }`.
+
+## What a filter costs
+
+| The filter keeps | Cost |
+|---|---|
+| A large part of the index (a language, a flag) | Nothing extra |
+| A small part (1% of the index) | The query scans more cells to find enough matches: up to 4 times the bytes of an unfiltered query |
+| A handful of documents | A poor fit. Keep your own list of those ids, or give the group its own index. |
+
+A semantic search with a selective filter widens its scan by itself, up to `maxNprobe` cells (4 times `nprobe` by
+default). A keyword search filters after scoring, so a very selective filter can return fewer than `topK`
+results.
+
+## Filter or separate indexes?
+
+For multi-tenant data you have two choices:
+
+| | One index, `tenant` field | One index for each tenant (a `prefix`) |
+|---|---|---|
+| Isolation | By filter. A missing filter shows other tenants' data. | By storage. No query can cross tenants. |
+| Small tenants | Efficient | Efficient: an idle index costs only storage |
+| A query across all tenants | Possible | Not possible |
+| Number of tenants | Limited by the bits of the field | Unlimited |
+
+When tenants must never see each other's data, prefer one index for each tenant.
+
+## Limits
+
+- 32 bits for each document, for all fields together.
+- No `$or`, no string comparison, no floating-point values.
+- A field's layout cannot change after it is defined. You can add fields, and add values to the end of a list.
+- The reference Worker's `/upsert` takes the raw number only. Pack fields with the SDK (`packAttrs`), or write
+  through the SDK.
+
+## Under the hood
+
+The rest of this page is the design: where the number is stored, how a filter is compiled, and how the scan uses
+it.
+
+### The attribute word
 
 Every document carries one 32-bit **attrs** word. It is stored three times, always next to something a query
 reads anyway:
@@ -41,7 +166,7 @@ valid. Without a schema the whole word is one numeric field named `attrs`, which
 the schema existed (g4) is filtered. 32 bits is the budget: a tenant id, a language, a few flags and a coarse date
 fit; anything larger belongs in the `meta` string or in the application's own store, keyed by id.
 
-## Filter expressions and their compiled form
+### Filter expressions and their compiled form
 
 A filter is a conjunction of conditions on fields, in a Vectorize-like syntax:
 
@@ -75,7 +200,7 @@ checked by both test suites, and the interop test compares them live); a host th
 Worker, a cached query) passes them as they are. The compiled words are the argument every scan kernel takes
 (`scan`, `scan_pq`, `scan_delta`), next to the tombstone set.
 
-## Dense queries: pre-filtering inside the scan
+### Dense queries: pre-filtering inside the scan
 
 The scan kernels apply the filter the way they apply tombstones: an entry's attrs word is tested **before top-k
 insertion**, and only for entries whose score beats the running heap threshold, so the cost is a masked compare
@@ -111,7 +236,7 @@ Speculative rerank reads (see [query-path.md](query-path.md#the-two-phase-query)
 the *last* batch remain; a filtered query knows a batch is last when it reaches the bound or already holds `T`
 matching candidates.
 
-## Text queries: post-filtering through the docs store
+### Text queries: post-filtering through the docs store
 
 Postings carry no attrs (that would cost bytes on every posting of every term), so a text query filters after
 scoring: the BM25 list is taken deeper than `k` (first `max(4 k, 32)`), each candidate's word is resolved through
@@ -124,7 +249,7 @@ fusion, so the fused result holds matching ids only.
 `DocRecord` carries the word (`attrs`), so a hit resolved with `docs: true` can be decoded with `unpackAttrs`
 without another read.
 
-## Formats
+### Formats
 
 - Slab and delta entries have carried the word since the first format; no index needs rebuilding. The index built
   before schemas existed has every word at 0.
@@ -134,7 +259,7 @@ without another read.
   grew from 576 bytes to 1 KiB so a `meta` with the extra summary field still arrives in the first fetch.
 - `manifest.attrs` holds the schema; `configureAttrs` writes it (`change.op: "configure-attrs"`).
 
-## Not done
+### Not done
 
 - No `$or` between fields; the clause list is a conjunction. A disjunction over one field is `$in`.
 - A text query's filter is a post-filter: a filter that keeps very few of the documents matching the query terms

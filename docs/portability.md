@@ -1,17 +1,86 @@
-# Moving an index: copies, snapshots and packs
+# Move an index
 
-An index is a set of immutable objects under a prefix, so it moves by copying. This page covers the three ways to do
-that from either SDK, when each one fits, and the format of a **pack**: one file holding a whole snapshot, which can
-be copied anywhere and queried in place without unpacking it.
+An index is a set of files that never change. So you move it by copying it. This page shows the three ways: copy
+everything, copy one revision, or pack one revision into a single file that you can query in place.
 
-| you want to | do |
+| You want to | Do |
 |---|---|
-| mirror a bucket to a laptop, or a laptop to a bucket | `copyObjects(src, dst)` / `copy_objects(src, dst)` |
-| ship exactly one revision, nothing stale | `copyObjects(src, dst, ["idx/current.json", ...snapshotKeys(index.revision)])` |
-| move it as **one file** and query it in place | `packIndex` / `pack_index`, then `storeAt(file)` / `open_index(file)` |
-| write on top of a pack | copy it into a directory or bucket first (`copyObjects(pack, dst)`); packs are read-only |
+| Mirror a bucket to a laptop, or a laptop to a bucket | [Copy](#copy-an-index) |
+| Ship exactly one revision, with nothing stale | [Copy a snapshot](#copy-one-revision) |
+| Move the index as **one file** and query it in place | [Make a pack](#make-a-pack) |
+| Write on top of a pack | Copy the pack into a folder or a bucket first. Packs are read-only. |
 
-## Stores you can move between
+## Copy an index
+
+`copyObjects` copies between any two [stores](storage.md): a bucket, a folder, memory.
+
+```ts
+import { copyObjects, S3BlobStore } from "@aiuitech/thread-sdk";
+import { FileBlobStore } from "@aiuitech/thread-sdk/node";
+
+const bucket = new S3BlobStore({ endpoint, bucket: "my-bucket", region: "auto", accessKeyId, secretAccessKey });
+const laptop = new FileBlobStore("/data/my-index");
+
+await copyObjects(bucket, laptop);                                   // everything
+await copyObjects(bucket, laptop, undefined, { skipExisting: true }); // only what is new: a sync
+```
+
+```python
+from thread_sdk import FileBlobStore, S3BlobStore, copy_objects
+
+copy_objects(S3BlobStore.r2(account_id, "my-bucket", key_id, secret), FileBlobStore("/data/my-index"))
+```
+
+The folder holds the same layout as the bucket, so `rsync`, `aws s3 sync` and `rclone` work too.
+
+## Copy one revision
+
+A live index holds history: old revisions and files that compaction replaced. A **snapshot** is the list of files
+that one revision needs, and nothing else.
+
+```ts
+import { copyObjects, snapshotKeys } from "@aiuitech/thread-sdk";
+
+await copyObjects(source, target, ["idx/current.json", ...snapshotKeys(index.revision)]);
+```
+
+## Make a pack
+
+A **pack** is one file that holds one revision. You can `scp` it, attach it to a release, or put it in a bucket.
+You query it where it is. Nothing is unpacked.
+
+```ts
+import { packIndexToFile, storeAt } from "@aiuitech/thread-sdk/node";
+
+await packIndexToFile(store, "docs.threadpack");                       // the current revision
+
+const index = await thread.open({ store: await storeAt("docs.threadpack") });
+```
+
+```python
+from thread_sdk import open_index, pack_index
+
+pack_index(store, "docs.threadpack")
+index = open_index("docs.threadpack")
+```
+
+Why use a pack:
+
+- **One object to move.** No folder of thousands of files to sync, and no half-copied index.
+- **A consistent snapshot.** It holds the revision that you asked for and nothing else.
+- **Queried in place.** A query reads the same small ranges from the pack that it would read from a bucket. This
+  also works for a pack that is an object in a bucket, from a Worker.
+- **The same from both SDKs.** TypeScript and Python write byte-identical packs for the same revision.
+
+Ideas for packs: ship a search index with a desktop or mobile app, publish the index of your documentation with a
+release, give a customer an export, keep a dated backup.
+
+## Under the hood
+
+The rest of this page is the detail: which stores can copy to which, what a snapshot contains, the pack file
+format, and base packs.
+
+### Stores you can move between
 
 Every store speaks the same `BlobStore` interface (`get` with ranges, `head`, optional `put` with create-only and
 compare-and-swap conditions, optional `list`), so any pair can be copied between:
@@ -34,7 +103,7 @@ directory: the manifest create-only put (a hard link) serializes them correctly,
 `current.json` is guarded by a `.thread-lock.d` directory in Node and an advisory `flock` in Python, which do not
 exclude each other. Writers of one language, or writers taking turns, are fine.
 
-## Snapshots
+### Snapshots
 
 A live prefix holds history: every manifest revision ever committed, slab revisions a compaction has superseded,
 delta segments a compaction has folded in. A query only needs what its revision lists. `snapshotKeys(revState)` /
@@ -49,7 +118,7 @@ delta segments a compaction has folded in. A query only needs what its revision 
 `idx/current.json` is not in the list because a snapshot writes its own, pointing at the packed revision. An index
 opened from a snapshot is pinned to it: `refresh()` finds nothing newer.
 
-## Packs
+### Packs
 
 ```ts
 // Node
@@ -89,7 +158,7 @@ the Cache API (TypeScript) or a `MemoryCache` for remote stores (Python), so the
 (`idx/g4/slab/00123`) and a miss fetches one slab. A cache *below* the pack would see one 5 GB key and try to fill
 it on a miss; `PackedBlobStore` never forwards `fill` to its inner store for that reason.
 
-### The file format
+#### The file format
 
 All integers are little-endian. One file, four regions:
 
@@ -137,13 +206,13 @@ fetches it with one GET in the background and serves those prefixes from memory 
 size from `head`, and refuses a read past the prefix rather than return a short object. Unknown fourth elements
 (anything without `"partial": true`) are ignored.
 
-## Copying by hand
+### Copying by hand
 
 A pack and a directory are plain files, so the usual tools work: `rsync -a laptop/idx/ bucket-mirror/`, `aws s3
 sync`, `rclone`. Copy `idx/{gen}/` before `idx/current.json` if readers may open the destination while the copy is
 running, since `current.json` is the only pointer they follow.
 
-## Base packs
+### Base packs
 
 A **base pack** is a pack of just what a cold open reads, written per revision by publish / publish-rev next to the
 index: `idx/{gen}/base.{rev}.threadpack` holds the manifest, slabs table, tombstone sets, `coarse.f32`, `pq.bin`,

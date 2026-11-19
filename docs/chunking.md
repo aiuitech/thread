@@ -1,13 +1,85 @@
-# Chunking: word windows before embedding
+# Chunking
 
-Embedding models take a bounded passage, and a hit is more useful when it points at a passage than at a whole
-file. Both SDKs and the CLI therefore split a text into **flat word windows** before it is embedded and upserted.
-This is a client-side transform: the index never sees the parent text, each chunk is an ordinary document, and
-nothing in the wire format changes. The implementations are `sdk/ts/src/chunk.ts`, `sdk/python/thread_sdk/chunk.py`
-and `crates/thread-cli/src/chunk.rs`; all three are checked against one fixture, `sdk/ts/test/fixtures/chunks.json`,
-so they produce the same chunks character for character.
+A long document makes a poor search result. Its one vector is an average of everything in it, and a hit on a
+50-page file does not say where to look. Chunking splits each text into passages, and each passage becomes its own
+document with its own vector.
 
-## The rule
+```ts
+await index.upsert({ keys: ["docs/handbook.md"], texts: [handbook], metas: ["Handbook"], chunk: true });
+```
+
+```python
+index.upsert(keys=["docs/handbook.md"], texts=[handbook], metas=["Handbook"], chunk=True)
+```
+
+## What happens
+
+1. The text is split into windows of 200 words.
+2. Each window is stored as a document with the key `docs/handbook.md#0`, `docs/handbook.md#1`, and so on.
+3. Each window gets the `metas` and `attrs` of the parent, so titles and filters work as before.
+4. Each window is embedded: by the index's model, or by the `embed` function that you pass.
+
+A search then returns passages. The key of a passage tells you the document and the position.
+
+## Options
+
+```ts
+await index.upsert({ keys, texts, chunk: { words: 200, overlap: 20 } });
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `words` | 200 | The size of a window, in words |
+| `overlap` | 0 | How many words a window shares with the one before it |
+
+Which values to choose:
+
+- **200 words** suits most embedding models and most prose. It is about one long paragraph.
+- **Smaller windows** (50 to 100) give more precise hits and more documents. Use them for FAQs and short notes.
+- **An overlap** of 10% to 20% helps when a sentence that matters can fall on a border between two windows.
+- Check the input limit of your embedding model. A window must fit in it.
+
+## Update or delete a chunked document
+
+Upsert the document again with the same key. Its chunks are replaced. If the new text is shorter, the chunks that
+no longer exist are removed in the same write.
+
+To delete a chunked document, list its chunk keys and delete them:
+
+```ts
+const { entries } = await index.listKeys({ prefix: "docs/handbook.md#" });
+await index.deleteKeys(entries.map((entry) => entry.key));
+```
+
+## Chunk without writing
+
+`chunkText` gives you the same windows, if you want to see them or embed them yourself.
+
+```ts
+import { chunkText } from "@aiuitech/thread-sdk";
+
+chunkText("w1 w2 w3 w4 w5 w6 w7", { words: 3, overlap: 1 });
+// [{ index: 0, text: "w1 w2 w3", start: 0, end: 8, words: 3 }, { index: 1, text: "w3 w4 w5", ... }, ...]
+```
+
+```python
+from thread_sdk import chunk_text
+
+chunk_text("w1 w2 w3 w4 w5 w6 w7", words=3, overlap=1)
+```
+
+## Limits
+
+- A chunked upsert needs `keys` and `texts`. It does not work with numeric ids alone.
+- One call writes at most 4,096 chunks. Send fewer documents in a call when they are long.
+- Windows are counted in words. There is no sentence-aware or token-aware splitting.
+- TypeScript, Python and the CLI produce the same chunks, character for character.
+
+## Under the hood
+
+The rest of this page is the exact rule and the behaviour of chunked writes.
+
+### The rule
 
 - A **word** is a maximal run of characters that are not Unicode White_Space (what Rust's `char::is_whitespace`
   tests; spelled out in the TypeScript and Python sources since JS's `\s` and Python's `str.split` each include a
@@ -35,7 +107,7 @@ thread chunk --words 3 --overlap 1 "w1 w2 w3 w4 w5 w6 w7"   # {"words": 3, "over
 thread chunk --file report.txt                               # the defaults
 ```
 
-## Chunked upserts
+### Chunked upserts
 
 `upsert` takes the same parameters and writes one document per chunk:
 
@@ -74,7 +146,7 @@ splits every row's text, keys the chunks `k#i` when rows have keys, copies `meta
 chunk ids from `--first-id` in file order (the id field is not used). Its output reports `documents` (rows) next
 to `docs` (chunks written).
 
-## What is not here yet
+### What is not here yet
 
 Only the flat strategy exists. Sentence- or token-aware windows, per-chunk metadata (the chunk's offsets in a
 JSON meta), and deleting a parent's chunks in one call (`listKeys` by prefix, then `deleteKeys`, today) are

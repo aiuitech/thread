@@ -1,5 +1,8 @@
 # Query path: slab formats, the two-phase query, caching and routing
 
+> This page is the detailed design. To use search, read [Search](search.md). For the ideas, read [How it
+> works](how-it-works.md).
+
 How a dense query turns into bytes read and scores returned. The Worker (`examples/cloudflare-worker/src/index.ts`)
 and the SDKs (`sdk/ts`, `sdk/python`) implement the same path; the endpoint names below are the Worker's, the
 SDK equivalents are in their READMEs. Build-time knobs: [profiles.md](profiles.md). Deltas and tombstones on the

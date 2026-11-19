@@ -1,5 +1,8 @@
 # Incremental updates: manifest revisions, delta segments, tombstones, compaction
 
+> This page is the detailed design. To write documents, read [Write documents](writing.md). To run compaction,
+> read [Run it in production](production.md).
+
 Status: implemented in the Worker (`examples/cloudflare-worker/src/index.ts`) on top of the Rust delta kernels (`DeltaJob`,
 `scan_delta`, `delta_records_for_cell`, `slab_to_records`, `filter_hits`, `split_slab`, `split_slab_records`, ...),
 including automatic compaction after writes and cell splitting; the TypeScript SDK runs the same compaction in one

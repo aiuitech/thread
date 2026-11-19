@@ -1,13 +1,95 @@
-# Keys: `get(key)`, unique string keys and a key-value index
+# Keys
 
-thread's ids are u32. Many corpora are named by strings instead: an object address, a path, a URL, a primary key.
-This page is the design of the **key store**: how a string key resolves to an id and its document, how keyed
-writes allocate ids, what a prefix listing costs, and how a "simple lookup of unique keys with a few attributes"
-(a key-value index, with or without vectors and text) fits the blob-native design. The format is in
-[lexical.md](lexical.md#keys-keysrs-magic-thrdkeys-version-1), the code in `crates/thread-core/src/keys.rs`, the
-SDK methods in [sdk/ts/README.md](../sdk/ts/README.md) and [sdk/python/README.md](../sdk/python/README.md).
+A key is a unique string name for a document: a path, a URL, an object address, a primary key. With keys you do
+not manage numeric ids, and you can fetch a document directly, without a search.
 
-## In one paragraph
+```ts
+await index.upsert({ keys: ["notes/deploy.md"], texts: [text], metas: ["Deploy runbook"] });
+
+const { records } = await index.get(["notes/deploy.md"], { text: true });
+records.get("notes/deploy.md");     // { key, id, meta: "Deploy runbook", attrs, text }
+```
+
+Keys need a text configuration on the index. Every index made with `createGeneration` or
+`createLexicalGeneration` has one, unless you passed `lex: null`.
+
+## Write by key
+
+```ts
+const result = await index.upsert({
+  keys: ["s3://bucket/a.bin", "s3://bucket/c.bin"],
+  metas: [JSON.stringify({ host: "cdn-1", size: 4096 }), JSON.stringify({ host: "cdn-2", size: 128 })],
+});
+// result.ids = [1000, 1001]     thread gave each new key an id
+// result.allocated = 2          how many keys were new
+```
+
+```python
+result = index.upsert(keys=["s3://bucket/a.bin", "s3://bucket/c.bin"], metas=[meta_a, meta_c])
+# result.ids, result.allocated
+```
+
+- A **new key** gets the next free id.
+- A **known key** keeps its id, and the new document replaces the old one.
+
+A key is a non-empty string of at most 4,096 bytes. Keys must be unique within one call.
+
+## Get, list and delete
+
+| Task | TypeScript | Python |
+|---|---|---|
+| Get documents by key | `await index.get(keys, { text: true })` | `index.get(keys, text=True)` |
+| Get only the ids | `await index.resolveKeys(keys)` | `index.resolve_keys(keys)` |
+| List keys under a prefix | `await index.listKeys({ prefix, limit })` | `index.list_keys(prefix, limit=100)` |
+| Delete by key | `await index.deleteKeys(keys)` | `index.delete_keys(keys)` |
+
+Listing returns pages in key order:
+
+```ts
+let after: string | undefined;
+do {
+  const page = await index.listKeys({ prefix: "s3://bucket/", limit: 100, after });
+  for (const { key, id } of page.entries) console.log(key, id);
+  after = page.more ? page.next : undefined;
+} while (after !== undefined);
+```
+
+A missing key is not an error. `get` leaves it out of `records`, and `deleteKeys` lists it in `missing`.
+
+## What a lookup costs
+
+`get` is two small range reads from cached files: one finds the id of the key, one reads the document. From a
+Worker with a warm cache that is tens of milliseconds, and a few milliseconds from a local copy. Keys add nothing
+to the cost of a search.
+
+## Good to know
+
+- **A search hit does not include its key.** If your results must show the key, also put it in `metas`.
+- **Chunked documents** use the key of the parent plus `#` and a number: `docs/a.md#0`, `docs/a.md#1`
+  ([Chunking](chunking.md)).
+- **You can use ids and keys together.** `upsert({ ids: [7], keys: ["seven"] })` names id 7.
+
+## An index as a key-value store
+
+An index with keys and no vectors is a small key-value store that you can also search and filter. It suits
+records with a unique name and a few attributes: files, hosts, products.
+
+| You need | Use |
+|---|---|
+| The record | `metas`, as a JSON string |
+| Lookup by name | `get([key])` |
+| All names under a prefix | `listKeys({ prefix })` |
+| "All records where host is X" | A tag in `texts`, such as `host:cdn-1`, then `search({ text: "host:cdn-1" })`. Create the index with `tokenizer: { identifiers: "keep" }` so that a tag stays one token. |
+| A small range, such as a size class | A [filter field](filtering.md) |
+
+About 180 MB for each million records with 60-byte keys and 100-byte metas.
+[The key-value case](#the-key-value-case) below has the details.
+
+## Under the hood
+
+The rest of this page is the design: how keys are stored, how ids are allocated, and what a listing reads.
+
+### In one paragraph
 
 A segment (the immutable `THREADIX` object an upsert writes, see [lexical.md](lexical.md)) can carry a `keys`
 section: the batch's unique string keys sorted by bytes, each with its u32 id, bucketed behind a small resident
@@ -19,34 +101,7 @@ ids: a known key keeps its id, a new key takes the next one from a counter in th
 section is sorted, a prefix listing is a binary search to the first bucket and a forward scan. Nothing in the
 dense query path changes.
 
-## API
-
-```ts
-await index.upsert({ keys: ["s3://b/a.bin", "s3://b/c.bin"], metas: [metaA, metaC], texts: ["host:cdn-1 size:large", ...] });
-// -> { ids: [1000, 1001], allocated: 2, ... }   known keys keep their id, new keys get the next ones
-const { records } = await index.get(["s3://b/a.bin"], { text: true });   // Map<key, {key, id, meta, attrs, text?}>
-const { ids } = await index.resolveKeys(["s3://b/a.bin"]);              // Map<key, id>
-const page = await index.listKeys({ prefix: "s3://b/", limit: 100 });   // {entries: [{key, id}], more, next}
-await index.listKeys({ prefix: "s3://b/", after: page.next });           // the next page
-await index.deleteKeys(["s3://b/c.bin"]);                                // {count, missing, ...}
-await index.upsert({ ids: [7], keys: ["seven"], metas: ["m"] });         // ids and keys together: keys name the ids
-```
-
-```python
-r = index.upsert(keys=["s3://b/a.bin", "s3://b/c.bin"], metas=[meta_a, meta_c], texts=[...])   # r.ids, r.allocated
-index.get(["s3://b/a.bin"], text=True)              # {key: KeyRecord(id, meta, text, attrs, key)}
-index.resolve_keys(["s3://b/a.bin"])                # {key: id}
-page = index.list_keys("s3://b/", limit=100)        # KeyPage(entries=[(key, id)], more, next)
-index.list_keys("s3://b/", after=page.next)
-index.delete_keys(["s3://b/c.bin"])
-```
-
-Keys are non-empty UTF-8 strings of at most 4096 bytes, unique within a batch. A generation needs a lexical
-configuration (`configureLexical` / `createLexicalGeneration`) to store them; `manifest.lex.bucketKeys` (default
-128) is the only knob. A segment carries a `keys` section when its upsert passed keys (`segments[].keys: true`);
-other segments are unaffected.
-
-## The key-value case
+### The key-value case
 
 The case that motivated this: records named by a unique string address with a few attributes (a host, a size,
 ...) that are looked up by key and sometimes listed or filtered, without vectors. This is a **lexical-only
@@ -69,7 +124,7 @@ Approximate size per record with 60-byte keys, a 100-byte meta and three facets:
 postings ~6 B; about 180 MB per million records, with resident directories under 1 MB (16 B + one key per
 bucket of 128 keys, 16 B per bucket of 128 docs).
 
-## Ids: allocation and the counter
+### Ids: allocation and the counter
 
 `manifest.nextId` is the next id a keyed upsert allocates; absent, it is `manifest.vectors` (a built dense base
 holds ids `[0, vectors)`; a lexical-only generation starts at 0). A keyed upsert resolves its keys against the
@@ -84,7 +139,7 @@ the upsert's tombstone set hides the older copies (slab, delta, docs, postings),
 Giving `ids` and `keys` together is allowed: the keys then name those ids (a key moved to another id resolves to
 the newest copy; the old id's document stays until it is deleted or replaced).
 
-## Resolution and listing across segments
+### Resolution and listing across segments
 
 `resolveKeys` walks the segments newest first. In each, the pending keys are looked up (one coalesced bucket read
 per segment); a key found there is decided by that copy: live if no tombstone set with `rev > addedRev` holds its
@@ -100,7 +155,7 @@ what is known, since keys past its last entry could have a newer copy there: the
 such cursor and returns it as `next`; the caller continues with `after: next` until `more` is false. Within one
 segment a page is one contiguous range read (`ceil((limit + 1) / bucketKeys) + 1` buckets, usually a few KB).
 
-## Delete, compaction, GC, packs
+### Delete, compaction, GC, packs
 
 `deleteKeys` resolves the keys through the head revision and writes one tombstone set for the ids found (nothing
 when none was). `compactSegments` merges the `keys` sections like the `docs` sections: inputs oldest first, the
@@ -108,14 +163,14 @@ newest copy of a key wins, entries whose id a tombstone set hides are dropped; t
 snapshots and packs treat segments as opaque objects, so keys travel with them, and the interop test checks that
 an index keyed from one SDK resolves identically from the other.
 
-## What it costs on the hot path
+### What it costs on the hot path
 
 Nothing. The dense and lexical query paths do not read the `keys` section; a segment's resident parts grow by its
 keys directory (one entry plus one key per bucket). `get` is two rounds (keys bucket, docs bucket) against
 immutable cached objects: a few milliseconds from a local copy, tens of milliseconds from a Worker through a warm
 edge cache, the same as resolving a hit's document today.
 
-## Adding vectors to a text-first index
+### Adding vectors to a text-first index
 
 A keyed index often gets its texts and metas first and its embeddings later. `upsert({ keys, vectors, scope:
 "dense" })` (Python `scope="dense"`) attaches the vectors to the existing documents: the keys resolve through the
@@ -124,7 +179,7 @@ copies, so `get(key)`, `listKeys`, text search and the stored meta and text stay
 model, `texts` (not stored) can stand in for `vectors`. The other way round, `scope: "lexical"` changes texts or
 metas without the vector. See [update-path.md](update-path.md#scoped-tombstone-sets-one-sided-updates).
 
-## Not done
+### Not done
 
 - No reverse lookup (id -> key): put the key in `meta` if a search hit must show it.
 - No Bloom filter for negative lookups: a missing key reads one bucket per segment with keys.
