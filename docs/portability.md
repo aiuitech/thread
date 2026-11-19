@@ -22,8 +22,14 @@ const bucket = new S3BlobStore({ endpoint, bucket: "my-bucket", region: "auto", 
 const laptop = new FileBlobStore("/data/my-index");
 
 await copyObjects(bucket, laptop);                                   // everything
-await copyObjects(bucket, laptop, undefined, { skipExisting: true }); // only what is new: a sync
+
+// A sync: copy only the files that are new, then the pointer
+await copyObjects(bucket, laptop, undefined, { skipExisting: true });
+await copyObjects(bucket, laptop, ["idx/current.json"]);
 ```
+
+`skipExisting` compares sizes. That is right for index files, because they never change. The pointer
+`idx/current.json` is the one file that does change, so copy it again, last.
 
 ```python
 from thread_sdk import FileBlobStore, S3BlobStore, copy_objects
@@ -39,10 +45,14 @@ A live index holds history: old revisions and files that compaction replaced. A 
 that one revision needs, and nothing else.
 
 ```ts
-import { copyObjects, snapshotKeys } from "@aiuitech/thread-sdk";
+import { copyObjects, setCurrent, snapshotKeys } from "@aiuitech/thread-sdk";
 
-await copyObjects(source, target, ["idx/current.json", ...snapshotKeys(index.revision)]);
+await copyObjects(source, target, snapshotKeys(index.revision));      // the files of the revision that is open
+await setCurrent(target, { gen: index.gen, rev: index.rev });         // a pointer to exactly that revision
 ```
+
+Write the pointer yourself, as above. The source's `idx/current.json` can already point to a newer revision than
+the one your handle has open.
 
 ## Make a pack
 

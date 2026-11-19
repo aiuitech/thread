@@ -44,12 +44,25 @@ Which values to choose:
 Upsert the document again with the same key. Its chunks are replaced. If the new text is shorter, the chunks that
 no longer exist are removed in the same write.
 
-To delete a chunked document, list its chunk keys and delete them:
+To delete a chunked document, list its chunk keys and delete them. Read every page of the listing, and keep
+only the keys that are chunks of this document: another document can have a key that starts the same way.
 
 ```ts
-const { entries } = await index.listKeys({ prefix: "docs/handbook.md#" });
-await index.deleteKeys(entries.map((entry) => entry.key));
+import { chunkIndexOf } from "@aiuitech/thread-sdk";
+
+const parent = "docs/handbook.md";
+const chunkKeys: string[] = [];
+let after: string | undefined;
+do {
+  const page = await index.listKeys({ prefix: parent + "#", limit: 1000, after });
+  for (const { key } of page.entries) if (chunkIndexOf(key, parent) !== null) chunkKeys.push(key);
+  after = page.more ? page.next : undefined;
+} while (after !== undefined);
+
+await index.deleteKeys(chunkKeys);
 ```
+
+In Python the test is `chunk_index_of(key, parent) is not None`.
 
 ## Chunk without writing
 

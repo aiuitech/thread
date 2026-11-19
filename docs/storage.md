@@ -102,7 +102,7 @@ A disk cache survives restarts, so a new process does not start cold:
 ```ts
 import { DiskCache } from "@aiuitech/thread-sdk/node";
 
-const index = await thread.open({ store, cache: new DiskCache("/var/cache/thread", { maxBytes: 8 << 30 }) });
+const index = await thread.open({ store, cache: new DiskCache("/var/cache/thread", { maxBytes: 8 * 1024 ** 3 }) });
 ```
 
 ```python
@@ -119,8 +119,8 @@ them.
 
 ## Which revision you read
 
-By default, `open` follows the pointer `idx/current.json`, and the index moves to a new revision in the
-background when a writer commits one. Three options change that:
+By default, `open` follows the pointer `idx/current.json`. A search checks the pointer in the background every
+30 seconds, and the index moves to a new revision when a writer has committed one. Three options change that:
 
 | Option | Effect |
 |---|---|

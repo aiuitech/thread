@@ -40,17 +40,17 @@ const store = new FileBlobStore("./my-index");
 // Create a text index. Do this once.
 await createLexicalGeneration({ store, gen: "notes", lex: { text: true } });
 
-// Add three documents. Each has a key (its name), a text, and a meta string that comes back with a hit.
+// Three documents. Each has a key (its name), a text, and a meta string that comes back with a hit.
+const keys = ["notes/deploy.md", "notes/billing.md", "notes/oncall.md"];
+const texts = [
+  "The deploy failed because the migration timed out. Roll back, then run it again.",
+  "Invoices go out on the first of the month. Refunds take five days.",
+  "When a deployment fails at night, page the on-call engineer.",
+];
+const metas = ["Deploy runbook", "Billing FAQ", "On-call guide"];
+
 const index = await thread.open({ store });
-await index.upsert({
-  keys: ["notes/deploy.md", "notes/billing.md", "notes/oncall.md"],
-  texts: [
-    "The deploy failed because the migration timed out. Roll back, then run it again.",
-    "Invoices go out on the first of the month. Refunds take five days.",
-    "When a deployment fails at night, page the on-call engineer.",
-  ],
-  metas: ["Deploy runbook", "Billing FAQ", "On-call guide"],
-});
+await index.upsert({ keys, texts, metas });
 
 // Search.
 const { hits } = await index.search({ text: "deploy failed", topK: 3, docs: "text" });
@@ -81,7 +81,7 @@ Keyword search needs the right words. Semantic search finds text with the same m
 model. thread does not run a model. You tell it which model the index is for, and how to call it.
 
 This example uses OpenAI. Any OpenAI-compatible endpoint works, and so does
-[Workers AI or your own function](embedding.md).
+[Workers AI or your own function](embedding.md). Add these lines to the end of `demo.mjs`:
 
 ```js
 const embedding = { provider: "openai", model: "text-embedding-3-small", dim: 1536 };
@@ -90,20 +90,21 @@ const embedding = { provider: "openai", model: "text-embedding-3-small", dim: 15
 await thread.createGeneration({ store, gen: "notes-v2", embedding, lex: { text: true } });
 
 // Open it and say how to call the model.
-const index = await thread.open({ store, embed: { apiKey: process.env.OPENAI_API_KEY } });
+const semantic = await thread.open({ store, embed: { apiKey: process.env.OPENAI_API_KEY } });
 
 // The same upsert as before. The index embeds each text for you.
-await index.upsert({ keys, texts, metas });
+await semantic.upsert({ keys, texts, metas });
 
 // The same search as before. The query is embedded, BM25 runs too, and the two lists are merged.
-const { hits, mode } = await index.search({ text: "what do I do when a release breaks?", topK: 3, docs: true });
-console.log(mode);   // "hybrid"
+const result = await semantic.search({ text: "what do I do when a release breaks?", topK: 3, docs: true });
+console.log(result.mode);   // "hybrid"
+for (const hit of result.hits) console.log(hit.score.toFixed(3), hit.doc.meta);
 ```
 
 `createGeneration` makes the new index the current one, so `thread.open({ store })` now opens `notes-v2`.
 
-If you already have vectors, pass them: `index.upsert({ keys, vectors, texts, metas })` and
-`index.search({ vector, text })`.
+If you already have vectors, pass them: `upsert({ keys, vectors, texts, metas })` and
+`search({ vector, text })`.
 
 ## Python
 
@@ -124,17 +125,17 @@ store = FileBlobStore("./my-index")
 # Create a text index. Do this once.
 create_lexical_generation(store, "notes", lex={"text": True})
 
+# Three documents. Each has a key (its name), a text, and a meta string that comes back with a hit.
+keys = ["notes/deploy.md", "notes/billing.md", "notes/oncall.md"]
+texts = [
+    "The deploy failed because the migration timed out. Roll back, then run it again.",
+    "Invoices go out on the first of the month. Refunds take five days.",
+    "When a deployment fails at night, page the on-call engineer.",
+]
+metas = ["Deploy runbook", "Billing FAQ", "On-call guide"]
+
 with open_index(store) as index:
-    # Each document has a key (its name), a text, and a meta string that comes back with a hit.
-    index.upsert(
-        keys=["notes/deploy.md", "notes/billing.md", "notes/oncall.md"],
-        texts=[
-            "The deploy failed because the migration timed out. Roll back, then run it again.",
-            "Invoices go out on the first of the month. Refunds take five days.",
-            "When a deployment fails at night, page the on-call engineer.",
-        ],
-        metas=["Deploy runbook", "Billing FAQ", "On-call guide"],
-    )
+    index.upsert(keys=keys, texts=texts, metas=metas)
 
     result = index.search(text="deploy failed", top_k=3, docs="text")
     for hit in result.hits:
@@ -147,6 +148,8 @@ with open_index(store) as index:
 ```
 
 ### 3. Add semantic search
+
+Add these lines to the end of the same script:
 
 ```python
 import os
@@ -190,9 +193,12 @@ const embedding = {
 let index: Promise<ThreadIndex> | undefined;
 
 function getIndex(env: Env, ctx: ExecutionContext) {
-  index ??= Thread.init({ wasmModule }).then((thread) =>
-    thread.open({ bucket: env.BUCKET, embed: { ai: env.AI }, waitUntil: (p) => ctx.waitUntil(p) }),
-  );
+  if (!index) {
+    index = Thread.init({ wasmModule }).then((thread) =>
+      thread.open({ bucket: env.BUCKET, embed: { ai: env.AI }, waitUntil: (p) => ctx.waitUntil(p) }),
+    );
+    index.catch(() => (index = undefined));   // a failed open is tried again on the next request
+  }
   return index;
 }
 
@@ -200,8 +206,10 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
 
-    // Run once, to create the index in the bucket.
+    // Run once, to create the index in the bucket: curl -X POST https://<your-worker>/setup
+    // It makes the new, empty index the live one. Never leave this route open.
     if (url.pathname === "/setup") {
+      if (request.method !== "POST") return new Response("use POST", { status: 405 });
       const thread = await Thread.init({ wasmModule });
       await thread.createGeneration({ store: new R2BlobStore(env.BUCKET), gen: "docs", embedding, lex: { text: true } });
       return new Response("created");
@@ -230,7 +238,9 @@ Notes for Workers:
   ([how](../sdk/ts/README.md#importing-the-wasm)).
 - **The cache.** `open` puts the Workers Cache API in front of the bucket. Index files never change, so they stay
   cached. Pass `waitUntil` so that cache writes can finish after the response.
-- **Protect the write routes.** This example has no authentication. Add your own before you deploy it.
+- **Protect the write routes.** This example has no authentication. `/setup` and `/add` change the index, so put
+  your own authentication in front of them before you deploy, or create the index from a script and leave
+  `/setup` out.
 
 ## What to read next
 

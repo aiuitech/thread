@@ -83,8 +83,8 @@ The full comparison, with the cases where another tool is the better choice, is 
 4. A write never changes a file. It adds small new files and a new **revision**. A background step, compaction,
    merges them later.
 
-Because no file ever changes, every file can stay in a cache for ever, and every query reads a consistent
-snapshot. [How it works](docs/how-it-works.md) explains this with pictures. The engine is Rust, compiled to wasm
+Because no file ever changes, every file can stay in a cache for ever, and a reader never sees a half-written
+index. [How it works](docs/how-it-works.md) explains this with pictures. The engine is Rust, compiled to wasm
 for Workers and Node, and to a native extension for Python.
 
 ## Status

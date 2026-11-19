@@ -31,7 +31,7 @@ Three words to know:
 This one rule gives thread most of its properties:
 
 - A file can stay in a cache for ever. It will never be wrong.
-- A query reads one revision from start to end, so it always sees a consistent index.
+- A reader never sees a half-written index. It moves from one complete revision to the next.
 - A copy of the files is a copy of the index. A backup is a copy.
 
 ## How a vector query finds its neighbours
@@ -168,8 +168,8 @@ split into two. Compaction makes a new revision, like any other write, and reade
 What this means for you:
 
 - **Batch your writes.** One write of 100 documents is far cheaper than 100 writes of one document.
-- **A new write is visible to other readers within 30 seconds.** Readers check the pointer in the background. The
-  handle that made the write sees it at once.
+- **A new write is visible to other readers after about 30 seconds.** Readers check the pointer in the background
+  when they search. The handle that made the write sees it at once.
 - **Compaction must run somewhere.** [Run it in production](production.md) shows how.
 
 Details: [Update path](update-path.md).

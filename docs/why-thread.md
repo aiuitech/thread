@@ -34,7 +34,7 @@ for.
 | **You own the data** | The index is in your bucket, in a documented format, under an MIT licence. You can copy it, back it up and leave. |
 | **Portable** | The same index opens in a Worker, in Node, in Python, from a folder, or from one pack file with no network. Build it in one place and query it in another. |
 | **Scales with your platform** | Readers hold no state, so 1 reader and 1,000 readers are the same. One Worker deployment served about 2,500 queries a second on the 1M benchmark. |
-| **Consistent reads** | A query reads one revision of the index from start to end. A write that happens during the query does not change the answer. |
+| **No half-written index** | A write becomes visible as one complete revision, or not at all. A reader that is pinned to a revision always gets the same answer. |
 | **Hybrid search included** | Vectors and BM25 text share one index and one set of ids. You do not need a second system for keyword search. |
 
 ## When thread is a good choice
@@ -55,7 +55,7 @@ Be honest with yourself about these. thread is not the best tool for every job.
 |---|---|---|
 | The lowest latency for each query | A query is a few dozen cached reads. The median on the 1M benchmark is about 90 ms from a Worker. A managed service was 31 ms. | Vectorize, Pinecone, an in-memory engine |
 | Rich filters on metadata | Filters use 32 bits of fields per document: a tenant, a language, a few flags, a coarse date. There is no `$or`, and no filter on strings or large numbers. | Postgres with pgvector, Elasticsearch, Qdrant |
-| Many small writes, visible at once | Every write is a new revision. Writes are batched and become visible to other readers within 30 seconds. | A database |
+| Many small writes, visible at once | Every write is a new revision. Writes are batched and become visible to other readers after about 30 seconds. | A database |
 | Distance other than cosine | thread normalizes vectors and uses cosine similarity only. | Most vector databases |
 | Transactions with your other data | The index is separate from your database. | pgvector |
 | A vendor with a support contract and an SLA | thread is an open-source library. | A managed service |

@@ -88,8 +88,16 @@ index.query(vector, top_k=10, filter={"public": True, "year": {"$gte": 2020, "$l
 Conditions on different fields are joined with "and". There is no `$or`. For "one of several values" of the same
 field, use `$in`.
 
-To read the fields of a hit: `index.unpackAttrs(hit.attrs)` (Python: `index.unpack_attrs`) gives
-`{ tenant: 42, lang: "en", public: true, year: 2025 }`.
+To read the fields of a hit, unpack its attributes (Python: `index.unpack_attrs`). The result is
+`{ tenant: 42, lang: "en", public: true, year: 2025 }`. Where the attributes are depends on the call:
+
+```ts
+const q = await index.query(vector, { topK: 10 });
+index.unpackAttrs(q.hits[0].attrs);                    // a query hit carries them
+
+const s = await index.search({ text: "deploy failed", docs: true });
+index.unpackAttrs(s.hits[0].doc.attrs);                // a search hit has them on its document: ask for docs
+```
 
 ## What a filter costs
 
@@ -109,7 +117,7 @@ For multi-tenant data you have two choices:
 
 | | One index, `tenant` field | One index for each tenant (a `prefix`) |
 |---|---|---|
-| Isolation | By filter. A missing filter shows other tenants' data. | By storage. No query can cross tenants. |
+| Isolation | By filter. A missing filter shows other tenants' data, and so can a document that changes tenant while a search runs. | By storage. No query can cross tenants. |
 | Small tenants | Efficient | Efficient: an idle index costs only storage |
 | A query across all tenants | Possible | Not possible |
 | Number of tenants | Limited by the bits of the field | Unlimited |

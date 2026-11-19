@@ -142,23 +142,35 @@ pipeline, [Build pipeline](build-pipeline.md) and [Operations](operations.md).
 
 ## Change the model, or rebuild
 
-Build the new generation beside the live one, then move the pointer. Readers move to the new generation within
-30 seconds and never see a half-built index.
+Build the new generation beside the live one, then move the pointer. Readers move to the new generation at their
+next refresh and never see a half-built index.
+
+Writes need care. A writer that still has the old generation open keeps writing to the old generation after the
+switch, and those writes are lost when you delete it. So, in this order:
 
 ```ts
 // 1. Create it without making it live
 await thread.createGeneration({ store, gen: "docs-v2", embedding: newModel, lex: { text: true }, setCurrent: false });
 
-// 2. Fill it. Writes to a named generation do not move the pointer.
+// 2. From now on, send every new write to both generations (or record the writes, to replay them in step 4).
 const next = await thread.open({ store, gen: "docs-v2", embed: { ai: env.AI } });
+
+// 3. Copy the existing documents. Writes to a named generation do not move the pointer.
 await next.upsert({ keys, texts, metas });
 
-// 3. Switch. `expect` makes the switch fail if someone else moved the pointer first.
+// 4. Stop the writers of the old generation, and replay any write that you recorded.
+
+// 5. Switch. `expect` makes the switch fail if someone else moved the pointer or wrote to the old generation.
 await setCurrent(store, { gen: "docs-v2", expect: { gen: "docs", rev: liveRev } });
 
-// 4. Later, delete the old generation
+// 6. Open the writers again, without `gen`: they now follow the pointer to the new generation.
+
+// 7. Later, when no handle has the old generation open, delete it
 await dropGeneration(store, { gen: "docs", dryRun: false });
 ```
+
+`liveRev` is the last revision of the old generation that your copy includes. If a writer committed after it,
+the switch fails with a 409, and no write is lost: copy what is missing and try again.
 
 Details: [switching generations](update-path.md#switching-generations).
 

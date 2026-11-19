@@ -14,7 +14,7 @@ A document can have these parts. All are optional except a name (a key or an id)
 | `texts` | The text. It is indexed for keyword search, and embedded if the index has a model. | `"The deploy failed..."` |
 | `vectors` | The embedding, if you make it yourself. | `Float32Array(768)` |
 | `metas` | A string that comes back with a hit: a title, or a JSON object. | `'{"title":"Runbook"}'` |
-| `attrs` | Small fields that you can [filter](filtering.md) on. | `{ tenant: 42, lang: "en" }` |
+| `attrs` | Small fields that you can [filter](filtering.md) on. Define the fields first. | `{ tenant: 42, lang: "en" }` |
 
 Every part is a list, with one entry for each document in the batch.
 
@@ -25,7 +25,6 @@ const result = await index.upsert({
   keys: ["notes/deploy.md", "notes/billing.md"],
   texts: ["The deploy failed because the migration timed out.", "Invoices go out on the first of the month."],
   metas: ["Deploy runbook", "Billing FAQ"],
-  attrs: [{ tenant: 42 }, { tenant: 42 }],
 });
 // result.ids = [0, 1]    the ids of the documents
 // result.rev = 4         the revision that this write made
@@ -36,7 +35,6 @@ result = index.upsert(
     keys=["notes/deploy.md", "notes/billing.md"],
     texts=["The deploy failed because the migration timed out.", "Invoices go out on the first of the month."],
     metas=["Deploy runbook", "Billing FAQ"],
-    attrs=[{"tenant": 42}, {"tenant": 42}],
 )
 ```
 
@@ -72,11 +70,15 @@ To add or change only the vector, or only the text, use `scope`. The other part 
 
 ```ts
 // add a vector to a document that has only text
-await index.upsert({ keys: ["notes/deploy.md"], vectors: [vector], scope: "dense" });
+await index.upsert({ keys: ["notes/deploy.md"], vectors: [vector], attrs: [{ tenant: 42 }], scope: "dense" });
 
 // change the text and the meta, keep the vector
 await index.upsert({ keys: ["notes/deploy.md"], texts: [newText], metas: ["Deploy runbook v2"], scope: "lexical" });
 ```
+
+**With `scope: "dense"`, pass the document's `attrs` again.** The vector keeps its own copy of the attributes,
+and a filter on a vector search tests that copy. Without `attrs`, the new vector has none, and a filter such as
+`{ tenant: 42 }` no longer finds the document by its vector.
 
 ## Delete documents
 
@@ -92,21 +94,18 @@ index.delete([1042, 1043])
 
 A delete hides the whole document at once: its vector, its text, its meta and its key.
 
-To delete every chunk of a long document, list its keys by prefix first:
-
-```ts
-const { entries } = await index.listKeys({ prefix: "docs/handbook.md#" });
-await index.deleteKeys(entries.map((entry) => entry.key));
-```
+To delete every chunk of a long document, see [Chunking](chunking.md#update-or-delete-a-chunked-document).
 
 ## When a write is visible
 
 | Reader | Sees the write |
 |---|---|
 | The handle that made the write | At once |
-| Any other open index | Within 30 seconds (its `refreshInterval`), or at once after `await index.refresh()` |
+| Another open index that runs searches | After its next background refresh: a search checks for a new revision when `refreshInterval` (30 seconds) has passed, and the searches after that one use it |
+| Another open index that only calls `get` or `listKeys` | After `await index.refresh()`. Lookups do not start a refresh. |
 
-A query that is running during a write is not affected. It finishes on the revision that it started on.
+When a lookup must see a write that has completed, call `await index.refresh()` first.
+[Know your freshness](production.md#know-your-freshness) has the details.
 
 ## Three rules for cheap writes
 
@@ -119,17 +118,19 @@ go through your own code, run compaction after a write when it is due:
 
 ```ts
 if (index.compactionDue().due) {
-  let run;
-  do run = await index.compact();
-  while (run.more);
+  for (let i = 0; i < 8; i++) {                           // a few bounded slices, then stop
+    const run = await index.compact();
+    if (!run.more || run.outcome === "locked") break;     // locked: another run has the work
+  }
 }
 await index.compactSegments();     // the same for the text side, from time to time
 ```
 
 [Run it in production](production.md#run-compaction) explains where to run this.
 
-**3. Write from one place.** Two writers at the same time are safe: the store accepts one revision and the other
-writer tries again. But each retry costs time. One writer for each index (a queue consumer, a Durable Object, a
+**3. Write from one place.** Two writers at the same time are safe on a bucket: the store accepts one revision
+and the other writer tries again. (A folder on disk that Node and Python both write to is the exception: see
+[Write from one place](production.md#write-from-one-place).) But each retry costs time. One writer for each index (a queue consumer, a Durable Object, a
 cron job) is simpler and faster. In a Worker, also keep writes out of the isolates that serve queries: a write
 uses memory that the isolate does not give back.
 

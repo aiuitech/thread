@@ -22,7 +22,7 @@ still change between minor versions. [The changelog](../CHANGELOG.md) records ev
 
 | Limit | Value |
 |---|---|
-| Document ids | Unsigned 32-bit integers (0 to 4,294,967,295) |
+| Document ids | Unsigned 32-bit integers, 0 to 4,294,967,294 (the last value is reserved) |
 | Key length | 4,096 bytes, UTF-8 |
 | Documents in one `upsert` | 4,096 |
 | Chunks in one chunked `upsert` | 4,096 |
@@ -53,8 +53,11 @@ has one, and a few KB for each text segment. Everything else streams through.
 
 - No transactions across documents or across indexes. One `upsert` call is atomic: all of it becomes visible, or
   none of it.
-- A write is not visible to other readers at once. They see it within their refresh interval (30 seconds by
-  default).
+- A write is not visible to other readers at once. They see it after their next refresh: a search starts one
+  every 30 seconds by default, and a lookup (`get`, `listKeys`) never does.
+- A search is not a strict snapshot. If the handle refreshes while a search runs, the ranked lists and the
+  documents can come from two revisions. Pin a handle to a revision when you need one.
+- No insert that fails when the key exists. `upsert` always replaces.
 - Many small writes are expensive. Batch them.
 - Compaction is not automatic when you write through the SDKs. You call it.
 - No call deletes every chunk of a document. List the keys by prefix, then delete them.
