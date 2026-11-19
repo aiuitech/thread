@@ -101,7 +101,8 @@ console.log(result.mode);   // "hybrid"
 for (const hit of result.hits) console.log(hit.score.toFixed(3), hit.doc.meta);
 ```
 
-`createGeneration` makes the new index the current one, so `thread.open({ store })` now opens `notes-v2`.
+`createGeneration` makes the new index the current one, so `thread.open({ store })` now opens `notes-v2`. As
+before, delete `./my-index` before you run the script a second time.
 
 If you already have vectors, pass them: `upsert({ keys, vectors, texts, metas })` and
 `search({ vector, text })`.
@@ -164,14 +165,15 @@ with open_index(store, embed={"api_key": os.environ["OPENAI_API_KEY"]}) as index
     print(result.mode)   # "hybrid"
 ```
 
-To use a model that you run yourself, pass a function: `open_index(store, embed=lambda texts, kind:
+Delete `./my-index` before you run the script a second time. To use a model that you run yourself, pass a
+function: `open_index(store, embed=lambda texts, kind:
 model.encode(texts))`.
 
 ## In a Cloudflare Worker
 
 In a Worker, the store is an R2 bucket and the model can be Workers AI. The index code does not change.
 
-You need two bindings: an R2 bucket (`BUCKET`) and Workers AI (`AI`).
+You need two bindings, an R2 bucket (`BUCKET`) and Workers AI (`AI`), and one secret, `ADMIN_TOKEN`.
 
 ```ts
 import wasmModule from "@aiuitech/thread-sdk/wasm/thread_bg.wasm";
@@ -180,6 +182,7 @@ import { R2BlobStore, Thread, type ThreadIndex } from "@aiuitech/thread-sdk";
 interface Env {
   BUCKET: R2Bucket;
   AI: Ai;
+  ADMIN_TOKEN: string;   // a secret: only its holder may change the index
 }
 
 const embedding = {
@@ -206,10 +209,15 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
 
-    // Run once, to create the index in the bucket: curl -X POST https://<your-worker>/setup
-    // It makes the new, empty index the live one. Never leave this route open.
-    if (url.pathname === "/setup") {
+    // The two routes that change the index take POST with the admin token.
+    if (url.pathname === "/setup" || url.pathname === "/add") {
       if (request.method !== "POST") return new Response("use POST", { status: 405 });
+      if (request.headers.get("authorization") !== `Bearer ${env.ADMIN_TOKEN}`) return new Response("forbidden", { status: 403 });
+    }
+
+    // Run once, to create the index in the bucket. It makes the new, empty index the live one.
+    //   curl -X POST -H "authorization: Bearer $ADMIN_TOKEN" https://<your-worker>/setup
+    if (url.pathname === "/setup") {
       const thread = await Thread.init({ wasmModule });
       await thread.createGeneration({ store: new R2BlobStore(env.BUCKET), gen: "docs", embedding, lex: { text: true } });
       return new Response("created");
@@ -217,7 +225,7 @@ export default {
 
     const idx = await getIndex(env, ctx);
 
-    if (url.pathname === "/add" && request.method === "POST") {
+    if (url.pathname === "/add") {
       const { key, text, title } = await request.json<{ key: string; text: string; title: string }>();
       // `chunk: true` splits a long text into passages of 200 words, each with its own vector.
       const result = await idx.upsert({ keys: [key], texts: [text], metas: [title], chunk: true });
@@ -238,9 +246,8 @@ Notes for Workers:
   ([how](../sdk/ts/README.md#importing-the-wasm)).
 - **The cache.** `open` puts the Workers Cache API in front of the bucket. Index files never change, so they stay
   cached. Pass `waitUntil` so that cache writes can finish after the response.
-- **Protect the write routes.** This example has no authentication. `/setup` and `/add` change the index, so put
-  your own authentication in front of them before you deploy, or create the index from a script and leave
-  `/setup` out.
+- **The write routes.** `/setup` and `/add` change the index, so the example asks for a token. Replace that
+  check with your own authentication. The search route is open.
 
 ## What to read next
 

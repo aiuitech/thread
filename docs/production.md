@@ -154,9 +154,15 @@ How an open index refreshes:
 - `get`, `listKeys` and `docs` do not start a refresh. A handle that only does lookups stays on its revision until
   you call `refresh()`.
 
-If a user must see their own write at once (read-your-writes), run their next call on the handle that wrote, or
-`await index.refresh()` first. A shorter `refreshInterval` gives faster visibility for one more small read per
-interval.
+If a user must see their own write at once (read-your-writes), run their next call on the handle that wrote. On
+another handle, refresh until it has reached the revision that the write returned:
+
+```ts
+const written = await writer.upsert({ keys, texts });
+while (reader.rev < written.rev) await reader.refresh();     // one refresh is usually enough
+```
+
+A shorter `refreshInterval` gives faster visibility for one more small read per interval.
 
 A search is not a strict snapshot when the handle refreshes while it runs: the ranked lists can come from one
 revision and the documents (`docs: true`) from the next. If every part of a result must come from one revision,
@@ -179,10 +185,10 @@ What to watch:
 
 | Signal | Healthy | If not |
 |---|---|---|
-| Cache misses for each call (`stats.trace.io.misses`) | Near 0 after warm-up | Traffic is too low to keep the edge cache warm, or the revision changes very often |
+| Cache misses of a search (`result.stats.trace.io.misses`) | Near 0 after warm-up | Traffic is too low to keep the edge cache warm, or the revision changes very often |
 | Delta files in the revision (`compactionDue().pressure.deltas`) | Under 16 | Compaction is not running, or writes are too small |
 | Write conflicts (`result.conflicts`) | 0 | More than one writer. Use one writer. |
-| Time for each call (`stats.timing.total`) | Stable | Read the phases to find which step grew |
+| Time of a search (`result.stats.timing.total`) | Stable | Read the phases to find which step grew |
 
 [Observability](observability.md) explains traces, sinks and how to find a bottleneck.
 
@@ -192,8 +198,9 @@ What to watch:
 import { copyObjects, setCurrent, snapshotKeys } from "@aiuitech/thread-sdk";
 
 // One consistent revision, to another bucket or a folder
-await copyObjects(source, backup, snapshotKeys(index.revision));      // the files of the revision that is open
-await setCurrent(backup, { gen: index.gen, rev: index.rev });         // then a pointer to exactly that revision
+const revision = index.revision;                                          // take it once: the handle can move on
+await copyObjects(source, backup, snapshotKeys(revision));                // the files of that revision
+await setCurrent(backup, { gen: revision.gen, rev: revision.rev });       // then a pointer to exactly it
 ```
 
 Do not copy `idx/current.json` from the source. It can point to a newer revision than the files you copied.

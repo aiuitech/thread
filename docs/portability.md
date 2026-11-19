@@ -5,14 +5,15 @@ everything, copy one revision, or pack one revision into a single file that you 
 
 | You want to | Do |
 |---|---|
-| Mirror a bucket to a laptop, or a laptop to a bucket | [Copy](#copy-an-index) |
-| Ship exactly one revision, with nothing stale | [Copy a snapshot](#copy-one-revision) |
+| Copy a whole index that nobody writes to | [Copy](#copy-an-index) |
+| Mirror or sync an index that is in use, or ship exactly one revision | [Copy one revision](#copy-one-revision) |
 | Move the index as **one file** and query it in place | [Make a pack](#make-a-pack) |
 | Write on top of a pack | Copy the pack into a folder or a bucket first. Packs are read-only. |
 
 ## Copy an index
 
-`copyObjects` copies between any two [stores](storage.md): a bucket, a folder, memory.
+`copyObjects` copies between any two [stores](storage.md): a bucket, a folder, memory. With no key list, it
+copies every file. Do this when no writer is active:
 
 ```ts
 import { copyObjects, S3BlobStore } from "@aiuitech/thread-sdk";
@@ -21,15 +22,8 @@ import { FileBlobStore } from "@aiuitech/thread-sdk/node";
 const bucket = new S3BlobStore({ endpoint, bucket: "my-bucket", region: "auto", accessKeyId, secretAccessKey });
 const laptop = new FileBlobStore("/data/my-index");
 
-await copyObjects(bucket, laptop);                                   // everything
-
-// A sync: copy only the files that are new, then the pointer
-await copyObjects(bucket, laptop, undefined, { skipExisting: true });
-await copyObjects(bucket, laptop, ["idx/current.json"]);
+await copyObjects(bucket, laptop);
 ```
-
-`skipExisting` compares sizes. That is right for index files, because they never change. The pointer
-`idx/current.json` is the one file that does change, so copy it again, last.
 
 ```python
 from thread_sdk import FileBlobStore, S3BlobStore, copy_objects
@@ -37,22 +31,34 @@ from thread_sdk import FileBlobStore, S3BlobStore, copy_objects
 copy_objects(S3BlobStore.r2(account_id, "my-bucket", key_id, secret), FileBlobStore("/data/my-index"))
 ```
 
-The folder holds the same layout as the bucket, so `rsync`, `aws s3 sync` and `rclone` work too.
+The folder holds the same layout as the bucket, so `rsync`, `aws s3 sync` and `rclone` work too. With any of
+these, copy `idx/current.json` last: it is the pointer that readers follow.
+
+If writers are active during the copy, a plain copy can take the pointer of one revision and the files of
+another. Copy one revision instead.
 
 ## Copy one revision
 
 A live index holds history: old revisions and files that compaction replaced. A **snapshot** is the list of files
-that one revision needs, and nothing else.
+that one revision needs, and nothing else. This is also the safe way to copy or sync an index that is being
+written.
 
 ```ts
 import { copyObjects, setCurrent, snapshotKeys } from "@aiuitech/thread-sdk";
 
-await copyObjects(source, target, snapshotKeys(index.revision));      // the files of the revision that is open
-await setCurrent(target, { gen: index.gen, rev: index.rev });         // a pointer to exactly that revision
+const index = await thread.open({ store: source });
+const revision = index.revision;                          // take the revision once: the handle can move on
+
+// 1. The files of that revision. They never change, so files that the target has can be skipped.
+await copyObjects(source, target, snapshotKeys(revision), { skipExisting: true });
+
+// 2. Then the pointer, to exactly that revision.
+await setCurrent(target, { gen: revision.gen, rev: revision.rev });
 ```
 
-Write the pointer yourself, as above. The source's `idx/current.json` can already point to a newer revision than
-the one your handle has open.
+Run it again later and it is a sync: only the new files are copied, and the pointer moves when they are all
+there. Do not copy the source's `idx/current.json` yourself. It can point to a newer revision than the files you
+copied.
 
 ## Make a pack
 

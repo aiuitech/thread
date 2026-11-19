@@ -69,16 +69,20 @@ await index.upsert({ keys: ["docs/handbook.md"], texts: [handbook], metas: ["Han
 To add or change only the vector, or only the text, use `scope`. The other part stays as it is.
 
 ```ts
-// add a vector to a document that has only text
-await index.upsert({ keys: ["notes/deploy.md"], vectors: [vector], attrs: [{ tenant: 42 }], scope: "dense" });
+// add a vector to a document that has only text. Read its attributes, and give them to the vector.
+const key = "notes/deploy.md";
+const { records } = await index.get([key]);
+const doc = records.get(key);
+if (doc) await index.upsert({ keys: [key], vectors: [vector], attrs: [doc.attrs], scope: "dense" });
 
 // change the text and the meta, keep the vector
-await index.upsert({ keys: ["notes/deploy.md"], texts: [newText], metas: ["Deploy runbook v2"], scope: "lexical" });
+await index.upsert({ keys: [key], texts: [newText], metas: ["Deploy runbook v2"], scope: "lexical" });
 ```
 
-**With `scope: "dense"`, pass the document's `attrs` again.** The vector keeps its own copy of the attributes,
-and a filter on a vector search tests that copy. Without `attrs`, the new vector has none, and a filter such as
-`{ tenant: 42 }` no longer finds the document by its vector.
+**With `scope: "dense"`, pass the document's own `attrs`, as above.** The vector keeps its own copy of the
+attributes, and a filter on a vector search tests that copy. Without `attrs` the vector has none, and with other
+values the vector and the document disagree: a filter can then miss the document or match the wrong one. Do the
+read and the write from one writer, so that the document cannot change between them.
 
 ## Delete documents
 
@@ -104,8 +108,8 @@ To delete every chunk of a long document, see [Chunking](chunking.md#update-or-d
 | Another open index that runs searches | After its next background refresh: a search checks for a new revision when `refreshInterval` (30 seconds) has passed, and the searches after that one use it |
 | Another open index that only calls `get` or `listKeys` | After `await index.refresh()`. Lookups do not start a refresh. |
 
-When a lookup must see a write that has completed, call `await index.refresh()` first.
-[Know your freshness](production.md#know-your-freshness) has the details.
+When another handle must see a write that has completed, refresh it until `index.rev` has reached the `rev` that
+the write returned. [Know your freshness](production.md#know-your-freshness) has the details.
 
 ## Three rules for cheap writes
 

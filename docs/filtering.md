@@ -96,7 +96,8 @@ const q = await index.query(vector, { topK: 10 });
 index.unpackAttrs(q.hits[0].attrs);                    // a query hit carries them
 
 const s = await index.search({ text: "deploy failed", docs: true });
-index.unpackAttrs(s.hits[0].doc.attrs);                // a search hit has them on its document: ask for docs
+const doc = s.hits[0].doc;                             // a search hit has them on its document: ask for docs
+if (doc) index.unpackAttrs(doc.attrs);                 // `doc` is null for a document stored without text or meta
 ```
 
 ## What a filter costs

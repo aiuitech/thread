@@ -45,24 +45,28 @@ Upsert the document again with the same key. Its chunks are replaced. If the new
 no longer exist are removed in the same write.
 
 To delete a chunked document, list its chunk keys and delete them. Read every page of the listing, and keep
-only the keys that are chunks of this document: another document can have a key that starts the same way.
+only the keys that are exactly a chunk key of this document: another document can have a key that starts the
+same way, such as `docs/handbook.md#notes`.
 
 ```ts
-import { chunkIndexOf } from "@aiuitech/thread-sdk";
+import { chunkIndexOf, chunkKey } from "@aiuitech/thread-sdk";
 
 const parent = "docs/handbook.md";
 const chunkKeys: string[] = [];
 let after: string | undefined;
 do {
   const page = await index.listKeys({ prefix: parent + "#", limit: 1000, after });
-  for (const { key } of page.entries) if (chunkIndexOf(key, parent) !== null) chunkKeys.push(key);
+  for (const { key } of page.entries) {
+    const i = chunkIndexOf(key, parent);
+    if (i !== null && chunkKey(parent, i) === key) chunkKeys.push(key);   // "#3" is a chunk, "#03" is not
+  }
   after = page.more ? page.next : undefined;
 } while (after !== undefined);
 
-await index.deleteKeys(chunkKeys);
+if (chunkKeys.length > 0) await index.deleteKeys(chunkKeys);
 ```
 
-In Python the test is `chunk_index_of(key, parent) is not None`.
+Python has the same two functions: `chunk_index_of(key, parent)` and `chunk_key(parent, i)`.
 
 ## Chunk without writing
 

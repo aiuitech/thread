@@ -23,7 +23,7 @@ If you have not chosen yet, [Why thread](why-thread.md#cloudflare-vectorize) com
 | `query(vector, { returnMetadata: "all" })` | `index.search({ vector, topK, docs: true })`, then `hit.doc.meta` |
 | `query(vector, { filter: { field: { $eq: value } } })` | `index.query(vector, { filter: { field: value } })` with the same operators: `$eq`, `$ne`, `$in`, `$nin`, `$lt`, `$lte`, `$gt`, `$gte` |
 | `upsert([{ id, values, metadata }])` | `index.upsert({ keys, vectors, metas, attrs })` |
-| `insert([...])`, which keeps the first vector of an id | No equivalent. `upsert` always replaces. To keep the first, call `index.resolveKeys(keys)` and write only the keys that are missing, from one writer. |
+| `insert([...])`, which keeps the first vector of an id | No equivalent. `upsert` always replaces. |
 | `deleteByIds(ids)` | `index.deleteKeys(keys)`, or `index.delete(ids)` for numeric ids |
 | `getByIds(ids)` | `index.get(keys)` returns the meta, the attributes and the text. The stored vector is not returned. |
 | `describe()` | `index.manifest`, `index.dim`, `index.cells` |
@@ -79,18 +79,24 @@ A hit does not carry its key, so the example stores the key in `metas`.
    If you want thread to embed texts for you from now on, give `embedding` in place of `dim`
    ([Create an index](create-an-index.md)).
 
-2. **Write to both.** From now on, send each new write and delete to Vectorize and to thread. Start this before
-   the copy, so that no change falls between the copy and the switch.
+2. **Stop writes, or record them.** A copy that runs while documents change can put an old version over a new
+   one, or bring back a deleted document. So either pause writes until step 4 is done, or record every write and
+   delete in order (a queue, a log table), from before the copy starts.
 
 3. **Copy the data.** Read your documents from your source of truth, with their vectors, and upsert them in
-   batches of a few hundred to 4,096. A document that step 2 already wrote is replaced by the same content. For
-   more than a few tens of thousands of vectors, use a [bulk build](create-an-index.md#load-a-lot-of-data) so
-   that the cells are good from the start.
+   batches of a few hundred to 4,096.
 
-4. **Compare.** Run the same queries against both and compare the top results. They will not be identical: both
+   For more than a few tens of thousands of vectors, use a
+   [bulk build](create-an-index.md#load-a-lot-of-data) in place of steps 1 and 3. It creates the generation
+   itself, so give it a name that does not exist yet.
+
+4. **Replay, then write to both.** When the copy is complete, apply the recorded changes to thread in the order
+   they happened. From then on, send each write and delete to Vectorize and to thread.
+
+5. **Compare.** Run the same queries against both and compare the top results. They will not be identical: both
    indexes are approximate. Expect most of the top 10 to agree.
 
-5. **Switch reads** to thread. Then stop the writes to Vectorize.
+6. **Switch reads** to thread. Then stop the writes to Vectorize.
 
 ## What you gain and what you give up
 

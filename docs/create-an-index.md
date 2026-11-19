@@ -145,32 +145,36 @@ pipeline, [Build pipeline](build-pipeline.md) and [Operations](operations.md).
 Build the new generation beside the live one, then move the pointer. Readers move to the new generation at their
 next refresh and never see a half-built index.
 
-Writes need care. A writer that still has the old generation open keeps writing to the old generation after the
-switch, and those writes are lost when you delete it. So, in this order:
+Writes need care, for two reasons. A copy that runs while documents change can put an old version over a new
+one. And a writer that still has the old generation open keeps writing to it after the switch, where those
+writes are lost. The simple way is to pause writes from step 2 to step 5. If you cannot, record every write and
+delete in order from before step 2, and replay them in step 3.
 
 ```ts
 // 1. Create it without making it live
 await thread.createGeneration({ store, gen: "docs-v2", embedding: newModel, lex: { text: true }, setCurrent: false });
 
-// 2. From now on, send every new write to both generations (or record the writes, to replay them in step 4).
+// 2. Copy the existing documents. Writes to a named generation do not move the pointer.
 const next = await thread.open({ store, gen: "docs-v2", embed: { ai: env.AI } });
-
-// 3. Copy the existing documents. Writes to a named generation do not move the pointer.
 await next.upsert({ keys, texts, metas });
 
-// 4. Stop the writers of the old generation, and replay any write that you recorded.
+// 3. Stop the writers of the old generation. Replay the changes that you recorded, in order.
 
-// 5. Switch. `expect` makes the switch fail if someone else moved the pointer or wrote to the old generation.
+// 4. Switch. `expect` makes the switch fail if the old generation is not at the revision that you copied.
 await setCurrent(store, { gen: "docs-v2", expect: { gen: "docs", rev: liveRev } });
 
-// 6. Open the writers again, without `gen`: they now follow the pointer to the new generation.
+// 5. Open the writers again, without `gen`: they now follow the pointer to the new generation.
 
-// 7. Later, when no handle has the old generation open, delete it
+// 6. Later, when no handle has the old generation open, delete it
 await dropGeneration(store, { gen: "docs", dryRun: false });
 ```
 
 `liveRev` is the last revision of the old generation that your copy includes. If a writer committed after it,
-the switch fails with a 409, and no write is lost: copy what is missing and try again.
+the switch fails with a 409 and nothing is lost: copy what is missing and try again.
+
+A search that is running at the moment of the switch can fail once, with a 400 error about the vector size,
+when the two models have different sizes: it embedded its query with the old model and then moved to the new
+index. Run that search again.
 
 Details: [switching generations](update-path.md#switching-generations).
 

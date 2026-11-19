@@ -557,8 +557,8 @@ a cold start. A `DiskCache` is also a `FileBlobStore`, so warming a laptop from 
 ```ts
 import { DiskCache, FileBlobStore } from "@aiuitech/thread-sdk/node";
 const disk = new DiskCache("/var/cache/thread", { maxBytes: 8 * 1024 ** 3 });   // not 8 << 30, which is 0 in JavaScript
-await copyObjects(s3, disk, snapshotKeys(index.revision));            // one revision, ~7 GB on g4
 const index = await thread.open({ store: s3, cache: disk });           // or offline: { store: new FileBlobStore(dir), gen, rev }
+await copyObjects(s3, disk, snapshotKeys(index.revision));            // one revision, ~7 GB on g4
 ```
 
 **Connections.** Node's `fetch` (undici) speaks HTTP/1.1 (no HTTP/2 unless an `Agent` with `allowH2` is used), one
